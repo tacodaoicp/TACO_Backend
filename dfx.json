@@ -1,0 +1,52 @@
+{
+  "canisters": {
+    "DAO_backend": {
+      "main": "src/DAO_backend/DAO.mo",
+      "type": "motoko"
+    },
+    "testDAO": {
+      "main": "examples/test.mo",
+      "type": "motoko"
+    },
+    "treasury": {
+      "main": "src/treasury/treasury.mo",
+      "type": "motoko"
+    },
+    "neuronSnapshot": {
+      "main": "src/neuron_snapshot/neuronSnapshot.mo",
+      "type": "motoko"
+    },
+    "actorA": {
+      "main": "examples/testActorA.mo",
+      "type": "motoko"
+    },
+    "actorB": {
+      "main": "examples/testActorB.mo",
+      "type": "motoko"
+    },
+    "actorC": {
+      "main": "examples/testActorC.mo",
+      "type": "motoko"
+    },
+    "mockICPswap": {
+      "main": "examples/mockICPswap.mo",
+      "type": "motoko"
+    },
+    "mockKongswap": {
+      "main": "examples/mockKongswap.mo",
+      "type": "motoko"
+    },
+    "mintingVault": {
+      "main": "src/minting_vault/minting_vault.mo",
+      "type": "motoko"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": "mops sources"
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
