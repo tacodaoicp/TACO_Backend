@@ -75,9 +75,9 @@ actor ContinuousDAO {
   //MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := 500; // delete this in production
   //SNAPSHOT_INTERVAL := 86400000000000; // delete this in production
   spamGuard.setTest(false); 
-  MAX_ALLOCATIONS_PER_DAY := 5; // delete this in production
-  MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := 10; // delete this in production
-  SNAPSHOT_INTERVAL := 900_000_000_000; // delete this in production
+  //MAX_ALLOCATIONS_PER_DAY := 5; // delete this in production
+  //MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := 10; // delete this in production
+  //SNAPSHOT_INTERVAL := 900_000_000_000; // delete this in production
 
   // Logger
   let logger = Logger.Logger();
@@ -1887,7 +1887,7 @@ actor ContinuousDAO {
 
       case (#SnapshotInterval(newInterval)) {
         if (newInterval < 600_000_000_000 or newInterval > 172_800_000_000_000) {
-          // 18 minutes to 48 hours
+          // 10 minutes to 48 hours
           return #err(
             #UnexpectedError(
               "Snapshot interval must be between " #
