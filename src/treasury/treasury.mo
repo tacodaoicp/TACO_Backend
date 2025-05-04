@@ -128,6 +128,14 @@ actor treasury {
   let DAOPrincipal = Principal.fromText(DAOText);
   stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
 
+  var masterAdmins = [
+    Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae"), 
+    Principal.fromText("uuyso-zydjd-tsb4o-lgpgj-dfsvq-awald-j2zfp-e6h72-d2je3-whmjr-xae"), 
+    Principal.fromText("5uvsz-em754-ulbgb-vxihq-wqyzd-brdgs-snzlu-mhlqw-k74uu-4l5h3-2qe"),
+    Principal.fromText("6mxg4-njnu6-qzizq-2ekit-rnagc-4d42s-qyayx-jghoe-nd72w-elbsy-xqe"),
+    Principal.fromText("6q3ra-pds56-nqzzc-itigw-tsw4r-vs235-yqx5u-dg34n-nnsus-kkpqf-aqe")];
+
+
   // Core type aliases
   type Subaccount = Blob;
   type TransferRecipient = TreasuryTypes.TransferRecipient;
@@ -228,6 +236,15 @@ actor treasury {
   stable let transferQueue = Vector.new<(TransferRecipient, Nat, Principal, Nat8)>();
   stable var transferTimerIDs = Vector.new<Nat>();
   stable var nsAdd : Nat64 = 0; // ns to add tx time to avoid errorsstable var nsAdd : Nat64 = 0;
+
+  private func isMasterAdmin(caller : Principal) : Bool {
+    for (admin in masterAdmins.vals()) {
+      if (admin == caller) {
+        return true;
+      };
+    };
+    false;
+  };
 
   //=========================================================================
   // 3. PUBLIC INTERFACES
@@ -2599,10 +2616,12 @@ actor treasury {
   startAllSyncTimers<system>(true);
 
   // Security check for message inspection
-  /*system func inspect({
+  system func inspect({
     arg : Blob;
     caller : Principal;
     msg : {
+      #admin_executeTradingCycle : () -> ();
+      #admin_recoverPoolBalances : () -> ();
       #admin_syncWithDao : () -> ();
       #getCurrentAllocations : () -> ();
       #getTokenDetails : () -> ();
@@ -2617,6 +2636,6 @@ actor treasury {
       #getSystemParameters : () -> ();
     };
   }) : Bool {
-    Principal.isController(caller);
-  };*/
+     (isMasterAdmin(caller) or Principal.isController(caller)) and arg.size() < 50000;
+  };
 };

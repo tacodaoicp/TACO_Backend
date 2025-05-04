@@ -41,10 +41,17 @@ actor {
   //let DAOprincipal = Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai");
   let DAOprincipal = Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai");
 
-  stable var logAdmin : Principal = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
+  stable var masterAdmin : Principal = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
 
-  //stable var sns_governance_canister_id = Principal.fromText("aaaaa-aa"); // change in production if known already
-  var sns_governance_canister_id = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai"); // NB: SNEED GOV! change in production when known!
+  var masterAdmins = [
+    Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae"), 
+    Principal.fromText("uuyso-zydjd-tsb4o-lgpgj-dfsvq-awald-j2zfp-e6h72-d2je3-whmjr-xae"), 
+    Principal.fromText("5uvsz-em754-ulbgb-vxihq-wqyzd-brdgs-snzlu-mhlqw-k74uu-4l5h3-2qe"),
+    Principal.fromText("6mxg4-njnu6-qzizq-2ekit-rnagc-4d42s-qyayx-jghoe-nd72w-elbsy-xqe"),
+    Principal.fromText("6q3ra-pds56-nqzzc-itigw-tsw4r-vs235-yqx5u-dg34n-nnsus-kkpqf-aqe")];
+
+  stable var sns_governance_canister_id = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai"); // change in production if known already
+  //var sns_governance_canister_id = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai"); // NB: SNEED GOV! change in production when known!
 
   var snapshotTimerId : Nat = 0;
 
@@ -81,7 +88,7 @@ actor {
   let testActorA = Principal.fromText("hhaaz-2aaaa-aaaaq-aacla-cai");
   let testActorB = Principal.fromText("qtooy-2yaaa-aaaaq-aabvq-cai");
   let testActorC = Principal.fromText("aanaa-xaaaa-aaaah-aaeiq-cai");
-
+/*
   public query func get_neuron_snapshot_curr_neuron_id() : async ?T.NeuronId {
     neuron_snapshot_curr_neuron_id;
   };
@@ -89,7 +96,16 @@ actor {
   public query func get_neuron_snapshot_importing_count() : async Nat {
     List.size(neuron_snapshot_importing);
   };
-
+*/
+  private func isMasterAdmin(caller : Principal) : Bool {
+    if (caller == masterAdmin) { return true; };
+    for (admin in masterAdmins.vals()) {
+      if (admin == caller) {
+        return true;
+      };
+    };
+    false;
+  };
 
   public shared ({ caller }) func setTest(enabled : Bool) : async () {
     assert (Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")));
@@ -706,28 +722,28 @@ actor {
 
   // Function to get logs - restricted to controllers only
   public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
-    if (caller == logAdmin or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
       logger.getLastLogs(count);
     } else { [] };
   };
 
   // Function to get logs by context - restricted to controllers only
   public query ({ caller }) func getLogsByContext(context : Text, count : Nat) : async [Logger.LogEntry] {
-    if (caller == logAdmin or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
+    if (isMasterAdmin(caller)or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
       logger.getContextLogs(context, count);
     } else { [] };
   };
 
   // Function to get logs by level - restricted to controllers only
   public query ({ caller }) func getLogsByLevel(level : Logger.LogLevel, count : Nat) : async [Logger.LogEntry] {
-    if (caller == logAdmin or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
       logger.getLogsByLevel(level, count);
     } else { [] };
   };
 
   // Function to clear logs - restricted to controllers
   public shared ({ caller }) func clearLogs() : async () {
-    if (caller == logAdmin or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
       logger.info("System", "Logs cleared by: " # Principal.toText(caller), "clearLogs");
       logger.clearLogs();
       logger.clearContextLogs("all");
@@ -735,58 +751,59 @@ actor {
   };
 
   public shared ({ caller }) func setLogAdmin(admin : Principal) : async () {
-    if (caller == logAdmin or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
-      logAdmin := admin;
+    if (isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
+      masterAdmin := admin;
     };
   };
 
   public shared ({ caller }) func setSnsGovernanceCanisterId(canisterId : Principal) : async () {
-    if (Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
       sns_governance_canister_id := canisterId;
     };
   };
 
-  /*system func inspect({
+  system func inspect({
     arg : Blob;
     caller : Principal;
     msg : {
       #cancel_neuron_snapshot : () -> ();
-      #getCumulativeValuesAtSnapshot : () -> ?T.SnapshotId;
+      #clearLogs : () -> ();
+      #getLogs : () -> Nat;
+      #getLogsByContext : () -> (Text, Nat);
+      #getLogsByLevel : () -> (T.LogLevel, Nat);
       #getNeuronDataForDAO : () -> (T.SnapshotId, Nat, Nat);
+      //#get_neuron_snapshot_curr_neuron_id : () -> ?T.NeuronId;
       #get_neuron_snapshot_head_id : () -> ();
       #get_neuron_snapshot_info : () -> T.SnapshotId;
       #get_neuron_snapshot_neurons : () -> (T.SnapshotId, Nat, Nat);
       #get_neuron_snapshot_status : () -> ();
       #get_neuron_snapshots_info : () -> (Nat, Nat);
-      #setTest : () -> Bool;
-      #take_neuron_snapshot : () -> ();
-      #getLogs : () -> Nat;
-      #getLogsByContext : () -> (Text, Nat);
-      #getLogsByLevel : () -> (T.LogLevel, Nat);
-      #clearLogs : () -> ();
+      #getCumulativeValuesAtSnapshot : () -> ?T.SnapshotId;
       #setLogAdmin : () -> Principal;
       #setSnsGovernanceCanisterId : () -> Principal;
+      #setTest : () -> Bool;
+      #take_neuron_snapshot : () -> ();
     };
   }) : Bool {
     switch (msg) {
       case (#setLogAdmin(_)) {
-        (caller == logAdmin or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 5000;
+        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
       };
       case (#clearLogs(_)) {
-        (caller == logAdmin or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 5000;
+        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
       };
       case (#getLogs(_)) {
-        (caller == logAdmin or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 5000;
+        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
       };
       case (#getLogsByContext(_)) {
-        (caller == logAdmin or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 5000;
+        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
       };
       case (#getLogsByLevel(_)) {
-        (caller == logAdmin or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 5000;
+        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
       };
       case (_) {
-        Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")) and arg.size() < 5000;
+        isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")) and arg.size() < 50000;
       };
     };
-  };*/
+  };
 };
