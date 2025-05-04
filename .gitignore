@@ -12,6 +12,7 @@
 .mops/
 
 # generated files
+package-lock.json
 
 # rust
 target/
@@ -25,3 +26,4 @@ dist/
 .env
 *.pem
 dfx_output.txt
+
