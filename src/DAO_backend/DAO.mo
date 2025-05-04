@@ -2174,7 +2174,8 @@ actor ContinuousDAO {
     };
   };
 
-  //addSnapshotUpdateTimer<system>(SNAPSHOT_INTERVAL);
+  // Start snapshot timer on canister upgrades:
+  addSnapshotUpdateTimer<system>(SNAPSHOT_INTERVAL);
 
   // Set the SNS governance canister id
   public shared ({ caller }) func set_sns_governance_canister_id(p : Principal) : async () {
