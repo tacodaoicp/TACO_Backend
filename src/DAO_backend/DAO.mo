@@ -1691,6 +1691,7 @@ actor ContinuousDAO {
   };
 
   private func isAllowed(principal : Principal) : Bool {
+    if (isMasterAdmin(principal)) { return true; };
     switch (spamGuard.isAllowed(principal, sns_governance_canister_id)) {
       case (1) { return true };
       case (_) { return false };
@@ -1698,6 +1699,7 @@ actor ContinuousDAO {
   };
 
   private func isAllowedQuery(principal : Principal) : Bool {
+    if (isMasterAdmin(principal)) { return true; };
     switch (spamGuard.isAllowedQuery(principal)) {
       case (1) { return true };
       case (_) { return false };
@@ -2179,55 +2181,60 @@ actor ContinuousDAO {
     assert (Principal.isController(caller) or sns_governance_canister_id == ?caller);
     sns_governance_canister_id := ?p;
   };
-/*
+
   // Inspect message validation
   system func inspect({
     caller : Principal;
     msg : {
-      #updateAllocation : () -> [Allocation];
-      #updateSystemState : () -> SystemState;
       #addAdmin : () -> Principal;
-      #removeAdmin : () -> Principal;
+      #addToken : () -> (Principal, TokenType);
+      #admin_getNeuronAllocations : () -> ();
+      #admin_getUserAllocation : () -> Principal;
+      #admin_getUserAllocations : () -> ();
+      #admin_recalculateAllVotingPower : () -> Nat;      
+      #clearLogs : () -> ();
+      #followAllocation : () -> Principal;
+      #getAdminPermissions : () -> ();
       #getAggregateAllocation : () -> ();
-      #getUserAllocation : () -> ();
+      #getFollowersWithNeuronCounts : () -> ();
+      #getHistoricBalanceAndAllocation : () -> Nat;
+      #getLogs : () -> Nat;
+      #getLogsByContext : () -> (Text, Nat);
+      #getLogsByLevel : () -> (LogLevel, Nat);
+      #getNeuronAllocation : () -> Blob;
       #getSnapshotInfo : () -> ();
+      #getSystemParameters : () -> ();
+      #getTokenDetails : () -> ();
+      #getUserAllocation : () -> ();
+      #grantAdminPermission : () -> (Principal, SpamProtection.AdminFunction, Nat);
+      #hasAdminPermission : () -> (Principal, SpamProtection.AdminFunction);
+      #pauseToken : () -> Principal;
+      #removeAdmin : () -> Principal;
+      #removeFollower : () -> (follower : Principal);
+      #removeToken : () -> Principal;
+      #setTacoAddress : () -> Principal;
+      #set_sns_governance_canister_id : () -> Principal;
+      #syncTokenDetailsFromTreasury : () -> [(Principal, TokenDetails)];
+      #unfollowAllocation : () -> Principal;
+      #unpauseToken : () -> Principal;
+      #updateAllocation : () -> [Allocation];
+      #updateMintingVaultConfig : () -> MintingVault.UpdateConfig;
       #updateSpamParameters : () -> {
         allowedCalls : ?Nat;
         allowedSilentWarnings : ?Nat;
         timeWindowSpamCheck : ?Int;
       };
-      #addToken : () -> (Principal, TokenType);
-      #removeToken : () -> Principal;
-      #pauseToken : () -> Principal;
-      #unpauseToken : () -> Principal;
-      #grantAdminPermission : () -> (Principal, SpamProtection.AdminFunction, Nat);
-      #getAdminPermissions : () -> ();
-      #getTokenDetails : () -> ();
-      #followAllocation : () -> Principal;
-      #unfollowAllocation : () -> Principal;
-      #votingPowerMetrics : () -> ();
       #updateSystemParameter : () -> SystemParameter;
-      #syncTokenDetailsFromTreasury : () -> [(Principal, TokenDetails)];
-      #getNeuronAllocation : () -> Blob;
-      #getSystemParameters : () -> ();
-      #getHistoricBalanceAndAllocation : () -> Nat;
+      #updateSystemState : () -> SystemState;      
       #updateTreasuryConfig : () -> (TreasuryTypes.UpdateConfig, ?Bool);
-      #updateMintingVaultConfig : () -> MintingVault.UpdateConfig;
-      #clearLogs : () -> ();
-      #getLogs : () -> Nat;
-      #getLogsByContext : () -> (Text, Nat);
-      #getLogsByLevel : () -> (LogLevel, Nat);
-      #setTacoAddress : () -> Principal;
-      #set_sns_governance_canister_id : () -> Principal;
-      #getFollowersWithNeuronCounts : () -> ();
-      #removeFollower : () -> (follower : Principal);
+      #votingPowerMetrics : () -> ();
     };
     arg : Blob;
   }) : Bool {
-    if (arg.size() > 5000) { return false }; //Not sure how much this should be
+    if (arg.size() > 50000) { return false }; //Not sure how much this should be
     switch (msg) {
       case (#set_sns_governance_canister_id p) {
-        Principal.isController(caller) or sns_governance_canister_id == ?caller;
+        isMasterAdmin(caller) or Principal.isController(caller) or sns_governance_canister_id == ?caller;
       };
       case (#updateAllocation d) {
         let newAllocations = d();
@@ -2266,13 +2273,13 @@ actor ContinuousDAO {
         let timenow = Time.now();
         let pastAllocSize = userState.pastAllocations.size();
         let max_past_allocations = if (MAX_ALLOCATIONS_PER_DAY > 0) {
-          Int.abs(MAX_ALLOCATIONS_PER_DAY) - 1;
+          if (Int.abs(MAX_ALLOCATIONS_PER_DAY) >= 1) { Int.abs(MAX_ALLOCATIONS_PER_DAY) - 1 } else { 0 };
         } else { 0 };
 
         if (pastAllocSize >= max_past_allocations) {
           let recentAllocations = Array.subArray(
             userState.pastAllocations,
-            pastAllocSize - max_past_allocations,
+            if (pastAllocSize < max_past_allocations) { 0 } else { pastAllocSize - max_past_allocations },
             max_past_allocations,
           );
 
@@ -2518,22 +2525,37 @@ actor ContinuousDAO {
       case (#updateTreasuryConfig d) {
         isAdmin(caller, #updateTreasuryConfig);
       };
+      case (#admin_getNeuronAllocations d) {
+        isAdmin(caller, #getLogs);
+      };
+      case (#admin_getUserAllocation d) {
+        isAdmin(caller, #getLogs);
+      };
+      case (#admin_getUserAllocations d) {
+        isAdmin(caller, #getLogs);
+      };
+      case (#admin_recalculateAllVotingPower d) {
+        isMasterAdmin(caller);
+      };
+      case (#hasAdminPermission d) {
+        isMasterAdmin(caller) or caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller or isAdmin(d());
+      };
       case (#clearLogs _) {
-        caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
+        isMasterAdmin(caller) or caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
       };
       case (#getLogs _) {
-        caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
+        isMasterAdmin(caller) or caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
       };
       case (#getLogsByContext _) {
-        caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
+        isMasterAdmin(caller) or caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
       };
       case (#getLogsByLevel _) {
-        caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
+        isMasterAdmin(caller) or caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller;
       };
       case (#setTacoAddress _) {
-        Principal.isController(caller) or isAdmin(caller, #setTacoAddress) or sns_governance_canister_id == ?caller;
+        isMasterAdmin(caller) or isAdmin(caller, #setTacoAddress) or Principal.isController(caller) or sns_governance_canister_id == ?caller;
       };
 
     };
-  };*/
+  };
 };
