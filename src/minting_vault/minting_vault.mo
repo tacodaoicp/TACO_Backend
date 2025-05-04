@@ -84,7 +84,7 @@ actor MintingVaultDAO {
   stable var TreasurySubaccount = Blob.fromArray([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
   // Admin other than controller that has access to logs
-  stable var logAdmin = Principal.fromText("ko5bb-yjzyp-qwhip-o3oxz-z2wo5-c7ovm-54iqy-i5dtw-cfzkt-7r26t-gqe");
+  stable var logAdmin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
 
   let TACOaddress = "csyra-haaaa-aaaaq-aacva-cai"; //change in production
 
