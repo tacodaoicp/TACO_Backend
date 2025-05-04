@@ -71,13 +71,13 @@ actor ContinuousDAO {
   let spamGuard = SpamProtection.SpamGuard();
 
   //spamGuard.setTest(true); // delete this in production
-  MAX_ALLOCATIONS_PER_DAY := 500; // delete this in production
-  MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := 500; // delete this in production
-  SNAPSHOT_INTERVAL := 86400000000000; // delete this in production
-  spamGuard.setTest(false); // delete this in production
-  //MAX_ALLOCATIONS_PER_DAY := 5; // delete this in production
-  //MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := 10; // delete this in production
-  //SNAPSHOT_INTERVAL := 900_000_000_000; // delete this in production
+  //MAX_ALLOCATIONS_PER_DAY := 500; // delete this in production
+  //MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := 500; // delete this in production
+  //SNAPSHOT_INTERVAL := 86400000000000; // delete this in production
+  spamGuard.setTest(false); 
+  MAX_ALLOCATIONS_PER_DAY := 5; // delete this in production
+  MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := 10; // delete this in production
+  SNAPSHOT_INTERVAL := 900_000_000_000; // delete this in production
 
   // Logger
   let logger = Logger.Logger();
@@ -88,12 +88,9 @@ actor ContinuousDAO {
   spamGuard.setSelf(Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai"));
 
   // Admin other than controller that has access to logs
-  //stable var logAdmin = Principal.fromText("ko5bb-yjzyp-qwhip-o3oxz-z2wo5-c7ovm-54iqy-i5dtw-cfzkt-7r26t-gqe");
-  /*stable*/ var logAdmin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
+  stable var logAdmin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
 
-  //var logAdmins = [Principal.fromText("ko5bb-yjzyp-qwhip-o3oxz-z2wo5-c7ovm-54iqy-i5dtw-cfzkt-7r26t-gqe"), Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae"), Principal.fromText("uuyso-zydjd-tsb4o-lgpgj-dfsvq-awald-j2zfp-e6h72-d2je3-whmjr-xae"), Principal.fromText("5uvsz-em754-ulbgb-vxihq-wqyzd-brdgs-snzlu-mhlqw-k74uu-4l5h3-2qe")];
   var masterAdmins = [
-    Principal.fromText("ko5bb-yjzyp-qwhip-o3oxz-z2wo5-c7ovm-54iqy-i5dtw-cfzkt-7r26t-gqe"), 
     Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae"), 
     Principal.fromText("uuyso-zydjd-tsb4o-lgpgj-dfsvq-awald-j2zfp-e6h72-d2je3-whmjr-xae"), 
     Principal.fromText("5uvsz-em754-ulbgb-vxihq-wqyzd-brdgs-snzlu-mhlqw-k74uu-4l5h3-2qe"),

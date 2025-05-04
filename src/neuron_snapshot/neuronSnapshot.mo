@@ -41,10 +41,10 @@ actor {
   //let DAOprincipal = Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai");
   let DAOprincipal = Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai");
 
-  stable var logAdmin : Principal = Principal.fromText("ko5bb-yjzyp-qwhip-o3oxz-z2wo5-c7ovm-54iqy-i5dtw-cfzkt-7r26t-gqe");
+  stable var logAdmin : Principal = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
 
   //stable var sns_governance_canister_id = Principal.fromText("aaaaa-aa"); // change in production if known already
-  var sns_governance_canister_id = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai"); // NB: SNEED GOV! change in production if known already
+  var sns_governance_canister_id = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai"); // NB: SNEED GOV! change in production when known!
 
   var snapshotTimerId : Nat = 0;
 
