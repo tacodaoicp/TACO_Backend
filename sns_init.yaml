@@ -171,109 +171,109 @@ Distribution:
           vesting_period: 23 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 10
           dissolve_delay: 1 month
           vesting_period: 0 month
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 11
           dissolve_delay: 1 month
           vesting_period: 2 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 12
           dissolve_delay: 1 month
           vesting_period: 5 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 13
           dissolve_delay: 1 month
           vesting_period: 8 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 14
           dissolve_delay: 1 month
           vesting_period: 11 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 15
           dissolve_delay: 1 month
           vesting_period: 14 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 16
           dissolve_delay: 1 month
           vesting_period: 17 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 17
           dissolve_delay: 1 month
           vesting_period: 20 months
 
         - principal: dew4p-qrten-wh6kq-5cf2b-iccms-7sddu-n2tb2-h7ya4-smfl5-b3xvr-vae
-          stake: 36681.2222 tokens
+          stake: 36681.1167 tokens
           memo: 18
           dissolve_delay: 1 month
           vesting_period: 23 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 19
           dissolve_delay: 1 month
           vesting_period: 0 month
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 20
           dissolve_delay: 1 month
           vesting_period: 2 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 21
           dissolve_delay: 1 month
           vesting_period: 5 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 22
           dissolve_delay: 1 month
           vesting_period: 8 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 23
           dissolve_delay: 1 month
           vesting_period: 11 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 24
           dissolve_delay: 1 month
           vesting_period: 14 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 25
           dissolve_delay: 1 month
           vesting_period: 17 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 26
           dissolve_delay: 1 month
           vesting_period: 20 months
 
         - principal: 2idvh-d47e5-7jqgq-j6mh5-qzuga-b7v6t-qrlvw-wfdvz-edran-6hfhn-mqe
-          stake:  34460.2222 tokens
+          stake:  34455.4529 tokens
           memo: 27
           dissolve_delay: 1 month
           vesting_period: 23 months
@@ -423,7 +423,7 @@ Distribution:
           vesting_period: 0 month
 
         - principal: f3qow-odbkr-eyqs7-3mqnc-nvlhp-vx4rt-bbm7r-zardu-bawaw-jzkl6-rqe
-          stake: 33056 tokens
+          stake: 33057 tokens
           memo: 60
           dissolve_delay: 1 month
           vesting_period: 0 month
