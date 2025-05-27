@@ -12,6 +12,10 @@
       "main": "src/treasury/treasury.mo",
       "type": "motoko"
     },
+    "validation": {
+      "main": "src/validation/validation.mo",
+      "type": "motoko"
+    },
     "neuronSnapshot": {
       "main": "src/neuron_snapshot/neuronSnapshot.mo",
       "type": "motoko"
