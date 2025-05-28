@@ -58,7 +58,7 @@ module {
     var test : Bool;
   };
 
-  public func initState() : SpamState {
+  public func initState(thisPrincipal: Principal) : SpamState {
     {
       var admins = TrieSet.empty<Principal>();
       var adminPermissions = Map.new<Principal, Vector.Vector<AdminPermission>>();
@@ -77,7 +77,7 @@ module {
       var allowedCanisters = TrieSet.empty<Principal>();
       var test = false;
       //var self = Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai");
-      var self = Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai");
+      var self = thisPrincipal;
     };
   };
   //0=not allowed 1=allowed 2=warning 3=day-ban 4=all-time ban
@@ -97,8 +97,8 @@ module {
   // *** To afat: 1. adminCheck indeed adds principals to the Dayban if someone tries to perform a functions thats not allowed.
   // *** This is done to directly discourage people who are sniffing around. As I would also go for admin functions as the first thing to try
   // *** This should not give problems considering these addresses will be different from the principals that use the exchange as they should.
-  public class SpamGuard() {
-    public var state : SpamState = initState();
+  public class SpamGuard(thisPrincipal: Principal) {
+    public var state : SpamState = initState(thisPrincipal);
     private let dayInNanos = 86400000000000;
 
     public func isAllowed(caller : Principal, sns_governance_canister_id : ?Principal) : Nat {

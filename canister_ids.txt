@@ -16,3 +16,4 @@ taco_dao_frontend lx7ws-diaaa-aaaag-aubda-cai
 
 TACO DAO SNS:
 governance lhdfz-wqaaa-aaaaq-aae3q-cai
+ledger kknbx-zyaaa-aaaaq-aae4a-cai

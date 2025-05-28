@@ -27,9 +27,15 @@ import Debug "mo:base/Debug";
 import Array "mo:base/Array";
 import Iter "mo:base/Iter";
 import Logger "../helper/logger";
-import DAO_types "../DAO_backend/dao_types"
+import DAO_types "../DAO_backend/dao_types";
+import CanisterIds "../helper/CanisterIds";
 
-actor MintingVaultDAO {
+shared (deployer) actor class MintingVaultDAO() = this {
+
+  private func this_canister_id() : Principal {
+      Principal.fromActor(this);
+  };
+
   // Type definitions
   type Token = Text;
   type Decimals = MintingVaultTypes.Decimals;
@@ -67,26 +73,30 @@ actor MintingVaultDAO {
   // Error types
   type AddTokenError = MintingVaultTypes.AddTokenError;
 
+  let TACOaddress = "kknbx-zyaaa-aaaaq-aae4a-cai"; // TACO ledger canister ID
+
   let { phash; thash } = Map;
 
   let hashpp = TreasuryTypes.hashpp;
 
-  let spamGuard = SpamProtection.SpamGuard();
+  let spamGuard = SpamProtection.SpamGuard(this_canister_id());
 
   let logger = Logger.Logger();
 
+  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+  let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+
   //stable var DAOprincipal = Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai");
-  stable var DAOprincipal = Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai");
+  stable var DAOprincipal = DAO_BACKEND_ID;
 
   //stable var TreasuryPrincipal = Principal.fromText("z4is7-giaaa-aaaad-qg6uq-cai");
-  stable var TreasuryPrincipal = Principal.fromText("v6t5d-6yaaa-aaaan-qzzja-cai");
+  stable var TreasuryPrincipal = TREASURY_ID;
 
   stable var TreasurySubaccount = Blob.fromArray([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
   // Admin other than controller that has access to logs
   stable var logAdmin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
-
-  let TACOaddress = "csyra-haaaa-aaaaq-aacva-cai"; //change in production
 
   let redemptionAccountID = Principal.toLedgerAccount(TreasuryPrincipal, ?TreasurySubaccount);
 

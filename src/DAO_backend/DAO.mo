@@ -73,7 +73,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   stable var sns_governance_canister_id : ?Principal = null;
 
   // Spam protection
-  let spamGuard = SpamProtection.SpamGuard();
+  let spamGuard = SpamProtection.SpamGuard(this_canister_id());
 
   //spamGuard.setTest(true); // delete this in production
   //MAX_ALLOCATIONS_PER_DAY := 500; // delete this in production
@@ -112,6 +112,7 @@ shared (deployer) actor class ContinuousDAO() = this {
     Principal.fromText("k2xol-5avzc-lf3wt-vwoft-pjx6k-77fjh-7pera-6b7qt-fwt5e-a3ekl-vqe"),
     Principal.fromText("qgjut-u3ase-3lxef-vcxtr-4g6jb-mazlw-jpins-wrvpv-jt5wn-2nrx6-sae"),
     Principal.fromText("as6jn-gaoo7-k4kji-tdkxg-jlsrk-avxkc-zu76j-vz7hj-di3su-2f74z-qqe")];
+
 
 //
   // State variables
@@ -191,13 +192,8 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   stable var systemState : SystemState = #Paused;
 
-  // Principal of the neuron snapshot canister
-  //let NEURON_SNAPSHOT_CANISTER = Principal.fromText("zvlzd-qaaaa-aaaad-qg6va-cai");
-  //let NEURON_SNAPSHOT_CANISTER = Principal.fromText("qjlja-kiaaa-aaaan-qzv3a-cai");
-  let NEURON_SNAPSHOT_CANISTER = Principal.fromText("vzs3x-taaaa-aaaan-qzzjq-cai");
-
   // Neuron snapshot interface
-  let neuronSnapshot = actor (Principal.toText(NEURON_SNAPSHOT_CANISTER)) : NeuronSnapshot.Self;
+  let neuronSnapshot = actor (Principal.toText(NEURON_SNAPSHOT_ID)) : NeuronSnapshot.Self;
 
   //let treasury = actor ("z4is7-giaaa-aaaad-qg6uq-cai") : Treasury.Self;
   let treasury = actor (Principal.toText(TREASURY_ID)) : Treasury.Self;

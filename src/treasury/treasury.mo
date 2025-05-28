@@ -2248,7 +2248,7 @@ shared (deployer) actor class treasury() = this {
   private func syncPriceWithNTN() : async* () {
     let allTokensNTN = try { await priceCheckNTN.getAllTokens() } catch (_) {
       if test {
-        for (t in [(ICPprincipal, 100000000, 20.0), (Principal.fromText("mxzaz-hqaaa-aaaar-qaada-cai"), 20000000, 4.0), (Principal.fromText("zxeu2-7aaaa-aaaaq-aaafa-cai"), 50000000, 10.0), (Principal.fromText("csyra-haaaa-aaaaq-aacva-cai"), 1000000, 0.2), (Principal.fromText("xevnm-gaaaa-aaaar-qafnq-cai"), 5000000, 1.0)].vals()) {
+        for (t in [(ICPprincipal, 100000000, 20.0), (Principal.fromText("mxzaz-hqaaa-aaaar-qaada-cai"), 20000000, 4.0), (Principal.fromText("zxeu2-7aaaa-aaaaq-aaafa-cai"), 50000000, 10.0), (Principal.fromText("kknbx-zyaaa-aaaaq-aae4a-cai"), 1000000, 0.2), (Principal.fromText("xevnm-gaaaa-aaaar-qafnq-cai"), 5000000, 1.0)].vals()) {
           switch (Map.get(tokenDetailsMap, phash, t.0)) {
             case (?_) {
               // Update price with history

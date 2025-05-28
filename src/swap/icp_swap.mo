@@ -17,8 +17,6 @@ module {
   private let FACTORY_CANISTER_ID = "4mmnk-kiaaa-aaaag-qbllq-cai";
   private let DEFAULT_FEE = 3000; // 0.3%
 
-  private let selfId = "v6t5d-6yaaa-aaaan-qzzja-cai";
-
   private let test = false;
   private let phash = Map.phash;
 
@@ -226,7 +224,7 @@ module {
                     fee = metadata.tokenTransferFee;
                   };
 
-                  let result = await executeWithdraw(withdrawParams);
+                  let result = await executeWithdraw(selfId, withdrawParams);
                   switch (result) {
                     case (#ok(amount)) {
                       Debug.print("Successfully withdrew " # Nat.toText(amount) # " of token0");
@@ -263,7 +261,7 @@ module {
                     fee = metadata.tokenTransferFee;
                   };
 
-                  let result = await executeWithdraw(withdrawParams);
+                  let result = await executeWithdraw(selfId, withdrawParams);
                   switch (result) {
                     case (#ok(amount)) {
                       Debug.print("Successfully withdrew " # Nat.toText(amount) # " of token1");
@@ -660,12 +658,12 @@ module {
     };
   };
 
-  public func executeWithdraw(params : Types.ICPSwapWithdrawParams) : async Result.Result<Nat, Text> {
+  public func executeWithdraw(selfId : Principal, params : Types.ICPSwapWithdrawParams) : async Result.Result<Nat, Text> {
     Debug.print("ICPSwap.executeWithdraw: Starting withdrawal with params: " # debug_show (params));
     try {
       let pool : Types.ICPSwapPool = actor (if test { FACTORY_CANISTER_ID } else { Principal.toText(params.poolId) });
 
-      let balance = await getBalance(Principal.fromText(selfId), params.poolId);
+      let balance = await getBalance(selfId, params.poolId);
       switch (balance) {
         case (#ok(balance)) {
           if (balance.balance0 < params.amount and balance.balance1 < params.amount) {
@@ -744,7 +742,7 @@ module {
                 fee = metadata.tokenTransferFee;
               };
 
-              let withdrawResult = await executeWithdraw(withdrawParamsWithFee);
+              let withdrawResult = await executeWithdraw(selfId, withdrawParamsWithFee);
               Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Withdrawal result: " # debug_show (withdrawResult));
 
               switch (withdrawResult) {
