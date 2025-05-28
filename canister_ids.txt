@@ -13,3 +13,6 @@ neuronSnapshot vzs3x-taaaa-aaaan-qzzjq-cai
 treasury v6t5d-6yaaa-aaaan-qzzja-cai
 validation th44n-iyaaa-aaaan-qzz5a-cai
 taco_dao_frontend lx7ws-diaaa-aaaag-aubda-cai
+
+TACO DAO SNS:
+governance lhdfz-wqaaa-aaaaq-aae3q-cai
