@@ -9,11 +9,6 @@ export interface PricePoint {
   'time' : bigint,
   'icpPrice' : bigint,
 }
-export interface PricePoint__1 {
-  'usdPrice' : number,
-  'time' : bigint,
-  'icpPrice' : bigint,
-}
 export interface RebalanceConfig {
   'tokenSyncTimeoutNS' : bigint,
   'maxSlippageBasisPoints' : bigint,
@@ -59,7 +54,7 @@ export type Result_2 = {
     }
   } |
   { 'err' : string };
-export type Result_3 = { 'ok' : Array<[Principal, Array<PricePoint__1>]> } |
+export type Result_3 = { 'ok' : Array<[Principal, Array<PricePoint>]> } |
   { 'err' : string };
 export type Result_4 = { 'ok' : string } |
   { 'err' : string };
@@ -113,7 +108,7 @@ export interface UpdateConfig {
   'maxTradeAttemptsPerInterval' : [] | [bigint],
   'maxKongswapAttempts' : [] | [bigint],
 }
-export interface _SERVICE {
+export interface treasury {
   'admin_executeTradingCycle' : ActorMethod<[], Result>,
   'admin_recoverPoolBalances' : ActorMethod<[], Result_4>,
   'admin_syncWithDao' : ActorMethod<[], Result_4>,
@@ -135,5 +130,6 @@ export interface _SERVICE {
   >,
   'updateRebalanceConfig' : ActorMethod<[UpdateConfig, [] | [boolean]], Result>,
 }
+export interface _SERVICE extends treasury {}
 export declare const idlFactory: IDL.InterfaceFactory;
 export declare const init: (args: { IDL: typeof IDL }) => IDL.Type[];

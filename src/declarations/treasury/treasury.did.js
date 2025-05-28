@@ -47,13 +47,8 @@ export const idlFactory = ({ IDL }) => {
     'pausedDueToSyncFailure' : IDL.Bool,
     'tokenType' : TokenType,
   });
-  const PricePoint__1 = IDL.Record({
-    'usdPrice' : IDL.Float64,
-    'time' : IDL.Int,
-    'icpPrice' : IDL.Nat,
-  });
   const Result_3 = IDL.Variant({
-    'ok' : IDL.Vec(IDL.Tuple(IDL.Principal, IDL.Vec(PricePoint__1))),
+    'ok' : IDL.Vec(IDL.Tuple(IDL.Principal, IDL.Vec(PricePoint))),
     'err' : IDL.Text,
   });
   const ExchangeType = IDL.Variant({
@@ -124,7 +119,7 @@ export const idlFactory = ({ IDL }) => {
     'maxTradeAttemptsPerInterval' : IDL.Opt(IDL.Nat),
     'maxKongswapAttempts' : IDL.Opt(IDL.Nat),
   });
-  return IDL.Service({
+  const treasury = IDL.Service({
     'admin_executeTradingCycle' : IDL.Func([], [Result], []),
     'admin_recoverPoolBalances' : IDL.Func([], [Result_4], []),
     'admin_syncWithDao' : IDL.Func([], [Result_4], []),
@@ -169,5 +164,6 @@ export const idlFactory = ({ IDL }) => {
         [],
       ),
   });
+  return treasury;
 };
 export const init = ({ IDL }) => { return []; };
