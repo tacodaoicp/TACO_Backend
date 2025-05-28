@@ -204,7 +204,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   //let mintingVault = actor ("ywhqf-eyaaa-aaaad-qg6tq-cai") : MintingVault.Self;
   let mintingVault = actor (Principal.toText(this_canister_id())) : MintingVault.Self;
   //let treasuryPrincipal = Principal.fromText("z4is7-giaaa-aaaad-qg6uq-cai");
-  let treasuryPrincipal = Principal.toText(TREASURY_ID);
+  let treasuryPrincipal = TREASURY_ID;
   // Timer IDs
   private stable var snapshotTimerId : Nat = 0;
 
