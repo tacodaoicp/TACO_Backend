@@ -101,7 +101,7 @@ shared deployer actor class neuronSnapshot() = this {
   let testActorA = Principal.fromText("hhaaz-2aaaa-aaaaq-aacla-cai");
   let testActorB = Principal.fromText("qtooy-2yaaa-aaaaq-aabvq-cai");
   let testActorC = Principal.fromText("aanaa-xaaaa-aaaah-aaeiq-cai");
-/*
+
   public query func get_neuron_snapshot_curr_neuron_id() : async ?T.NeuronId {
     neuron_snapshot_curr_neuron_id;
   };
@@ -109,7 +109,7 @@ shared deployer actor class neuronSnapshot() = this {
   public query func get_neuron_snapshot_importing_count() : async Nat {
     List.size(neuron_snapshot_importing);
   };
-*/
+
   private func isMasterAdmin(caller : Principal) : Bool {
     if (caller == masterAdmin) { return true; };
     for (admin in masterAdmins.vals()) {
@@ -785,7 +785,6 @@ shared deployer actor class neuronSnapshot() = this {
       #getLogsByContext : () -> (Text, Nat);
       #getLogsByLevel : () -> (T.LogLevel, Nat);
       #getNeuronDataForDAO : () -> (T.SnapshotId, Nat, Nat);
-      //#get_neuron_snapshot_curr_neuron_id : () -> ?T.NeuronId;
       #get_neuron_snapshot_head_id : () -> ();
       #get_neuron_snapshot_info : () -> T.SnapshotId;
       #get_neuron_snapshot_neurons : () -> (T.SnapshotId, Nat, Nat);
@@ -796,6 +795,8 @@ shared deployer actor class neuronSnapshot() = this {
       #setSnsGovernanceCanisterId : () -> Principal;
       #setTest : () -> Bool;
       #take_neuron_snapshot : () -> ();
+      #get_neuron_snapshot_curr_neuron_id : () -> ();
+      #get_neuron_snapshot_importing_count : () -> ();
     };
   }) : Bool {
     switch (msg) {
@@ -815,7 +816,7 @@ shared deployer actor class neuronSnapshot() = this {
         (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
       };
       case (_) {
-        isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")) and arg.size() < 50000;
+        isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")) and arg.size() < 500000;
       };
     };
   };
