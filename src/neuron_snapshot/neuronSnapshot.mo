@@ -16,8 +16,13 @@ import Nat8 "mo:base/Nat8";
 import Logger "../helper/logger";
 import Error "mo:base/Error";
 import Array "mo:base/Array";
+import CanisterIds "../helper/CanisterIds";
 
-actor {
+shared deployer actor class neuronSnapshot() = this {
+
+  private func this_canister_id() : Principal {
+      Principal.fromActor(this);
+  };
 
   let logger = Logger.Logger();
 
@@ -38,8 +43,14 @@ actor {
   let NEURON_SNAPSHOT_NEURONS_PER_CALL : Nat32 = 50;
   let NEURON_SNAPSHOT_NEURONS_PER_TICK : Nat32 = NEURON_SNAPSHOT_NEURONS_PER_CALL * 5;
 
+  stable var sns_governance_canister_id = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai"); // TACO DAO SNS Governance Canister ID
+  //var sns_governance_canister_id = Principal.fromText("aaaaa-aa"); // NB: SNEED GOV! change in production when known!
+
+  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+
   //let DAOprincipal = Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai");
-  let DAOprincipal = Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai");
+  let DAOprincipal = DAO_BACKEND_ID;
 
   stable var masterAdmin : Principal = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
 
@@ -54,8 +65,6 @@ actor {
     Principal.fromText("qgjut-u3ase-3lxef-vcxtr-4g6jb-mazlw-jpins-wrvpv-jt5wn-2nrx6-sae"),
     Principal.fromText("as6jn-gaoo7-k4kji-tdkxg-jlsrk-avxkc-zu76j-vz7hj-di3su-2f74z-qqe")];
 
-  stable var sns_governance_canister_id = Principal.fromText("aaaaa-aa"); // change in production if known already
-  //var sns_governance_canister_id = Principal.fromText("aaaaa-aa"); // NB: SNEED GOV! change in production when known!
 
   var snapshotTimerId : Nat = 0;
 

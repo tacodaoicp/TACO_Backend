@@ -107,8 +107,13 @@ import ICPSwap "../swap/icp_swap";
 import swaptypes "../swap/swap_types";
 import Fuzz "mo:fuzz";
 import SpamProtection "../helper/spam_protection";
+import CanisterIds "../helper/CanisterIds";
 
-actor treasury {
+shared (deployer) actor class treasury() = this {
+
+  private func this_canister_id() : Principal {
+      Principal.fromActor(this);
+  };
 
   //=========================================================================
   // 1. SYSTEM CONFIGURATION & STATE
@@ -116,17 +121,22 @@ actor treasury {
 
   var test = false;
 
+  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+  let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
+
   // Canister principals and references
   //let self = "z4is7-giaaa-aaaad-qg6uq-cai";
-  let self = "v6t5d-6yaaa-aaaan-qzzja-cai";
+  let self = Principal.toText(this_canister_id());
   let ICPprincipalText = "ryjl3-tyaaa-aaaaa-aaaba-cai";
   let ICPprincipal = Principal.fromText(ICPprincipalText);
   //stable var DAOText = "ywhqf-eyaaa-aaaad-qg6tq-cai";
   //stable var DAOText = "vxqw7-iqaaa-aaaan-qzziq-cai";
-  let DAOText = "vxqw7-iqaaa-aaaan-qzziq-cai";
+  let DAOText = Principal.toText(DAO_BACKEND_ID);
   //stable var DAOPrincipal = Principal.fromText(DAOText);
-  let DAOPrincipal = Principal.fromText(DAOText);
-  stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
+  let DAOPrincipal = DAO_BACKEND_ID;
+  //stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
+  stable var MintVaultPrincipal = DAO_BACKEND_ID;
 
   var masterAdmins = [
     Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae"), 

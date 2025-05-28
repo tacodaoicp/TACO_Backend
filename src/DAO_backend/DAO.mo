@@ -20,8 +20,13 @@ import Float "mo:base/Float";
 import MintingVault "../minting_vault/minting_vault_types";
 import TreasuryTypes "../treasury/treasury_types";
 import Logger "../helper/logger";
+import CanisterIds "../helper/CanisterIds";
 
-actor ContinuousDAO {
+shared (deployer) actor class ContinuousDAO() = this {
+
+  private func this_canister_id() : Principal {
+      Principal.fromActor(this);
+  };
 
   // Core types
   type TokenDetails = DAO_types.TokenDetails;
@@ -82,10 +87,17 @@ actor ContinuousDAO {
   // Logger
   let logger = Logger.Logger();
 
+  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+  let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
+
   //spamGuard.setAllowedCanisters([Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai")]);
   //spamGuard.setSelf(Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai"));
-  spamGuard.setAllowedCanisters([Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai"), Principal.fromText("v6t5d-6yaaa-aaaan-qzzja-cai")]);
-  spamGuard.setSelf(Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai"));
+
+  spamGuard.setAllowedCanisters([this_canister_id(), // Really? TODO: See if we can remove!
+                                 TREASURY_ID]);
+
+  spamGuard.setSelf(this_canister_id());
 
   // Admin other than controller that has access to logs
   stable var logAdmin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
@@ -188,11 +200,11 @@ actor ContinuousDAO {
   let neuronSnapshot = actor (Principal.toText(NEURON_SNAPSHOT_CANISTER)) : NeuronSnapshot.Self;
 
   //let treasury = actor ("z4is7-giaaa-aaaad-qg6uq-cai") : Treasury.Self;
-  let treasury = actor ("v6t5d-6yaaa-aaaan-qzzja-cai") : Treasury.Self;
+  let treasury = actor (Principal.toText(TREASURY_ID)) : Treasury.Self;
   //let mintingVault = actor ("ywhqf-eyaaa-aaaad-qg6tq-cai") : MintingVault.Self;
-  let mintingVault = actor ("vxqw7-iqaaa-aaaan-qzziq-cai") : MintingVault.Self;
+  let mintingVault = actor (Principal.toText(this_canister_id())) : MintingVault.Self;
   //let treasuryPrincipal = Principal.fromText("z4is7-giaaa-aaaad-qg6uq-cai");
-  let treasuryPrincipal = Principal.fromText("v6t5d-6yaaa-aaaan-qzzja-cai");
+  let treasuryPrincipal = Principal.toText(TREASURY_ID);
   // Timer IDs
   private stable var snapshotTimerId : Nat = 0;
 
