@@ -805,22 +805,22 @@ shared deployer actor class neuronSnapshot() = this {
   }) : Bool {
     switch (msg) {
       case (#setLogAdmin(_)) {
-        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
+        ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 50000;
       };
       case (#clearLogs(_)) {
-        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
+        ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 50000;
       };
       case (#getLogs(_)) {
-        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
+        ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 50000;
       };
       case (#getLogsByContext(_)) {
-        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
+        ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 50000;
       };
       case (#getLogsByLevel(_)) {
-        (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) and arg.size() < 50000;
+        ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 50000;
       };
       case (_) {
-        isMasterAdmin(caller) or Principal.isController(caller) or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")) and arg.size() < 500000;
+        ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 500000;
       };
     };
   };

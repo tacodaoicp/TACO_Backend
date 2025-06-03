@@ -2196,7 +2196,7 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   // Set the SNS governance canister id
   public shared ({ caller }) func set_sns_governance_canister_id(p : Principal) : async () {
-    assert (Principal.isController(caller) or sns_governance_canister_id == ?caller);
+    assert (Principal.isController(caller) or isAdmin(caller, #updateSystemParameter) or sns_governance_canister_id == ?caller);
     sns_governance_canister_id := ?p;
   };
 
