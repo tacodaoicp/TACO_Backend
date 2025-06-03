@@ -779,6 +779,7 @@ shared deployer actor class neuronSnapshot() = this {
     };
   };
 
+/* NB: Turn on again after initial setup
   system func inspect({
     arg : Blob;
     caller : Principal;
@@ -824,4 +825,5 @@ shared deployer actor class neuronSnapshot() = this {
       };
     };
   };
+  */
 };

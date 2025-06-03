@@ -2633,6 +2633,7 @@ shared (deployer) actor class treasury() = this {
   // Initialize sync timer at system startup
   startAllSyncTimers<system>(true);
 
+/* NB: Turn on again after initial setup
   // Security check for message inspection
   system func inspect({
     arg : Blob;
@@ -2656,4 +2657,5 @@ shared (deployer) actor class treasury() = this {
   }) : Bool {
      (isMasterAdmin(caller) or Principal.isController(caller)) and arg.size() < 50000;
   };
+  */
 };

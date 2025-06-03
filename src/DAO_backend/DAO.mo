@@ -2200,6 +2200,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sns_governance_canister_id := ?p;
   };
 
+
+/* NB: Turn on again after initial setup
   // Inspect message validation
   system func inspect({
     caller : Principal;
@@ -2576,4 +2578,5 @@ shared (deployer) actor class ContinuousDAO() = this {
 
     };
   };
+  */
 };
