@@ -1243,13 +1243,14 @@ shared (deployer) actor class treasury() = this {
         Debug.print("Selecting trading pair...");
         switch (selectTradingPair(tradeDiffs)) {
           case (?(sellToken, buyToken)) {
-            var totalValueICP = 0;
-            for ((principal, details) in Map.entries(tokenDetailsMap)) {
-              if (details.Active and not details.isPaused and not details.pausedDueToSyncFailure) {
-                let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-                totalValueICP += valueInICP;
-              };
-            };
+            // only needed if we want to use calculateTradeSizeRebalancePeriod.
+            //var totalValueICP = 0;
+            //for ((principal, details) in Map.entries(tokenDetailsMap)) {
+            //  if (details.Active and not details.isPaused and not details.pausedDueToSyncFailure) {
+            //    let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+            //    totalValueICP += valueInICP;
+            //  };
+            //};
             let tokenDetailsSell = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
               case (?details) { details };
               case (null) {
@@ -1258,7 +1259,7 @@ shared (deployer) actor class treasury() = this {
               };
             };
 
-            let tradeSize = ((calculateTradeSize(totalValueICP) * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP);
+            let tradeSize = ((calculateTradeSizeMinMax() * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP);
             Debug.print("Selected pair: " # Principal.toText(sellToken) # " -> " # Principal.toText(buyToken) # " with size: " # Nat.toText(tradeSize));
 
             let bestExecution = await* findBestExecution(sellToken, buyToken, tradeSize);
@@ -1650,9 +1651,19 @@ shared (deployer) actor class treasury() = this {
   };
 
   /**
+   * Calculate trade size based on min and max trade value
+   */
+  private func calculateTradeSizeMinMax() : Nat {
+    let range = rebalanceConfig.maxTradeValueICP - rebalanceConfig.minTradeValueICP;
+    let randomOffset = fuzz.nat.randomRange(0, range);
+    rebalanceConfig.minTradeValueICP + randomOffset
+  };
+
+
+  /**
    * Calculate trade size based on portfolio value and rebalance period
    */
-  private func calculateTradeSize(totalPortfolioValue : Nat) : Nat {
+  private func calculateTradeSizeRebalancePeriod(totalPortfolioValue : Nat) : Nat {
     // Target complete rebalance over portfolioRebalancePeriodNS
     let intervalsInPeriod = rebalanceConfig.portfolioRebalancePeriodNS / rebalanceConfig.rebalanceIntervalNS;
     let baseTradeSize = totalPortfolioValue / intervalsInPeriod;
@@ -1861,7 +1872,7 @@ shared (deployer) actor class treasury() = this {
               };
 
               if (tx_fee > amountIn) {
-                return #err("Token transfer fee is greater than amount in");
+                return #err("Token transfer fee " # Nat.toText(tx_fee) # " is greater than amount in " # Nat.toText(amountIn) # " for " # Principal.toText(sellToken));
               };
 
               // Prepare deposit params
