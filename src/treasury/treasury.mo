@@ -127,7 +127,7 @@ shared (deployer) actor class treasury() = this {
   let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
 
   // Logger
-  let logger = Logger.Logger();
+  stable var logger = Logger.Logger();
 
   // Canister principals and references
   //let self = "z4is7-giaaa-aaaad-qg6uq-cai";
@@ -2002,6 +2002,7 @@ shared (deployer) actor class treasury() = this {
       var bestPriceSlippage : Float = 100.0; // Start with 100% as worse case
 
       // Check KongSwap
+      // VERBOSE LOGGING: Exchange comparison start
       let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details.tokenSymbol };
         case null { return #err("Token details not found for sell token") };
@@ -2010,8 +2011,31 @@ shared (deployer) actor class treasury() = this {
         case (?details) { details.tokenSymbol };
         case null { return #err("Token details not found for buy token") };
       };
+      let sellDecimals = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?details) { details.tokenDecimals };
+        case null { 8 };
+      };
+      
+      logger.info("EXCHANGE_COMPARISON", 
+        "Starting exchange comparison - Pair=" # sellSymbol # "/" # buySymbol #
+        " Amount_in=" # Nat.toText(amountIn) # " (raw)" #
+        " Amount_formatted=" # Nat.toText(amountIn / (10 ** (if (sellDecimals >= 6) { sellDecimals - 6 } else { 1 }))) # 
+        (if (sellDecimals >= 6) { "M" } else { "" }) #
+        " Max_slippage=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
+        "findBestExecution"
+      );
+
+      // Check KongSwap
 
       Debug.print("Checking KongSwap for " # sellSymbol # " -> " # buySymbol);
+      
+      // VERBOSE LOGGING: KongSwap quote attempt
+      logger.info("EXCHANGE_COMPARISON", 
+        "Requesting KongSwap quote - Pair=" # sellSymbol # "/" # buySymbol #
+        " Amount=" # Nat.toText(amountIn),
+        "findBestExecution"
+      );
+      
       try {
         let kongQuote = await KongSwap.getQuote(sellSymbol, buySymbol, amountIn);
         switch (kongQuote) {
@@ -2021,24 +2045,63 @@ shared (deployer) actor class treasury() = this {
               bestAmountOut := quote.receive_amount;
               bestPriceSlippage := quote.slippage;
               Debug.print("KongSwap quote seems good: " # debug_show (quote));
+              
+              // VERBOSE LOGGING: KongSwap quote success
+              logger.info("EXCHANGE_COMPARISON", 
+                "KongSwap quote received - Amount_out=" # Nat.toText(quote.receive_amount) #
+                " Slippage=" # Float.toText(quote.slippage) # "%" #
+                " Price=" # Float.toText(quote.price) #
+                " Status=ACCEPTED",
+                "findBestExecution"
+              );
             //};
             //Debug.print("KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
           };
           case (#err(e)) {
             Debug.print("KongSwap quote error: " # e);
+            
+            // VERBOSE LOGGING: KongSwap quote error
+            logger.warn("EXCHANGE_COMPARISON", 
+              "KongSwap quote failed - Error=" # e #
+              " Status=REJECTED",
+              "findBestExecution"
+            );
           };
         };
       } catch (e) {
         Debug.print("KongSwap error: " # Error.message(e));
+        
+        // VERBOSE LOGGING: KongSwap exception
+        logger.error("EXCHANGE_COMPARISON", 
+          "KongSwap threw exception - Error=" # Error.message(e) #
+          " Status=EXCEPTION",
+          "findBestExecution"
+        );
       };
 
       // Check ICPSwap
       Debug.print("Checking ICPSwap for pair");
+      
+      // VERBOSE LOGGING: ICPSwap pool check
+      logger.info("EXCHANGE_COMPARISON", 
+        "Checking ICPSwap pool - Pair=" # sellSymbol # "/" # buySymbol #
+        " Pool_count=" # Nat.toText(Map.size(ICPswapPools)),
+        "findBestExecution"
+      );
+      
       try {
         let poolResult = Map.get(ICPswapPools, hashpp, (sellToken, buyToken));
 
         switch (poolResult) {
           case (?poolData) {
+            
+            // VERBOSE LOGGING: ICPSwap pool found
+            logger.info("EXCHANGE_COMPARISON", 
+              "ICPSwap pool found - Pool_ID=" # Principal.toText(poolData.canisterId) #
+              " Token0=" # poolData.token0.address # " Token1=" # poolData.token1.address #
+              " Requesting_quote=true",
+              "findBestExecution"
+            );
 
             let quoteArgs = {
               poolId = poolData.canisterId;
@@ -2058,23 +2121,73 @@ shared (deployer) actor class treasury() = this {
                     bestExchange := ? #ICPSwap;
                     bestAmountOut := quote.amountOut;
                     bestPriceSlippage := quote.slippage;
+                    
+                    // VERBOSE LOGGING: ICPSwap selected as best
+                    logger.info("EXCHANGE_COMPARISON", 
+                      "ICPSwap quote accepted as BEST - Amount_out=" # Nat.toText(quote.amountOut) #
+                      " Slippage=" # Float.toText(quote.slippage) # "%" #
+                      " Previous_best=" # (switch bestExchange { case null "NONE"; case _ "KONGSWAP" }) #
+                      " Status=BEST_EXECUTION",
+                      "findBestExecution"
+                    );
+                  } else {
+                    // VERBOSE LOGGING: ICPSwap quote but not selected
+                    logger.info("EXCHANGE_COMPARISON", 
+                      "ICPSwap quote received but NOT selected - Amount_out=" # Nat.toText(quote.amountOut) #
+                      " Slippage=" # Float.toText(quote.slippage) # "%" #
+                      " Best_amount=" # Nat.toText(bestAmountOut) #
+                      " Status=NOT_SELECTED",
+                      "findBestExecution"
+                    );
                   };
                 //};
                 Debug.print("ICPSwap quote: " # debug_show (quote));
               };
               case (#err(e)) {
                 Debug.print("ICPSwap quote error: " # e);
+                
+                // VERBOSE LOGGING: ICPSwap quote error
+                logger.warn("EXCHANGE_COMPARISON", 
+                  "ICPSwap quote failed - Error=" # e #
+                  " Status=QUOTE_ERROR",
+                  "findBestExecution"
+                );
               };
             };
           };
-          case (_) {};
+          case (_) {
+            // VERBOSE LOGGING: ICPSwap pool not found
+            logger.warn("EXCHANGE_COMPARISON", 
+              "ICPSwap pool NOT found - Pair=" # sellSymbol # "/" # buySymbol #
+              " Available_pools=" # Nat.toText(Map.size(ICPswapPools)) #
+              " Status=NO_POOL",
+              "findBestExecution"
+            );
+          };
         };
       } catch (e) {
         Debug.print("ICPSwap error: " # Error.message(e));
+        
+        // VERBOSE LOGGING: ICPSwap exception
+        logger.error("EXCHANGE_COMPARISON", 
+          "ICPSwap threw exception - Error=" # Error.message(e) #
+          " Status=EXCEPTION",
+          "findBestExecution"
+        );
       };
 
       switch (bestExchange) {
         case (?exchange) {
+          
+          // VERBOSE LOGGING: Final exchange selection
+          logger.info("EXCHANGE_COMPARISON", 
+            "Exchange selection FINAL - Selected=" # debug_show(exchange) #
+            " Amount_out=" # Nat.toText(bestAmountOut) #
+            " Best_slippage=" # Float.toText(bestPriceSlippage) # "%" #
+            " Status=SELECTED",
+            "findBestExecution"
+          );
+          
           #ok({
             exchange = exchange;
             expectedOut = bestAmountOut;
@@ -2082,6 +2195,15 @@ shared (deployer) actor class treasury() = this {
           });
         };
         case null {
+          
+          // VERBOSE LOGGING: No exchange found
+          logger.warn("EXCHANGE_COMPARISON", 
+            "No viable exchange found - KongSwap_available=" # debug_show(Map.size(tokenDetailsMap) > 0) #
+            " ICPSwap_pools=" # Nat.toText(Map.size(ICPswapPools)) #
+            " Status=NO_EXECUTION_PATH",
+            "findBestExecution"
+          );
+          
           #err("No viable execution path found");
         };
       };
@@ -2110,6 +2232,31 @@ shared (deployer) actor class treasury() = this {
       let startTime = now();
       Debug.print("Executing trade on " # debug_show (exchange));
 
+      // VERBOSE LOGGING: Trade execution start
+      let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?details) { details.tokenSymbol };
+        case null { "UNKNOWN" };
+      };
+      let buySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+        case (?details) { details.tokenSymbol };
+        case null { "UNKNOWN" };
+      };
+      let sellDecimals = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?details) { details.tokenDecimals };
+        case null { 8 };
+      };
+      
+      logger.info("TRADE_EXECUTION", 
+        "Trade execution STARTED - Exchange=" # debug_show(exchange) #
+        " Pair=" # sellSymbol # "/" # buySymbol #
+        " Amount_in=" # Nat.toText(amountIn) # " (raw)" #
+        " Amount_formatted=" # Nat.toText(amountIn / (10 ** (if (sellDecimals >= 6) { sellDecimals - 6 } else { 1 }))) # 
+        (if (sellDecimals >= 6) { "M" } else { "" }) #
+        " Min_amount_out=" # Nat.toText(minAmountOut) # " (raw)" #
+        " Timestamp=" # Int.toText(startTime),
+        "executeTrade"
+      );
+
       Debug.print("Min amount out: " # Nat.toText(minAmountOut));
       switch (exchange) {
         case (#KongSwap) {
@@ -2126,6 +2273,18 @@ shared (deployer) actor class treasury() = this {
             };
           };
 
+          // VERBOSE LOGGING: KongSwap trade preparation
+          let slippageTolerancePercent = Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0;
+          let deadlineSeconds = (startTime + 300_000_000_000) / 1_000_000_000;
+          
+          logger.info("TRADE_EXECUTION", 
+            "KongSwap trade preparation - Symbols=" # sellSymbol # "/" # buySymbol #
+            " Slippage_tolerance=" # Float.toText(slippageTolerancePercent) # "%" #
+            " Deadline=" # Int.toText(deadlineSeconds) # "s" #
+            " Min_amount_out=" # Nat.toText(minAmountOut),
+            "executeTrade"
+          );
+
           let swapArgs : swaptypes.KongSwapParams = {
             token0_ledger = sellToken;
             token0_symbol = sellSymbol;
@@ -2139,9 +2298,30 @@ shared (deployer) actor class treasury() = this {
             slippageTolerance = Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0;
           };
 
+          // VERBOSE LOGGING: KongSwap execution start
+          logger.info("TRADE_EXECUTION", 
+            "KongSwap execution STARTING - Parameters_set=true" #
+            " Calling_executeTransferAndSwap=true",
+            "executeTrade"
+          );
+
           let swapResult = await KongSwap.executeTransferAndSwap(swapArgs, pendingTxs);
           switch (swapResult) {
             case (#ok(reply)) {
+              
+              // VERBOSE LOGGING: KongSwap trade success
+              let actualSlippage = reply.slippage;
+              let amountReceived = reply.receive_amount;
+              let executionTime = now() - startTime;
+              
+              logger.info("TRADE_EXECUTION", 
+                "KongSwap trade SUCCESS - Amount_received=" # Nat.toText(amountReceived) #
+                " Expected_min=" # Nat.toText(minAmountOut) #
+                " Actual_slippage=" # Float.toText(actualSlippage) # "%" #
+                " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
+                " Status=COMPLETED",
+                "executeTrade"
+              );
 
               #ok({
                 tokenSold = sellToken;
@@ -2156,6 +2336,17 @@ shared (deployer) actor class treasury() = this {
               });
             };
             case (#err(e)) {
+              
+              // VERBOSE LOGGING: KongSwap trade failure
+              let executionTime = now() - startTime;
+              
+              logger.error("TRADE_EXECUTION", 
+                "KongSwap trade FAILED - Error=" # e #
+                " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
+                " Status=FAILED",
+                "executeTrade"
+              );
+              
               #err("KongSwap trade failed: " # e);
             };
           };
@@ -2165,14 +2356,33 @@ shared (deployer) actor class treasury() = this {
 
           switch (poolResult) {
             case (?poolData) {
+              
+              // VERBOSE LOGGING: ICPSwap pool validation
+              logger.info("TRADE_EXECUTION", 
+                "ICPSwap pool validation - Pool_ID=" # Principal.toText(poolData.canisterId) #
+                " Token0=" # poolData.token0.address # " Token1=" # poolData.token1.address #
+                " Checking_transfer_fee=true",
+                "executeTrade"
+              );
 
               let tokenDetails = Map.get(tokenDetailsMap, phash, sellToken);
               let tx_fee = switch (tokenDetails) {
                 case (?details) { details.tokenTransferFee };
-                case null { return #err("Token details not found") };
+                case null { 
+                  logger.error("TRADE_EXECUTION", 
+                    "ICPSwap FAILED - Token details not found for sell token",
+                    "executeTrade"
+                  );
+                  return #err("Token details not found") 
+                };
               };
 
               if (tx_fee > amountIn) {
+                logger.error("TRADE_EXECUTION", 
+                  "ICPSwap FAILED - Transfer fee " # Nat.toText(tx_fee) # 
+                  " exceeds amount " # Nat.toText(amountIn),
+                  "executeTrade"
+                );
                 return #err("Token transfer fee " # Nat.toText(tx_fee) # " is greater than amount in " # Nat.toText(amountIn) # " for " # Principal.toText(sellToken));
               };
 
@@ -2188,10 +2398,12 @@ shared (deployer) actor class treasury() = this {
               };
 
               // Prepare swap params with slippage protection
+              let safeMaxSlippage = if (rebalanceConfig.maxSlippageBasisPoints <= 10000) { 10000 - rebalanceConfig.maxSlippageBasisPoints } else { 0 };
+              let adjustedMinOut = minAmountOut * safeMaxSlippage / 10000;
               let swapParams : swaptypes.ICPSwapParams = {
                 poolId = poolData.canisterId;
                 amountIn = amountIn - tx_fee;
-                minAmountOut = minAmountOut * (10000 - rebalanceConfig.maxSlippageBasisPoints) / 10000;
+                minAmountOut = adjustedMinOut;
                 zeroForOne = if (sellToken == Principal.fromText(poolData.token0.address)) {
                   true;
                 } else { false };
@@ -2203,6 +2415,16 @@ shared (deployer) actor class treasury() = this {
                 amount = null; // Withdraw all received tokens
               };
 
+              // VERBOSE LOGGING: ICPSwap execution parameters
+              logger.info("TRADE_EXECUTION", 
+                "ICPSwap execution parameters - Amount_after_fee=" # Nat.toText(amountIn - tx_fee) #
+                " Transfer_fee=" # Nat.toText(tx_fee) #
+                " Adjusted_min_out=" # Nat.toText(adjustedMinOut) #
+                " Zero_for_one=" # debug_show(swapParams.zeroForOne) #
+                " Starting_transfer_deposit_swap_withdraw=true",
+                "executeTrade"
+              );
+
               let swapResult = await ICPSwap.executeTransferDepositSwapAndWithdraw(
                 Principal.fromText(self),
                 depositParams,
@@ -2213,6 +2435,22 @@ shared (deployer) actor class treasury() = this {
 
               switch (swapResult) {
                 case (#ok(result)) {
+                  
+                  // VERBOSE LOGGING: ICPSwap trade success
+                  let executionTime = now() - startTime;
+                  let actualAmountOut = result.swapAmount;
+                  let effectiveSlippage = if (minAmountOut > 0) {
+                    Float.fromInt(Int.abs(actualAmountOut - minAmountOut)) / Float.fromInt(minAmountOut) * 100.0;
+                  } else { 0.0 };
+                  
+                  logger.info("TRADE_EXECUTION", 
+                    "ICPSwap trade SUCCESS - Amount_received=" # Nat.toText(actualAmountOut) #
+                    " Expected_min=" # Nat.toText(minAmountOut) #
+                    " Effective_slippage=" # Float.toText(effectiveSlippage) # "%" #
+                    " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
+                    " Status=COMPLETED",
+                    "executeTrade"
+                  );
 
                   #ok({
                     tokenSold = sellToken;
@@ -2228,15 +2466,48 @@ shared (deployer) actor class treasury() = this {
 
                 };
                 case (#err(e)) {
+                  
+                  // VERBOSE LOGGING: ICPSwap trade failure
+                  let executionTime = now() - startTime;
+                  
+                  logger.error("TRADE_EXECUTION", 
+                    "ICPSwap trade FAILED - Error=" # e #
+                    " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
+                    " Status=FAILED",
+                    "executeTrade"
+                  );
+                  
                   #err("Failed to execute ICPSwap trade: " # e);
                 };
               };
             };
-            case (_) { #err("ICPSwap pool not found") };
+            case (_) { 
+              
+              // VERBOSE LOGGING: ICPSwap pool not found
+              logger.error("TRADE_EXECUTION", 
+                "ICPSwap FAILED - Pool not found for pair " # sellSymbol # "/" # buySymbol #
+                " Available_pools=" # Nat.toText(Map.size(ICPswapPools)),
+                "executeTrade"
+              );
+              
+              #err("ICPSwap pool not found") 
+            };
           };
         };
       };
     } catch (e) {
+      
+      // VERBOSE LOGGING: Trade execution exception
+      let executionTime = now() - startTime;
+      
+      logger.error("TRADE_EXECUTION", 
+        "Trade execution EXCEPTION - Error=" # Error.message(e) #
+        " Exchange=" # debug_show(exchange) #
+        " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
+        " Status=EXCEPTION",
+        "executeTrade"
+      );
+      
       #err("Trade execution error: " # Error.message(e));
     };
   };
@@ -3027,3 +3298,4 @@ shared (deployer) actor class treasury() = this {
   };
   */
 };
+
