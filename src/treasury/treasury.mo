@@ -108,6 +108,7 @@ import swaptypes "../swap/swap_types";
 import Fuzz "mo:fuzz";
 import SpamProtection "../helper/spam_protection";
 import CanisterIds "../helper/CanisterIds";
+import Logger "../helper/logger";
 
 shared (deployer) actor class treasury() = this {
 
@@ -124,6 +125,9 @@ shared (deployer) actor class treasury() = this {
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
   let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
+
+  // Logger
+  let logger = Logger.Logger();
 
   // Canister principals and references
   //let self = "z4is7-giaaa-aaaad-qg6uq-cai";
@@ -2629,6 +2633,58 @@ shared (deployer) actor class treasury() = this {
   // Initialize sync timer at system startup
   startAllSyncTimers<system>(true);
 
+  //=========================================================================
+  // LOG ACCESS METHODS
+  //=========================================================================
+
+  /**
+   * Get the last N log entries
+   * Only accessible by master admin, controller, or DAO
+   */
+  public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
+      logger.getLastLogs(count);
+    } else {
+      [];
+    };
+  };
+
+  /**
+   * Get the last N log entries for a specific context
+   * Only accessible by master admin, controller, or DAO
+   */
+  public query ({ caller }) func getLogsByContext(context : Text, count : Nat) : async [Logger.LogEntry] {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
+      logger.getContextLogs(context, count);
+    } else {
+      [];
+    };
+  };
+
+  /**
+   * Get the last N log entries for a specific level
+   * Only accessible by master admin, controller, or DAO
+   */
+  public query ({ caller }) func getLogsByLevel(level : Logger.LogLevel, count : Nat) : async [Logger.LogEntry] {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
+      logger.getLogsByLevel(level, count);
+    } else {
+      [];
+    };
+  };
+
+  /**
+   * Clear all logs
+   * Only accessible by master admin or controller
+   */
+  public shared ({ caller }) func clearLogs() : async () {
+    if (isMasterAdmin(caller) or Principal.isController(caller)) {
+      logger.info("System", "Logs cleared by: " # Principal.toText(caller), "clearLogs");
+      logger.clearLogs();
+      logger.clearContextLogs("all");
+    };
+  };
+
   // Security check for message inspection
   system func inspect({
     arg : Blob;
@@ -2637,7 +2693,11 @@ shared (deployer) actor class treasury() = this {
       #admin_executeTradingCycle : () -> ();
       #admin_recoverPoolBalances : () -> ();
       #admin_syncWithDao : () -> ();
+      #clearLogs : () -> ();
       #getCurrentAllocations : () -> ();
+      #getLogs : () -> (count : Nat);
+      #getLogsByContext : () -> (context : Text, count : Nat);
+      #getLogsByLevel : () -> (level : Logger.LogLevel, count : Nat);
       #getTokenDetails : () -> ();
       #getTradingStatus : () -> ();
       #receiveTransferTasks : () -> ([(TransferRecipient, Nat, Principal, Nat8)], Bool);
