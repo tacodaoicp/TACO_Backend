@@ -127,7 +127,7 @@ shared (deployer) actor class treasury() = this {
   let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
 
   // Logger
-  stable var logger = Logger.Logger();
+  let logger = Logger.Logger();
 
   // Canister principals and references
   //let self = "z4is7-giaaa-aaaad-qg6uq-cai";
@@ -2498,12 +2498,9 @@ shared (deployer) actor class treasury() = this {
     } catch (e) {
       
       // VERBOSE LOGGING: Trade execution exception
-      let executionTime = now() - startTime;
-      
       logger.error("TRADE_EXECUTION", 
         "Trade execution EXCEPTION - Error=" # Error.message(e) #
         " Exchange=" # debug_show(exchange) #
-        " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
         " Status=EXCEPTION",
         "executeTrade"
       );
