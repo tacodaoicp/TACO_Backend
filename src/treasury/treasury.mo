@@ -381,7 +381,7 @@ shared (deployer) actor class treasury() = this {
         if (value < 30_000_000_000) {
           // Min 30 seconds
           validationErrors #= "Rebalance interval must be at least 30 seconds; ";
-        } else if (value > 86400_000_000_000) {
+        } else if (value > 86400_000_000) {
           // Max 24 hours
           validationErrors #= "Rebalance interval must be at most 24 hours; ";
         } else {
@@ -1528,6 +1528,13 @@ shared (deployer) actor class treasury() = this {
     let allocations = Vector.new<TokenAllocation>();
     let activeTokens = Vector.new<Principal>();
 
+    // VERBOSE LOGGING: Start allocation analysis
+    logger.info("ALLOCATION_ANALYSIS", 
+      "Starting allocation analysis - Total_tokens=" # Nat.toText(Map.size(tokenDetailsMap)) #
+      " Current_allocations_count=" # Nat.toText(Map.size(currentAllocations)),
+      "calculateTradeRequirements"
+    );
+
     // First pass - identify active tokens and calculate total target basis points
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
         if ((details.Active or details.balance > 0) and not details.isPaused and not details.pausedDueToSyncFailure) {
@@ -1537,6 +1544,32 @@ shared (deployer) actor class treasury() = this {
                 case null {};
             };
         };
+    };
+
+    // VERBOSE LOGGING: Active tokens and target allocations
+    logger.info("ALLOCATION_ANALYSIS", 
+      "Active token analysis - Active_tokens=" # Nat.toText(Vector.size(activeTokens)) #
+      " Total_target_basis_points=" # Nat.toText(totalTargetBasisPoints) #
+      " Expected_total=" # Nat.toText(10000),
+      "calculateTradeRequirements"
+    );
+
+    // Log individual target allocations
+    for (token in Vector.vals(activeTokens)) {
+      let targetAllocation = switch (Map.get(currentAllocations, phash, token)) {
+        case (?target) { target };
+        case null { 0 };
+      };
+      let tokenSymbol = switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) { details.tokenSymbol };
+        case null { "UNKNOWN" };
+      };
+      logger.info("ALLOCATION_ANALYSIS", 
+        "Target allocation - " # tokenSymbol # " (" # Principal.toText(token) # "): " #
+        Nat.toText(targetAllocation) # "bp (" # 
+        Nat.toText(targetAllocation / 100) # "." # Nat.toText((targetAllocation % 100) / 10) # "%)",
+        "calculateTradeRequirements"
+      );
     };
 
     // Second pass - calculate total value and store allocations
@@ -1608,6 +1641,14 @@ shared (deployer) actor class treasury() = this {
         };
     };
 
+    // VERBOSE LOGGING: Portfolio value and allocation calculations
+    logger.info("ALLOCATION_ANALYSIS", 
+      "Portfolio valuation complete - Total_ICP=" # Nat.toText(totalValueICP / 100000000) # "." # 
+      Nat.toText((totalValueICP % 100000000) / 1000000) # " Active_positions=" # 
+      Nat.toText(Vector.size(allocations)),
+      "calculateTradeRequirements"
+    );
+
     // Create weighted list of tokens to trade based on differences
     let tradePairs = Vector.new<(Principal, Int, Nat)>();
     for (alloc in Vector.vals(allocations)) {
@@ -1621,6 +1662,68 @@ shared (deployer) actor class treasury() = this {
             case null {};
         };
     };
+
+    // VERBOSE LOGGING: Final allocation analysis with differences
+    var overweightCount = 0;
+    var underweightCount = 0;
+    var balancedCount = 0;
+    var maxOverweight : Int = 0;
+    var maxUnderweight : Int = 0;
+    
+    for (alloc in Vector.vals(allocations)) {
+      let details = Map.get(tokenDetailsMap, phash, alloc.token);
+      switch details {
+        case (?d) {
+          if (not d.isPaused and not d.pausedDueToSyncFailure) {
+            if (alloc.diffBasisPoints > 0) {
+              underweightCount += 1;
+              if (alloc.diffBasisPoints > maxUnderweight) {
+                maxUnderweight := alloc.diffBasisPoints;
+              };
+            } else if (alloc.diffBasisPoints < 0) {
+              overweightCount += 1;
+              let absOverweight = Int.abs(alloc.diffBasisPoints);
+              if (absOverweight > Int.abs(maxOverweight)) {
+                maxOverweight := alloc.diffBasisPoints;
+              };
+            } else {
+              balancedCount += 1;
+            };
+            
+            // Log individual token analysis
+            let tokenSymbol = d.tokenSymbol;
+            let diffText = if (alloc.diffBasisPoints > 0) {
+              "UNDERWEIGHT +" # Int.toText(alloc.diffBasisPoints) # "bp";
+            } else if (alloc.diffBasisPoints < 0) {
+              "OVERWEIGHT " # Int.toText(alloc.diffBasisPoints) # "bp";
+            } else {
+              "BALANCED";
+            };
+            
+            logger.info("ALLOCATION_ANALYSIS", 
+              "Token analysis - " # tokenSymbol # ": Current=" # Nat.toText(alloc.currentBasisPoints) # "bp" #
+              " Target=" # Nat.toText(alloc.targetBasisPoints) # "bp" #
+              " Diff=" # diffText #
+              " Value=" # Nat.toText(alloc.valueInICP / 100000000) # "." # 
+              Nat.toText((alloc.valueInICP % 100000000) / 1000000) # "ICP",
+              "calculateTradeRequirements"
+            );
+          };
+        };
+        case null {};
+      };
+    };
+    
+    // Summary of allocation analysis
+    logger.info("ALLOCATION_ANALYSIS", 
+      "Allocation summary - Overweight=" # Nat.toText(overweightCount) # 
+      " Underweight=" # Nat.toText(underweightCount) #
+      " Balanced=" # Nat.toText(balancedCount) #
+      " Max_overweight=" # Int.toText(Int.abs(maxOverweight)) # "bp" #
+      " Max_underweight=" # Int.toText(maxUnderweight) # "bp" #
+      " Tradeable_pairs=" # Nat.toText(Vector.size(tradePairs)),
+      "calculateTradeRequirements"
+    );
 
     Vector.toArray(tradePairs);
   };
@@ -1638,7 +1741,19 @@ shared (deployer) actor class treasury() = this {
   ) : ?(Principal, Principal) {
     Debug.print("Selecting trading pair with " # Nat.toText(tradeDiffs.size()) # " diffs");
     Debug.print("Trade diffs: " # debug_show (tradeDiffs));
+    
+    // VERBOSE LOGGING: Trading pair selection start
+    logger.info("PAIR_SELECTION", 
+      "Starting pair selection - Total_candidates=" # Nat.toText(tradeDiffs.size()) #
+      " Min_required=2",
+      "selectTradingPair"
+    );
+    
     if (tradeDiffs.size() < 2) {
+      logger.warn("PAIR_SELECTION", 
+        "Insufficient candidates for pair selection - Need_at_least=2 Have=" # Nat.toText(tradeDiffs.size()),
+        "selectTradingPair"
+      );
       return null;
     };
 
@@ -1663,8 +1778,22 @@ shared (deployer) actor class treasury() = this {
     };
 
     if (Vector.size(toSell) == 0 or Vector.size(toBuy) == 0) {
+      // VERBOSE LOGGING: Insufficient candidates after filtering
+      logger.warn("PAIR_SELECTION", 
+        "Insufficient candidates after filtering - Sell_candidates=" # Nat.toText(Vector.size(toSell)) #
+        " Buy_candidates=" # Nat.toText(Vector.size(toBuy)) #
+        " Need_both_non_zero=true",
+        "selectTradingPair"
+      );
       return null;
     };
+
+    // VERBOSE LOGGING: Candidates ready for selection
+    logger.info("PAIR_SELECTION", 
+      "Candidates ready for weighted selection - Sell_candidates=" # Nat.toText(Vector.size(toSell)) #
+      " Buy_candidates=" # Nat.toText(Vector.size(toBuy)),
+      "selectTradingPair"
+    );
 
     // Calculate total weight for sell and buy sides
     var totalSellWeight = 0;
@@ -1704,6 +1833,34 @@ shared (deployer) actor class treasury() = this {
       };
     };
     Debug.print("selectTradingPair- selectedBuy: " # debug_show (selectedBuy));
+
+    // VERBOSE LOGGING: Final pair selection result
+    switch (selectedSell, selectedBuy) {
+      case (?sell, ?buy) {
+        let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sell)) {
+          case (?details) { details.tokenSymbol };
+          case null { "UNKNOWN" };
+        };
+        let buySymbol = switch (Map.get(tokenDetailsMap, phash, buy)) {
+          case (?details) { details.tokenSymbol };
+          case null { "UNKNOWN" };
+        };
+        logger.info("PAIR_SELECTION", 
+          "Pair selected successfully - Sell=" # sellSymbol # " (" # Principal.toText(sell) # ")" #
+          " Buy=" # buySymbol # " (" # Principal.toText(buy) # ")" #
+          " Sell_random=" # Nat.toText(sellRandom) # "/" # Nat.toText(totalSellWeight) #
+          " Buy_random=" # Nat.toText(buyRandom) # "/" # Nat.toText(totalBuyWeight),
+          "selectTradingPair"
+        );
+      };
+      case _ {
+        logger.warn("PAIR_SELECTION", 
+          "Failed to select valid pair - Sell_selected=" # debug_show(selectedSell) #
+          " Buy_selected=" # debug_show(selectedBuy),
+          "selectTradingPair"
+        );
+      };
+    };
 
     switch (selectedSell, selectedBuy) {
       case (?sell, ?buy) { ?(sell, buy) };
