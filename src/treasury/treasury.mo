@@ -381,7 +381,7 @@ shared (deployer) actor class treasury() = this {
         if (value < 30_000_000_000) {
           // Min 30 seconds
           validationErrors #= "Rebalance interval must be at least 30 seconds; ";
-        } else if (value > 86400_000_000) {
+        } else if (value > 86400_000_000_000) {
           // Max 24 hours
           validationErrors #= "Rebalance interval must be at most 24 hours; ";
         } else {
