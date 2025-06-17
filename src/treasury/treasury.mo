@@ -1938,10 +1938,10 @@ shared (deployer) actor class treasury() = this {
         if (details.pausedDueToSyncFailure) syncFailureCount += 1;
       };
       
-      // Format balance for display
-      let formattedBalance = if (decimals >= 6) {
-        Nat.toText(rawBalance / (10 ** (decimals - 6))) # "." # 
-        Nat.toText((rawBalance % (10 ** (decimals - 6))) / (10 ** (decimals - 8))) # "M";
+      // Format balance for display - simple decimal conversion
+      let formattedBalance = if (decimals > 0) {
+        let actualBalance = Float.fromInt(rawBalance) / Float.fromInt(10 ** decimals);
+        Float.toText(actualBalance);
       } else {
         Nat.toText(rawBalance);
       };
