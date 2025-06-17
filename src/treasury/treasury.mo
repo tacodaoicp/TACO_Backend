@@ -685,16 +685,22 @@ shared (deployer) actor class treasury() = this {
     var totalValueUSD : Float = 0;
     let currentAllocs = Vector.new<(Principal, Nat)>();
 
+    // First pass - calculate totals
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-      let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-      totalValueICP += valueInICP;
-      totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
-
-      if (valueInICP > 0) {
-        let basisPoints = (valueInICP * 10000) / totalValueICP;
-        Vector.add(currentAllocs, (principal, basisPoints));
-      };
+        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        totalValueICP += valueInICP;
+        totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
     };
+
+    // Second pass - calculate allocations
+    for ((principal, details) in Map.entries(tokenDetailsMap)) {
+        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        if (valueInICP > 0) {
+            let basisPoints = (valueInICP * 10000) / totalValueICP;
+            Vector.add(currentAllocs, (principal, basisPoints));
+        };
+    };
+
 
     // Calculate metrics from trade history
     var totalSlippage : Float = 0;
