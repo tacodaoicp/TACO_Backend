@@ -8,6 +8,18 @@ export const idlFactory = ({ IDL }) => {
   });
   const Result = IDL.Variant({ 'ok' : IDL.Text, 'err' : RebalanceError });
   const Result_4 = IDL.Variant({ 'ok' : IDL.Text, 'err' : IDL.Text });
+  const LogLevel = IDL.Variant({
+    'INFO' : IDL.Null,
+    'WARN' : IDL.Null,
+    'ERROR' : IDL.Null,
+  });
+  const LogEntry = IDL.Record({
+    'component' : IDL.Text,
+    'context' : IDL.Text,
+    'level' : LogLevel,
+    'message' : IDL.Text,
+    'timestamp' : IDL.Int,
+  });
   const RebalanceConfig = IDL.Record({
     'tokenSyncTimeoutNS' : IDL.Nat,
     'maxSlippageBasisPoints' : IDL.Nat,
@@ -47,8 +59,13 @@ export const idlFactory = ({ IDL }) => {
     'pausedDueToSyncFailure' : IDL.Bool,
     'tokenType' : TokenType,
   });
+  const PricePoint__1 = IDL.Record({
+    'usdPrice' : IDL.Float64,
+    'time' : IDL.Int,
+    'icpPrice' : IDL.Nat,
+  });
   const Result_3 = IDL.Variant({
-    'ok' : IDL.Vec(IDL.Tuple(IDL.Principal, IDL.Vec(PricePoint))),
+    'ok' : IDL.Vec(IDL.Tuple(IDL.Principal, IDL.Vec(PricePoint__1))),
     'err' : IDL.Text,
   });
   const ExchangeType = IDL.Variant({
@@ -123,9 +140,21 @@ export const idlFactory = ({ IDL }) => {
     'admin_executeTradingCycle' : IDL.Func([], [Result], []),
     'admin_recoverPoolBalances' : IDL.Func([], [Result_4], []),
     'admin_syncWithDao' : IDL.Func([], [Result_4], []),
+    'clearLogs' : IDL.Func([], [], []),
     'getCurrentAllocations' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Principal, IDL.Nat))],
+        ['query'],
+      ),
+    'getLogs' : IDL.Func([IDL.Nat], [IDL.Vec(LogEntry)], ['query']),
+    'getLogsByContext' : IDL.Func(
+        [IDL.Text, IDL.Nat],
+        [IDL.Vec(LogEntry)],
+        ['query'],
+      ),
+    'getLogsByLevel' : IDL.Func(
+        [LogLevel, IDL.Nat],
+        [IDL.Vec(LogEntry)],
         ['query'],
       ),
     'getSystemParameters' : IDL.Func([], [RebalanceConfig], ['query']),

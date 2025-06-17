@@ -4,7 +4,22 @@ import type { IDL } from '@dfinity/candid';
 
 export type ExchangeType = { 'KongSwap' : null } |
   { 'ICPSwap' : null };
+export interface LogEntry {
+  'component' : string,
+  'context' : string,
+  'level' : LogLevel,
+  'message' : string,
+  'timestamp' : bigint,
+}
+export type LogLevel = { 'INFO' : null } |
+  { 'WARN' : null } |
+  { 'ERROR' : null };
 export interface PricePoint {
+  'usdPrice' : number,
+  'time' : bigint,
+  'icpPrice' : bigint,
+}
+export interface PricePoint__1 {
   'usdPrice' : number,
   'time' : bigint,
   'icpPrice' : bigint,
@@ -54,7 +69,7 @@ export type Result_2 = {
     }
   } |
   { 'err' : string };
-export type Result_3 = { 'ok' : Array<[Principal, Array<PricePoint>]> } |
+export type Result_3 = { 'ok' : Array<[Principal, Array<PricePoint__1>]> } |
   { 'err' : string };
 export type Result_4 = { 'ok' : string } |
   { 'err' : string };
@@ -112,7 +127,11 @@ export interface treasury {
   'admin_executeTradingCycle' : ActorMethod<[], Result>,
   'admin_recoverPoolBalances' : ActorMethod<[], Result_4>,
   'admin_syncWithDao' : ActorMethod<[], Result_4>,
+  'clearLogs' : ActorMethod<[], undefined>,
   'getCurrentAllocations' : ActorMethod<[], Array<[Principal, bigint]>>,
+  'getLogs' : ActorMethod<[bigint], Array<LogEntry>>,
+  'getLogsByContext' : ActorMethod<[string, bigint], Array<LogEntry>>,
+  'getLogsByLevel' : ActorMethod<[LogLevel, bigint], Array<LogEntry>>,
   'getSystemParameters' : ActorMethod<[], RebalanceConfig>,
   'getTokenDetails' : ActorMethod<[], Array<[Principal, TokenDetails]>>,
   'getTokenPriceHistory' : ActorMethod<[Array<Principal>], Result_3>,

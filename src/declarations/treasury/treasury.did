@@ -3,11 +3,23 @@ type treasury =
    admin_executeTradingCycle: () -> (Result);
    admin_recoverPoolBalances: () -> (Result_4);
    admin_syncWithDao: () -> (Result_4);
+   /// * Clear all logs
+   ///    * Only accessible by master admin or controller
+   clearLogs: () -> ();
    /// * Get current token allocations in basis points
    getCurrentAllocations: () -> (vec record {
                                        principal;
                                        nat;
                                      }) query;
+   /// * Get the last N log entries
+   ///    * Only accessible by master admin, controller, or DAO
+   getLogs: (nat) -> (vec LogEntry) query;
+   /// * Get the last N log entries for a specific context
+   ///    * Only accessible by master admin, controller, or DAO
+   getLogsByContext: (text, nat) -> (vec LogEntry) query;
+   /// * Get the last N log entries for a specific level
+   ///    * Only accessible by master admin, controller, or DAO
+   getLogsByLevel: (LogLevel, nat) -> (vec LogEntry) query;
    /// * Get system rebalance parameters
    ///  *
    ///  * Returns all rebalancing configuration parameters that control the behavior
@@ -20,7 +32,7 @@ type treasury =
                                  principal;
                                  TokenDetails;
                                }) query;
-   getTokenPriceHistory: (tokens: vec principal) -> (Result_3) query;
+   getTokenPriceHistory: (vec principal) -> (Result_3) query;
    /// * Get detailed rebalancing status information
    ///    *
    ///    * Returns:
@@ -38,19 +50,19 @@ type treasury =
    ///    * tempTransferQueue - Array of transfer instructions
    ///    * Immediate - If true, process immediately and return block IDs
    ///    *
-   receiveTransferTasks: (tempTransferQueue:
-    vec record {
-          TransferRecipient;
-          nat;
-          principal;
-          nat8;
-        }, Immediate: bool) -> (bool, opt vec record {
-                                                principal;
-                                                nat64;
-                                              });
+   receiveTransferTasks: (vec record {
+                                TransferRecipient;
+                                nat;
+                                principal;
+                                nat8;
+                              }, bool) -> (bool,
+    opt vec record {
+              principal;
+              nat64;
+            });
    /// * Set test mode (modifies safety parameters)
    ///    * Only callable by DAO.
-   setTest: (a: bool) -> ();
+   setTest: (bool) -> ();
    /// * Start the automatic rebalancing process
    ///    *
    ///    * Initializes the rebalancing engine, which will periodically:
@@ -70,17 +82,15 @@ type treasury =
    ///    * Updates token status from the DAO including:
    ///    * - Active/Inactive status
    ///    * - Paused/Unpaused state
-   syncTokenDetailsFromDAO: (tokenDetails:
-    vec record {
-          principal;
-          TokenDetails;
-        }) -> (Result_1);
+   syncTokenDetailsFromDAO: (vec record {
+                                   principal;
+                                   TokenDetails;
+                                 }) -> (Result_1);
    /// * Update the rebalancing configuration parameters
    ///    *
    ///    * Allows adjustment of trading intervals, sizes, and safety limits
    ///    * Only callable by DAO or controller.
-   updateRebalanceConfig: (updates: UpdateConfig, rebalanceStateNew:
-    opt bool) -> (Result);
+   updateRebalanceConfig: (UpdateConfig, opt bool) -> (Result);
  };
 type UpdateConfig = 
  record {
@@ -157,7 +167,7 @@ type Result_3 =
    err: text;
    ok: vec record {
              principal;
-             vec PricePoint;
+             vec PricePoint__1;
            };
  };
 type Result_2 = 
@@ -228,11 +238,31 @@ type RebalanceConfig =
    shortSyncIntervalNS: nat;
    tokenSyncTimeoutNS: nat;
  };
+type PricePoint__1 = 
+ record {
+   icpPrice: nat;
+   time: int;
+   usdPrice: float64;
+ };
 type PricePoint = 
  record {
    icpPrice: nat;
    time: int;
    usdPrice: float64;
+ };
+type LogLevel = 
+ variant {
+   ERROR;
+   INFO;
+   WARN;
+ };
+type LogEntry = 
+ record {
+   component: text;
+   context: text;
+   level: LogLevel;
+   message: text;
+   timestamp: int;
  };
 type ExchangeType = 
  variant {
