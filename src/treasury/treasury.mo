@@ -1147,6 +1147,17 @@ shared (deployer) actor class treasury() = this {
 
   private func do_executeTradingCycle() : async* () {
 
+    // VERBOSE LOGGING: Trading cycle start
+    logger.info("REBALANCE_CYCLE", 
+      "Trading cycle started - Status=" # debug_show(rebalanceState.status) # 
+      " Pending_Txs=" # Nat.toText(Map.size(pendingTxs)) #
+      " Failed_Txs=" # Nat.toText(Map.size(failedTxs)) #
+      " Executed_Trades=" # Nat.toText(rebalanceState.metrics.totalTradesExecuted) #
+      " Failed_Trades=" # Nat.toText(rebalanceState.metrics.totalTradesFailed) #
+      " Last_Attempt=" # Int.toText((now() - rebalanceState.metrics.lastRebalanceAttempt) / 1_000_000_000) # "s_ago",
+      "do_executeTradingCycle"
+    );
+
     // Retry failed kongswap transactions
     await* retryFailedKongswapTransactions();
 
@@ -1228,12 +1239,24 @@ shared (deployer) actor class treasury() = this {
 
   private func do_executeTradingStep() : async* () {
 
+    // VERBOSE LOGGING: Portfolio state snapshot before trade analysis
+    await* logPortfolioState("Pre-trade analysis");
+
     try {
       var attempts = 0;
       var success = false;
       label a while (attempts < rebalanceConfig.maxTradeAttemptsPerInterval and not success) {
         attempts += 1;
         Debug.print("Trading attempt " # Nat.toText(attempts) # " of " # Nat.toText(rebalanceConfig.maxTradeAttemptsPerInterval));
+
+        // VERBOSE LOGGING: Trading attempt start
+        logger.info("REBALANCE_CYCLE", 
+          "Trading attempt " # Nat.toText(attempts) # "/" # Nat.toText(rebalanceConfig.maxTradeAttemptsPerInterval) #
+          " started - Interval=" # Nat.toText(rebalanceConfig.rebalanceIntervalNS / 1_000_000_000) # "s" #
+          " Max_Trade_Value=" # Nat.toText(rebalanceConfig.maxTradeValueICP / 100000000) # "ICP" #
+          " Max_Slippage=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
+          "do_executeTradingStep"
+        );
 
         Debug.print("Calculating trade requirements...");
         let tradeDiffs = calculateTradeRequirements();
@@ -1362,6 +1385,9 @@ shared (deployer) actor class treasury() = this {
                     };
                     success := true;
                     Debug.print("Trade executed successfully and prices updated");
+                    
+                    // VERBOSE LOGGING: Portfolio state after successful trade
+                    await* logPortfolioState("Post-trade completed");
                   };
                   case (#err(errorMsg)) {
                     // Create a failed trade record using the correct structure
@@ -1424,6 +1450,14 @@ shared (deployer) actor class treasury() = this {
                 currentStatus = #Idle;
               };
             };
+            
+            // VERBOSE LOGGING: No trading pairs found
+            logger.info("REBALANCE_CYCLE", 
+              "No valid trading pairs found - Setting status to Idle" #
+              " Trade_diffs_count=" # Nat.toText(tradeDiffs.size()) #
+              " Active_tokens=" # Nat.toText(Map.size(tokenDetailsMap)),
+              "do_executeTradingStep"
+            );
           };
         };
       };
@@ -1437,9 +1471,26 @@ shared (deployer) actor class treasury() = this {
             currentStatus = #Trading;
           };
         };
+        
+        // VERBOSE LOGGING: All attempts failed
+        logger.warn("REBALANCE_CYCLE", 
+          "All " # Nat.toText(rebalanceConfig.maxTradeAttemptsPerInterval) # " trade attempts failed" #
+          " - Will retry in next cycle" #
+          " Total_Executed=" # Nat.toText(rebalanceState.metrics.totalTradesExecuted) #
+          " Total_Failed=" # Nat.toText(rebalanceState.metrics.totalTradesFailed + attempts),
+          "do_executeTradingStep"
+        );
       };
     } catch (e) {
       Debug.print("Trading step failed: " # Error.message(e));
+      
+      // VERBOSE LOGGING: Trading step exception
+      logger.error("REBALANCE_CYCLE", 
+        "Trading step failed with exception: " # Error.message(e) # 
+        " - Attempting recovery",
+        "do_executeTradingStep"
+      );
+      
       await* recoverFromFailure();
     };
   };
@@ -1664,6 +1715,89 @@ shared (deployer) actor class treasury() = this {
       rebalanceConfig.maxTradeValueICP;
     } else {
       baseTradeSize;
+    };
+  };
+
+  /**
+   * VERBOSE LOGGING: Log comprehensive portfolio state
+   * 
+   * Captures complete portfolio snapshot including:
+   * - Total portfolio value in ICP and USD
+   * - Individual token balances, prices, and values
+   * - Token status (active/paused/sync failures)
+   */
+  private func logPortfolioState(context : Text) : async* () {
+    var totalValueICP = 0;
+    var totalValueUSD : Float = 0;
+    var activeTokenCount = 0;
+    var pausedTokenCount = 0;
+    var syncFailureCount = 0;
+    
+    let tokenStates = Vector.new<Text>();
+    
+    // Calculate totals and collect per-token data
+    for ((principal, details) in Map.entries(tokenDetailsMap)) {
+      let rawBalance = details.balance;
+      let decimals = details.tokenDecimals;
+      let priceICP = details.priceInICP;
+      let priceUSD = details.priceInUSD;
+      
+      // Calculate values
+      let valueInICP = if (decimals > 0) {
+        (rawBalance * priceICP) / (10 ** decimals);
+      } else { 0 };
+      let valueInUSD = if (decimals > 0) {
+        priceUSD * Float.fromInt(rawBalance) / (10.0 ** Float.fromInt(decimals));
+      } else { 0.0 };
+      
+      // Only include active, unpaused tokens in total
+      if (details.Active and not details.isPaused and not details.pausedDueToSyncFailure) {
+        totalValueICP += valueInICP;
+        totalValueUSD += valueInUSD;
+        activeTokenCount += 1;
+      } else {
+        if (details.isPaused) pausedTokenCount += 1;
+        if (details.pausedDueToSyncFailure) syncFailureCount += 1;
+      };
+      
+      // Format balance for display
+      let formattedBalance = if (decimals >= 6) {
+        Nat.toText(rawBalance / (10 ** (decimals - 6))) # "." # 
+        Nat.toText((rawBalance % (10 ** (decimals - 6))) / (10 ** (decimals - 8))) # "M";
+      } else {
+        Nat.toText(rawBalance);
+      };
+      
+      // Create token state string (simplified without Float.format)
+      let tokenState = details.tokenSymbol # " (" # Principal.toText(principal) # "): " #
+        "Balance=" # formattedBalance # " " #
+        "ICP_Value=" # Nat.toText(valueInICP / 100000000) # "." # Nat.toText((valueInICP % 100000000) / 1000000) # " " #
+        "USD_Value=" # Float.toText(valueInUSD) # " " #
+        "Price_ICP=" # Nat.toText(priceICP / 100000000) # "." # Nat.toText((priceICP % 100000000) / 1000000) # " " #
+        "Price_USD=" # Float.toText(priceUSD) # " " #
+        "Status=" # (if (details.Active) "Active" else "Inactive") # 
+        (if (details.isPaused) "+Paused" else "") #
+        (if (details.pausedDueToSyncFailure) "+SyncFail" else "") #
+        " LastSync=" # Int.toText((now() - details.lastTimeSynced) / 1_000_000_000) # "s_ago";
+      
+      Vector.add(tokenStates, tokenState);
+    };
+    
+    // Log portfolio summary (simplified without Float.format)
+    logger.info("PORTFOLIO_STATE", 
+      context # " - Portfolio Summary: " #
+      "Total_ICP=" # Nat.toText(totalValueICP / 100000000) # "." # Nat.toText((totalValueICP % 100000000) / 1000000) # " " #
+      "Total_USD=" # Float.toText(totalValueUSD) # " " #
+      "Active_Tokens=" # Nat.toText(activeTokenCount) # " " #
+      "Paused_Tokens=" # Nat.toText(pausedTokenCount) # " " #
+      "Sync_Failed_Tokens=" # Nat.toText(syncFailureCount) # " " #
+      "Total_Tokens=" # Nat.toText(Map.size(tokenDetailsMap)), 
+      "logPortfolioState"
+    );
+    
+    // Log individual token details
+    for (tokenState in Vector.vals(tokenStates)) {
+      logger.info("PORTFOLIO_STATE", context # " - Token: " # tokenState, "logPortfolioState");
     };
   };
 
