@@ -217,26 +217,30 @@ module {
 
               switch (metadataResult) {
                 case (?metadata) {
-                  let withdrawParams : Types.ICPSwapWithdrawParams = {
-                    poolId = poolId;
-                    token = token0;
-                    amount = balance.balance0;
-                    fee = metadata.tokenTransferFee;
-                  };
+                  if (metadata.tokenTransferFee < balance.balance0) {
+                    let withdrawParams : Types.ICPSwapWithdrawParams = {
+                      poolId = poolId;
+                      token = token0;
+                      amount = balance.balance0;
+                      fee = metadata.tokenTransferFee;
+                    };
 
-                  let result = await executeWithdraw(selfId, withdrawParams);
-                  switch (result) {
-                    case (#ok(amount)) {
-                      Debug.print("Successfully withdrew " # Nat.toText(amount) # " of token0");
-                      let currentAmount = switch (Map.get(recoveredBalances, phash, token0)) {
-                        case (?existing) { existing + amount };
-                        case null { amount };
+                    let result = await executeWithdraw(selfId, withdrawParams);
+                    switch (result) {
+                      case (#ok(_tx_id)) {
+                        let amountOut = balance.balance0 - metadata.tokenTransferFee;
+                        Debug.print("Successfully withdrew " # Nat.toText(amountOut) # " of token0");
+                        let currentAmount = switch (Map.get(recoveredBalances, phash, token0)) {
+                          case (?existing) { existing + amountOut };
+                          case null { amountOut };
+                        };
+                        Map.set(recoveredBalances, phash, token0, currentAmount);
                       };
-                      Map.set(recoveredBalances, phash, token0, currentAmount);
+                      case (#err(e)) {
+                        Debug.print("Failed to withdraw token0: " # e);
+                      };
                     };
-                    case (#err(e)) {
-                      Debug.print("Failed to withdraw token0: " # e);
-                    };
+
                   };
                 };
                 case (_) {
@@ -251,28 +255,30 @@ module {
               Debug.print("Processing token1 withdrawal...");
 
               let metadataResult = Map.get(tokenDetailsMap, phash, token1);
-
               switch (metadataResult) {
                 case (?metadata) {
-                  let withdrawParams : Types.ICPSwapWithdrawParams = {
-                    poolId = poolId;
-                    token = token1;
-                    amount = balance.balance1;
-                    fee = metadata.tokenTransferFee;
-                  };
-
-                  let result = await executeWithdraw(selfId, withdrawParams);
-                  switch (result) {
-                    case (#ok(amount)) {
-                      Debug.print("Successfully withdrew " # Nat.toText(amount) # " of token1");
-                      let currentAmount = switch (Map.get(recoveredBalances, phash, token1)) {
-                        case (?existing) { existing + amount };
-                        case null { amount };
-                      };
-                      Map.set(recoveredBalances, phash, token1, currentAmount);
+                  if (metadata.tokenTransferFee < balance.balance1) {
+                    let withdrawParams : Types.ICPSwapWithdrawParams = {
+                      poolId = poolId;
+                      token = token1;
+                      amount = balance.balance1;
+                      fee = metadata.tokenTransferFee;
                     };
-                    case (#err(e)) {
-                      Debug.print("Failed to withdraw token1: " # e);
+
+                    let result = await executeWithdraw(selfId, withdrawParams);
+                    switch (result) {
+                      case (#ok(_tx_id)) {
+                        let amountOut = balance.balance1 - metadata.tokenTransferFee;
+                        Debug.print("Successfully withdrew " # Nat.toText(amountOut) # " of token1");
+                        let currentAmount = switch (Map.get(recoveredBalances, phash, token1)) {
+                          case (?existing) { existing + amountOut };
+                          case null { amountOut };
+                        };
+                        Map.set(recoveredBalances, phash, token1, currentAmount);
+                      };
+                      case (#err(e)) {
+                        Debug.print("Failed to withdraw token1: " # e);
+                      };
                     };
                   };
                 };
@@ -691,9 +697,9 @@ module {
       Debug.print("ICPSwap.executeWithdraw: Withdrawal result: " # debug_show (result));
 
       switch (result) {
-        case (#ok(amount)) {
-          Debug.print("ICPSwap.executeWithdraw: Withdrawal successful, amount: " # debug_show (amount));
-          #ok(amount);
+        case (#ok(tx_id)) {
+          Debug.print("ICPSwap.executeWithdraw: Withdrawal successful, amount: " # debug_show(params.amount) # " tx_id: " # debug_show (tx_id));
+          #ok(tx_id);
         };
         case (#err(e)) {
           Debug.print("ICPSwap.executeWithdraw: Error executing withdrawal: " # debug_show (e));
@@ -735,26 +741,30 @@ module {
               // Prepare withdraw parameters
               let withdrawAmount = swapAmount;
 
-              let withdrawParamsWithFee : Types.ICPSwapWithdrawParams = {
-                poolId = depositParams.poolId;
-                token = receivedToken;
-                amount = withdrawAmount;
-                fee = metadata.tokenTransferFee;
-              };
-
-              let withdrawResult = await executeWithdraw(selfId, withdrawParamsWithFee);
-              Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Withdrawal result: " # debug_show (withdrawResult));
-
-              switch (withdrawResult) {
-                case (#ok(withdrawAmount)) {
-                  #ok({
-                    swapAmount = withdrawAmount;
-                  });
+              if (withdrawAmount > metadata.tokenTransferFee) {
+                let withdrawParamsWithFee : Types.ICPSwapWithdrawParams = {
+                  poolId = depositParams.poolId;
+                  token = receivedToken;
+                  amount = withdrawAmount;
+                  fee = metadata.tokenTransferFee;
                 };
-                case (#err(e)) {
-                  Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Error in withdrawal: " # e);
-                  #err(e);
+
+                let withdrawResult = await executeWithdraw(selfId, withdrawParamsWithFee);
+                Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Withdrawal result: " # debug_show (withdrawResult));
+
+                switch (withdrawResult) {
+                  case (#ok(_tx_id)) {
+                    #ok({
+                      swapAmount = withdrawAmount - metadata.tokenTransferFee;
+                    });
+                  };
+                  case (#err(e)) {
+                    Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Error in withdrawal: " # e);
+                    #err(e);
+                  };
                 };
+              } else {
+                #err("Insufficient balance in pool for withdrawal.");
               };
             };
             case (null) {
