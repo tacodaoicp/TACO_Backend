@@ -2019,8 +2019,7 @@ shared (deployer) actor class treasury() = this {
       logger.info("EXCHANGE_COMPARISON", 
         "Starting exchange comparison - Pair=" # sellSymbol # "/" # buySymbol #
         " Amount_in=" # Nat.toText(amountIn) # " (raw)" #
-        " Amount_formatted=" # Nat.toText(amountIn / (10 ** (if (sellDecimals >= 6) { sellDecimals - 6 } else { 1 }))) # 
-        (if (sellDecimals >= 6) { "M" } else { "" }) #
+        " Amount_formatted=" # Float.toText(Float.fromInt(amountIn) / Float.fromInt(10 ** sellDecimals)) #
         " Max_slippage=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
         "findBestExecution"
       );
@@ -2245,14 +2244,18 @@ shared (deployer) actor class treasury() = this {
         case (?details) { details.tokenDecimals };
         case null { 8 };
       };
+      let buyDecimals = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+        case (?details) { details.tokenDecimals };
+        case null { 8 };
+      };
       
       logger.info("TRADE_EXECUTION", 
         "Trade execution STARTED - Exchange=" # debug_show(exchange) #
         " Pair=" # sellSymbol # "/" # buySymbol #
         " Amount_in=" # Nat.toText(amountIn) # " (raw)" #
-        " Amount_formatted=" # Nat.toText(amountIn / (10 ** (if (sellDecimals >= 6) { sellDecimals - 6 } else { 1 }))) # 
-        (if (sellDecimals >= 6) { "M" } else { "" }) #
+        " Amount_formatted=" # Float.toText(Float.fromInt(amountIn) / Float.fromInt(10 ** sellDecimals)) #
         " Min_amount_out=" # Nat.toText(minAmountOut) # " (raw)" #
+        " Min_amount_out_formatted=" # Float.toText(Float.fromInt(minAmountOut) / Float.fromInt(10 ** buyDecimals)) #
         " Timestamp=" # Int.toText(startTime),
         "executeTrade"
       );
