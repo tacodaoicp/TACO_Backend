@@ -2115,7 +2115,7 @@ shared (deployer) actor class treasury() = this {
             let quoteResult = await ICPSwap.getQuote(quoteArgs);
             switch (quoteResult) {
               case (#ok(quote)) {
-                //if (quote.slippage < Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
+                if (quote.slippage < Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
                   // If no quote yet or better than KongSwap
                   if (bestExchange == null or (quote.amountOut > bestAmountOut or test)) {
                     bestExchange := ? #ICPSwap;
@@ -2140,7 +2140,7 @@ shared (deployer) actor class treasury() = this {
                       "findBestExecution"
                     );
                   };
-                //};
+                };
                 Debug.print("ICPSwap quote: " # debug_show (quote));
               };
               case (#err(e)) {
