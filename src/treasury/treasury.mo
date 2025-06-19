@@ -1214,6 +1214,9 @@ shared (deployer) actor class treasury() = this {
       "do_executeTradingCycle"
     );
 
+    // Update balances before any trading decisions
+    await updateBalances();
+
     // Retry failed kongswap transactions
     await* retryFailedKongswapTransactions();
 
