@@ -102,10 +102,11 @@ module {
 
       switch (metadataResult) {
         case (#ok(metadata)) {
-          // Calculate price from sqrtPriceX96
-          // price = (sqrtPriceX96 / 2^96)^2
-          let sqrtPriceX96 = metadata.sqrtPriceX96;
-          let price = Float.fromInt(sqrtPriceX96 * sqrtPriceX96) / Float.fromInt(2 ** 192);
+          // Calculate price from sqrtPriceX96 using proper arithmetic
+          // price = (sqrtPriceX96)^2 / 2^192
+          // This represents the price of token1 in terms of token0
+          let sqrtPriceX96_squared = metadata.sqrtPriceX96 * metadata.sqrtPriceX96;
+          let price = Float.fromInt(sqrtPriceX96_squared) / Float.fromInt(2 ** 192);
           Debug.print("ICPSwap.getPrice: Calculated price: " # debug_show (price));
 
           #ok({
@@ -113,7 +114,7 @@ module {
             timestamp = Time.now();
             fee = metadata.fee;
             liquidity = metadata.liquidity;
-            priceX96 = sqrtPriceX96;
+            priceX96 = metadata.sqrtPriceX96;
             tick = metadata.tick;
             token0 = metadata.token0;
             token1 = metadata.token1;
@@ -391,38 +392,39 @@ module {
 
           switch (quoteResult) {
             case (#ok(amountOut)) {
-              // Simplified slippage calculation using Float arithmetic to avoid overflow
-              // Calculate effective price as amountOut/amountIn (for zeroForOne) or amountIn/amountOut (for !zeroForOne)
-              let effectivePrice : Float = if (params.zeroForOne) {
-                Float.fromInt(amountOut) / Float.fromInt(params.amountIn);
+              // Calculate spot price from sqrtPriceX96 using proper Nat arithmetic for precision
+              // price = (sqrtPriceX96)^2 / 2^192
+              // This represents the price of token1 in terms of token0
+              let sqrtPriceX96_squared = metadata.sqrtPriceX96 * metadata.sqrtPriceX96;
+              let spotPrice = Float.fromInt(sqrtPriceX96_squared) / Float.fromInt(2 ** 192);
+
+              // Calculate effective price from the quote
+              // Effective price = amountIn / amountOut for both directions
+              // This gives us how much we're paying per unit received
+              let effectivePrice = Float.fromInt(params.amountIn) / Float.fromInt(amountOut);
+
+              // For slippage calculation, we need to compare prices in the same direction
+              // The spot price from sqrtPriceX96 represents token1/token0 ratio
+              let normalizedSpotPrice = if (params.zeroForOne) {
+                // Trading token0 for token1, so we want token0/token1 (inverse of spot price)
+                if (spotPrice > 0.0) { 1.0 / spotPrice } else { 0.0 };
               } else {
-                Float.fromInt(params.amountIn) / Float.fromInt(amountOut);
-              };
-
-              // Calculate spot price from sqrtPriceX96
-              // price = (sqrtPriceX96 / 2^96)^2
-              let sqrtPriceFloat = Float.fromInt(metadata.sqrtPriceX96);
-              let q96Float = Float.fromInt(2 ** 96); // 2^96
-              let spotPrice = (sqrtPriceFloat / q96Float) ** 2;
-
-              // Normalize spot price for comparison (handle zeroForOne direction)
-              let normalizedSpotPrice : Float = if (params.zeroForOne) {
+                // Trading token1 for token0, so we want token1/token0 (same as spot price)
                 spotPrice;
-              } else {
-                1.0 / spotPrice; // Inverse price for opposite direction
               };
 
               // Calculate slippage as percentage
-              // |effectivePrice - spotPrice| / spotPrice * 100
+              // Slippage = (effectivePrice - spotPrice) / spotPrice * 100
+              // Positive slippage means we're paying more than spot price
               let slippage : Float = if (normalizedSpotPrice > 0.0) {
-                Float.abs(effectivePrice - normalizedSpotPrice) / normalizedSpotPrice * 100.0;
+                (effectivePrice - normalizedSpotPrice) / normalizedSpotPrice * 100.0;
               } else {
                 0.0; // Fallback if spot price calculation fails
               };
 
               #ok({
                 amountOut = amountOut;
-                slippage = slippage;
+                slippage = Float.abs(slippage); // Return absolute slippage
                 fee = metadata.fee;
                 token0 = metadata.token0;
                 token1 = metadata.token1;
