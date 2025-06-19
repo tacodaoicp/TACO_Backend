@@ -2040,7 +2040,7 @@ shared (deployer) actor class treasury() = this {
         let kongQuote = await KongSwap.getQuote(sellSymbol, buySymbol, amountIn);
         switch (kongQuote) {
           case (#ok(quote)) {
-            //if (quote.slippage <= Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
+            if (quote.slippage <= Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
               bestExchange := ? #KongSwap;
               bestAmountOut := quote.receive_amount;
               bestPriceSlippage := quote.slippage;
@@ -2054,8 +2054,13 @@ shared (deployer) actor class treasury() = this {
                 " Status=ACCEPTED",
                 "findBestExecution"
               );
-            //};
-            //Debug.print("KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
+            } else {
+              logger.info("EXCHANGE_COMPARISON", 
+                "KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage),
+                "findBestExecution"
+              );
+              Debug.print("KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
+            };
           };
           case (#err(e)) {
             Debug.print("KongSwap quote error: " # e);
@@ -2140,6 +2145,12 @@ shared (deployer) actor class treasury() = this {
                       "findBestExecution"
                     );
                   };
+                } else {
+                  logger.info("EXCHANGE_COMPARISON", 
+                    "ICPSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage),
+                    "findBestExecution"
+                  );
+                  Debug.print("ICPSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
                 };
                 Debug.print("ICPSwap quote: " # debug_show (quote));
               };
