@@ -1517,6 +1517,9 @@ shared (deployer) actor class treasury() = this {
                     success := true;
                     Debug.print("Trade executed successfully and prices updated");
                     
+                    // Refresh balances to get accurate post-trade data
+                    await updateBalances();
+                    
                     // VERBOSE LOGGING: Portfolio state after successful trade
                     await* logPortfolioState("Post-trade completed");
                   };
