@@ -1770,13 +1770,33 @@ shared (deployer) actor class treasury() = this {
     );
 
     // Create weighted list of tokens to trade based on differences
+    // Exclude tokens where the difference is smaller than min trade size
+    let minTradeValueBasisPoints = if (totalValueICP > 0) {
+        (rebalanceConfig.minTradeValueICP * 10000) / totalValueICP
+    } else { 0 };
+    
     let tradePairs = Vector.new<(Principal, Int, Nat)>();
+    var excludedDueToMinTradeSize = 0;
+    
     for (alloc in Vector.vals(allocations)) {
         let details = Map.get(tokenDetailsMap, phash, alloc.token);
         switch details {
             case (?d) {
                 if (not d.isPaused and not d.pausedDueToSyncFailure and alloc.diffBasisPoints != 0) {
-                    Vector.add(tradePairs, (alloc.token, alloc.diffBasisPoints, alloc.valueInICP));
+                    // Check if the allocation difference is significant enough to warrant a trade
+                    if (Int.abs(alloc.diffBasisPoints) > minTradeValueBasisPoints) {
+                        Vector.add(tradePairs, (alloc.token, alloc.diffBasisPoints, alloc.valueInICP));
+                    } else {
+                        excludedDueToMinTradeSize += 1;
+                        // VERBOSE LOGGING: Token excluded due to small difference
+                        logger.info("ALLOCATION_ANALYSIS", 
+                          "Token EXCLUDED (too close to target) - " # d.tokenSymbol # 
+                          ": Diff=" # Int.toText(Int.abs(alloc.diffBasisPoints)) # "bp" #
+                          " Min_trade_threshold=" # Nat.toText(minTradeValueBasisPoints) # "bp" #
+                          " Reason=Below_min_trade_size",
+                          "calculateTradeRequirements"
+                        );
+                    };
                 };
             };
             case null {};
@@ -1841,6 +1861,8 @@ shared (deployer) actor class treasury() = this {
       " Balanced=" # Nat.toText(balancedCount) #
       " Max_overweight=" # Int.toText(Int.abs(maxOverweight)) # "bp" #
       " Max_underweight=" # Int.toText(maxUnderweight) # "bp" #
+      " Excluded_too_close=" # Nat.toText(excludedDueToMinTradeSize) #
+      " Min_trade_threshold=" # Nat.toText(minTradeValueBasisPoints) # "bp" #
       " Tradeable_pairs=" # Nat.toText(Vector.size(tradePairs)),
       "calculateTradeRequirements"
     );
