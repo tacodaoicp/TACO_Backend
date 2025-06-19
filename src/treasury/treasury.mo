@@ -1411,9 +1411,9 @@ shared (deployer) actor class treasury() = this {
                 let ourSlippageToleranceFloat = Float.fromInt(ourSlippageToleranceBasisPoints) / 100.0; // Convert basis points to percentage
                 
                 // Calculate ideal output (what we'd get with zero slippage)
-                let idealOut = if (execution.slippage < 99.0) { // Avoid division by values too close to 1
+                let idealOut : Nat = if (execution.slippage < 99.0) { // Avoid division by values too close to 1
                   let actualSlippageDecimal = execution.slippage / 100.0; // Convert percentage to decimal
-                  Float.toInt(Float.fromInt(execution.expectedOut) / (1.0 - actualSlippageDecimal))
+                  Int.abs(Float.toInt(Float.fromInt(execution.expectedOut) / (1.0 - actualSlippageDecimal)))
                 } else {
                   execution.expectedOut // Fallback if slippage is too high
                 };
@@ -1428,6 +1428,7 @@ shared (deployer) actor class treasury() = this {
                   tradeSize,
                   execution.exchange,
                   minAmountOut,
+                  idealOut, // Pass the spot price amount for correct slippage calculation
                 );
 
                 switch (tradeResult) {
@@ -2478,6 +2479,7 @@ shared (deployer) actor class treasury() = this {
     amountIn : Nat,
     exchange : ExchangeType,
     minAmountOut : Nat,
+    idealAmountOut : Nat, // Original spot price for proper slippage calculation
   ) : async* Result.Result<TradeRecord, Text> {
     try {
       let startTime = now();
@@ -2692,8 +2694,11 @@ shared (deployer) actor class treasury() = this {
                   // VERBOSE LOGGING: ICPSwap trade success
                   let executionTime = now() - startTime;
                   let actualAmountOut = result.swapAmount;
-                  let effectiveSlippage = if (minAmountOut > 0) {
-                    Float.fromInt(Int.abs(actualAmountOut - minAmountOut)) / Float.fromInt(minAmountOut) * 100.0;
+                  let effectiveSlippage = if (idealAmountOut > 0) {
+                    // Calculate how much worse we did compared to the original quote
+                    if (actualAmountOut < idealAmountOut) {
+                      Float.fromInt(idealAmountOut - actualAmountOut) / Float.fromInt(idealAmountOut) * 100.0;
+                    } else { 0.0 }; // We got more than expected, so no negative slippage
                   } else { 0.0 };
                   
                   logger.info("TRADE_EXECUTION", 
