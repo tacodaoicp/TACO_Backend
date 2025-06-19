@@ -1326,14 +1326,15 @@ shared (deployer) actor class treasury() = this {
         Debug.print("Selecting trading pair...");
         switch (selectTradingPair(tradeDiffs)) {
           case (?(sellToken, buyToken)) {
-            // only needed if we want to use calculateTradeSizeRebalancePeriod.
-            //var totalValueICP = 0;
-            //for ((principal, details) in Map.entries(tokenDetailsMap)) {
-            //  if (details.Active and not details.isPaused and not details.pausedDueToSyncFailure) {
-            //    let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-            //    totalValueICP += valueInICP;
-            //  };
-            //};
+            // Calculate total portfolio value for exact targeting decisions
+            var totalValueICP = 0;
+            for ((principal, details) in Map.entries(tokenDetailsMap)) {
+              if (details.Active and not details.isPaused and not details.pausedDueToSyncFailure) {
+                let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+                totalValueICP += valueInICP;
+              };
+            };
+            
             let tokenDetailsSell = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
               case (?details) { details };
               case (null) {
@@ -1342,7 +1343,60 @@ shared (deployer) actor class treasury() = this {
               };
             };
 
-            let tradeSize = ((calculateTradeSizeMinMax() * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP);
+            // Extract allocation differences for the selected tokens from tradeDiffs
+            var sellTokenDiff : Nat = 0;
+            var buyTokenDiff : Nat = 0;
+            for ((token, diff, _) in tradeDiffs.vals()) {
+              if (token == sellToken) {
+                sellTokenDiff := Int.abs(diff);
+              } else if (token == buyToken) {
+                buyTokenDiff := Int.abs(diff);
+              };
+            };
+
+            // Determine trade size using hybrid approach
+            let useExactTargeting = shouldUseExactTargeting(sellTokenDiff, buyTokenDiff, totalValueICP);
+            let maxTradeValueBP = if (totalValueICP > 0) { (rebalanceConfig.maxTradeValueICP * 10000) / totalValueICP } else { 0 };
+            
+            let tradeSize = if (useExactTargeting) {
+              // VERBOSE LOGGING: Using exact targeting
+              logger.info("TRADE_SIZING", 
+                "Using EXACT targeting - Sell_diff=" # Int.toText(sellTokenDiff) # "bp" #
+                " Buy_diff=" # Int.toText(buyTokenDiff) # "bp" #
+                " Portfolio_value=" # Nat.toText(totalValueICP / 100000000) # "." # 
+                Nat.toText((totalValueICP % 100000000) / 1000000) # "ICP" #
+                " Max_trade_threshold=" # Nat.toText(maxTradeValueBP) # "bp" #
+                " Reason=Close_to_target",
+                "do_executeTradingStep"
+              );
+              calculateExactTargetTradeSize(sellToken, buyToken, totalValueICP, sellTokenDiff, buyTokenDiff);
+            } else {
+              // VERBOSE LOGGING: Using random sizing  
+              logger.info("TRADE_SIZING", 
+                "Using RANDOM sizing - Sell_diff=" # Int.toText(sellTokenDiff) # "bp" #
+                " Buy_diff=" # Int.toText(buyTokenDiff) # "bp" #
+                " Portfolio_value=" # Nat.toText(totalValueICP / 100000000) # "." # 
+                Nat.toText((totalValueICP % 100000000) / 1000000) # "ICP" #
+                " Max_trade_threshold=" # Nat.toText(maxTradeValueBP) # "bp" #
+                " Reason=Large_imbalance",
+                "do_executeTradingStep"
+              );
+              ((calculateTradeSizeMinMax() * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP);
+            };
+            
+            // VERBOSE LOGGING: Final trade size decision
+            let tradeSizeICP = (tradeSize * tokenDetailsSell.priceInICP) / (10 ** tokenDetailsSell.tokenDecimals);
+            logger.info("TRADE_SIZING", 
+              "Trade size calculated - Amount=" # Nat.toText(tradeSize) # " (raw)" #
+              " ICP_value=" # Nat.toText(tradeSizeICP / 100000000) # "." # 
+              Nat.toText((tradeSizeICP % 100000000) / 1000000) # "ICP" #
+              " Min_allowed=" # Nat.toText(rebalanceConfig.minTradeValueICP / 100000000) # "." # 
+              Nat.toText((rebalanceConfig.minTradeValueICP % 100000000) / 1000000) # "ICP" #
+              " Max_allowed=" # Nat.toText(rebalanceConfig.maxTradeValueICP / 100000000) # "." # 
+              Nat.toText((rebalanceConfig.maxTradeValueICP % 100000000) / 1000000) # "ICP",
+              "do_executeTradingStep"
+            );
+            
             Debug.print("Selected pair: " # Principal.toText(sellToken) # " -> " # Principal.toText(buyToken) # " with size: " # Nat.toText(tradeSize));
 
             let bestExecution = await* findBestExecution(sellToken, buyToken, tradeSize);
@@ -1943,6 +1997,102 @@ shared (deployer) actor class treasury() = this {
     rebalanceConfig.minTradeValueICP + randomOffset
   };
 
+  /**
+   * Determine whether to use exact targeting or random trade sizing
+   * 
+   * Uses exact targeting when either token is close enough to target
+   * that a max trade size would overshoot significantly.
+   */
+  private func shouldUseExactTargeting(
+    sellTokenDiffBasisPoints: Int,
+    buyTokenDiffBasisPoints: Int, 
+    totalPortfolioValueICP: Nat
+  ) : Bool {
+    if (totalPortfolioValueICP == 0) { return false };
+    
+    // Calculate what 50% of max trade size represents in basis points
+    // This ensures exact targeting activates before a max trade would overshoot
+    let halfMaxTradeValueBasisPoints = (rebalanceConfig.maxTradeValueICP * 10000 / 2) / totalPortfolioValueICP;
+    
+    // Use exact targeting if either token is within 50% of max trade size of target
+    let sellTokenCloseToTarget = Int.abs(sellTokenDiffBasisPoints) <= halfMaxTradeValueBasisPoints;
+    let buyTokenCloseToTarget = Int.abs(buyTokenDiffBasisPoints) <= halfMaxTradeValueBasisPoints;
+    
+    sellTokenCloseToTarget or buyTokenCloseToTarget
+  };
+
+  /**
+   * Calculate exact trade size to bring one token to its target allocation
+   * 
+   * Chooses which token to target exactly (prefers the one closer to target)
+   * and calculates the precise trade size needed.
+   */
+  private func calculateExactTargetTradeSize(
+    sellToken: Principal,
+    buyToken: Principal, 
+    totalPortfolioValueICP: Nat,
+    sellTokenDiffBasisPoints: Nat,
+    buyTokenDiffBasisPoints: Nat
+  ) : Nat {
+    
+    // Choose which token to target exactly (prefer the one closer to target)
+    let targetSellToken = Int.abs(sellTokenDiffBasisPoints) <= Int.abs(buyTokenDiffBasisPoints);
+    
+    if (targetSellToken) {
+      // Calculate exact amount to sell to reach sell token's target
+      // sellTokenDiffBasisPoints is negative (overweight), so we need Int.abs
+      let excessValueICP = (Int.abs(sellTokenDiffBasisPoints) * totalPortfolioValueICP) / 10000;
+      
+      let sellTokenDetails = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?details) { details };
+        case null { 
+          Debug.print("Warning: Sell token details not found for exact targeting, using random size");
+          return calculateTradeSizeMinMax();
+        };
+      };
+      
+      let exactTradeSize = (excessValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP;
+      
+      // Ensure trade size is within reasonable bounds
+      let tradeSizeICP = (exactTradeSize * sellTokenDetails.priceInICP) / (10 ** sellTokenDetails.tokenDecimals);
+      if (tradeSizeICP < rebalanceConfig.minTradeValueICP) {
+        Debug.print("Exact trade size too small, using minimum trade size");
+        ((rebalanceConfig.minTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
+      } else if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
+        Debug.print("Exact trade size too large, using maximum trade size");  
+        ((rebalanceConfig.maxTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
+      } else {
+        exactTradeSize
+      }
+      
+    } else {
+      // Calculate exact amount to buy to reach buy token's target
+      // buyTokenDiffBasisPoints is positive (underweight)
+      let deficitValueICP : Nat = (buyTokenDiffBasisPoints * totalPortfolioValueICP) / 10000;
+      
+      let sellTokenDetails = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?details) { details };
+        case null { 
+          Debug.print("Warning: Sell token details not found for exact targeting, using random size");
+          return calculateTradeSizeMinMax();
+        };
+      };
+      
+      let exactTradeSize : Nat = (deficitValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP;
+      
+      // Ensure trade size is within reasonable bounds
+      let tradeSizeICP = (exactTradeSize * sellTokenDetails.priceInICP) / (10 ** sellTokenDetails.tokenDecimals);
+      if (tradeSizeICP < rebalanceConfig.minTradeValueICP) {
+        Debug.print("Exact trade size too small, using minimum trade size");
+        ((rebalanceConfig.minTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
+      } else if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
+        Debug.print("Exact trade size too large, using maximum trade size");
+        ((rebalanceConfig.maxTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
+      } else {
+        exactTradeSize
+      }
+    }
+  };
 
   /**
    * Calculate trade size based on portfolio value and rebalance period
