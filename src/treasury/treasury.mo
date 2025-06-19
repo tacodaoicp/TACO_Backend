@@ -1263,6 +1263,7 @@ shared (deployer) actor class treasury() = this {
         logger.info("REBALANCE_CYCLE", 
           "Trading attempt " # Nat.toText(attempts) # "/" # Nat.toText(rebalanceConfig.maxTradeAttemptsPerInterval) #
           " started - Interval=" # Nat.toText(rebalanceConfig.rebalanceIntervalNS / 1_000_000_000) # "s" #
+          " Min_Trade_Value=" # Nat.toText(rebalanceConfig.minTradeValueICP / 100000000) # "ICP" #
           " Max_Trade_Value=" # Nat.toText(rebalanceConfig.maxTradeValueICP / 100000000) # "ICP" #
           " Max_Slippage=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
           "do_executeTradingStep"

@@ -391,43 +391,34 @@ module {
 
           switch (quoteResult) {
             case (#ok(amountOut)) {
-              // Calculate price impact using fixed-point arithmetic
-              // We'll use a scaling factor of 10^18 for precision
-              let SCALE_FACTOR : Nat = 10 ** 18;
+              // Simplified slippage calculation using Float arithmetic to avoid overflow
+              // Calculate effective price as amountOut/amountIn (for zeroForOne) or amountIn/amountOut (for !zeroForOne)
+              let effectivePrice : Float = if (params.zeroForOne) {
+                Float.fromInt(amountOut) / Float.fromInt(params.amountIn);
+              } else {
+                Float.fromInt(params.amountIn) / Float.fromInt(amountOut);
+              };
 
               // Calculate spot price from sqrtPriceX96
-              // price = (sqrtPriceX96/2^96)^2 * SCALE_FACTOR
-              let spotPriceScaled : Nat = (metadata.sqrtPriceX96 * metadata.sqrtPriceX96 * SCALE_FACTOR) / (2 ** 192);
+              // price = (sqrtPriceX96 / 2^96)^2
+              let sqrtPriceFloat = Float.fromInt(metadata.sqrtPriceX96);
+              let q96Float = Float.fromInt(2 ** 96); // 2^96
+              let spotPrice = (sqrtPriceFloat / q96Float) ** 2;
 
-              // Calculate effective execution price, scaled
-              // For zeroForOne=true: amountOut/amountIn * SCALE_FACTOR
-              // For zeroForOne=false: amountIn/amountOut * SCALE_FACTOR
-              let effectivePriceScaled : Nat = if (params.zeroForOne) {
-                (amountOut * SCALE_FACTOR) / params.amountIn;
+              // Normalize spot price for comparison (handle zeroForOne direction)
+              let normalizedSpotPrice : Float = if (params.zeroForOne) {
+                spotPrice;
               } else {
-                // For the inverse price case, we invert the calculation
-                (params.amountIn * SCALE_FACTOR) / amountOut;
+                1.0 / spotPrice; // Inverse price for opposite direction
               };
 
-              // Calculate normalized spot price
-              let normalizedSpotPriceScaled : Nat = if (params.zeroForOne) {
-                spotPriceScaled;
+              // Calculate slippage as percentage
+              // |effectivePrice - spotPrice| / spotPrice * 100
+              let slippage : Float = if (normalizedSpotPrice > 0.0) {
+                Float.abs(effectivePrice - normalizedSpotPrice) / normalizedSpotPrice * 100.0;
               } else {
-                // For inverse price, calculate (SCALE_FACTOR * SCALE_FACTOR) / spotPriceScaled
-                // This is equivalent to SCALE_FACTOR / (spotPriceScaled / SCALE_FACTOR)
-                (SCALE_FACTOR * SCALE_FACTOR) / spotPriceScaled;
+                0.0; // Fallback if spot price calculation fails
               };
-
-              // Calculate slippage as a percentage * 100 (so 1% = 100)
-              // |effectivePrice - spotPrice| / spotPrice * 10000
-              let slippageBasisPoints : Nat = if (effectivePriceScaled > normalizedSpotPriceScaled) {
-                ((effectivePriceScaled - normalizedSpotPriceScaled) * 10000) / normalizedSpotPriceScaled;
-              } else {
-                ((normalizedSpotPriceScaled - effectivePriceScaled) * 10000) / normalizedSpotPriceScaled;
-              };
-
-              // Convert basis points to slippage percentage (optional)
-              let slippage : Float = Float.fromInt(slippageBasisPoints) / 100.0;
 
               #ok({
                 amountOut = amountOut;
