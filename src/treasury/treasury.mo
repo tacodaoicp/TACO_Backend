@@ -360,6 +360,52 @@ shared (deployer) actor class treasury() = this {
   };
 
   /**
+   * Reset the rebalancing state to initial values
+   *
+   * Completely resets all metrics, trade history, and timers
+   * Only callable by DAO or controller.
+   */
+  public shared ({ caller }) func resetRebalanceState() : async Result.Result<Text, RebalanceError> {
+    if (((await hasAdminPermission(caller, #stopRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      Debug.print("Not authorized to reset rebalance state: " # debug_show(caller));
+      return #err(#ConfigError("Not authorized"));
+    };
+
+    Debug.print("Resetting rebalance state");
+    
+    // Cancel existing timers
+    switch (rebalanceState.priceUpdateTimerId) {
+      case (?id) { cancelTimer(id) };
+      case null {};
+    };
+    switch (rebalanceState.rebalanceTimerId) {
+      case (?id) { cancelTimer(id) };
+      case null {};
+    };
+
+    // Reset to initial state
+    rebalanceState := {
+      status = #Idle;
+      config = rebalanceConfig;
+      metrics = {
+        lastPriceUpdate = 0;
+        lastRebalanceAttempt = 0;
+        totalTradesExecuted = 0;
+        totalTradesFailed = 0;
+        currentStatus = #Idle;
+        portfolioValueICP = 0;
+        portfolioValueUSD = 0;
+      };
+      lastTrades = Vector.new<TradeRecord>();
+      priceUpdateTimerId = null;
+      rebalanceTimerId = null;
+    };
+
+    Debug.print("Rebalance state reset complete");
+    #ok("Rebalance state reset to initial values");
+  };
+
+  /**
    * Update the rebalancing configuration parameters
    *
    * Allows adjustment of trading intervals, sizes, and safety limits
@@ -3300,6 +3346,7 @@ shared (deployer) actor class treasury() = this {
       #setTest : () -> Bool;
       #startRebalancing : () -> ();
       #stopRebalancing : () -> ();
+      #resetRebalanceState : () -> ();
       #syncTokenDetailsFromDAO : () -> [(Principal, TokenDetails)];
       #updateRebalanceConfig : () -> (UpdateConfig, ?Bool);
       #getTokenPriceHistory : () -> [Principal];
