@@ -25,7 +25,9 @@ module {
 
       // Get pool information using query call
       // Use the non-ICP token for the query as ICP pairs are too numerous
-      let searchToken = if (tokenA == "ICP") tokenB else tokenA;
+      var searchToken = if (tokenA == "ICP") tokenB else tokenA;
+      searchToken := "IC." # searchToken;
+
       let poolsResult = await kong.pools(?searchToken);
 
       switch (poolsResult) {
@@ -74,7 +76,7 @@ module {
     Debug.print("KongSwap.getQuote: Getting quote for " # debug_show (amountIn) # " " # tokenA # " to " # tokenB);
     try {
       let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
-      let result = await kong.swap_amounts(tokenA, amountIn, tokenB);
+      let result = await kong.swap_amounts("IC." # tokenA, amountIn, "IC." # tokenB);
 
       switch (result) {
         case (#Ok(quote)) {
@@ -100,13 +102,13 @@ module {
       let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
 
       let swapArgs : Types.KongSwapArgs = {
-        pay_token = params.token0_symbol; // Kong expects just the symbol
+        pay_token = "IC." # params.token0_symbol; // Kong expects just the symbol
         pay_amount = params.amountIn;
         pay_tx_id = switch (params.txId) {
           case (?id) { ? #BlockIndex(id) };
           case (null) { null };
         };
-        receive_token = params.token1_symbol; // Kong expects just the symbol
+        receive_token = "IC." # params.token1_symbol; // Kong expects just the symbol
         receive_amount = null; // Let Kong calculate the receive amount
         receive_address = params.recipient;
         max_slippage = ?params.slippageTolerance; // Hardcode 100% slippage
@@ -143,13 +145,13 @@ module {
 
       // Prepare swap arguments
       let swapArgs : Types.KongSwapArgs = {
-        pay_token = params.token0_symbol;
+        pay_token = "IC." # params.token0_symbol;
         pay_amount = params.amountIn;
         pay_tx_id = switch (params.txId) {
           case (?id) { ? #BlockIndex(id) };
           case (null) { null };
         };
-        receive_token = params.token1_symbol;
+        receive_token = "IC." # params.token1_symbol;
         receive_amount = ?params.minAmountOut;
         receive_address = null; // Use default (our canister)
         max_slippage = ?1.0; // Allow 100% slippage if user specified minAmountOut
