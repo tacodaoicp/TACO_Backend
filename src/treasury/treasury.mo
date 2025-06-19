@@ -2477,13 +2477,11 @@ shared (deployer) actor class treasury() = this {
                 };
               };
 
-              // Prepare swap params with slippage protection
-              let safeMaxSlippage = if (rebalanceConfig.maxSlippageBasisPoints <= 10000) { 10000 - rebalanceConfig.maxSlippageBasisPoints } else { 0 };
-              let adjustedMinOut = minAmountOut * safeMaxSlippage / 10000;
+              // Prepare swap params - minAmountOut already has correct slippage protection applied
               let swapParams : swaptypes.ICPSwapParams = {
                 poolId = poolData.canisterId;
                 amountIn = amountIn - tx_fee;
-                minAmountOut = adjustedMinOut;
+                minAmountOut = minAmountOut;
                 zeroForOne = if (sellToken == Principal.fromText(poolData.token0.address)) {
                   true;
                 } else { false };
@@ -2499,7 +2497,7 @@ shared (deployer) actor class treasury() = this {
               logger.info("TRADE_EXECUTION", 
                 "ICPSwap execution parameters - Amount_after_fee=" # Nat.toText(amountIn - tx_fee) #
                 " Transfer_fee=" # Nat.toText(tx_fee) #
-                " Adjusted_min_out=" # Nat.toText(adjustedMinOut) #
+                " Min_amount_out=" # Nat.toText(minAmountOut) #
                 " Zero_for_one=" # debug_show(swapParams.zeroForOne) #
                 " Starting_transfer_deposit_swap_withdraw=true",
                 "executeTrade"
