@@ -2,6 +2,7 @@ import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Time "mo:base/Time";
 import Error "mo:base/Error";
+import Float "mo:base/Float";
 import Nat "mo:base/Nat";
 import Nat8 "mo:base/Nat8";
 import Nat64 "mo:base/Nat64";
@@ -81,8 +82,33 @@ module {
       switch (result) {
         case (#Ok(quote)) {
           Debug.print("KongSwap.getQuote: Quote received successfully of tokenA: " # tokenA # " to tokenB: " # tokenB);
-          Debug.print("KongSwap.getQuote: Quote: " # debug_show (quote));
-          #ok(quote);
+          Debug.print("KongSwap.getQuote: Original quote: " # debug_show (quote));
+          
+          // Calculate our own slippage using mid_price (spot price) vs actual quote
+          let calculatedSlippage = if (quote.mid_price > 0.0) {
+            // Calculate what we should get at spot price (mid_price)
+            let spotAmountOut = Float.fromInt(amountIn) * quote.mid_price;
+            let actualAmountOut = Float.fromInt(quote.receive_amount);
+            
+            // Slippage = (spot_amount - actual_amount) / spot_amount * 100
+            if (spotAmountOut > actualAmountOut) {
+              (spotAmountOut - actualAmountOut) / spotAmountOut * 100.0;
+            } else {
+              0.0; // No slippage if we got more than expected
+            };
+          } else {
+            quote.slippage; // Fallback to their calculation if mid_price is unavailable
+          };
+          
+          Debug.print("KongSwap.getQuote: Calculated slippage: " # Float.toText(calculatedSlippage) # "% vs Kong's reported: " # Float.toText(quote.slippage) # "%");
+          
+          // Return quote with our calculated slippage
+          let correctedQuote = {
+            quote with
+            slippage = calculatedSlippage;
+          };
+          
+          #ok(correctedQuote);
         };
         case (#Err(e)) {
           Debug.print("KongSwap.getQuote: Error getting swap quote for tokenA: " # tokenA # " to tokenB: " # tokenB);
