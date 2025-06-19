@@ -1349,9 +1349,25 @@ shared (deployer) actor class treasury() = this {
 
             switch (bestExecution) {
               case (#ok(execution)) {
-                let slippage = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
-                //let minAmountOut = (execution.expectedOut * (10000 - slippage + 30)) / 10000;
-                let minAmountOut = execution.expectedOut / 2;
+                // Calculate minimum amount out considering the actual slippage already in expectedOut
+                // execution.expectedOut already includes the exchange's price impact (execution.slippage)
+                // We need to calculate what the ideal output would be, then apply our slippage tolerance
+                
+                let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+                let ourSlippageToleranceFloat = Float.fromInt(ourSlippageToleranceBasisPoints) / 100.0; // Convert basis points to percentage
+                
+                // Calculate ideal output (what we'd get with zero slippage)
+                let idealOut = if (execution.slippage < 99.0) { // Avoid division by values too close to 1
+                  let actualSlippageDecimal = execution.slippage / 100.0; // Convert percentage to decimal
+                  Float.toInt(Float.fromInt(execution.expectedOut) / (1.0 - actualSlippageDecimal))
+                } else {
+                  execution.expectedOut // Fallback if slippage is too high
+                };
+                
+                // Apply our slippage tolerance to the ideal output
+                let minAmountOutFloat = Float.fromInt(idealOut) * (1.0 - ourSlippageToleranceFloat / 100.0);
+                let minAmountOut = Int.abs(Float.toInt(minAmountOutFloat));
+                
                 let tradeResult = await* executeTrade(
                   sellToken,
                   buyToken,
