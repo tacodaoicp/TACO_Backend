@@ -233,7 +233,7 @@ shared (deployer) actor class treasury() = this {
     rebalanceTimerId = null;
   };
 
-  stable var MAX_PRICE_HISTORY_ENTRIES = 100;
+  stable var MAX_PRICE_HISTORY_ENTRIES = 2000;
 
   //=========================================================================
   // 2. PORTFOLIO DATA STRUCTURES
