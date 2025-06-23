@@ -171,12 +171,23 @@ module {
     };
   };
 
+  // Granular skip tracking
+  public type SkipBreakdown = {
+    noPairsFound : Nat;         // When selectTradingPair returns null
+    noExecutionPath : Nat;      // When findBestExecution fails
+    tokensFiltered : Nat;       // When tokens excluded due to small allocation differences
+    pausedTokens : Nat;         // When tokens excluded due to being paused/sync failures
+    insufficientCandidates : Nat; // When less than 2 viable tokens for trading
+  };
+
   // System metrics for monitoring
   public type RebalanceMetrics = {
     lastPriceUpdate : Int;
     lastRebalanceAttempt : Int;
     totalTradesExecuted : Nat;
     totalTradesFailed : Nat;
+    totalTradesSkipped : Nat;   // NEW: Total count of all skipped trades
+    skipBreakdown : SkipBreakdown; // NEW: Granular breakdown of skip reasons
     currentStatus : RebalanceStatus;
     portfolioValueICP : Nat;
     portfolioValueUSD : Float;

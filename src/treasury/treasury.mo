@@ -224,6 +224,14 @@ shared (deployer) actor class treasury() = this {
       lastRebalanceAttempt = 0;
       totalTradesExecuted = 0;
       totalTradesFailed = 0;
+      totalTradesSkipped = 0;
+      skipBreakdown = {
+        noPairsFound = 0;
+        noExecutionPath = 0;
+        tokensFiltered = 0;
+        pausedTokens = 0;
+        insufficientCandidates = 0;
+      };
       currentStatus = #Idle;
       portfolioValueICP = 0;
       portfolioValueUSD = 0;
@@ -266,6 +274,49 @@ shared (deployer) actor class treasury() = this {
       };
     };
     false;
+  };
+
+  // Helper function to increment skip counters
+  private func incrementSkipCounter(skipType : { #noPairsFound; #noExecutionPath; #tokensFiltered; #pausedTokens; #insufficientCandidates }) {
+    rebalanceState := {
+      rebalanceState with
+      metrics = {
+        rebalanceState.metrics with
+        totalTradesSkipped = rebalanceState.metrics.totalTradesSkipped + 1;
+        skipBreakdown = switch (skipType) {
+          case (#noPairsFound) {
+            {
+              rebalanceState.metrics.skipBreakdown with
+              noPairsFound = rebalanceState.metrics.skipBreakdown.noPairsFound + 1;
+            };
+          };
+          case (#noExecutionPath) {
+            {
+              rebalanceState.metrics.skipBreakdown with
+              noExecutionPath = rebalanceState.metrics.skipBreakdown.noExecutionPath + 1;
+            };
+          };
+          case (#tokensFiltered) {
+            {
+              rebalanceState.metrics.skipBreakdown with
+              tokensFiltered = rebalanceState.metrics.skipBreakdown.tokensFiltered + 1;
+            };
+          };
+          case (#pausedTokens) {
+            {
+              rebalanceState.metrics.skipBreakdown with
+              pausedTokens = rebalanceState.metrics.skipBreakdown.pausedTokens + 1;
+            };
+          };
+          case (#insufficientCandidates) {
+            {
+              rebalanceState.metrics.skipBreakdown with
+              insufficientCandidates = rebalanceState.metrics.skipBreakdown.insufficientCandidates + 1;
+            };
+          };
+        };
+      };
+    };
   };
 
   //=========================================================================
@@ -392,6 +443,14 @@ shared (deployer) actor class treasury() = this {
         lastRebalanceAttempt = 0;
         totalTradesExecuted = 0;
         totalTradesFailed = 0;
+        totalTradesSkipped = 0;
+        skipBreakdown = {
+          noPairsFound = 0;
+          noExecutionPath = 0;
+          tokensFiltered = 0;
+          pausedTokens = 0;
+          insufficientCandidates = 0;
+        };
         currentStatus = #Idle;
         portfolioValueICP = 0;
         portfolioValueUSD = 0;
@@ -728,7 +787,7 @@ shared (deployer) actor class treasury() = this {
    * - Current vs target allocations
    * - Performance metrics
    */
-  public shared query func getTradingStatus() : async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; avgSlippage : Float; successRate : Float } }, Text> {
+  public shared query func getTradingStatus() : async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text> {
 
     // Calculate total portfolio value
     var totalValueICP = 0;
@@ -766,8 +825,14 @@ shared (deployer) actor class treasury() = this {
       totalSlippage / Float.fromInt(impactCount);
     } else { 0.0 };
 
+    let totalAttempts = rebalanceState.metrics.totalTradesExecuted + rebalanceState.metrics.totalTradesFailed + rebalanceState.metrics.totalTradesSkipped;
+    
     let successRate = if (rebalanceState.metrics.totalTradesExecuted + rebalanceState.metrics.totalTradesFailed > 0) {
       Float.fromInt(rebalanceState.metrics.totalTradesExecuted) / Float.fromInt(rebalanceState.metrics.totalTradesExecuted + rebalanceState.metrics.totalTradesFailed);
+    } else { 0.0 };
+
+    let skipRate = if (totalAttempts > 0) {
+      Float.fromInt(rebalanceState.metrics.totalTradesSkipped) / Float.fromInt(totalAttempts);
     } else { 0.0 };
 
     #ok({
@@ -783,8 +848,17 @@ shared (deployer) actor class treasury() = this {
         lastUpdate = rebalanceState.metrics.lastPriceUpdate;
         totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted;
         totalTradesFailed = rebalanceState.metrics.totalTradesFailed;
+        totalTradesSkipped = rebalanceState.metrics.totalTradesSkipped;
+        skipBreakdown = {
+          noPairsFound = rebalanceState.metrics.skipBreakdown.noPairsFound;
+          noExecutionPath = rebalanceState.metrics.skipBreakdown.noExecutionPath;
+          tokensFiltered = rebalanceState.metrics.skipBreakdown.tokensFiltered;
+          pausedTokens = rebalanceState.metrics.skipBreakdown.pausedTokens;
+          insufficientCandidates = rebalanceState.metrics.skipBreakdown.insufficientCandidates;
+        };
         avgSlippage = avgSlippage;
         successRate = successRate;
+        skipRate = skipRate;
       };
     });
   };
@@ -794,6 +868,34 @@ shared (deployer) actor class treasury() = this {
    */
   public query func getCurrentAllocations() : async [(Principal, Nat)] {
     Iter.toArray(Map.entries(currentAllocations));
+  };
+
+  /**
+   * Get skip metrics and breakdown
+   * 
+   * Returns detailed information about skipped trades including:
+   * - Total skipped trades
+   * - Breakdown by skip reason
+   * - Skip rate as percentage of all attempts
+   */
+  public query func getSkipMetrics() : async { totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; skipRate : Float } {
+    let totalAttempts = rebalanceState.metrics.totalTradesExecuted + rebalanceState.metrics.totalTradesFailed + rebalanceState.metrics.totalTradesSkipped;
+    
+    let skipRate = if (totalAttempts > 0) {
+      Float.fromInt(rebalanceState.metrics.totalTradesSkipped) / Float.fromInt(totalAttempts);
+    } else { 0.0 };
+
+    {
+      totalTradesSkipped = rebalanceState.metrics.totalTradesSkipped;
+      skipBreakdown = {
+        noPairsFound = rebalanceState.metrics.skipBreakdown.noPairsFound;
+        noExecutionPath = rebalanceState.metrics.skipBreakdown.noExecutionPath;
+        tokensFiltered = rebalanceState.metrics.skipBreakdown.tokensFiltered;
+        pausedTokens = rebalanceState.metrics.skipBreakdown.pausedTokens;
+        insufficientCandidates = rebalanceState.metrics.skipBreakdown.insufficientCandidates;
+      };
+      skipRate = skipRate;
+    };
   };
 
   /**
@@ -1563,6 +1665,7 @@ shared (deployer) actor class treasury() = this {
               };
               case (#err(e)) {
                 Debug.print("Could not find execution path: " # e);
+                incrementSkipCounter(#noExecutionPath);
                 rebalanceState := {
                   rebalanceState with
                   metrics = {
@@ -1577,6 +1680,7 @@ shared (deployer) actor class treasury() = this {
           };
           case null {
             Debug.print("No valid trading pairs found");
+            incrementSkipCounter(#noPairsFound);
             rebalanceState := {
               rebalanceState with
               status = #Idle;
@@ -1590,7 +1694,8 @@ shared (deployer) actor class treasury() = this {
             logger.info("REBALANCE_CYCLE", 
               "No valid trading pairs found - Setting status to Idle" #
               " Trade_diffs_count=" # Nat.toText(tradeDiffs.size()) #
-              " Active_tokens=" # Nat.toText(Map.size(tokenDetailsMap)),
+              " Active_tokens=" # Nat.toText(Map.size(tokenDetailsMap)) #
+              " Total_skipped=" # Nat.toText(rebalanceState.metrics.totalTradesSkipped),
               "do_executeTradingStep"
             );
           };
@@ -1871,6 +1976,13 @@ shared (deployer) actor class treasury() = this {
       "calculateTradeRequirements"
     );
 
+    // Track tokens filtered due to small allocation differences
+    if (excludedDueToMinTradeSize > 0) {
+      for (_ in Iter.range(0, excludedDueToMinTradeSize - 1)) {
+        incrementSkipCounter(#tokensFiltered);
+      };
+    };
+
     Vector.toArray(tradePairs);
   };
 
@@ -1896,6 +2008,7 @@ shared (deployer) actor class treasury() = this {
     );
     
     if (tradeDiffs.size() < 2) {
+      incrementSkipCounter(#insufficientCandidates);
       logger.warn("PAIR_SELECTION", 
         "Insufficient candidates for pair selection - Need_at_least=2 Have=" # Nat.toText(tradeDiffs.size()),
         "selectTradingPair"
