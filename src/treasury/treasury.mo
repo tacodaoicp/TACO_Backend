@@ -1425,6 +1425,27 @@ shared (deployer) actor class treasury() = this {
 
         Debug.print("Trade diffs: " # debug_show (tradeDiffs));
 
+        // Check if we have any viable trading candidates
+        if (tradeDiffs.size() == 0) {
+          Debug.print("No viable trading candidates after filtering - all tokens too close to target");
+          incrementSkipCounter(#tokensFiltered);
+          rebalanceState := {
+            rebalanceState with
+            status = #Idle;
+            metrics = {
+              rebalanceState.metrics with
+              currentStatus = #Idle;
+            };
+          };
+          
+          logger.info("REBALANCE_CYCLE", 
+            "No viable trading candidates - All tokens too close to target" #
+            " Total_skipped=" # Nat.toText(rebalanceState.metrics.totalTradesSkipped),
+            "do_executeTradingStep"
+          );
+          continue a;
+        };
+
         Debug.print("Selecting trading pair...");
         switch (selectTradingPair(tradeDiffs)) {
           case (?(sellToken, buyToken)) {
@@ -1976,12 +1997,9 @@ shared (deployer) actor class treasury() = this {
       "calculateTradeRequirements"
     );
 
-    // Track tokens filtered due to small allocation differences
-    if (excludedDueToMinTradeSize > 0) {
-      for (_ in Iter.range(0, excludedDueToMinTradeSize - 1)) {
-        incrementSkipCounter(#tokensFiltered);
-      };
-    };
+    // Note: We don't increment skip counters here for filtered tokens
+    // Skip counters are only incremented when an actual trade attempt is skipped
+    // Individual token filtering is just part of the normal allocation analysis
 
     Vector.toArray(tradePairs);
   };
