@@ -1686,16 +1686,200 @@ shared (deployer) actor class treasury() = this {
               };
               case (#err(e)) {
                 Debug.print("Could not find execution path: " # e);
-                incrementSkipCounter(#noExecutionPath);
-                rebalanceState := {
-                  rebalanceState with
-                  metrics = {
-                    rebalanceState.metrics with
-                    currentStatus = #Failed(e);
+                
+                // ICP FALLBACK STRATEGY: If we can't find a direct route, try selling for ICP instead
+                // This creates an ICP overweight that will be corrected in the next cycle
+                if (buyToken != ICPprincipal) {
+                  Debug.print("Attempting ICP fallback route: " # Principal.toText(sellToken) # " -> ICP");
+                  
+                  // VERBOSE LOGGING: ICP fallback attempt
+                  let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                    case (?details) { details.tokenSymbol };
+                    case null { "UNKNOWN" };
                   };
+                  let buySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                    case (?details) { details.tokenSymbol };
+                    case null { "UNKNOWN" };
+                  };
+                  
+                  logger.info("ICP_FALLBACK", 
+                    "Direct route failed, attempting ICP fallback - Original_pair=" # sellSymbol # "/" # buySymbol #
+                    " Fallback_pair=" # sellSymbol # "/ICP" #
+                    " Original_error=" # e #
+                    " Strategy=Two_step_rebalancing",
+                    "do_executeTradingStep"
+                  );
+                  
+                  let icpFallbackExecution = await* findBestExecution(sellToken, ICPprincipal, tradeSize);
+                  
+                  switch (icpFallbackExecution) {
+                    case (#ok(icpExecution)) {
+                      Debug.print("ICP fallback route found, executing trade");
+                      
+                      // Calculate minimum amount out for ICP trade
+                      let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+                      let ourSlippageToleranceFloat = Float.fromInt(ourSlippageToleranceBasisPoints) / 100.0;
+                      
+                      let idealOut : Nat = if (icpExecution.slippage < 99.0) {
+                        let actualSlippageDecimal = icpExecution.slippage / 100.0;
+                        Int.abs(Float.toInt(Float.fromInt(icpExecution.expectedOut) / (1.0 - actualSlippageDecimal)))
+                      } else {
+                        icpExecution.expectedOut
+                      };
+                      
+                      let minAmountOutFloat = Float.fromInt(idealOut) * (1.0 - ourSlippageToleranceFloat / 100.0);
+                      let minAmountOut = Int.abs(Float.toInt(minAmountOutFloat));
+                      
+                      let icpTradeResult = await* executeTrade(
+                        sellToken,
+                        ICPprincipal,
+                        tradeSize,
+                        icpExecution.exchange,
+                        minAmountOut,
+                        idealOut,
+                      );
+                      
+                      switch (icpTradeResult) {
+                        case (#ok(record)) {
+                          // Update trade history with fallback trade
+                          let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                          
+                          // Create a special trade record that indicates this was a fallback
+                          let fallbackRecord : TradeRecord = {
+                            record with
+                            // Add a note in the error field to indicate this was a fallback trade
+                            error = ?("ICP_FALLBACK: Original target was " # buySymbol # ", traded for ICP to enable future " # buySymbol # " purchase");
+                          };
+                          
+                          Vector.add(lastTrades, fallbackRecord);
+                          if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                            Vector.reverse(lastTrades);
+                            while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                              ignore Vector.removeLast(lastTrades);
+                            };
+                            Vector.reverse(lastTrades);
+                          };
+
+                          // Update ICP price based on trade
+                          let sellTokenDetails = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                            case (?details) { details };
+                            case (null) {
+                              Debug.print("Error: Sell token not found in details");
+                              return;
+                            };
+                          };
+                          
+                          // Calculate new ICP price from the trade
+                          let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** sellTokenDetails.tokenDecimals);
+                          let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
+                          let newICPPrice = Int.abs(Float.toInt((actualTokensSold / actualICP) * Float.fromInt(sellTokenDetails.priceInICP)));
+                          let newICPPriceUSD = sellTokenDetails.priceInUSD * actualTokensSold / actualICP;
+                          
+                          updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+
+                          // Update rebalance state
+                          rebalanceState := {
+                            rebalanceState with
+                            metrics = {
+                              rebalanceState.metrics with
+                              totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                            };
+                            lastTrades = lastTrades;
+                          };
+                          
+                          success := true;
+                          Debug.print("ICP fallback trade executed successfully");
+                          
+                          // VERBOSE LOGGING: ICP fallback success
+                          logger.info("ICP_FALLBACK", 
+                            "ICP fallback trade SUCCESS - Sold=" # sellSymbol # 
+                            " Amount_sold=" # Nat.toText(record.amountSold) #
+                            " ICP_received=" # Nat.toText(record.amountBought) #
+                            " Exchange=" # debug_show(record.exchange) #
+                            " Next_cycle_will_trade=ICP_to_" # buySymbol,
+                            "do_executeTradingStep"
+                          );
+                          
+                          // Refresh balances to get accurate post-trade data
+                          await updateBalances();
+                          
+                          // VERBOSE LOGGING: Portfolio state after fallback trade
+                          await* logPortfolioState("Post-ICP-fallback completed");
+                        };
+                        case (#err(icpErrorMsg)) {
+                          Debug.print("ICP fallback trade also failed: " # icpErrorMsg);
+                          
+                          // VERBOSE LOGGING: ICP fallback failed
+                          logger.error("ICP_FALLBACK", 
+                            "ICP fallback trade FAILED - Original_error=" # e #
+                            " ICP_fallback_error=" # icpErrorMsg #
+                            " Status=Both_routes_failed",
+                            "do_executeTradingStep"
+                          );
+                          
+                          // Both direct and ICP fallback failed - count as skip
+                          incrementSkipCounter(#noExecutionPath);
+                          rebalanceState := {
+                            rebalanceState with
+                            metrics = {
+                              rebalanceState.metrics with
+                              currentStatus = #Failed("Both direct and ICP fallback routes failed: " # e # " | " # icpErrorMsg);
+                            };
+                          };
+                          
+                          // Attempt system recovery
+                          await* recoverFromFailure();
+                        };
+                      };
+                    };
+                    case (#err(icpRouteError)) {
+                      Debug.print("ICP fallback route also not available: " # icpRouteError);
+                      
+                      // VERBOSE LOGGING: ICP fallback route not found
+                      logger.error("ICP_FALLBACK", 
+                        "ICP fallback route NOT FOUND - Original_error=" # e #
+                        " ICP_route_error=" # icpRouteError #
+                        " Status=No_routes_available",
+                        "do_executeTradingStep"
+                      );
+                      
+                      // No routes available at all - count as skip
+                      incrementSkipCounter(#noExecutionPath);
+                      rebalanceState := {
+                        rebalanceState with
+                        metrics = {
+                          rebalanceState.metrics with
+                          currentStatus = #Failed("No routes available: " # e # " | ICP fallback: " # icpRouteError);
+                        };
+                      };
+                      
+                      // Attempt system recovery
+                      await* recoverFromFailure();
+                    };
+                  };
+                } else {
+                  // We were already trying to buy ICP and that failed - no fallback possible
+                  Debug.print("No ICP fallback possible - was already trying to buy ICP");
+                  
+                  logger.warn("ICP_FALLBACK", 
+                    "No ICP fallback possible - Original trade was already targeting ICP" #
+                    " Error=" # e #
+                    " Status=ICP_route_failed",
+                    "do_executeTradingStep"
+                  );
+                  
+                  incrementSkipCounter(#noExecutionPath);
+                  rebalanceState := {
+                    rebalanceState with
+                    metrics = {
+                      rebalanceState.metrics with
+                      currentStatus = #Failed(e);
+                    };
+                  };
+                  
+                  // Attempt system recovery
+                  await* recoverFromFailure();
                 };
-                // Attempt system recovery
-                await* recoverFromFailure();
               };
             };
           };
