@@ -245,6 +245,77 @@ module {
     valueInICP : Nat; // Current value in ICP
   };
 
+  //=========================================================================
+  // PRICE FAILSAFE SYSTEM TYPES
+  //=========================================================================
+
+  // Price movement direction for trigger conditions
+  public type PriceDirection = {
+    #Up;    // Price increase
+    #Down;  // Price decrease
+  };
+
+  // Type of price change that triggered the condition
+  public type ChangeType = {
+    #CurrentToMin;  // Change from current price to minimum in window
+    #CurrentToMax;  // Change from current price to maximum in window
+    #MinToMax;      // Change from minimum to maximum in window
+  };
+
+  // Price trigger condition configuration
+  public type TriggerCondition = {
+    id : Nat;                      // Unique identifier
+    name : Text;                   // Human-readable name
+    direction : PriceDirection;    // Price direction to monitor
+    percentage : Float;            // Percentage change threshold (e.g., 20.0 for 20%)
+    timeWindowNS : Nat;           // Time window in nanoseconds
+    applicableTokens : [Principal]; // Empty array means applies to all tokens
+    isActive : Bool;               // Can be disabled without deleting
+    createdAt : Int;               // Creation timestamp
+    createdBy : Principal;         // Creator principal
+  };
+
+  // Price data at the time of trigger
+  public type TriggerPriceData = {
+    currentPrice : Nat;         // Current price when triggered
+    minPriceInWindow : Nat;     // Minimum price in the time window
+    maxPriceInWindow : Nat;     // Maximum price in the time window
+    windowStartTime : Int;      // Start of the analysis window
+    actualChangePercent : Float; // Actual percentage change that triggered
+    changeType : ChangeType;    // Type of change that caused the trigger
+  };
+
+  // Log entry for price alert events
+  public type PriceAlertLog = {
+    id : Nat;                           // Unique log entry ID
+    timestamp : Int;                    // When the alert was triggered
+    token : Principal;                  // Token that triggered the alert
+    tokenSymbol : Text;                 // Token symbol for readability
+    triggeredCondition : TriggerCondition; // The condition that was triggered
+    priceData : TriggerPriceData;       // Price data at trigger time
+  };
+
+  // Errors for price failsafe operations
+  public type PriceFailsafeError = {
+    #NotAuthorized;
+    #ConditionNotFound;
+    #InvalidPercentage;
+    #InvalidTimeWindow;
+    #InvalidTokenList;
+    #DuplicateName;
+    #SystemError : Text;
+  };
+
+  // Update parameters for trigger conditions
+  public type TriggerConditionUpdate = {
+    name : ?Text;
+    direction : ?PriceDirection;
+    percentage : ?Float;
+    timeWindowNS : ?Nat;
+    applicableTokens : ?[Principal];
+    isActive : ?Bool;
+  };
+
   public type Self = actor {
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Principal, Nat8)], Bool) -> async (Bool, ?[(Principal, Nat64)]);
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];

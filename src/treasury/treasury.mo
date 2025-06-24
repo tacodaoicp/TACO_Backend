@@ -180,6 +180,15 @@ shared (deployer) actor class treasury() = this {
   type UpdateConfig = TreasuryTypes.UpdateConfig;
   type PricePoint = TreasuryTypes.PricePoint;
 
+  // Price failsafe system type aliases
+  type PriceDirection = TreasuryTypes.PriceDirection;
+  type ChangeType = TreasuryTypes.ChangeType;
+  type TriggerCondition = TreasuryTypes.TriggerCondition;
+  type TriggerPriceData = TreasuryTypes.TriggerPriceData;
+  type PriceAlertLog = TreasuryTypes.PriceAlertLog;
+  type PriceFailsafeError = TreasuryTypes.PriceFailsafeError;
+  type TriggerConditionUpdate = TreasuryTypes.TriggerConditionUpdate;
+
   // Actor references
   let dao = actor (DAOText) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
@@ -266,6 +275,17 @@ shared (deployer) actor class treasury() = this {
   stable let transferQueue = Vector.new<(TransferRecipient, Nat, Principal, Nat8)>();
   stable var transferTimerIDs = Vector.new<Nat>();
   stable var nsAdd : Nat64 = 0; // ns to add tx time to avoid errorsstable var nsAdd : Nat64 = 0;
+
+  //=========================================================================
+  // PRICE FAILSAFE SYSTEM STORAGE
+  //=========================================================================
+  
+  // Storage for trigger conditions and price alerts
+  stable let triggerConditions = Map.new<Nat, TriggerCondition>();
+  stable let priceAlerts = Vector.new<PriceAlertLog>();
+  stable var nextConditionId : Nat = 1;
+  stable var nextAlertId : Nat = 1;
+  stable var maxPriceAlerts = 1000; // Maximum number of price alerts to store
 
   private func isMasterAdmin(caller : Principal) : Bool {
     for (admin in masterAdmins.vals()) {
@@ -929,6 +949,546 @@ shared (deployer) actor class treasury() = this {
     assert (caller == DAOPrincipal);
     test := a;
     Debug.print("Test is set");
+  };
+
+  //=========================================================================
+  // PRICE FAILSAFE SYSTEM - PUBLIC INTERFACE
+  //=========================================================================
+
+  /**
+   * Add a new price trigger condition
+   *
+   * Creates a failsafe rule that will pause tokens when price movements
+   * exceed the specified threshold within the time window.
+   *
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func addTriggerCondition(
+    name : Text,
+    direction : PriceDirection,
+    percentage : Float,
+    timeWindowNS : Nat,
+    applicableTokens : [Principal]
+  ) : async Result.Result<Nat, PriceFailsafeError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Validate inputs
+    if (percentage <= 0.0 or percentage > 1000.0) {
+      return #err(#InvalidPercentage);
+    };
+
+    if (timeWindowNS < 60_000_000_000 or timeWindowNS > (86400_000_000_000 * 7)) { // 1 minute to 7 * 24 hours (1 week)
+      return #err(#InvalidTimeWindow);
+    };
+
+    // Check for duplicate names
+    for ((_, condition) in Map.entries(triggerConditions)) {
+      if (condition.name == name) {
+        return #err(#DuplicateName);
+      };
+    };
+
+    // Validate applicable tokens exist in our system
+    for (token in applicableTokens.vals()) {
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case null {
+          return #err(#InvalidTokenList);
+        };
+        case (?_) {};
+      };
+    };
+
+    let conditionId = nextConditionId;
+    nextConditionId += 1;
+
+    let newCondition : TriggerCondition = {
+      id = conditionId;
+      name = name;
+      direction = direction;
+      percentage = percentage;
+      timeWindowNS = timeWindowNS;
+      applicableTokens = applicableTokens;
+      isActive = true;
+      createdAt = now();
+      createdBy = caller;
+    };
+
+    Map.set(triggerConditions, Map.nhash, conditionId, newCondition);
+
+    logger.info(
+      "PRICE_FAILSAFE", 
+      "Trigger condition added - ID=" # Nat.toText(conditionId) #
+      " Name=" # name #
+      " Direction=" # debug_show(direction) #
+      " Percentage=" # Float.toText(percentage) # "%" #
+      " TimeWindow=" # Nat.toText(timeWindowNS / 1_000_000_000) # "s" #
+      " ApplicableTokens=" # Nat.toText(applicableTokens.size()),
+      " CreatedBy=" # Principal.toText(caller)
+    );
+
+    #ok(conditionId);
+  };
+
+  /**
+   * Update an existing trigger condition
+   *
+   * Modifies parameters of an existing failsafe rule.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func updateTriggerCondition(
+    conditionId : Nat,
+    updates : TriggerConditionUpdate
+  ) : async Result.Result<Text, PriceFailsafeError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (Map.get(triggerConditions, Map.nhash, conditionId)) {
+      case null {
+        return #err(#ConditionNotFound);
+      };
+      case (?currentCondition) {
+        var updatedCondition = currentCondition;
+
+        // Apply updates
+        switch (updates.name) {
+          case (?newName) {
+            // Check for duplicate names (excluding current condition)
+            for ((id, condition) in Map.entries(triggerConditions)) {
+              if (id != conditionId and condition.name == newName) {
+                return #err(#DuplicateName);
+              };
+            };
+            updatedCondition := { updatedCondition with name = newName };
+          };
+          case null {};
+        };
+
+        switch (updates.direction) {
+          case (?newDirection) {
+            updatedCondition := { updatedCondition with direction = newDirection };
+          };
+          case null {};
+        };
+
+        switch (updates.percentage) {
+          case (?newPercentage) {
+            if (newPercentage <= 0.0 or newPercentage > 1000.0) {
+              return #err(#InvalidPercentage);
+            };
+            updatedCondition := { updatedCondition with percentage = newPercentage };
+          };
+          case null {};
+        };
+
+        switch (updates.timeWindowNS) {
+          case (?newTimeWindow) {
+            if (newTimeWindow < 60_000_000_000 or newTimeWindow > 86400_000_000_000) {
+              return #err(#InvalidTimeWindow);
+            };
+            updatedCondition := { updatedCondition with timeWindowNS = newTimeWindow };
+          };
+          case null {};
+        };
+
+        switch (updates.applicableTokens) {
+          case (?newTokens) {
+            // Validate applicable tokens exist in our system
+            for (token in newTokens.vals()) {
+              switch (Map.get(tokenDetailsMap, phash, token)) {
+                case null {
+                  return #err(#InvalidTokenList);
+                };
+                case (?_) {};
+              };
+            };
+            updatedCondition := { updatedCondition with applicableTokens = newTokens };
+          };
+          case null {};
+        };
+
+        switch (updates.isActive) {
+          case (?newActive) {
+            updatedCondition := { updatedCondition with isActive = newActive };
+          };
+          case null {};
+        };
+
+        Map.set(triggerConditions, Map.nhash, conditionId, updatedCondition);
+
+        Debug.print("PRICE_FAILSAFE: " # 
+          "Trigger condition updated - ID=" # Nat.toText(conditionId) #
+          " Name=" # updatedCondition.name #
+          " UpdatedBy=" # Principal.toText(caller)
+        );
+
+        #ok("Trigger condition updated successfully");
+      };
+    };
+  };
+
+  /**
+   * Remove a trigger condition
+   *
+   * Deletes a failsafe rule permanently.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func removeTriggerCondition(conditionId : Nat) : async Result.Result<Text, PriceFailsafeError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (Map.remove(triggerConditions, Map.nhash, conditionId)) {
+      case null {
+        return #err(#ConditionNotFound);
+      };
+      case (?removedCondition) {
+        Debug.print("PRICE_FAILSAFE: " # 
+          "Trigger condition removed - ID=" # Nat.toText(conditionId) #
+          " Name=" # removedCondition.name #
+          " RemovedBy=" # Principal.toText(caller)
+        );
+
+        #ok("Trigger condition removed successfully");
+      };
+    };
+  };
+
+  /**
+   * List all trigger conditions
+   *
+   * Returns all configured failsafe rules.
+   * Accessible by any user with query access.
+   */
+  public query func listTriggerConditions() : async [TriggerCondition] {
+    Iter.toArray(Map.vals(triggerConditions));
+  };
+
+  /**
+   * Get a specific trigger condition by ID
+   *
+   * Returns details of a single failsafe rule.
+   * Accessible by any user with query access.
+   */
+  public query func getTriggerCondition(conditionId : Nat) : async ?TriggerCondition {
+    Map.get(triggerConditions, Map.nhash, conditionId);
+  };
+
+  /**
+   * Activate or deactivate a trigger condition
+   *
+   * Enables or disables a failsafe rule without deleting it.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func setTriggerConditionActive(
+    conditionId : Nat,
+    isActive : Bool
+  ) : async Result.Result<Text, PriceFailsafeError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (Map.get(triggerConditions, Map.nhash, conditionId)) {
+      case null {
+        return #err(#ConditionNotFound);
+      };
+      case (?condition) {
+        let updatedCondition = { condition with isActive = isActive };
+        Map.set(triggerConditions, Map.nhash, conditionId, updatedCondition);
+
+        Debug.print("PRICE_FAILSAFE: " # 
+          "Trigger condition " # (if isActive "activated" else "deactivated") # 
+          " - ID=" # Nat.toText(conditionId) #
+          " Name=" # condition.name #
+          " UpdatedBy=" # Principal.toText(caller)
+        );
+
+        #ok("Trigger condition " # (if isActive "activated" else "deactivated") # " successfully");
+      };
+    };
+  };
+
+  /**
+   * Get price alerts (paginated)
+   *
+   * Returns recent price alert events that triggered token pausing.
+   * Accessible by any user with query access.
+   */
+  public query func getPriceAlerts(offset : Nat, limit : Nat) : async {
+    alerts : [PriceAlertLog];
+    totalCount : Nat;
+  } {
+    let totalCount = Vector.size(priceAlerts);
+    let alertsArray = Vector.toArray(priceAlerts);
+    
+    // Reverse the array to show most recent first
+    let reversedAlerts = Array.reverse(alertsArray);
+    
+    let actualLimit = if (limit > 100) { 100 } else { limit }; // Cap at 100
+    let endIndex = if (offset + actualLimit > reversedAlerts.size()) {
+      reversedAlerts.size();
+    } else {
+      offset + actualLimit;
+    };
+    
+    if (offset >= reversedAlerts.size()) {
+      return { alerts = []; totalCount = totalCount };
+    };
+    
+    let slicedAlerts = Iter.toArray(Array.slice(reversedAlerts, offset, endIndex));
+    
+    {
+      alerts = slicedAlerts;
+      totalCount = totalCount;
+    };
+  };
+
+  /**
+   * Get price alerts for a specific token
+   *
+   * Returns price alert events for a particular token.
+   * Accessible by any user with query access.
+   */
+  public query func getPriceAlertsForToken(token : Principal, limit : Nat) : async [PriceAlertLog] {
+    let alertsArray = Vector.toArray(priceAlerts);
+    let reversedAlerts = Array.reverse(alertsArray);
+    
+    let filteredAlerts = Array.filter<PriceAlertLog>(reversedAlerts, func(alert) {
+      alert.token == token
+    });
+    
+    let actualLimit = if (limit > 100) { 100 } else { limit };
+    Iter.toArray(Array.slice(filteredAlerts, 0, if (actualLimit > filteredAlerts.size()) { filteredAlerts.size() } else { actualLimit }));
+  };
+
+  /**
+   * Clear price alerts log
+   *
+   * Removes all price alert history.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func clearPriceAlerts() : async Result.Result<Text, PriceFailsafeError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let clearedCount = Vector.size(priceAlerts);
+    Vector.clear(priceAlerts);
+    nextAlertId := 1;
+
+    Debug.print("PRICE_FAILSAFE: " # 
+      "Price alerts cleared - Count=" # Nat.toText(clearedCount) #
+      " ClearedBy=" # Principal.toText(caller)
+    );
+
+    #ok("Cleared " # Nat.toText(clearedCount) # " price alerts");
+  };
+
+  //=========================================================================
+  // PRICE FAILSAFE SYSTEM - CORE MONITORING
+  //=========================================================================
+
+  /**
+   * Check all active trigger conditions for a token
+   *
+   * Analyzes price history to detect significant price movements
+   * and triggers token pausing if conditions are met.
+   */
+  private func checkPriceFailsafeConditions(token : Principal, currentPrice : Nat, priceHistory : [PricePoint]) {
+    // Get token symbol for logging
+    let tokenSymbol = switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?details) { details.tokenSymbol };
+      case null { Principal.toText(token) };
+    };
+
+    // Check all active trigger conditions
+    for ((conditionId, condition) in Map.entries(triggerConditions)) {
+      if (condition.isActive and isTokenApplicable(token, condition)) {
+                 switch (analyzePriceChangeInWindow(currentPrice, priceHistory, condition)) {
+          case (?triggerData) {
+            // Condition triggered - pause the token and log the alert
+            pauseTokenDueToPriceAlert(token, condition, triggerData);
+          };
+          case null {
+            // No trigger - continue monitoring
+          };
+        };
+      };
+    };
+  };
+
+  /**
+   * Check if a token is applicable for a given trigger condition
+   */
+  private func isTokenApplicable(token : Principal, condition : TriggerCondition) : Bool {
+    if (condition.applicableTokens.size() == 0) {
+      return true; // Empty list means applies to all tokens
+    };
+    
+    for (applicableToken in condition.applicableTokens.vals()) {
+      if (applicableToken == token) {
+        return true;
+      };
+    };
+    
+    false;
+  };
+
+  /**
+   * Analyze price changes within the specified time window
+   *
+   * Returns trigger data if the condition is met, null otherwise
+   */
+  private func analyzePriceChangeInWindow(
+    currentPrice : Nat,
+    priceHistory : [PricePoint],
+    condition : TriggerCondition
+  ) : ?TriggerPriceData {
+    let currentTime = now();
+    let windowStartTime = currentTime - condition.timeWindowNS;
+    
+    // Filter price points within the time window
+    let relevantPrices = Array.filter<PricePoint>(priceHistory, func(point) {
+      point.time >= windowStartTime
+    });
+    
+    // Need at least 2 price points to detect changes
+    if (relevantPrices.size() < 2) {
+      return null;
+    };
+    
+    // Find min and max prices in the window
+    var minPrice = currentPrice;
+    var maxPrice = currentPrice;
+    
+    for (point in relevantPrices.vals()) {
+      if (point.icpPrice < minPrice) {
+        minPrice := point.icpPrice;
+      };
+      if (point.icpPrice > maxPrice) {
+        maxPrice := point.icpPrice;
+      };
+    };
+    
+    // Calculate percentage changes and check if any exceed threshold
+    let changes = [
+      {
+        fromPrice = currentPrice;
+        toPrice = minPrice;
+        changeType = #CurrentToMin;
+      },
+      {
+        fromPrice = currentPrice;
+        toPrice = maxPrice;
+        changeType = #CurrentToMax;
+      },
+      {
+        fromPrice = minPrice;
+        toPrice = maxPrice;
+        changeType = #MinToMax;
+      }
+    ];
+    
+    for (change in changes.vals()) {
+      let percentageChange = calculatePercentageChange(change.fromPrice, change.toPrice);
+      let directionMatches = switch (condition.direction) {
+        case (#Up) { change.toPrice > change.fromPrice };
+        case (#Down) { change.toPrice < change.fromPrice };
+      };
+      
+      if (directionMatches and Float.abs(percentageChange) >= condition.percentage) {
+        return ?{
+          currentPrice = currentPrice;
+          minPriceInWindow = minPrice;
+          maxPriceInWindow = maxPrice;
+          windowStartTime = windowStartTime;
+          actualChangePercent = Float.abs(percentageChange);
+          changeType = change.changeType;
+        };
+      };
+    };
+    
+    null;
+  };
+
+  /**
+   * Calculate percentage change between two prices
+   */
+  private func calculatePercentageChange(fromPrice : Nat, toPrice : Nat) : Float {
+    if (fromPrice == 0) {
+      return 0.0;
+    };
+    
+    let change = Float.fromInt(toPrice) - Float.fromInt(fromPrice);
+    let percentage = (change / Float.fromInt(fromPrice)) * 100.0;
+    percentage;
+  };
+
+  /**
+   * Pause a token due to price alert and create log entry
+   */
+  private func pauseTokenDueToPriceAlert(
+    token : Principal,
+    condition : TriggerCondition,
+    triggerData : TriggerPriceData
+  ) {
+    // Get token details
+    switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?details) {
+        // Pause the token by setting isPaused to true
+        let updatedDetails = { details with isPaused = true };
+        Map.set(tokenDetailsMap, phash, token, updatedDetails);
+        
+        // Create price alert log entry
+        let alertId = nextAlertId;
+        nextAlertId += 1;
+        
+        let alert : PriceAlertLog = {
+          id = alertId;
+          timestamp = now();
+          token = token;
+          tokenSymbol = details.tokenSymbol;
+          triggeredCondition = condition;
+          priceData = triggerData;
+        };
+        
+        // Add to alerts and maintain size limit
+        Vector.add(priceAlerts, alert);
+        if (Vector.size(priceAlerts) > maxPriceAlerts) {
+          Vector.reverse(priceAlerts);
+          while (Vector.size(priceAlerts) > maxPriceAlerts) {
+            ignore Vector.removeLast(priceAlerts);
+          };
+          Vector.reverse(priceAlerts);
+        };
+        
+        // Log the event
+        logger.warn("PRICE_FAILSAFE_TRIGGER", 
+          "PRICE ALERT TRIGGERED - Token=" # details.tokenSymbol # 
+          " (" # Principal.toText(token) # ")" #
+          " Condition=" # condition.name #
+          " Direction=" # debug_show(condition.direction) #
+          " Threshold=" # Float.toText(condition.percentage) # "%" #
+          " Actual_Change=" # Float.toText(triggerData.actualChangePercent) # "%" #
+          " Change_Type=" # debug_show(triggerData.changeType) #
+          " Current_Price=" # Nat.toText(triggerData.currentPrice) #
+          " Min_Price=" # Nat.toText(triggerData.minPriceInWindow) #
+          " Max_Price=" # Nat.toText(triggerData.maxPriceInWindow) #
+          " Window_Start=" # Int.toText((now() - triggerData.windowStartTime) / 1_000_000_000) # "s_ago" #
+          " TOKEN_PAUSED=true",
+          "pauseTokenDueToPriceAlert"
+        );
+        
+        Debug.print("PRICE ALERT: Token " # details.tokenSymbol # " paused due to " # 
+          Float.toText(triggerData.actualChangePercent) # "% " # debug_show(condition.direction) # 
+          " price change (condition: " # condition.name # ")");
+      };
+      case null {
+        Debug.print("Error: Token details not found when trying to pause due to price alert");
+      };
+    };
   };
 
   //=========================================================================
@@ -3390,6 +3950,9 @@ shared (deployer) actor class treasury() = this {
               lastTimeSynced = now();
             },
           );
+
+          // Check price failsafe conditions after updating the history
+          checkPriceFailsafeConditions(token, priceInICP, Vector.toArray(newPriceHistory));
         };
       };
       case null {};
