@@ -3912,7 +3912,7 @@ shared (deployer) actor class treasury() = this {
   private func updateTokenPriceWithHistory(token : Principal, priceInICP : Nat, priceInUSD : Float) {
     switch (Map.get(tokenDetailsMap, phash, token)) {
       case (?details) {
-        // Only add to history if price has changed
+        // Only add to history if price has changed        
         if (details.priceInICP != priceInICP or details.priceInUSD != priceInUSD) {
           let timestamp = now();
 
@@ -3996,7 +3996,12 @@ shared (deployer) actor class treasury() = this {
       };
 
       let icpPrice = Float.toInt((usdPrice * (10.0 ** Float.fromInt(details.tokenDecimals))) / ICPprice);
-      updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+      // testing, remove this
+      //if (principal == Principal.fromText("k45jy-aiaaa-aaaaq-aadcq-cai")) {
+      //  updateTokenPriceWithHistory(principal, Int.abs(icpPrice) * 2, usdPrice * 2.0);
+      //} else {
+        updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+      //};
     };
 
     rebalanceState := {
