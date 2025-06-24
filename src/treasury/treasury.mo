@@ -81,6 +81,7 @@
 
 import Text "mo:base/Text";
 import Blob "mo:base/Blob";
+import Bool "mo:base/Bool";
 import Iter "mo:base/Iter";
 import Principal "mo:base/Principal";
 import Map "mo:map/Map";
@@ -189,6 +190,12 @@ shared (deployer) actor class treasury() = this {
   type PriceFailsafeError = TreasuryTypes.PriceFailsafeError;
   type TriggerConditionUpdate = TreasuryTypes.TriggerConditionUpdate;
 
+  // Trading pause system type aliases
+  type TradingPauseReason = TreasuryTypes.TradingPauseReason;
+  type TradingPauseRecord = TreasuryTypes.TradingPauseRecord;
+  type TradingPausesResponse = TreasuryTypes.TradingPausesResponse;
+  type TradingPauseError = TreasuryTypes.TradingPauseError;
+
   // Actor references
   let dao = actor (DAOText) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
@@ -287,6 +294,9 @@ shared (deployer) actor class treasury() = this {
   stable var nextAlertId : Nat = 1;
   stable var maxPriceAlerts = 1000; // Maximum number of price alerts to store
 
+  // Trading pause storage
+  stable let tradingPauses = Map.new<Principal, TradingPauseRecord>();
+
   private func isMasterAdmin(caller : Principal) : Bool {
     for (admin in masterAdmins.vals()) {
       if (admin == caller) {
@@ -335,6 +345,87 @@ shared (deployer) actor class treasury() = this {
             };
           };
         };
+      };
+    };
+  };
+
+  //=========================================================================
+  // TRADING PAUSE SYSTEM HELPERS
+  //=========================================================================
+
+  /**
+   * Check if a token is paused from trading
+   * This checks BOTH the old pause system AND the new trading pause system
+   */
+  private func isTokenPausedFromTrading(token : Principal) : Bool {
+    // Check old pause system
+    let pausedByOldSystem = switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?details) { details.isPaused or details.pausedDueToSyncFailure };
+      case null { false };
+    };
+    
+    // Check new trading pause system
+    let pausedByTradingRules = switch (Map.get(tradingPauses, phash, token)) {
+      case (?_) { true };
+      case null { false };
+    };
+    
+    // Token is paused if either system says it's paused
+    pausedByOldSystem or pausedByTradingRules;
+  };
+
+  /**
+   * Pause a token from trading due to price alert
+   */
+  private func pauseTokenFromTrading(token : Principal, reason : TradingPauseReason) : Bool {
+    switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?details) {
+        // Check if already paused
+        switch (Map.get(tradingPauses, phash, token)) {
+          case (?_) { 
+            Debug.print("Token " # details.tokenSymbol # " already paused from trading");
+            return false; 
+          };
+          case null {};
+        };
+
+        // Create pause record
+        let pauseRecord : TradingPauseRecord = {
+          token = token;
+          tokenSymbol = details.tokenSymbol;
+          reason = reason;
+          pausedAt = now();
+        };
+
+        Map.set(tradingPauses, phash, token, pauseRecord);
+        
+        // Log the pause
+        switch (reason) {
+          case (#PriceAlert(data)) {
+            logger.warn("TRADING_PAUSE", 
+              "Token paused from trading due to PRICE ALERT - Token=" # details.tokenSymbol # 
+              " (" # Principal.toText(token) # ")" #
+              " Condition=" # data.conditionName #
+              " Alert_ID=" # Nat.toText(data.alertId),
+              "pauseTokenFromTrading"
+            );
+          };
+          case (#CircuitBreaker(data)) {
+            logger.warn("TRADING_PAUSE", 
+              "Token paused from trading due to CIRCUIT BREAKER - Token=" # details.tokenSymbol # 
+              " (" # Principal.toText(token) # ")" #
+              " Reason=" # data.reason #
+              " Severity=" # data.severity,
+              "pauseTokenFromTrading"
+            );
+          };
+        };
+        
+        true;
+      };
+      case null { 
+        Debug.print("Error: Token details not found when trying to pause from trading");
+        false;
       };
     };
   };
@@ -1434,17 +1525,12 @@ shared (deployer) actor class treasury() = this {
     condition : TriggerCondition,
     triggerData : TriggerPriceData
   ) {
-    // Get token details
+    // Create price alert log entry
+    let alertId = nextAlertId;
+    nextAlertId += 1;
+    
     switch (Map.get(tokenDetailsMap, phash, token)) {
       case (?details) {
-        // Pause the token by setting isPaused to true
-        let updatedDetails = { details with isPaused = true };
-        Map.set(tokenDetailsMap, phash, token, updatedDetails);
-        
-        // Create price alert log entry
-        let alertId = nextAlertId;
-        nextAlertId += 1;
-        
         let alert : PriceAlertLog = {
           id = alertId;
           timestamp = now();
@@ -1464,6 +1550,15 @@ shared (deployer) actor class treasury() = this {
           Vector.reverse(priceAlerts);
         };
         
+        // Pause the token using the new trading pause system
+        let pauseReason : TradingPauseReason = #PriceAlert({
+          conditionName = condition.name;
+          triggeredAt = now();
+          alertId = alertId;
+        });
+        
+        let paused = pauseTokenFromTrading(token, pauseReason);
+        
         // Log the event
         logger.warn("PRICE_FAILSAFE_TRIGGER", 
           "PRICE ALERT TRIGGERED - Token=" # details.tokenSymbol # 
@@ -1477,7 +1572,8 @@ shared (deployer) actor class treasury() = this {
           " Min_Price=" # Nat.toText(triggerData.minPriceInWindow) #
           " Max_Price=" # Nat.toText(triggerData.maxPriceInWindow) #
           " Window_Start=" # Int.toText((now() - triggerData.windowStartTime) / 1_000_000_000) # "s_ago" #
-          " TOKEN_PAUSED=true",
+          " TOKEN_PAUSED=" # Bool.toText(paused) #
+          " Alert_ID=" # Nat.toText(alertId),
           "pauseTokenDueToPriceAlert"
         );
         
@@ -1489,6 +1585,132 @@ shared (deployer) actor class treasury() = this {
         Debug.print("Error: Token details not found when trying to pause due to price alert");
       };
     };
+  };
+
+  //=========================================================================
+  // TRADING PAUSE SYSTEM - PUBLIC API
+  //=========================================================================
+
+  /**
+   * List all tokens currently paused from trading
+   *
+   * Returns all tokens in the trading pause registry with their pause reasons.
+   * Accessible by any user with query access.
+   */
+  public query func listTradingPauses() : async TradingPausesResponse {
+    let pausedArray = Iter.toArray(Map.vals(tradingPauses));
+    
+    {
+      pausedTokens = pausedArray;
+      totalCount = pausedArray.size();
+    };
+  };
+
+  /**
+   * Get trading pause record for a specific token
+   *
+   * Returns the pause record if the token is paused from trading, null otherwise.
+   * Accessible by any user with query access.
+   */
+  public query func getTradingPauseInfo(token : Principal) : async ?TradingPauseRecord {
+    Map.get(tradingPauses, phash, token);
+  };
+
+  /**
+   * Manually unpause a token from trading
+   *
+   * Removes a token from the trading pause registry, allowing it to trade again.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func unpauseTokenFromTrading(token : Principal) : async Result.Result<Text, TradingPauseError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Check if token is currently paused
+    let pauseRecord = switch (Map.remove(tradingPauses, phash, token)) {
+      case (?record) { record };
+      case null { return #err(#TokenNotPaused) };
+    };
+
+    logger.info(
+      "TRADING_PAUSE",
+      "Token UNPAUSED from trading - Token=" # pauseRecord.tokenSymbol #
+      " (" # Principal.toText(token) # ")" #
+      " Original_reason=" # debug_show(pauseRecord.reason) #
+      " UnpausedBy=" # Principal.toText(caller) #
+      " Paused_duration=" # Int.toText((now() - pauseRecord.pausedAt) / 1_000_000_000) # "s",
+      "unpauseTokenFromTrading"
+    );
+
+    #ok("Token " # pauseRecord.tokenSymbol # " unpaused from trading successfully");
+  };
+
+  /**
+   * Manually pause a token from trading (for admin use)
+   *
+   * Allows admins to pause tokens from trading with a circuit breaker reason.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func pauseTokenFromTradingManual(
+    token : Principal,
+    reason : Text
+  ) : async Result.Result<Text, TradingPauseError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Check if token exists in our system
+    let tokenDetails = switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?details) { details };
+      case null { return #err(#TokenNotFound) };
+    };
+
+    // Check if already paused
+    switch (Map.get(tradingPauses, phash, token)) {
+      case (?_) { return #err(#TokenAlreadyPaused) };
+      case null {};
+    };
+
+    // Create pause record with circuit breaker reason
+    let pauseReason : TradingPauseReason = #CircuitBreaker({
+      reason = reason;
+      triggeredAt = now();
+      severity = "Manual";
+    });
+
+    let success = pauseTokenFromTrading(token, pauseReason);
+    
+    if (success) {
+      #ok("Token " # tokenDetails.tokenSymbol # " paused from trading successfully");
+    } else {
+      #err(#SystemError("Failed to pause token"));
+    };
+  };
+
+  /**
+   * Clear all trading pauses (emergency function)
+   *
+   * Removes all tokens from the trading pause registry.
+   * Only callable by master admins.
+   */
+  public shared ({ caller }) func clearAllTradingPauses() : async Result.Result<Text, TradingPauseError> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let clearedCount = Map.size(tradingPauses);
+    Map.clear(tradingPauses);
+
+    logger.warn(
+      "TRADING_PAUSE",
+      "ALL TRADING PAUSES CLEARED - Count=" # Nat.toText(clearedCount) #
+      " ClearedBy=" # Principal.toText(caller) #
+      " Reason=Emergency_admin_action",
+      "clearAllTradingPauses"
+    );
+
+    #ok("Cleared " # Nat.toText(clearedCount) # " trading pauses");
   };
 
   //=========================================================================
@@ -2012,7 +2234,7 @@ shared (deployer) actor class treasury() = this {
             // Calculate total portfolio value for exact targeting decisions
             var totalValueICP = 0;
             for ((principal, details) in Map.entries(tokenDetailsMap)) {
-              if (details.Active and not details.isPaused and not details.pausedDueToSyncFailure) {
+              if (details.Active and not isTokenPausedFromTrading(principal)) {
                 let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
                 totalValueICP += valueInICP;
               };
@@ -2531,7 +2753,7 @@ shared (deployer) actor class treasury() = this {
 
     // First pass - identify active tokens and calculate total target basis points
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        if ((details.Active or details.balance > 0) and not details.isPaused and not details.pausedDueToSyncFailure) {
+        if ((details.Active or details.balance > 0) and not isTokenPausedFromTrading(principal)) {
             Vector.add(activeTokens, principal);
             switch (Map.get(currentAllocations, phash, principal)) {
                 case (?target) { totalTargetBasisPoints += target };
@@ -2572,14 +2794,14 @@ shared (deployer) actor class treasury() = this {
             let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
             
             // Only include value of unpaused tokens in total
-            if (not details.isPaused and not details.pausedDueToSyncFailure) {
+            if (not isTokenPausedFromTrading(principal)) {
                 totalValueICP += valueInICP;
             };
 
             // Calculate adjusted target basis points
             let targetBasisPoints = if (not details.Active and details.balance > 0) {
                 0 // Force sell inactive tokens with balance
-            } else if (details.isPaused or details.pausedDueToSyncFailure) {
+            } else if (isTokenPausedFromTrading(principal)) {
                 0 // No target allocation for paused tokens
             } else {
                 switch (Map.get(currentAllocations, phash, principal)) {
@@ -2612,7 +2834,7 @@ shared (deployer) actor class treasury() = this {
             
             let currentBasisPoints = switch details {
                 case (?d) {
-                    if (d.isPaused or d.pausedDueToSyncFailure) {
+                    if (isTokenPausedFromTrading(alloc.token)) {
                         0 // Paused tokens don't contribute to current allocation
                     } else {
                         (alloc.valueInICP * 10000) / totalValueICP
@@ -2656,7 +2878,7 @@ shared (deployer) actor class treasury() = this {
         let details = Map.get(tokenDetailsMap, phash, alloc.token);
         switch details {
             case (?d) {
-                if (not d.isPaused and not d.pausedDueToSyncFailure and alloc.diffBasisPoints != 0) {
+                if (not isTokenPausedFromTrading(alloc.token) and alloc.diffBasisPoints != 0) {
                     // Check if the allocation difference is significant enough to warrant a trade
                     if (Int.abs(alloc.diffBasisPoints) > minTradeValueBasisPoints) {
                         Vector.add(tradePairs, (alloc.token, alloc.diffBasisPoints, alloc.valueInICP));
@@ -2688,7 +2910,7 @@ shared (deployer) actor class treasury() = this {
       let details = Map.get(tokenDetailsMap, phash, alloc.token);
       switch details {
         case (?d) {
-          if (not d.isPaused and not d.pausedDueToSyncFailure) {
+          if (not isTokenPausedFromTrading(alloc.token)) {
             if (alloc.diffBasisPoints > 0) {
               underweightCount += 1;
               if (alloc.diffBasisPoints > maxUnderweight) {
@@ -2783,13 +3005,7 @@ shared (deployer) actor class treasury() = this {
     let toBuy = Vector.new<(Principal, Nat)>();
 
     for ((token, diff, value) in tradeDiffs.vals()) {
-      // Check if token is paused
-      let isPaused = switch (Map.get(tokenDetailsMap, phash, token)) {
-        case (?details) { details.isPaused or details.pausedDueToSyncFailure };
-        case (null) { true }; // Treat unknown tokens as paused
-      };
-
-      if (not isPaused) {
+      if (not isTokenPausedFromTrading(token)) {
         if (diff < 0) {
           Vector.add(toSell, (token, Int.abs(diff)));
         } else if (diff > 0) {
@@ -3046,13 +3262,14 @@ shared (deployer) actor class treasury() = this {
       } else { 0.0 };
       
       // Only include active, unpaused tokens in total
-      if (details.Active and not details.isPaused and not details.pausedDueToSyncFailure) {
+      if (details.Active and not isTokenPausedFromTrading(principal)) {
         totalValueICP += valueInICP;
         totalValueUSD += valueInUSD;
         activeTokenCount += 1;
       } else {
         if (details.isPaused) pausedTokenCount += 1;
         if (details.pausedDueToSyncFailure) syncFailureCount += 1;
+        if (Map.get(tradingPauses, phash, principal) != null) pausedTokenCount += 1;
       };
       
       // Format balance for display - simple decimal conversion

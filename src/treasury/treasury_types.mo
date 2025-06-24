@@ -316,6 +316,47 @@ module {
     isActive : ?Bool;
   };
 
+  //=========================================================================
+  // TRADING PAUSE SYSTEM TYPES
+  //=========================================================================
+
+  // Reasons why a token can be paused from trading
+  public type TradingPauseReason = {
+    #PriceAlert : { 
+      conditionName : Text; 
+      triggeredAt : Int;
+      alertId : Nat;
+    };
+    #CircuitBreaker : { 
+      reason : Text; 
+      triggeredAt : Int;
+      severity : Text; // "High", "Critical", etc.
+    };
+  };
+
+  // Record of a token paused from trading
+  public type TradingPauseRecord = {
+    token : Principal;
+    tokenSymbol : Text;
+    reason : TradingPauseReason;
+    pausedAt : Int;
+  };
+
+  // Response for querying trading pauses
+  public type TradingPausesResponse = {
+    pausedTokens : [TradingPauseRecord];
+    totalCount : Nat;
+  };
+
+  // Errors for trading pause operations
+  public type TradingPauseError = {
+    #NotAuthorized;
+    #TokenNotFound;
+    #TokenNotPaused;
+    #TokenAlreadyPaused;
+    #SystemError : Text;
+  };
+
   public type Self = actor {
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Principal, Nat8)], Bool) -> async (Bool, ?[(Principal, Nat64)]);
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
