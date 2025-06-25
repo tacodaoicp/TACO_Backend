@@ -203,6 +203,15 @@ shared (deployer) actor class treasury() = this {
   type PortfolioHistoryResponse = TreasuryTypes.PortfolioHistoryResponse;
   type PortfolioSnapshotError = TreasuryTypes.PortfolioSnapshotError;
 
+  // Portfolio circuit breaker system type aliases
+  type PortfolioDirection = TreasuryTypes.PortfolioDirection;
+  type PortfolioValueType = TreasuryTypes.PortfolioValueType;
+  type PortfolioCircuitBreakerCondition = TreasuryTypes.PortfolioCircuitBreakerCondition;
+  type PortfolioTriggerData = TreasuryTypes.PortfolioTriggerData;
+  type PortfolioCircuitBreakerLog = TreasuryTypes.PortfolioCircuitBreakerLog;
+  type PortfolioCircuitBreakerError = TreasuryTypes.PortfolioCircuitBreakerError;
+  type PortfolioCircuitBreakerUpdate = TreasuryTypes.PortfolioCircuitBreakerUpdate;
+
   // Actor references
   let dao = actor (DAOText) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
@@ -313,6 +322,17 @@ shared (deployer) actor class treasury() = this {
   stable var maxPortfolioSnapshots : Nat = 1000; // Keep ~42 days of hourly data
   stable var lastPortfolioSnapshotTime : Int = 0;
   stable var portfolioSnapshotTimerId : Nat = 0;
+
+  //=========================================================================
+  // PORTFOLIO CIRCUIT BREAKER SYSTEM STORAGE
+  //=========================================================================
+  
+  // Storage for portfolio circuit breaker conditions and logs
+  stable let portfolioCircuitBreakerConditions = Map.new<Nat, PortfolioCircuitBreakerCondition>();
+  stable let portfolioCircuitBreakerLogs = Vector.new<PortfolioCircuitBreakerLog>();
+  stable var nextPortfolioConditionId : Nat = 1;
+  stable var nextPortfolioCircuitBreakerId : Nat = 1;
+  stable var maxPortfolioCircuitBreakerLogs = 500; // Maximum number of circuit breaker logs to store
 
   private func isMasterAdmin(caller : Principal) : Bool {
     for (admin in masterAdmins.vals()) {
@@ -1894,6 +1914,491 @@ shared (deployer) actor class treasury() = this {
 
     await takePortfolioSnapshot(#Manual);
     #ok("Manual portfolio snapshot taken successfully");
+  };
+
+  //=========================================================================
+  // PORTFOLIO CIRCUIT BREAKER SYSTEM
+  //=========================================================================
+
+  /**
+   * Add a portfolio circuit breaker condition
+   *
+   * Creates a circuit breaker rule that will pause all trading when portfolio value
+   * changes exceed the specified threshold within the time window.
+   *
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func addPortfolioCircuitBreakerCondition(
+    name : Text,
+    direction : PortfolioDirection,
+    percentage : Float,
+    timeWindowNS : Nat,
+    valueType : PortfolioValueType
+  ) : async Result.Result<Nat, PortfolioCircuitBreakerError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Validate inputs
+    if (percentage <= 0.0 or percentage > 1000.0) {
+      return #err(#InvalidPercentage);
+    };
+
+    if (timeWindowNS < 60_000_000_000 or timeWindowNS > (86400_000_000_000 * 7)) { // 1 minute to 7 days
+      return #err(#InvalidTimeWindow);
+    };
+
+    // Check for duplicate names
+    for ((_, condition) in Map.entries(portfolioCircuitBreakerConditions)) {
+      if (condition.name == name) {
+        return #err(#DuplicateName);
+      };
+    };
+
+    let conditionId = nextPortfolioConditionId;
+    nextPortfolioConditionId += 1;
+
+    let newCondition : PortfolioCircuitBreakerCondition = {
+      id = conditionId;
+      name = name;
+      direction = direction;
+      percentage = percentage;
+      timeWindowNS = timeWindowNS;
+      valueType = valueType;
+      isActive = true;
+      createdAt = now();
+      createdBy = caller;
+    };
+
+    Map.set(portfolioCircuitBreakerConditions, Map.nhash, conditionId, newCondition);
+
+    logger.info(
+      "PORTFOLIO_CIRCUIT_BREAKER", 
+      "Portfolio circuit breaker condition added - ID=" # Nat.toText(conditionId) #
+      " Name=" # name #
+      " Direction=" # debug_show(direction) #
+      " Percentage=" # Float.toText(percentage) # "%" #
+      " TimeWindow=" # Nat.toText(timeWindowNS / 1_000_000_000) # "s" #
+      " ValueType=" # debug_show(valueType) #
+      " CreatedBy=" # Principal.toText(caller),
+      "addPortfolioCircuitBreakerCondition"
+    );
+
+    #ok(conditionId);
+  };
+
+  /**
+   * Update an existing portfolio circuit breaker condition
+   */
+  public shared ({ caller }) func updatePortfolioCircuitBreakerCondition(
+    conditionId : Nat,
+    updates : PortfolioCircuitBreakerUpdate
+  ) : async Result.Result<Text, PortfolioCircuitBreakerError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (Map.get(portfolioCircuitBreakerConditions, Map.nhash, conditionId)) {
+      case null {
+        return #err(#ConditionNotFound);
+      };
+      case (?currentCondition) {
+        var updatedCondition = currentCondition;
+
+        // Apply updates
+        switch (updates.name) {
+          case (?newName) {
+            // Check for duplicate names (excluding current condition)
+            for ((id, condition) in Map.entries(portfolioCircuitBreakerConditions)) {
+              if (id != conditionId and condition.name == newName) {
+                return #err(#DuplicateName);
+              };
+            };
+            updatedCondition := { updatedCondition with name = newName };
+          };
+          case null {};
+        };
+
+        switch (updates.direction) {
+          case (?newDirection) {
+            updatedCondition := { updatedCondition with direction = newDirection };
+          };
+          case null {};
+        };
+
+        switch (updates.percentage) {
+          case (?newPercentage) {
+            if (newPercentage <= 0.0 or newPercentage > 1000.0) {
+              return #err(#InvalidPercentage);
+            };
+            updatedCondition := { updatedCondition with percentage = newPercentage };
+          };
+          case null {};
+        };
+
+        switch (updates.timeWindowNS) {
+          case (?newTimeWindow) {
+            if (newTimeWindow < 60_000_000_000 or newTimeWindow > (86400_000_000_000 * 7)) {
+              return #err(#InvalidTimeWindow);
+            };
+            updatedCondition := { updatedCondition with timeWindowNS = newTimeWindow };
+          };
+          case null {};
+        };
+
+        switch (updates.valueType) {
+          case (?newValueType) {
+            updatedCondition := { updatedCondition with valueType = newValueType };
+          };
+          case null {};
+        };
+
+        switch (updates.isActive) {
+          case (?newActive) {
+            updatedCondition := { updatedCondition with isActive = newActive };
+          };
+          case null {};
+        };
+
+        Map.set(portfolioCircuitBreakerConditions, Map.nhash, conditionId, updatedCondition);
+
+        logger.info(
+          "PORTFOLIO_CIRCUIT_BREAKER",
+          "Portfolio circuit breaker condition updated - ID=" # Nat.toText(conditionId) #
+          " Name=" # updatedCondition.name #
+          " UpdatedBy=" # Principal.toText(caller),
+          "updatePortfolioCircuitBreakerCondition"
+        );
+
+        #ok("Portfolio circuit breaker condition updated successfully");
+      };
+    };
+  };
+
+  /**
+   * Remove a portfolio circuit breaker condition
+   */
+  public shared ({ caller }) func removePortfolioCircuitBreakerCondition(conditionId : Nat) : async Result.Result<Text, PortfolioCircuitBreakerError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (Map.remove(portfolioCircuitBreakerConditions, Map.nhash, conditionId)) {
+      case null {
+        return #err(#ConditionNotFound);
+      };
+      case (?removedCondition) {
+        logger.info(
+          "PORTFOLIO_CIRCUIT_BREAKER",
+          "Portfolio circuit breaker condition removed - ID=" # Nat.toText(conditionId) #
+          " Name=" # removedCondition.name #
+          " RemovedBy=" # Principal.toText(caller),
+          "removePortfolioCircuitBreakerCondition"
+        );
+
+        #ok("Portfolio circuit breaker condition removed successfully");
+      };
+    };
+  };
+
+  /**
+   * Set portfolio circuit breaker condition active/inactive
+   */
+  public shared ({ caller }) func setPortfolioCircuitBreakerConditionActive(conditionId : Nat, isActive : Bool) : async Result.Result<Text, PortfolioCircuitBreakerError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (Map.get(portfolioCircuitBreakerConditions, Map.nhash, conditionId)) {
+      case null {
+        return #err(#ConditionNotFound);
+      };
+      case (?condition) {
+        let updatedCondition = { condition with isActive = isActive };
+        Map.set(portfolioCircuitBreakerConditions, Map.nhash, conditionId, updatedCondition);
+
+        logger.info(
+          "PORTFOLIO_CIRCUIT_BREAKER",
+          "Portfolio circuit breaker condition " # (if isActive "activated" else "deactivated") # 
+          " - ID=" # Nat.toText(conditionId) #
+          " Name=" # condition.name #
+          " UpdatedBy=" # Principal.toText(caller),
+          "setPortfolioCircuitBreakerConditionActive"
+        );
+
+        #ok("Portfolio circuit breaker condition " # (if isActive "activated" else "deactivated") # " successfully");
+      };
+    };
+  };
+
+  /**
+   * List all portfolio circuit breaker conditions
+   */
+  public query func listPortfolioCircuitBreakerConditions() : async [PortfolioCircuitBreakerCondition] {
+    Iter.toArray(Map.vals(portfolioCircuitBreakerConditions));
+  };
+
+  /**
+   * Get a specific portfolio circuit breaker condition
+   */
+  public query func getPortfolioCircuitBreakerCondition(conditionId : Nat) : async ?PortfolioCircuitBreakerCondition {
+    Map.get(portfolioCircuitBreakerConditions, Map.nhash, conditionId);
+  };
+
+  /**
+   * Get portfolio circuit breaker logs
+   */
+  public query func getPortfolioCircuitBreakerLogs(offset : Nat, limit : Nat) : async { logs : [PortfolioCircuitBreakerLog]; totalCount : Nat } {
+    let logsArray = Vector.toArray(portfolioCircuitBreakerLogs);
+    let reversedLogs = Array.reverse(logsArray);
+    let totalCount = reversedLogs.size();
+    
+    let actualLimit = if (limit > 100) { 100 } else { limit };
+    let endIndex = if (offset + actualLimit > reversedLogs.size()) {
+      reversedLogs.size();
+    } else {
+      offset + actualLimit;
+    };
+    
+    if (offset >= reversedLogs.size()) {
+      return { logs = []; totalCount = totalCount };
+    };
+    
+    let slicedLogs = Iter.toArray(Array.slice(reversedLogs, offset, endIndex));
+    
+    {
+      logs = slicedLogs;
+      totalCount = totalCount;
+    };
+  };
+
+  /**
+   * Clear portfolio circuit breaker logs
+   */
+  public shared ({ caller }) func clearPortfolioCircuitBreakerLogs() : async Result.Result<Text, PortfolioCircuitBreakerError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let clearedCount = Vector.size(portfolioCircuitBreakerLogs);
+    Vector.clear(portfolioCircuitBreakerLogs);
+    nextPortfolioCircuitBreakerId := 1;
+
+    logger.info(
+      "PORTFOLIO_CIRCUIT_BREAKER",
+      "Portfolio circuit breaker logs cleared - Count=" # Nat.toText(clearedCount) #
+      " ClearedBy=" # Principal.toText(caller),
+      "clearPortfolioCircuitBreakerLogs"
+    );
+
+    #ok("Cleared " # Nat.toText(clearedCount) # " portfolio circuit breaker logs");
+  };
+
+  //=========================================================================
+  // PORTFOLIO CIRCUIT BREAKER SYSTEM - CORE MONITORING
+  //=========================================================================
+
+  /**
+   * Check all active portfolio circuit breaker conditions
+   *
+   * Analyzes portfolio value history to detect significant changes
+   * and triggers circuit breaker (pauses all trading) if conditions are met.
+   */
+  private func checkPortfolioCircuitBreakerConditions() {
+    // Check all active portfolio circuit breaker conditions
+    for ((conditionId, condition) in Map.entries(portfolioCircuitBreakerConditions)) {
+      if (condition.isActive) {
+        switch (analyzePortfolioValueChangeInWindow(condition)) {
+          case (?triggerData) {
+            // Condition triggered - activate circuit breaker
+            triggerPortfolioCircuitBreaker(condition, triggerData);
+          };
+          case null {
+            // No trigger - continue monitoring
+          };
+        };
+      };
+    };
+  };
+
+  /**
+   * Analyze portfolio value changes within the specified time window
+   *
+   * Returns trigger data if the condition is met, null otherwise
+   */
+  private func analyzePortfolioValueChangeInWindow(
+    condition : PortfolioCircuitBreakerCondition
+  ) : ?PortfolioTriggerData {
+    let currentTime = now();
+    let windowStartTime = currentTime - condition.timeWindowNS;
+    
+    // Filter portfolio snapshots within the time window
+    let snapshotsArray = Vector.toArray(portfolioSnapshots);
+    let relevantSnapshots = Array.filter<PortfolioSnapshot>(snapshotsArray, func(snapshot) {
+      snapshot.timestamp >= windowStartTime
+    });
+    
+    // Need at least 2 snapshots to detect changes
+    if (relevantSnapshots.size() < 2) {
+      return null;
+    };
+    
+    // Get current portfolio value
+    let currentValue = getCurrentPortfolioValue(condition.valueType);
+    
+    // Find min and max portfolio values in the window
+    var minValue = currentValue;
+    var maxValue = currentValue;
+    
+    for (snapshot in relevantSnapshots.vals()) {
+      let snapshotValue = switch (condition.valueType) {
+        case (#ICP) { Float.fromInt(snapshot.totalValueICP) / 100_000_000.0 }; // Convert e8s to ICP
+        case (#USD) { snapshot.totalValueUSD };
+      };
+      
+      if (snapshotValue < minValue) {
+        minValue := snapshotValue;
+      };
+      if (snapshotValue > maxValue) {
+        maxValue := snapshotValue;
+      };
+    };
+    
+    // Calculate percentage changes and check if any exceed threshold
+    let changes = [
+      {
+        fromValue = currentValue;
+        toValue = minValue;
+      },
+      {
+        fromValue = currentValue;
+        toValue = maxValue;
+      },
+      {
+        fromValue = minValue;
+        toValue = maxValue;
+      }
+    ];
+    
+    for (change in changes.vals()) {
+      let percentageChange = calculatePortfolioPercentageChange(change.fromValue, change.toValue);
+      let directionMatches = switch (condition.direction) {
+        case (#Up) { change.toValue > change.fromValue };
+        case (#Down) { change.toValue < change.fromValue };
+      };
+      
+      if (directionMatches and Float.abs(percentageChange) >= condition.percentage) {
+        return ?{
+          currentValue = currentValue;
+          minValueInWindow = minValue;
+          maxValueInWindow = maxValue;
+          windowStartTime = windowStartTime;
+          actualChangePercent = Float.abs(percentageChange);
+          valueType = condition.valueType;
+        };
+      };
+    };
+    
+    null;
+  };
+
+  /**
+   * Get current portfolio value
+   */
+  private func getCurrentPortfolioValue(valueType : PortfolioValueType) : Float {
+    var totalValueICP : Nat = 0;
+    var totalValueUSD : Float = 0.0;
+
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and details.balance > 0) {
+        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        let valueInUSD = (Float.fromInt(details.balance) * details.priceInUSD) / Float.fromInt(10 ** details.tokenDecimals);
+        
+        totalValueICP += valueInICP;
+        totalValueUSD += valueInUSD;
+      };
+    };
+
+    switch (valueType) {
+      case (#ICP) { Float.fromInt(totalValueICP) / 100_000_000.0 }; // Convert e8s to ICP
+      case (#USD) { totalValueUSD };
+    };
+  };
+
+  /**
+   * Calculate percentage change between two portfolio values
+   */
+  private func calculatePortfolioPercentageChange(fromValue : Float, toValue : Float) : Float {
+    if (fromValue == 0.0) {
+      return 0.0;
+    };
+    
+    let change = toValue - fromValue;
+    let percentage = (change / fromValue) * 100.0;
+    percentage;
+  };
+
+  /**
+   * Trigger portfolio circuit breaker
+   *
+   * Pauses all trading tokens and logs the event
+   */
+  private func triggerPortfolioCircuitBreaker(
+    condition : PortfolioCircuitBreakerCondition,
+    triggerData : PortfolioTriggerData
+  ) {
+    // Get all active trading tokens to pause
+    let tokensToProcess = Iter.toArray(Map.entries(tokenDetailsMap));
+    let pausedTokens = Vector.new<Principal>();
+
+    for ((token, details) in tokensToProcess.vals()) {
+      if (details.Active and not isTokenPausedFromTrading(token)) {
+        let pauseReason : TradingPauseReason = #CircuitBreaker({
+          reason = "Portfolio circuit breaker triggered: " # condition.name;
+          triggeredAt = now();
+          severity = "Critical";
+        });
+
+        let success = pauseTokenFromTrading(token, pauseReason);
+        if (success) {
+          Vector.add(pausedTokens, token);
+        };
+      };
+    };
+
+    // Create and store the circuit breaker log
+    let logId = nextPortfolioCircuitBreakerId;
+    nextPortfolioCircuitBreakerId += 1;
+
+    let circuitBreakerLog : PortfolioCircuitBreakerLog = {
+      id = logId;
+      timestamp = now();
+      triggeredCondition = condition;
+      portfolioData = triggerData;
+      pausedTokens = Vector.toArray(pausedTokens);
+    };
+
+    Vector.add(portfolioCircuitBreakerLogs, circuitBreakerLog);
+
+    // Remove oldest logs if we exceed the limit
+    while (Vector.size(portfolioCircuitBreakerLogs) > maxPortfolioCircuitBreakerLogs) {
+      ignore Vector.removeLast(portfolioCircuitBreakerLogs);
+    };
+
+    let valueTypeText = switch (triggerData.valueType) {
+      case (#ICP) { "ICP" };
+      case (#USD) { "USD" };
+    };
+
+    logger.warn(
+      "PORTFOLIO_CIRCUIT_BREAKER",
+      "PORTFOLIO CIRCUIT BREAKER TRIGGERED - Condition=" # condition.name #
+      " Current_Value=" # Float.toText(triggerData.currentValue) # valueTypeText #
+      " Change=" # Float.toText(triggerData.actualChangePercent) # "%" #
+      " Direction=" # debug_show(condition.direction) #
+      " Tokens_Paused=" # Nat.toText(Vector.size(pausedTokens)),
+      "triggerPortfolioCircuitBreaker"
+    );
   };
 
   //=========================================================================
@@ -4423,6 +4928,9 @@ shared (deployer) actor class treasury() = this {
 
     // Take portfolio snapshot after price updates
     await takePortfolioSnapshot(#PriceUpdate);
+
+    // Check portfolio circuit breaker conditions after price updates and snapshot
+    checkPortfolioCircuitBreakerConditions();
   };
 
   /**

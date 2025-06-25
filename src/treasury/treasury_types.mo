@@ -364,6 +364,74 @@ module {
   };
 
   //=========================================================================
+  // PORTFOLIO CIRCUIT BREAKER SYSTEM TYPES
+  //=========================================================================
+
+  // Portfolio value change direction for circuit breaker conditions
+  public type PortfolioDirection = {
+    #Up;    // Portfolio value increase
+    #Down;  // Portfolio value decrease
+  };
+
+  // Portfolio circuit breaker trigger condition configuration
+  public type PortfolioCircuitBreakerCondition = {
+    id : Nat;                      // Unique identifier
+    name : Text;                   // Human-readable name
+    direction : PortfolioDirection; // Portfolio value direction to monitor
+    percentage : Float;            // Percentage change threshold (e.g., 20.0 for 20%)
+    timeWindowNS : Nat;           // Time window in nanoseconds
+    valueType : PortfolioValueType; // Whether to monitor ICP or USD value
+    isActive : Bool;               // Can be disabled without deleting
+    createdAt : Int;               // Creation timestamp
+    createdBy : Principal;         // Creator principal
+  };
+
+  // Type of portfolio value to monitor
+  public type PortfolioValueType = {
+    #ICP;  // Monitor portfolio value in ICP
+    #USD;  // Monitor portfolio value in USD
+  };
+
+  // Portfolio value data at the time of trigger
+  public type PortfolioTriggerData = {
+    currentValue : Float;        // Current portfolio value when triggered
+    minValueInWindow : Float;    // Minimum portfolio value in the time window
+    maxValueInWindow : Float;    // Maximum portfolio value in the time window
+    windowStartTime : Int;       // Start of the analysis window
+    actualChangePercent : Float; // Actual percentage change that triggered
+    valueType : PortfolioValueType; // Whether this is ICP or USD value
+  };
+
+  // Log entry for portfolio circuit breaker events
+  public type PortfolioCircuitBreakerLog = {
+    id : Nat;                           // Unique log entry ID
+    timestamp : Int;                    // When the circuit breaker was triggered
+    triggeredCondition : PortfolioCircuitBreakerCondition; // The condition that was triggered
+    portfolioData : PortfolioTriggerData; // Portfolio data at trigger time
+    pausedTokens : [Principal];         // Tokens that were paused as a result
+  };
+
+  // Errors for portfolio circuit breaker operations
+  public type PortfolioCircuitBreakerError = {
+    #NotAuthorized;
+    #ConditionNotFound;
+    #InvalidPercentage;
+    #InvalidTimeWindow;
+    #DuplicateName;
+    #SystemError : Text;
+  };
+
+  // Update parameters for portfolio circuit breaker conditions
+  public type PortfolioCircuitBreakerUpdate = {
+    name : ?Text;
+    direction : ?PortfolioDirection;
+    percentage : ?Float;
+    timeWindowNS : ?Nat;
+    valueType : ?PortfolioValueType;
+    isActive : ?Bool;
+  };
+
+  //=========================================================================
   // TRADING PAUSE SYSTEM TYPES
   //=========================================================================
 
