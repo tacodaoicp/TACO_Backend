@@ -2761,14 +2761,18 @@ shared (deployer) actor class treasury() = this {
    * Execute a complete trading cycle
    *
    * Main trading loop that:
-   * 1. Retries any failed transactions
-   * 2. Executes the trading step
-   * 3. Recovers from failures if needed
+   * 1. Checks circuit breaker conditions
+   * 2. Retries any failed transactions
+   * 3. Executes the trading step
+   * 4. Recovers from failures if needed
    */
   private func executeTradingCycle() : async* () {
     if (rebalanceState.status == #Idle) {
       return;
     };
+
+    // Check circuit breaker conditions before each trading cycle
+    checkPortfolioCircuitBreakerConditions();
 
     await* do_executeTradingCycle();
   };
@@ -2872,6 +2876,9 @@ shared (deployer) actor class treasury() = this {
 
     // Take portfolio snapshot before trading
     await takePortfolioSnapshot(#PreTrade);
+
+    // Check circuit breaker conditions after taking pre-trade snapshot
+    checkPortfolioCircuitBreakerConditions();
 
     // VERBOSE LOGGING: Portfolio state snapshot before trade analysis
     await* logPortfolioState("Pre-trade analysis");
@@ -3119,7 +3126,10 @@ shared (deployer) actor class treasury() = this {
                     
                     // Take portfolio snapshot after successful trade
                     await takePortfolioSnapshot(#PostTrade);
-                    
+
+                    // Check circuit breaker conditions after post-trade snapshot
+                    checkPortfolioCircuitBreakerConditions();
+                              
                     // VERBOSE LOGGING: Portfolio state after successful trade
                     await* logPortfolioState("Post-trade completed");
                   };
@@ -3281,6 +3291,9 @@ shared (deployer) actor class treasury() = this {
                           
                           // Take portfolio snapshot after successful ICP fallback trade
                           await takePortfolioSnapshot(#PostTrade);
+
+                          // Check circuit breaker conditions after ICP fallback trade snapshot
+                          checkPortfolioCircuitBreakerConditions();
                           
                           // VERBOSE LOGGING: Portfolio state after fallback trade
                           await* logPortfolioState("Post-ICP-fallback completed");
