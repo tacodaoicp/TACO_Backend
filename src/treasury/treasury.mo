@@ -1437,6 +1437,21 @@ shared (deployer) actor class treasury() = this {
    * and triggers token pausing if conditions are met.
    */
   private func checkPriceFailsafeConditions(token : Principal, currentPrice : Nat, priceHistory : [PricePoint]) {
+    // Optimization: Skip price alert checks if token is already paused
+    if (isTokenPausedFromTrading(token)) {
+      // Get token symbol for logging
+      let tokenSymbol = switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) { details.tokenSymbol };
+        case null { Principal.toText(token) };
+      };
+      
+      //logger.info("PRICE_ALERT", 
+      //  "Skipping price alert checks - Token already paused: " # tokenSymbol,
+      //  "checkPriceFailsafeConditions"
+      //);
+      return;
+    };
+    
     // Get token symbol for logging
     let tokenSymbol = switch (Map.get(tokenDetailsMap, phash, token)) {
       case (?details) { details.tokenSymbol };
@@ -2205,6 +2220,23 @@ shared (deployer) actor class treasury() = this {
    * and triggers circuit breaker (pauses all trading) if conditions are met.
    */
   private func checkPortfolioCircuitBreakerConditions() {
+    // Optimization: Skip circuit breaker checks if all tokens are already paused
+    var allTokensPaused = true;
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and not isTokenPausedFromTrading(token)) {
+        allTokensPaused := false;
+      };
+    };
+    
+    if (allTokensPaused) {
+      // All tokens are already paused - no need to check circuit breakers
+      //logger.info("CIRCUIT_BREAKER", 
+      //  "Skipping circuit breaker checks - All active tokens are already paused",
+      //  "checkPortfolioCircuitBreakerConditions"
+      //);
+      return;
+    };
+    
     // Check all active portfolio circuit breaker conditions
     for ((conditionId, condition) in Map.entries(portfolioCircuitBreakerConditions)) {
       if (condition.isActive) {
