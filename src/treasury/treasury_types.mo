@@ -317,6 +317,53 @@ module {
   };
 
   //=========================================================================
+  // PORTFOLIO SNAPSHOT SYSTEM TYPES
+  //=========================================================================
+
+  // Individual token data in a portfolio snapshot
+  public type TokenSnapshot = {
+    token : Principal;
+    symbol : Text;
+    balance : Nat;           // Absolute token amount
+    decimals : Nat;
+    priceInICP : Nat;        // Price at snapshot time (e8s)
+    priceInUSD : Float;      // Price at snapshot time
+    valueInICP : Nat;        // balance * priceInICP
+    valueInUSD : Float;      // balance * priceInUSD
+  };
+
+  // Complete portfolio state at a point in time
+  public type PortfolioSnapshot = {
+    timestamp : Int;
+    tokens : [TokenSnapshot];
+    totalValueICP : Nat;
+    totalValueUSD : Float;
+    snapshotReason : SnapshotReason;
+  };
+
+  // Reason why a portfolio snapshot was taken
+  public type SnapshotReason = {
+    #PreTrade;          // Before executing trades
+    #PostTrade;         // After executing trades
+    #Scheduled;         // Timer-based hourly snapshot
+    #PriceUpdate;       // After price sync
+    #Manual;            // Admin-triggered
+  };
+
+  // Response for portfolio history queries
+  public type PortfolioHistoryResponse = {
+    snapshots : [PortfolioSnapshot];
+    totalCount : Nat;
+  };
+
+  // Errors for portfolio snapshot operations
+  public type PortfolioSnapshotError = {
+    #NotAuthorized;
+    #InvalidLimit;
+    #SystemError : Text;
+  };
+
+  //=========================================================================
   // TRADING PAUSE SYSTEM TYPES
   //=========================================================================
 

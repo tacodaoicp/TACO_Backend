@@ -196,6 +196,13 @@ shared (deployer) actor class treasury() = this {
   type TradingPausesResponse = TreasuryTypes.TradingPausesResponse;
   type TradingPauseError = TreasuryTypes.TradingPauseError;
 
+  // Portfolio snapshot system type aliases
+  type TokenSnapshot = TreasuryTypes.TokenSnapshot;
+  type PortfolioSnapshot = TreasuryTypes.PortfolioSnapshot;
+  type SnapshotReason = TreasuryTypes.SnapshotReason;
+  type PortfolioHistoryResponse = TreasuryTypes.PortfolioHistoryResponse;
+  type PortfolioSnapshotError = TreasuryTypes.PortfolioSnapshotError;
+
   // Actor references
   let dao = actor (DAOText) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
@@ -296,6 +303,16 @@ shared (deployer) actor class treasury() = this {
 
   // Trading pause storage
   stable let tradingPauses = Map.new<Principal, TradingPauseRecord>();
+
+  //=========================================================================
+  // PORTFOLIO SNAPSHOT SYSTEM STORAGE
+  //=========================================================================
+  
+  // Portfolio snapshot storage
+  stable let portfolioSnapshots = Vector.new<PortfolioSnapshot>();
+  stable var maxPortfolioSnapshots : Nat = 1000; // Keep ~42 days of hourly data
+  stable var lastPortfolioSnapshotTime : Int = 0;
+  stable var portfolioSnapshotTimerId : Nat = 0;
 
   private func isMasterAdmin(caller : Principal) : Bool {
     for (admin in masterAdmins.vals()) {
@@ -467,6 +484,12 @@ shared (deployer) actor class treasury() = this {
 
     try {
       startTradingTimer<system>();
+      
+      // Start portfolio snapshot timer if not already running
+      if (portfolioSnapshotTimerId == 0) {
+        ignore await* startPortfolioSnapshotTimer<system>();
+      };
+      
       Debug.print("Rebalancing started");
       #ok("Rebalancing started");
     } catch (e) {
@@ -504,6 +527,12 @@ shared (deployer) actor class treasury() = this {
     switch (rebalanceState.rebalanceTimerId) {
       case (?id) { cancelTimer(id) };
       case null {};
+    };
+    
+    // Cancel portfolio snapshot timer
+    if (portfolioSnapshotTimerId != 0) {
+      cancelTimer(portfolioSnapshotTimerId);
+      portfolioSnapshotTimerId := 0;
     };
 
     rebalanceState := {
@@ -1714,6 +1743,160 @@ shared (deployer) actor class treasury() = this {
   };
 
   //=========================================================================
+  // PORTFOLIO SNAPSHOT SYSTEM
+  //=========================================================================
+
+  /**
+   * Take a portfolio snapshot for the given reason
+   * 
+   * Captures current portfolio state including all token balances,
+   * prices, and calculated values at the current moment.
+   */
+  private func takePortfolioSnapshot(reason : SnapshotReason) : async () {
+    try {
+      let timestamp = now();
+      let tokenSnapshots = Vector.new<TokenSnapshot>();
+      var totalValueICP : Nat = 0;
+      var totalValueUSD : Float = 0.0;
+
+      // Collect data for each active token
+      for ((token, details) in Map.entries(tokenDetailsMap)) {
+        if (details.Active and details.balance > 0) {
+          let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+          let valueInUSD = (Float.fromInt(details.balance) * details.priceInUSD) / Float.fromInt(10 ** details.tokenDecimals);
+          
+          totalValueICP += valueInICP;
+          totalValueUSD += valueInUSD;
+
+          let tokenSnapshot : TokenSnapshot = {
+            token = token;
+            symbol = details.tokenSymbol;
+            balance = details.balance;
+            decimals = details.tokenDecimals;
+            priceInICP = details.priceInICP;
+            priceInUSD = details.priceInUSD;
+            valueInICP = valueInICP;
+            valueInUSD = valueInUSD;
+          };
+          
+          Vector.add(tokenSnapshots, tokenSnapshot);
+        };
+      };
+
+      // Create the portfolio snapshot
+      let snapshot : PortfolioSnapshot = {
+        timestamp = timestamp;
+        tokens = Vector.toArray(tokenSnapshots);
+        totalValueICP = totalValueICP;
+        totalValueUSD = totalValueUSD;
+        snapshotReason = reason;
+      };
+
+      // Add to storage and manage size limit
+      Vector.add(portfolioSnapshots, snapshot);
+      
+      // Remove oldest snapshots if we exceed the limit
+      while (Vector.size(portfolioSnapshots) > maxPortfolioSnapshots) {
+        ignore Vector.removeLast(portfolioSnapshots);
+      };
+
+      lastPortfolioSnapshotTime := timestamp;
+
+      // Log the snapshot (only for non-scheduled to avoid spam)
+      switch (reason) {
+        case (#Scheduled) { /* Skip logging for scheduled snapshots */ };
+        case (_) {
+          logger.info(
+            "PORTFOLIO_SNAPSHOT",
+            "Portfolio snapshot taken - Reason=" # debug_show(reason) #
+            " Total_ICP=" # Nat.toText(totalValueICP / 100_000_000) # "." # 
+            Nat.toText((totalValueICP % 100_000_000) / 1_000_000) #
+            " Total_USD=" # Float.toText(totalValueUSD) #
+            " Tokens=" # Nat.toText(Vector.size(tokenSnapshots)),
+            "takePortfolioSnapshot"
+          );
+        };
+      };
+
+    } catch (e) {
+      logger.error(
+        "PORTFOLIO_SNAPSHOT",
+        "Failed to take portfolio snapshot: " # Error.message(e),
+        "takePortfolioSnapshot"
+      );
+    };
+  };
+
+  /**
+   * Start the hourly portfolio snapshot timer
+   */
+  private func startPortfolioSnapshotTimer<system>() : async* () {
+    if (portfolioSnapshotTimerId != 0) {
+      cancelTimer(portfolioSnapshotTimerId);
+    };
+
+    portfolioSnapshotTimerId := setTimer<system>(
+      #nanoseconds(3_600_000_000_000), // 1 hour
+      func() : async () {
+        await takePortfolioSnapshot(#Scheduled);
+        await* startPortfolioSnapshotTimer();
+      }
+    );
+
+    logger.info(
+      "PORTFOLIO_SNAPSHOT",
+      "Portfolio snapshot timer started - Interval=1h Timer_ID=" # Nat.toText(portfolioSnapshotTimerId),
+      "startPortfolioSnapshotTimer"
+    );
+  };
+
+  /**
+   * Get portfolio history
+   * 
+   * Returns recent portfolio snapshots for analysis and charting.
+   * Accessible by authenticated users.
+   */
+  public shared query ({ caller }) func getPortfolioHistory(limit : Nat) : async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError> {
+    // Allow any authenticated caller (not anonymous)
+    if (Principal.isAnonymous(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (limit == 0 or limit > 2000) {
+      return #err(#InvalidLimit);
+    };
+
+    let snapshots = Vector.toArray(portfolioSnapshots);
+    let totalCount = snapshots.size();
+    
+    // Get the most recent 'limit' snapshots (reverse order, newest first)
+    let startIndex = if (totalCount > limit) { totalCount - limit } else { 0 };
+    let limitedSnapshots = Array.subArray(snapshots, startIndex, totalCount - startIndex);
+    
+    // Reverse to get newest first
+    let reversedSnapshots = Array.reverse(limitedSnapshots);
+
+    let response : PortfolioHistoryResponse = {
+      snapshots = reversedSnapshots;
+      totalCount = totalCount;
+    };
+
+    #ok(response);
+  };
+
+  /**
+   * Manually trigger a portfolio snapshot (admin function)
+   */
+  public shared ({ caller }) func takeManualPortfolioSnapshot() : async Result.Result<Text, PortfolioSnapshotError> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    await takePortfolioSnapshot(#Manual);
+    #ok("Manual portfolio snapshot taken successfully");
+  };
+
+  //=========================================================================
   // 4. TOKEN TRANSFER SYSTEM
   //=========================================================================
 
@@ -2182,6 +2365,9 @@ shared (deployer) actor class treasury() = this {
 
   private func do_executeTradingStep() : async* () {
 
+    // Take portfolio snapshot before trading
+    await takePortfolioSnapshot(#PreTrade);
+
     // VERBOSE LOGGING: Portfolio state snapshot before trade analysis
     await* logPortfolioState("Pre-trade analysis");
 
@@ -2426,6 +2612,9 @@ shared (deployer) actor class treasury() = this {
                     // Refresh balances to get accurate post-trade data
                     await updateBalances();
                     
+                    // Take portfolio snapshot after successful trade
+                    await takePortfolioSnapshot(#PostTrade);
+                    
                     // VERBOSE LOGGING: Portfolio state after successful trade
                     await* logPortfolioState("Post-trade completed");
                   };
@@ -2584,6 +2773,9 @@ shared (deployer) actor class treasury() = this {
                           
                           // Refresh balances to get accurate post-trade data
                           await updateBalances();
+                          
+                          // Take portfolio snapshot after successful ICP fallback trade
+                          await takePortfolioSnapshot(#PostTrade);
                           
                           // VERBOSE LOGGING: Portfolio state after fallback trade
                           await* logPortfolioState("Post-ICP-fallback completed");
@@ -4228,6 +4420,9 @@ shared (deployer) actor class treasury() = this {
         lastPriceUpdate = now();
       };
     };
+
+    // Take portfolio snapshot after price updates
+    await takePortfolioSnapshot(#PriceUpdate);
   };
 
   /**
