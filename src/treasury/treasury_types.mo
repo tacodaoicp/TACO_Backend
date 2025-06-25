@@ -417,6 +417,7 @@ module {
     #ConditionNotFound;
     #InvalidPercentage;
     #InvalidTimeWindow;
+    #InvalidParameters : Text;
     #DuplicateName;
     #SystemError : Text;
   };

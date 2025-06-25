@@ -247,6 +247,9 @@ shared (deployer) actor class treasury() = this {
     tokenSyncTimeoutNS = 21_600_000_000_000; // 6 hours
   };
 
+  // Separate stable variable for circuit breaker configuration
+  stable var pausedTokenThresholdForCircuitBreaker : Nat = 3; // Circuit breaker when 3+ tokens are paused
+
   // Rebalancing state
   stable var rebalanceState : RebalanceState = {
     status = #Idle;
@@ -2209,6 +2212,47 @@ shared (deployer) actor class treasury() = this {
     #ok("Cleared " # Nat.toText(clearedCount) # " portfolio circuit breaker logs");
   };
 
+  /**
+   * Get the current paused token threshold for circuit breaker
+   */
+  public query func getPausedTokenThresholdForCircuitBreaker() : async Nat {
+    pausedTokenThresholdForCircuitBreaker;
+  };
+
+  /**
+   * Update the paused token threshold for circuit breaker
+   *
+   * Sets the number of paused tokens that will trigger the circuit breaker.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func updatePausedTokenThresholdForCircuitBreaker(newThreshold : Nat) : async Result.Result<Text, PortfolioCircuitBreakerError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Validate the threshold
+    if (newThreshold < 1) {
+      return #err(#InvalidParameters("Threshold cannot be less than 1"));
+    };
+
+    if (newThreshold > 100) {
+      return #err(#InvalidParameters("Threshold cannot be more than 100"));
+    };
+
+    let oldThreshold = pausedTokenThresholdForCircuitBreaker;
+    pausedTokenThresholdForCircuitBreaker := newThreshold;
+
+    logger.info(
+      "PAUSED_TOKEN_THRESHOLD_CONFIG",
+      "Paused token threshold for circuit breaker updated - Old=" # Nat.toText(oldThreshold) #
+      " New=" # Nat.toText(newThreshold) #
+      " Updated_by=" # Principal.toText(caller),
+      "updatePausedTokenThresholdForCircuitBreaker"
+    );
+
+    #ok("Paused token threshold for circuit breaker updated to " # Nat.toText(newThreshold));
+  };
+
   //=========================================================================
   // PORTFOLIO CIRCUIT BREAKER SYSTEM - CORE MONITORING
   //=========================================================================
@@ -2222,9 +2266,15 @@ shared (deployer) actor class treasury() = this {
   private func checkPortfolioCircuitBreakerConditions() {
     // Optimization: Skip circuit breaker checks if all tokens are already paused
     var allTokensPaused = true;
+    var pausedTokenCount = 0;
+    
     for ((token, details) in Map.entries(tokenDetailsMap)) {
-      if (details.Active and not isTokenPausedFromTrading(token)) {
-        allTokensPaused := false;
+      if (details.Active) {
+        if (isTokenPausedFromTrading(token)) {
+          pausedTokenCount += 1;
+        } else {
+          allTokensPaused := false;
+        };
       };
     };
     
@@ -2235,6 +2285,12 @@ shared (deployer) actor class treasury() = this {
       //  "checkPortfolioCircuitBreakerConditions"
       //);
       return;
+    };
+    
+    // Check if we've hit the paused token threshold circuit breaker
+    if (pausedTokenCount >= pausedTokenThresholdForCircuitBreaker) {
+      triggerPausedTokenThresholdCircuitBreaker(pausedTokenCount);
+      return; // Exit early since circuit breaker was triggered
     };
     
     // Check all active portfolio circuit breaker conditions
@@ -2368,6 +2424,42 @@ shared (deployer) actor class treasury() = this {
     let change = toValue - fromValue;
     let percentage = (change / fromValue) * 100.0;
     percentage;
+  };
+
+  /**
+   * Trigger circuit breaker due to paused token threshold
+   *
+   * Called when the number of paused tokens reaches the configured threshold.
+   * Pauses all remaining active tokens.
+   */
+  private func triggerPausedTokenThresholdCircuitBreaker(pausedTokenCount : Nat) {
+    // Get all active trading tokens to pause
+    let tokensToProcess = Iter.toArray(Map.entries(tokenDetailsMap));
+    let pausedTokens = Vector.new<Principal>();
+
+    for ((token, details) in tokensToProcess.vals()) {
+      if (details.Active and not isTokenPausedFromTrading(token)) {
+        let pauseReason : TradingPauseReason = #CircuitBreaker({
+          reason = "Paused token threshold circuit breaker triggered: " # Nat.toText(pausedTokenCount) # " tokens already paused (threshold: " # Nat.toText(pausedTokenThresholdForCircuitBreaker) # ")";
+          triggeredAt = now();
+          severity = "Critical";
+        });
+
+        let success = pauseTokenFromTrading(token, pauseReason);
+        if (success) {
+          Vector.add(pausedTokens, token);
+        };
+      };
+    };
+
+    logger.warn(
+      "PAUSED_TOKEN_THRESHOLD_CIRCUIT_BREAKER",
+      "PAUSED TOKEN THRESHOLD CIRCUIT BREAKER TRIGGERED - " #
+      " Paused_Tokens=" # Nat.toText(pausedTokenCount) #
+      " Threshold=" # Nat.toText(pausedTokenThresholdForCircuitBreaker) #
+      " Additional_Tokens_Paused=" # Nat.toText(Vector.size(pausedTokens)),
+      "triggerPausedTokenThresholdCircuitBreaker"
+    );
   };
 
   /**
