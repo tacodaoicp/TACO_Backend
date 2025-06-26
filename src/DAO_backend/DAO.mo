@@ -21,6 +21,7 @@ import MintingVault "../minting_vault/minting_vault_types";
 import TreasuryTypes "../treasury/treasury_types";
 import Logger "../helper/logger";
 import CanisterIds "../helper/CanisterIds";
+import calcHelp "../neuron_snapshot/VPcalculation";
 
 shared (deployer) actor class ContinuousDAO() = this {
 
@@ -54,6 +55,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   type UnfollowError = DAO_types.UnfollowError;
   type AuthorizationError = DAO_types.AuthorizationError;
   type SyncError = DAO_types.SyncError;
+  type RefreshError = DAO_types.RefreshError;
   type TokenType = DAO_types.TokenType;
   type NeuronAllocation = DAO_types.NeuronAllocation;
   type NeuronAllocationMap = DAO_types.NeuronAllocationMap;
@@ -1578,6 +1580,245 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  // Refreshes voting power for the calling user by fetching their current neurons from SNS governance
+  // This allows users to see their voting power immediately after adding hotkeys without waiting for the next snapshot
+  public shared ({ caller }) func refreshUserVotingPower() : async Result.Result<{
+    oldVotingPower: Nat;
+    newVotingPower: Nat;
+    neuronsUpdated: Nat;
+    aggregateUpdated: Bool;
+  }, RefreshError> {
+    if (not isAllowed(caller)) {
+      return #err(#NotAllowed);
+    };
+
+    if (systemState != #Active) {
+      return #err(#SystemInactive);
+    };
+
+    // Check if SNS governance canister is set
+    let snsGovId = switch (sns_governance_canister_id) {
+      case (?id) { id };
+      case (null) {
+        return #err(#SnsGovernanceError("SNS governance canister ID not set"));
+      };
+    };
+
+    try {
+      // Get current user state for comparison
+      let currentUserState = switch (Map.get(userStates, phash, caller)) {
+        case (?state) { state };
+        case (null) {
+          // User doesn't exist yet, create empty state for comparison
+          emptyUserState;
+        };
+      };
+
+      let oldVotingPower = currentUserState.votingPower;
+
+      // Create SNS governance actor
+      let snsGov = actor (Principal.toText(snsGovId)) : actor {
+        list_neurons : shared query NeuronSnapshot.ListNeurons -> async NeuronSnapshot.ListNeuronsResponse;
+        get_nervous_system_parameters : shared () -> async NeuronSnapshot.NervousSystemParameters;
+      };
+
+      // Fetch user's neurons from SNS governance
+      logger.info("VotingPower", "Refreshing voting power for user: " # Principal.toText(caller), "refreshUserVotingPower");
+      
+      let neuronsResult = await snsGov.list_neurons({
+        of_principal = ?caller;
+        limit = 1000; // Should be enough for most users
+        start_page_at = null;
+      });
+
+      if (neuronsResult.neurons.size() == 0) {
+        logger.info("VotingPower", "No neurons found for user: " # Principal.toText(caller), "refreshUserVotingPower");
+        return #err(#NoNeuronsFound);
+      };
+
+      // Get nervous system parameters for voting power calculation
+      let params = await snsGov.get_nervous_system_parameters();
+      
+      // Create voting power calculator (reuse from neuron snapshot)
+      let vpCalc = calcHelp.vp_calc();
+      vpCalc.setParams(params);
+
+      // Process neurons and calculate voting power
+      let newNeurons = Vector.new<NeuronVP>();
+      var newTotalVP : Nat = 0;
+      var validNeuronsCount = 0;
+
+      for (neuron in neuronsResult.neurons.vals()) {
+        switch (neuron.id) {
+          case (null) { /* Skip neurons without ID */ };
+          case (?neuronId) {
+            // Check if this neuron has the caller as hotkey (permission type [4, 3] or [3, 4])
+            var isHotkey = false;
+            for (permission in neuron.permissions.vals()) {
+              switch (permission.principal) {
+                case (?p) {
+                  if (p == caller and (permission.permission_type == [4, 3] or permission.permission_type == [3, 4])) {
+                    isHotkey := true;
+                  };
+                };
+                case (null) { /* Skip */ };
+              };
+            };
+
+            if (isHotkey) {
+              // Calculate voting power for this neuron
+              let neuronDetails : NeuronSnapshot.NeuronDetails = {
+                id = neuron.id;
+                staked_maturity_e8s_equivalent = neuron.staked_maturity_e8s_equivalent;
+                cached_neuron_stake_e8s = neuron.cached_neuron_stake_e8s;
+                aging_since_timestamp_seconds = neuron.aging_since_timestamp_seconds;
+                dissolve_state = neuron.dissolve_state;
+                voting_power_percentage_multiplier = neuron.voting_power_percentage_multiplier;
+              };
+
+              let votingPower = vpCalc.getVotingPower(neuronDetails);
+              if (votingPower > 0) {
+                Vector.add(newNeurons, {
+                  neuronId = neuronId.id;
+                  votingPower = votingPower;
+                });
+                newTotalVP += votingPower;
+                validNeuronsCount += 1;
+              };
+            };
+          };
+        };
+      };
+
+      let timenow = Time.now();
+
+      // Calculate aggregate allocation changes
+      var aggregateUpdated = false;
+      
+      // If user has existing allocations, we need to update the aggregate
+      if (currentUserState.allocations.size() > 0) {
+        // Remove old voting power from aggregate
+        for (oldNeuron in currentUserState.neurons.vals()) {
+          switch (Map.get(neuronAllocationMap, bhash, oldNeuron.neuronId)) {
+            case (?neuronAlloc) {
+              if (neuronAlloc.allocations.size() > 0) {
+                for (alloc in neuronAlloc.allocations.vals()) {
+                  let currentVP = switch (Map.get(aggregateAllocation, phash, alloc.token)) {
+                    case (?vp) { vp };
+                    case (null) { 0 };
+                  };
+                  let vpToRemove = (oldNeuron.votingPower * alloc.basisPoints) / 10000;
+                  let newVP = if (vpToRemove > currentVP) { 0 } else { currentVP - vpToRemove };
+                  Map.set(aggregateAllocation, phash, alloc.token, newVP);
+                };
+                aggregateUpdated := true;
+              };
+            };
+            case (null) { /* Skip */ };
+          };
+        };
+
+        // Add new voting power to aggregate
+        for (newNeuron in Vector.vals(newNeurons)) {
+          switch (Map.get(neuronAllocationMap, bhash, newNeuron.neuronId)) {
+            case (?neuronAlloc) {
+              // Update neuron allocation with new voting power
+              Map.set(neuronAllocationMap, bhash, newNeuron.neuronId, {
+                neuronAlloc with
+                votingPower = newNeuron.votingPower;
+              });
+
+              if (neuronAlloc.allocations.size() > 0) {
+                for (alloc in neuronAlloc.allocations.vals()) {
+                  let currentVP = switch (Map.get(aggregateAllocation, phash, alloc.token)) {
+                    case (?vp) { vp };
+                    case (null) { 0 };
+                  };
+                  let vpToAdd = (newNeuron.votingPower * alloc.basisPoints) / 10000;
+                  Map.set(aggregateAllocation, phash, alloc.token, currentVP + vpToAdd);
+                };
+                aggregateUpdated := true;
+              };
+            };
+            case (null) {
+              // Create new neuron allocation entry
+              Map.set(neuronAllocationMap, bhash, newNeuron.neuronId, {
+                allocations = currentUserState.allocations;
+                lastUpdate = if (currentUserState.lastAllocationUpdate > 0) { currentUserState.lastAllocationUpdate } else { timenow };
+                votingPower = newNeuron.votingPower;
+                lastAllocationMaker = caller;
+              });
+
+              // Add to aggregate if user has allocations
+              if (currentUserState.allocations.size() > 0) {
+                for (alloc in currentUserState.allocations.vals()) {
+                  let currentVP = switch (Map.get(aggregateAllocation, phash, alloc.token)) {
+                    case (?vp) { vp };
+                    case (null) { 0 };
+                  };
+                  let vpToAdd = (newNeuron.votingPower * alloc.basisPoints) / 10000;
+                  Map.set(aggregateAllocation, phash, alloc.token, currentVP + vpToAdd);
+                };
+                aggregateUpdated := true;
+              };
+            };
+          };
+        };
+      } else {
+        // User has no allocations yet, just update neuron allocations with voting power
+        for (newNeuron in Vector.vals(newNeurons)) {
+          switch (Map.get(neuronAllocationMap, bhash, newNeuron.neuronId)) {
+            case (?neuronAlloc) {
+              Map.set(neuronAllocationMap, bhash, newNeuron.neuronId, {
+                neuronAlloc with
+                votingPower = newNeuron.votingPower;
+              });
+            };
+            case (null) {
+              Map.set(neuronAllocationMap, bhash, newNeuron.neuronId, {
+                allocations = [];
+                lastUpdate = 0;
+                votingPower = newNeuron.votingPower;
+                lastAllocationMaker = caller;
+              });
+            };
+          };
+        };
+      };
+
+      // Update user state
+      let newUserState : UserState = {
+        currentUserState with
+        neurons = Vector.toArray(newNeurons);
+        votingPower = newTotalVP;
+        lastVotingPowerUpdate = timenow;
+      };
+
+      Map.set(userStates, phash, caller, newUserState);
+
+      logger.info(
+        "VotingPower", 
+        "Updated voting power for " # Principal.toText(caller) # 
+        " from " # Nat.toText(oldVotingPower) # 
+        " to " # Nat.toText(newTotalVP) # 
+        " (" # Nat.toText(validNeuronsCount) # " neurons)",
+        "refreshUserVotingPower"
+      );
+
+      #ok({
+        oldVotingPower = oldVotingPower;
+        newVotingPower = newTotalVP;
+        neuronsUpdated = validNeuronsCount;
+        aggregateUpdated = aggregateUpdated;
+      });
+
+    } catch (e) {
+      let errorMsg = "Failed to refresh voting power: " # Error.message(e);
+      logger.error("VotingPower", errorMsg, "refreshUserVotingPower");
+      #err(#UnexpectedError(errorMsg));
+    };
+  };
+
   public query ({ caller }) func getSnapshotInfo() : async ?{
     lastSnapshotId : Nat;
     lastSnapshotTime : Int;
@@ -2226,6 +2467,7 @@ shared (deployer) actor class ContinuousDAO() = this {
       #getSystemParameters : () -> ();
       #getTokenDetails : () -> ();
       #getUserAllocation : () -> ();
+      #refreshUserVotingPower : () -> ();
       #grantAdminPermission : () -> (Principal, SpamProtection.AdminFunction, Nat);
       #hasAdminPermission : () -> (Principal, SpamProtection.AdminFunction);
       #pauseToken : () -> Principal;
@@ -2499,6 +2741,9 @@ shared (deployer) actor class ContinuousDAO() = this {
       };
       case (#getUserAllocation _) {
         isAllowedQuery(caller);
+      };
+      case (#refreshUserVotingPower _) {
+        isAllowed(caller) and (systemState == #Active);
       };
       case (#getSnapshotInfo _) {
         isAllowedQuery(caller);

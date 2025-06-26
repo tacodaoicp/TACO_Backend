@@ -167,6 +167,14 @@ module {
     #UnexpectedError : Text;
   };
 
+  public type RefreshError = {
+    #NotAllowed;
+    #SystemInactive;
+    #SnsGovernanceError : Text;
+    #NoNeuronsFound;
+    #UnexpectedError : Text;
+  };
+
   public type HistoricBalanceAllocation = {
     balances : [(Principal, Nat)]; // Token -> basis points of total balance
     allocations : [(Principal, Nat)]; // Token -> basis points of voting power allocation
@@ -178,6 +186,12 @@ module {
     updateAllocation : shared ([Allocation]) -> async Result.Result<Text, UpdateError>;
     getAggregateAllocation : shared query () -> async [(Principal, Nat)];
     getUserAllocation : shared query () -> async ?UserState;
+    refreshUserVotingPower : shared () -> async Result.Result<{
+      oldVotingPower: Nat;
+      newVotingPower: Nat;
+      neuronsUpdated: Nat;
+      aggregateUpdated: Bool;
+    }, RefreshError>;
     getSnapshotInfo : shared query () -> async {
       lastSnapshotId : Nat;
       lastSnapshotTime : Int;
