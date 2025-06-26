@@ -92,6 +92,9 @@ shared deployer actor class neuronSnapshot() = this {
   // Flag for cancelling snapshot tacking loop
   stable var CANCEL_NEURON_SNAPSHOT = false;
 
+  // Maximum number of snapshots to keep (configurable by admin/DAO)
+  stable var maxNeuronSnapshots : Nat = 100; // Keep last 100 snapshots by default
+
   // Test mode variables
   stable var test = false;
   stable let mockNeurons = Map.new<Principal, T.Neuron>();
@@ -570,6 +573,9 @@ shared deployer actor class neuronSnapshot() = this {
 
     neuron_snapshots := List.push(new_neuron_snapshot, neuron_snapshots);
     logger.info("Snapshot", "Snapshot " # Nat.toText(neuron_snapshot_head_id) # " added successfully", "add_neuron_snapshot");
+    
+    // Cleanup old snapshots if we exceed the limit
+    cleanup_old_snapshots();
   };
 
   /*public query func debug_get_neuron_data_for_principal(principal : Principal) : async [(Principal, [T.NeuronVP])] {
@@ -718,6 +724,35 @@ shared deployer actor class neuronSnapshot() = this {
     Nat64.fromNat(Int.abs(Time.now()));
   };
 
+  // Cleanup old snapshots when limit is exceeded
+  private func cleanup_old_snapshots() : () {
+    let currentCount = List.size(neuron_snapshots);
+    if (currentCount <= maxNeuronSnapshots) {
+      return; // No cleanup needed
+    };
+
+    logger.info("Snapshot", "Starting cleanup: " # Nat.toText(currentCount) # " snapshots, limit: " # Nat.toText(maxNeuronSnapshots), "cleanup_old_snapshots");
+
+    // Keep only the most recent maxNeuronSnapshots
+    let snapshotsToKeep = List.take(neuron_snapshots, maxNeuronSnapshots);
+    let snapshotsToRemove = List.drop(neuron_snapshots, maxNeuronSnapshots);
+
+    // Clean up associated data structures for removed snapshots
+    List.iterate<T.NeuronSnapshot>(snapshotsToRemove, func(snapshot) {
+      // Remove from neuronStore
+      Map.delete(neuronStore, nhash, snapshot.id);
+      // Remove from snapshotCumulativeValues
+      Map.delete(snapshotCumulativeValues, nhash, snapshot.id);
+      logger.info("Snapshot", "Cleaned up snapshot ID: " # Nat.toText(snapshot.id), "cleanup_old_snapshots");
+    });
+
+    // Update the snapshots list
+    neuron_snapshots := snapshotsToKeep;
+    
+    let removedCount = currentCount - maxNeuronSnapshots;
+    logger.info("Snapshot", "Cleanup completed: removed " # Nat.toText(removedCount) # " old snapshots", "cleanup_old_snapshots");
+  };
+
   system func preupgrade() {
     logger.info("System", "Pre-upgrade started", "preupgrade");
     // Reset neuron_snapshot_importing to ensure clean state after upgrade
@@ -779,6 +814,29 @@ shared deployer actor class neuronSnapshot() = this {
     };
   };
 
+  // Set the maximum number of neuron snapshots to keep
+  public shared ({ caller }) func setMaxNeuronSnapshots(maxSnapshots : Nat) : async () {
+    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"))) {
+      if (maxSnapshots == 0) {
+        logger.error("Config", "Invalid max snapshots: cannot be zero", "setMaxNeuronSnapshots");
+        return;
+      };
+      let oldMax = maxNeuronSnapshots;
+      maxNeuronSnapshots := maxSnapshots;
+      logger.info("Config", "Max snapshots updated from " # Nat.toText(oldMax) # " to " # Nat.toText(maxSnapshots), "setMaxNeuronSnapshots");
+      
+      // If new limit is smaller, trigger cleanup
+      if (maxSnapshots < oldMax) {
+        cleanup_old_snapshots();
+      };
+    };
+  };
+
+  // Get the current maximum number of neuron snapshots setting
+  public query func getMaxNeuronSnapshots() : async Nat {
+    maxNeuronSnapshots;
+  };
+
 /* NB: Turn on again after initial setup
   system func inspect({
     arg : Blob;
@@ -798,6 +856,8 @@ shared deployer actor class neuronSnapshot() = this {
       #getCumulativeValuesAtSnapshot : () -> ?T.SnapshotId;
       #setLogAdmin : () -> Principal;
       #setSnsGovernanceCanisterId : () -> Principal;
+      #setMaxNeuronSnapshots : () -> Nat;
+      #getMaxNeuronSnapshots : () -> ();
       #setTest : () -> Bool;
       #take_neuron_snapshot : () -> ();
       #get_neuron_snapshot_curr_neuron_id : () -> ();
@@ -819,6 +879,12 @@ shared deployer actor class neuronSnapshot() = this {
       };
       case (#getLogsByLevel(_)) {
         ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 50000;
+      };
+      case (#setMaxNeuronSnapshots(_)) {
+        ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 50000;
+      };
+      case (#getMaxNeuronSnapshots(_)) {
+        true and arg.size() < 50000; // Query function, no special access control needed
       };
       case (_) {
         ((isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) and arg.size() < 500000;
