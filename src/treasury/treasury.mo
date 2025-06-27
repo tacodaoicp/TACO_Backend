@@ -775,8 +775,8 @@ shared (deployer) actor class treasury() = this {
       case (?value) {
         if (value < 10) {
           validationErrors #= "Maximum price history entries cannot be less than 10; ";
-        } else if (value > 2000) {
-          validationErrors #= "Maximum price history entries cannot be more than 2000; ";
+        } else if (value > 1000000) {
+          validationErrors #= "Maximum price history entries cannot be more than 1,000,000; ";
         } else {
           MAX_PRICE_HISTORY_ENTRIES := value;
         };
