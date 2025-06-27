@@ -775,8 +775,8 @@ shared (deployer) actor class treasury() = this {
       case (?value) {
         if (value < 10) {
           validationErrors #= "Maximum price history entries cannot be less than 10; ";
-        } else if (value > 500) {
-          validationErrors #= "Maximum price history entries cannot be more than 500; ";
+        } else if (value > 2000) {
+          validationErrors #= "Maximum price history entries cannot be more than 2000; ";
         } else {
           MAX_PRICE_HISTORY_ENTRIES := value;
         };
@@ -5492,6 +5492,16 @@ shared (deployer) actor class treasury() = this {
     };
   };
 
+  /**
+   * Get current maximum price history entries configuration
+   * 
+   * Returns the current limit for price history entries per token.
+   * Accessible by any user with query access.
+   */
+  public query func getMaxPriceHistoryEntries() : async Nat {
+    MAX_PRICE_HISTORY_ENTRIES;
+  };
+
 /* NB: Turn on again after initial setup
   // Security check for message inspection
   system func inspect({
@@ -5515,6 +5525,7 @@ shared (deployer) actor class treasury() = this {
       #resetRebalanceState : () -> ();
       #syncTokenDetailsFromDAO : () -> [(Principal, TokenDetails)];
       #updateRebalanceConfig : () -> (UpdateConfig, ?Bool);
+      #getMaxPriceHistoryEntries : () -> Nat;
       #getTokenPriceHistory : () -> [Principal];
       #getSystemParameters : () -> ();
     };
