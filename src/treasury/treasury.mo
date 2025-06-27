@@ -4657,9 +4657,38 @@ shared (deployer) actor class treasury() = this {
                   logger.error("TRADE_EXECUTION", 
                     "ICPSwap trade FAILED - Error=" # e #
                     " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
-                    " Status=FAILED",
+                    " Status=FAILED" #
+                    " Attempting_immediate_recovery=true",
                     "executeTrade"
                   );
+                  
+                  // Attempt immediate recovery from the specific pool
+                  try {
+                    logger.info("TRADE_RECOVERY", 
+                      "Starting immediate recovery from pool " # Principal.toText(poolData.canisterId) #
+                      " for tokens " # Principal.toText(sellToken) # "/" # Principal.toText(buyToken),
+                      "executeTrade"
+                    );
+                    
+                    await* ICPSwap.recoverBalanceFromSpecificPool(
+                      Principal.fromText(self),
+                      poolData.canisterId,
+                      [sellToken, buyToken],
+                      tokenDetailsMap
+                    );
+                    
+                    logger.info("TRADE_RECOVERY", 
+                      "Immediate recovery completed for pool " # Principal.toText(poolData.canisterId),
+                      "executeTrade"
+                    );
+                  } catch (recoveryError) {
+                    logger.error("TRADE_RECOVERY", 
+                      "Immediate recovery failed for pool " # Principal.toText(poolData.canisterId) #
+                      " Error=" # Error.message(recoveryError),
+                      "executeTrade"
+                    );
+                    // Don't change the original error - recovery failure is secondary
+                  };
                   
                   #err("Failed to execute ICPSwap trade: " # e);
                 };

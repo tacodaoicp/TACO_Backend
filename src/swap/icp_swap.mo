@@ -705,6 +705,119 @@ module {
     };
   };
 
+  public func recoverBalanceFromSpecificPool(
+    selfId : Principal,
+    poolId : Principal,
+    tokens : [Principal],
+    tokenDetailsMap : Map.Map<Principal, dao_types.TokenDetails>,
+  ) : async* () {
+    Debug.print("Starting targeted balance recovery from pool: " # Principal.toText(poolId));
+
+    try {
+      // Direct call to the specific pool canister
+      let pool : Types.ICPSwapPool = actor (Principal.toText(poolId));
+      let balanceResult = await pool.getUserUnusedBalance(selfId);
+
+      switch (balanceResult) {
+        case (#ok(balance)) {
+          Debug.print("Pool balance check - Balance0: " # Nat.toText(balance.balance0) # " Balance1: " # Nat.toText(balance.balance1));
+
+          // Track recovered amounts
+          let recoveredBalances = Map.new<Principal, Nat>();
+          let { phash } = Map;
+
+          // Recover token0 if there's a balance
+          if (balance.balance0 > 0 and tokens.size() >= 1) {
+            let token0 = tokens[0];
+            switch (Map.get(tokenDetailsMap, phash, token0)) {
+              case (?tokenDetails) {
+                if (balance.balance0 > tokenDetails.tokenTransferFee) {
+                  let withdrawAmount = balance.balance0;
+                  let withdrawParams : Types.ICPSwapWithdrawParams = {
+                    poolId = poolId;
+                    token = token0;
+                    amount = withdrawAmount;
+                    fee = tokenDetails.tokenTransferFee;
+                  };
+
+                  Debug.print("Attempting to recover " # Nat.toText(withdrawAmount) # " of token0: " # Principal.toText(token0));
+                  let withdrawResult = await executeWithdraw(selfId, withdrawParams);
+
+                  switch (withdrawResult) {
+                    case (#ok(_)) {
+                      let recovered = withdrawAmount - tokenDetails.tokenTransferFee;
+                      Map.set(recoveredBalances, phash, token0, recovered);
+                      Debug.print("Successfully recovered " # Nat.toText(recovered) # " of token0");
+                    };
+                    case (#err(e)) {
+                      Debug.print("Failed to recover token0 balance: " # e);
+                    };
+                  };
+                } else {
+                  Debug.print("Token0 balance too small to withdraw (below fee): " # Nat.toText(balance.balance0));
+                };
+              };
+              case (null) {
+                Debug.print("Token0 details not found in tokenDetailsMap: " # Principal.toText(token0));
+              };
+            };
+          };
+
+          // Recover token1 if there's a balance
+          if (balance.balance1 > 0 and tokens.size() >= 2) {
+            let token1 = tokens[1];
+            switch (Map.get(tokenDetailsMap, phash, token1)) {
+              case (?tokenDetails) {
+                if (balance.balance1 > tokenDetails.tokenTransferFee) {
+                  let withdrawAmount = balance.balance1;
+                  let withdrawParams : Types.ICPSwapWithdrawParams = {
+                    poolId = poolId;
+                    token = token1;
+                    amount = withdrawAmount;
+                    fee = tokenDetails.tokenTransferFee;
+                  };
+
+                  Debug.print("Attempting to recover " # Nat.toText(withdrawAmount) # " of token1: " # Principal.toText(token1));
+                  let withdrawResult = await executeWithdraw(selfId, withdrawParams);
+
+                  switch (withdrawResult) {
+                    case (#ok(_)) {
+                      let recovered = withdrawAmount - tokenDetails.tokenTransferFee;
+                      Map.set(recoveredBalances, phash, token1, recovered);
+                      Debug.print("Successfully recovered " # Nat.toText(recovered) # " of token1");
+                    };
+                    case (#err(e)) {
+                      Debug.print("Failed to recover token1 balance: " # e);
+                    };
+                  };
+                } else {
+                  Debug.print("Token1 balance too small to withdraw (below fee): " # Nat.toText(balance.balance1));
+                };
+              };
+              case (null) {
+                Debug.print("Token1 details not found in tokenDetailsMap: " # Principal.toText(token1));
+              };
+            };
+          };
+
+          // Log recovery summary
+          let totalRecovered = Map.size(recoveredBalances);
+          if (totalRecovered > 0) {
+            Debug.print("Recovery complete - Successfully recovered balances for " # Nat.toText(totalRecovered) # " tokens from pool " # Principal.toText(poolId));
+          } else {
+            Debug.print("Recovery complete - No balances recovered from pool " # Principal.toText(poolId));
+          };
+
+        };
+        case (#err(e)) {
+          Debug.print("Error getting balance from pool " # Principal.toText(poolId) # ": " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("Exception during targeted recovery from pool " # Principal.toText(poolId) # ": " # Error.message(e));
+    };
+  };
+
   public func executeTransferDepositSwapAndWithdraw(
     selfId : Principal,
     depositParams : Types.ICPSwapDepositParams,
