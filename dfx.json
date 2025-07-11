@@ -43,6 +43,10 @@
     "mintingVault": {
       "main": "src/minting_vault/minting_vault.mo",
       "type": "motoko"
+    },
+    "tradingArchive": {
+      "main": "src/archives/trading_archive/trading_archive.mo",
+      "type": "motoko"
     }
   },
   "networks": {
