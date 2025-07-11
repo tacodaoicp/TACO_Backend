@@ -2509,8 +2509,12 @@ shared (deployer) actor class treasury() = this {
     Vector.add(portfolioCircuitBreakerLogs, circuitBreakerLog);
 
     // Remove oldest logs if we exceed the limit
-    while (Vector.size(portfolioCircuitBreakerLogs) > maxPortfolioCircuitBreakerLogs) {
-      ignore Vector.removeLast(portfolioCircuitBreakerLogs);
+    if (Vector.size(portfolioCircuitBreakerLogs) > maxPortfolioCircuitBreakerLogs) {
+      Vector.reverse(portfolioCircuitBreakerLogs);
+      while (Vector.size(portfolioCircuitBreakerLogs) > maxPortfolioCircuitBreakerLogs) {
+        ignore Vector.removeLast(portfolioCircuitBreakerLogs);
+      };
+      Vector.reverse(portfolioCircuitBreakerLogs);
     };
 
     let valueTypeText = switch (triggerData.valueType) {
