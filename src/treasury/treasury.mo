@@ -1935,6 +1935,61 @@ shared (deployer) actor class treasury() = this {
     #ok("Manual portfolio snapshot taken successfully");
   };
 
+  /**
+   * Get the current maximum portfolio snapshots limit
+   * 
+   * Returns the current limit for portfolio snapshots storage.
+   * Accessible by any user with query access.
+   */
+  public query func getMaxPortfolioSnapshots() : async Nat {
+    maxPortfolioSnapshots;
+  };
+
+  /**
+   * Update the maximum portfolio snapshots limit
+   * 
+   * Sets the maximum number of portfolio snapshots to store.
+   * Older snapshots will be automatically removed when the limit is exceeded.
+   * Only callable by admins with appropriate permissions.
+   */
+  public shared ({ caller }) func updateMaxPortfolioSnapshots(newLimit : Nat) : async Result.Result<Text, PortfolioSnapshotError> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Validate the new limit
+    if (newLimit < 10) {
+      return #err(#SystemError("Maximum portfolio snapshots cannot be less than 10"));
+    };
+
+    if (newLimit > 10000) {
+      return #err(#SystemError("Maximum portfolio snapshots cannot be more than 10,000"));
+    };
+
+    let oldLimit = maxPortfolioSnapshots;
+    maxPortfolioSnapshots := newLimit;
+
+    // If the new limit is smaller than current storage, trim excess snapshots
+    if (Vector.size(portfolioSnapshots) > newLimit) {
+      Vector.reverse(portfolioSnapshots);
+      while (Vector.size(portfolioSnapshots) > newLimit) {
+        ignore Vector.removeLast(portfolioSnapshots);
+      };
+      Vector.reverse(portfolioSnapshots);
+    };
+
+    logger.info(
+      "PORTFOLIO_SNAPSHOT_CONFIG",
+      "Maximum portfolio snapshots limit updated - Old=" # Nat.toText(oldLimit) #
+      " New=" # Nat.toText(newLimit) #
+      " Current_count=" # Nat.toText(Vector.size(portfolioSnapshots)) #
+      " Updated_by=" # Principal.toText(caller),
+      "updateMaxPortfolioSnapshots"
+    );
+
+    #ok("Maximum portfolio snapshots limit updated to " # Nat.toText(newLimit));
+  };
+
   //=========================================================================
   // PORTFOLIO CIRCUIT BREAKER SYSTEM
   //=========================================================================
@@ -5523,6 +5578,7 @@ shared (deployer) actor class treasury() = this {
       #getLogsByLevel : () -> (level : Logger.LogLevel, count : Nat);
       #getTokenDetails : () -> ();
       #getTradingStatus : () -> ();
+      #getMaxPortfolioSnapshots : () -> ();
       #receiveTransferTasks : () -> ([(TransferRecipient, Nat, Principal, Nat8)], Bool);
       #setTest : () -> Bool;
       #startRebalancing : () -> ();
@@ -5530,6 +5586,7 @@ shared (deployer) actor class treasury() = this {
       #resetRebalanceState : () -> ();
       #syncTokenDetailsFromDAO : () -> [(Principal, TokenDetails)];
       #updateRebalanceConfig : () -> (UpdateConfig, ?Bool);
+      #updateMaxPortfolioSnapshots : () -> ();
       #getMaxPriceHistoryEntries : () -> Nat;
       #getTokenPriceHistory : () -> [Principal];
       #getSystemParameters : () -> ();
