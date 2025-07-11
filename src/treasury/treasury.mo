@@ -1911,15 +1911,12 @@ shared (deployer) actor class treasury() = this {
     let snapshots = Vector.toArray(portfolioSnapshots);
     let totalCount = snapshots.size();
     
-    // Get the most recent 'limit' snapshots (reverse order, newest first)
+    // Get the most recent 'limit' snapshots in chronological order (oldest first)
     let startIndex = if (totalCount > limit) { totalCount - limit } else { 0 };
     let limitedSnapshots = Array.subArray(snapshots, startIndex, totalCount - startIndex);
-    
-    // Reverse to get newest first
-    let reversedSnapshots = Array.reverse(limitedSnapshots);
 
     let response : PortfolioHistoryResponse = {
-      snapshots = reversedSnapshots;
+      snapshots = limitedSnapshots;
       totalCount = totalCount;
     };
 
