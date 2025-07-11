@@ -1834,8 +1834,12 @@ shared (deployer) actor class treasury() = this {
       Vector.add(portfolioSnapshots, snapshot);
       
       // Remove oldest snapshots if we exceed the limit
-      while (Vector.size(portfolioSnapshots) > maxPortfolioSnapshots) {
-        ignore Vector.removeLast(portfolioSnapshots);
+      if (Vector.size(portfolioSnapshots) > maxPortfolioSnapshots) {
+        Vector.reverse(portfolioSnapshots);
+        while (Vector.size(portfolioSnapshots) > maxPortfolioSnapshots) {
+          ignore Vector.removeLast(portfolioSnapshots);
+        };
+        Vector.reverse(portfolioSnapshots);
       };
 
       lastPortfolioSnapshotTime := timestamp;
