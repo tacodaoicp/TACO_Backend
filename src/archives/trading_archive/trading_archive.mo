@@ -725,36 +725,7 @@ shared (deployer) actor class TradingArchive() = this {
    */
   private func importTradesBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // TODO: Implement getTradingStatus in treasury interface
-      // let tradingStatusResult = await treasuryCanister.getTradingStatus();
-      
-      // Temporary implementation - return no trades to import
-      let tradingStatusResult = #ok({
-        rebalanceStatus = #Idle;
-        executedTrades = [] : [TreasuryTypes.TradeRecord];
-        portfolioState = {
-          totalValueICP = 0;
-          totalValueUSD = 0.0;
-          currentAllocations = [];
-          targetAllocations = [];
-        };
-        metrics = {
-          lastUpdate = 0;
-          totalTradesExecuted = 0;
-          totalTradesFailed = 0;
-          totalTradesSkipped = 0;
-          skipBreakdown = {
-            noPairsFound = 0;
-            noExecutionPath = 0;
-            tokensFiltered = 0;
-            pausedTokens = 0;
-            insufficientCandidates = 0;
-          };
-          avgSlippage = 0.0;
-          successRate = 0.0;
-          skipRate = 0.0;
-        };
-      });
+      let tradingStatusResult = await treasuryCanister.getTradingStatus();
       
       switch (tradingStatusResult) {
         case (#ok(status)) {
@@ -840,14 +811,7 @@ shared (deployer) actor class TradingArchive() = this {
    */
   private func importPortfolioSnapshotsBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // TODO: Implement getPortfolioHistory in treasury interface
-      // let portfolioResult = await treasuryCanister.getPortfolioHistory(BATCH_SIZE);
-      
-      // Temporary implementation - return no portfolio snapshots to import
-      let portfolioResult = #ok({
-        snapshots = [] : [TreasuryTypes.PortfolioSnapshot];
-        totalCount = 0;
-      });
+      let portfolioResult = await treasuryCanister.getPortfolioHistory(BATCH_SIZE);
       
       switch (portfolioResult) {
         case (#ok(response)) {
@@ -945,13 +909,7 @@ shared (deployer) actor class TradingArchive() = this {
    */
   private func importPriceAlertsBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // TODO: Implement getPriceAlerts in treasury interface
-      // let alertsResult = await treasuryCanister.getPriceAlerts(lastImportedPriceAlertId, BATCH_SIZE);
-      
-      // Temporary implementation - return no price alerts to import
-      let alertsResult = {
-        alerts = [] : [TreasuryTypes.PriceAlertLog];
-      };
+      let alertsResult = await treasuryCanister.getPriceAlerts(lastImportedPriceAlertId, BATCH_SIZE);
       let alerts = alertsResult.alerts;
       var imported = 0;
       var failed = 0;
