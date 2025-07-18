@@ -10,6 +10,9 @@ import BTree "mo:stableheapbtreemap/BTree";
 import Float "mo:base/Float";
 import Int "mo:base/Int";
 import Nat "mo:base/Nat";
+import Nat8 "mo:base/Nat8";
+import Nat32 "mo:base/Nat32";
+import Text "mo:base/Text";
 import Debug "mo:base/Debug";
 import Error "mo:base/Error";
 import Blob "mo:base/Blob";
@@ -19,6 +22,7 @@ import Hash "mo:base/Hash";
 import ICRC3 "mo:icrc3-mo/service";
 import TradingArchiveTypes "./trading_archive_types";
 import TreasuryTypes "../../treasury/treasury_types";
+import DAO_types "../../DAO_backend/dao_types";
 import SpamProtection "../../helper/spam_protection";
 import Logger "../../helper/logger";
 import CanisterIds "../../helper/CanisterIds";
@@ -28,6 +32,12 @@ shared (deployer) actor class TradingArchive() = this {
   private func this_canister_id() : Principal {
     Principal.fromActor(this);
   };
+
+  // Type aliases for batch import
+  type PortfolioSnapshot = TreasuryTypes.PortfolioSnapshot;
+  type PriceAlertLog = TreasuryTypes.PriceAlertLog;
+  type TokenDetails = TreasuryTypes.TokenDetails;
+  type TradeRecord = TreasuryTypes.TradeRecord;
 
   // Type aliases for convenience
   type Value = TradingArchiveTypes.Value;
@@ -60,6 +70,12 @@ shared (deployer) actor class TradingArchive() = this {
 
   // Map utilities
   let { phash; thash; nhash } = Map;
+  let ihash = Map.ihash;
+  
+  // Helper function to convert timestamp to day
+  private func timestampToDay(timestamp : Int) : Int {
+    timestamp / 86400000000000; // Convert nanoseconds to days
+  };
 
   // Master admins
   var masterAdmins = [
@@ -144,12 +160,7 @@ shared (deployer) actor class TradingArchive() = this {
     true; // Allow public read access to trading data
   };
 
-  // Utility functions
-  private func timestampToDay(timestamp : Int) : Int {
-    timestamp / 86400000000000; // Convert to day
-  };
-
-  private func addToIndex<K>(index : Map.Map<K, [Nat]>, key : K, blockIndex : Nat, hash : Hash.Hash<K>) {
+  private func addToIndex<K>(index : Map.Map<K, [Nat]>, key : K, blockIndex : Nat, hash : Map.HashUtils<K>) {
     let existing = switch (Map.get(index, hash, key)) {
       case (?ids) { ids };
       case null { [] };
@@ -162,12 +173,13 @@ shared (deployer) actor class TradingArchive() = this {
     // This is a simplified hash calculation
     // In a production environment, you'd want to implement proper ICRC-3 RI hashing
     let blockText = debug_show(block);
-    let hash = Hash.hash(Text.encodeUtf8(blockText));
+    let textHash = Text.hash(blockText);
+    let hash32 = textHash; // Text.hash returns Nat32
     let hashArray = [
-      Nat8.fromNat((hash >> 24) & 0xFF),
-      Nat8.fromNat((hash >> 16) & 0xFF),
-      Nat8.fromNat((hash >> 8) & 0xFF),
-      Nat8.fromNat(hash & 0xFF)
+      Nat8.fromNat(Nat32.toNat((hash32 >> 24) & 0xFF)),
+      Nat8.fromNat(Nat32.toNat((hash32 >> 16) & 0xFF)),
+      Nat8.fromNat(Nat32.toNat((hash32 >> 8) & 0xFF)),
+      Nat8.fromNat(Nat32.toNat(hash32 & 0xFF))
     ];
     Blob.fromArray(hashArray);
   };
@@ -284,7 +296,7 @@ shared (deployer) actor class TradingArchive() = this {
     addToIndex(traderIndex, trade.trader, blockIndex, phash);
     addToIndex(tokenIndex, trade.tokenSold, blockIndex, phash);
     addToIndex(tokenIndex, trade.tokenBought, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, nhash);
+    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
 
     // Update statistics
     totalTrades += 1;
@@ -316,7 +328,7 @@ shared (deployer) actor class TradingArchive() = this {
     
     // Update indexes
     addToIndex(blockTypeIndex, "3portfolio", blockIndex, thash);
-    addToIndex(timeIndex, timestampToDay(portfolio.timestamp), blockIndex, nhash);
+    addToIndex(timeIndex, timestampToDay(portfolio.timestamp), blockIndex, ihash);
 
     for (token in portfolio.activeTokens.vals()) {
       addToIndex(tokenIndex, token, blockIndex, phash);
@@ -364,7 +376,7 @@ shared (deployer) actor class TradingArchive() = this {
     
     // Update indexes
     addToIndex(blockTypeIndex, "3circuit", blockIndex, thash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, nhash);
+    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
 
     for (token in circuitBreaker.tokensAffected.vals()) {
       addToIndex(tokenIndex, token, blockIndex, phash);
@@ -426,7 +438,7 @@ shared (deployer) actor class TradingArchive() = this {
     // Update indexes
     addToIndex(blockTypeIndex, "3price", blockIndex, thash);
     addToIndex(tokenIndex, price.token, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, nhash);
+    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
 
     nextBlockIndex += 1;
 
@@ -475,7 +487,7 @@ shared (deployer) actor class TradingArchive() = this {
     // Update indexes
     addToIndex(blockTypeIndex, "3pause", blockIndex, thash);
     addToIndex(tokenIndex, pause.token, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, nhash);
+    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
 
     nextBlockIndex += 1;
 
@@ -500,14 +512,14 @@ shared (deployer) actor class TradingArchive() = this {
       case (#Emergency) { "emergency" };
     };
 
-    let oldAllocationArray = #Array(Array.map(allocation.oldAllocation, func(alloc) = 
+    let oldAllocationArray = #Array(Array.map(allocation.oldAllocation, func(alloc : DAO_types.Allocation) : Value = 
       #Map([
         ("token", TradingArchiveTypes.principalToValue(alloc.token)),
         ("basis_points", #Nat(alloc.basisPoints))
       ])
     ));
 
-    let newAllocationArray = #Array(Array.map(allocation.newAllocation, func(alloc) = 
+    let newAllocationArray = #Array(Array.map(allocation.newAllocation, func(alloc : DAO_types.Allocation) : Value = 
       #Map([
         ("token", TradingArchiveTypes.principalToValue(alloc.token)),
         ("basis_points", #Nat(alloc.basisPoints))
@@ -534,7 +546,7 @@ shared (deployer) actor class TradingArchive() = this {
     // Update indexes
     addToIndex(blockTypeIndex, "3allocation", blockIndex, thash);
     addToIndex(traderIndex, allocation.user, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, nhash);
+    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
 
     nextBlockIndex += 1;
 
@@ -688,6 +700,491 @@ shared (deployer) actor class TradingArchive() = this {
     };
     
     logger.getLastLogs(count);
+  };
+
+  //=========================================================================
+  // BATCH IMPORT SYSTEM FOR TREASURY DATA
+  //=========================================================================
+  
+  // Tracking state for batch imports
+  private stable var lastImportedTradeTimestamp : Int = 0;
+  private stable var lastImportedPortfolioTimestamp : Int = 0;
+  private stable var lastImportedPriceAlertId : Nat = 0;
+  private stable var batchImportTimerId : Nat = 0;
+
+  // Batch import configuration
+  private let BATCH_SIZE : Nat = 50; // Conservative batch size to avoid cycles limit
+  private let IMPORT_INTERVAL_NS : Nat = 1_800_000_000_000; // 30 minutes
+  private let MAX_CATCH_UP_BATCHES : Nat = 10; // Limit catch-up to prevent cycles exhaustion
+
+  // Treasury interface for batch imports
+  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(canister_ids.getCanisterId(#treasury)));
+
+  /**
+   * Import batch of trades from treasury
+   */
+  private func importTradesBatch() : async { imported: Nat; failed: Nat } {
+    try {
+      // TODO: Implement getTradingStatus in treasury interface
+      // let tradingStatusResult = await treasuryCanister.getTradingStatus();
+      
+      // Temporary implementation - return no trades to import
+      let tradingStatusResult = #ok({
+        rebalanceStatus = #Idle;
+        executedTrades = [] : [TreasuryTypes.TradeRecord];
+        portfolioState = {
+          totalValueICP = 0;
+          totalValueUSD = 0.0;
+          currentAllocations = [];
+          targetAllocations = [];
+        };
+        metrics = {
+          lastUpdate = 0;
+          totalTradesExecuted = 0;
+          totalTradesFailed = 0;
+          totalTradesSkipped = 0;
+          skipBreakdown = {
+            noPairsFound = 0;
+            noExecutionPath = 0;
+            tokensFiltered = 0;
+            pausedTokens = 0;
+            insufficientCandidates = 0;
+          };
+          avgSlippage = 0.0;
+          successRate = 0.0;
+          skipRate = 0.0;
+        };
+      });
+      
+      switch (tradingStatusResult) {
+        case (#ok(status)) {
+          let trades = status.executedTrades;
+          var imported = 0;
+          var failed = 0;
+          
+          // Filter trades newer than last imported
+          let newTrades = Array.filter<TradeRecord>(trades, func(trade) {
+            trade.timestamp > lastImportedTradeTimestamp
+          });
+          
+          // Process trades in batches
+          let batchedTrades = if (newTrades.size() > BATCH_SIZE) {
+            Array.subArray(newTrades, 0, BATCH_SIZE)
+          } else {
+            newTrades
+          };
+          
+          for (trade in batchedTrades.vals()) {
+            let tradeBlockData : TradeBlockData = {
+              trader = canister_ids.getCanisterId(#treasury); // Treasury is the trader
+              tokenSold = trade.tokenSold;
+              tokenBought = trade.tokenBought;
+              amountSold = trade.amountSold;
+              amountBought = trade.amountBought;
+              exchange = trade.exchange;
+              success = trade.success;
+              slippage = trade.slippage;
+              fee = 0; // Treasury trades don't have explicit fees
+              error = trade.error;
+            };
+            
+            let blockResult = await archiveTradeBlock(tradeBlockData);
+            
+            switch (blockResult) {
+              case (#ok(index)) {
+                imported += 1;
+                lastImportedTradeTimestamp := trade.timestamp;
+              };
+              case (#err(error)) {
+                failed += 1;
+                logger.error(
+                  "BATCH_IMPORT",
+                  "Failed to import trade: " # debug_show(error),
+                  "importTradesBatch"
+                );
+              };
+            };
+          };
+          
+          if (imported > 0) {
+            logger.info(
+              "BATCH_IMPORT",
+              "Imported " # Nat.toText(imported) # " trades, failed " # Nat.toText(failed),
+              "importTradesBatch"
+            );
+          };
+          
+          { imported = imported; failed = failed };
+        };
+        case (#err(error)) {
+          logger.error(
+            "BATCH_IMPORT", 
+            "Failed to get trading status: " # error,
+            "importTradesBatch"
+          );
+          { imported = 0; failed = 1 };
+        };
+      };
+    } catch (e) {
+      logger.error(
+        "BATCH_IMPORT",
+        "Exception in importTradesBatch: " # Error.message(e),
+        "importTradesBatch"
+      );
+      { imported = 0; failed = 1 };
+    };
+  };
+
+  /**
+   * Import batch of portfolio snapshots from treasury
+   */
+  private func importPortfolioSnapshotsBatch() : async { imported: Nat; failed: Nat } {
+    try {
+      // TODO: Implement getPortfolioHistory in treasury interface
+      // let portfolioResult = await treasuryCanister.getPortfolioHistory(BATCH_SIZE);
+      
+      // Temporary implementation - return no portfolio snapshots to import
+      let portfolioResult = #ok({
+        snapshots = [] : [TreasuryTypes.PortfolioSnapshot];
+        totalCount = 0;
+      });
+      
+      switch (portfolioResult) {
+        case (#ok(response)) {
+          let snapshots = response.snapshots;
+          var imported = 0;
+          var failed = 0;
+          
+          // Filter snapshots newer than last imported
+          let newSnapshots = Array.filter<PortfolioSnapshot>(snapshots, func(snapshot) {
+            snapshot.timestamp > lastImportedPortfolioTimestamp
+          });
+          
+          // Get token details for active/paused token classification
+          let tokenDetails = await treasuryCanister.getTokenDetails();
+          
+          for (snapshot in newSnapshots.vals()) {
+            let activeTokens = Array.mapFilter<(Principal, TokenDetails), Principal>(
+              tokenDetails,
+              func(entry) = if (entry.1.Active and not entry.1.isPaused) { ?entry.0 } else { null }
+            );
+            
+            let pausedTokens = Array.mapFilter<(Principal, TokenDetails), Principal>(
+              tokenDetails,
+              func(entry) = if (entry.1.Active and entry.1.isPaused) { ?entry.0 } else { null }
+            );
+            
+            // Convert TreasuryTypes.SnapshotReason to TradingArchiveTypes.SnapshotReason
+            let mappedReason = switch (snapshot.snapshotReason) {
+              case (#Scheduled) { #Scheduled };
+              case (#PostTrade) { #PostTrade };
+              case (#PreTrade) { #PostTrade }; // Map PreTrade to PostTrade
+              case (#PriceUpdate) { #SystemEvent }; // Map PriceUpdate to SystemEvent
+              case (#Manual) { #ManualTrigger }; // Map Manual to ManualTrigger
+            };
+            
+            let portfolioBlockData : PortfolioBlockData = {
+              timestamp = snapshot.timestamp;
+              totalValueICP = snapshot.totalValueICP;
+              totalValueUSD = snapshot.totalValueUSD;
+              tokenCount = snapshot.tokens.size();
+              activeTokens = activeTokens;
+              pausedTokens = pausedTokens;
+              reason = mappedReason;
+            };
+            
+            let blockResult = await archivePortfolioBlock(portfolioBlockData);
+            
+            switch (blockResult) {
+              case (#ok(index)) {
+                imported += 1;
+                lastImportedPortfolioTimestamp := snapshot.timestamp;
+              };
+              case (#err(error)) {
+                failed += 1;
+                logger.error(
+                  "BATCH_IMPORT",
+                  "Failed to import portfolio snapshot: " # debug_show(error),
+                  "importPortfolioSnapshotsBatch"
+                );
+              };
+            };
+          };
+          
+          if (imported > 0) {
+            logger.info(
+              "BATCH_IMPORT",
+              "Imported " # Nat.toText(imported) # " portfolio snapshots, failed " # Nat.toText(failed),
+              "importPortfolioSnapshotsBatch"
+            );
+          };
+          
+          { imported = imported; failed = failed };
+        };
+        case (#err(error)) {
+          logger.error(
+            "BATCH_IMPORT",
+            "Failed to get portfolio history: " # debug_show(error),
+            "importPortfolioSnapshotsBatch"
+          );
+          { imported = 0; failed = 1 };
+        };
+      };
+    } catch (e) {
+      logger.error(
+        "BATCH_IMPORT",
+        "Exception in importPortfolioSnapshotsBatch: " # Error.message(e),
+        "importPortfolioSnapshotsBatch"
+      );
+      { imported = 0; failed = 1 };
+    };
+  };
+
+  /**
+   * Import batch of price alerts from treasury
+   */
+  private func importPriceAlertsBatch() : async { imported: Nat; failed: Nat } {
+    try {
+      // TODO: Implement getPriceAlerts in treasury interface
+      // let alertsResult = await treasuryCanister.getPriceAlerts(lastImportedPriceAlertId, BATCH_SIZE);
+      
+      // Temporary implementation - return no price alerts to import
+      let alertsResult = {
+        alerts = [] : [TreasuryTypes.PriceAlertLog];
+      };
+      let alerts = alertsResult.alerts;
+      var imported = 0;
+      var failed = 0;
+      
+      for (alert in alerts.vals()) {
+        if (alert.id > lastImportedPriceAlertId) {
+          let circuitBreakerData : CircuitBreakerBlockData = {
+            eventType = #PriceAlert;
+            triggerToken = ?alert.token;
+            thresholdValue = alert.triggeredCondition.percentage;
+            actualValue = alert.priceData.actualChangePercent;
+            tokensAffected = [alert.token];
+            systemResponse = "Price alert triggered: " # alert.triggeredCondition.name;
+            severity = "Medium";
+          };
+          
+          let blockResult = await archiveCircuitBreakerBlock(circuitBreakerData);
+          
+          switch (blockResult) {
+            case (#ok(index)) {
+              imported += 1;
+              lastImportedPriceAlertId := alert.id;
+            };
+            case (#err(error)) {
+              failed += 1;
+              logger.error(
+                "BATCH_IMPORT",
+                "Failed to import price alert: " # debug_show(error),
+                "importPriceAlertsBatch"
+              );
+            };
+          };
+        };
+      };
+      
+      if (imported > 0) {
+        logger.info(
+          "BATCH_IMPORT",
+          "Imported " # Nat.toText(imported) # " price alerts, failed " # Nat.toText(failed),
+          "importPriceAlertsBatch"
+        );
+      };
+      
+      { imported = imported; failed = failed };
+    } catch (e) {
+      logger.error(
+        "BATCH_IMPORT",
+        "Exception in importPriceAlertsBatch: " # Error.message(e),
+        "importPriceAlertsBatch"
+      );
+      { imported = 0; failed = 1 };
+    };
+  };
+
+  /**
+   * Run complete batch import cycle
+   */
+  private func runBatchImport() : async () {
+    logger.info(
+      "BATCH_IMPORT",
+      "Starting batch import cycle",
+      "runBatchImport"
+    );
+    
+    // Import trades
+    let tradeResults = await importTradesBatch();
+    
+    // Import portfolio snapshots
+    let portfolioResults = await importPortfolioSnapshotsBatch();
+    
+    // Import price alerts
+    let alertResults = await importPriceAlertsBatch();
+    
+    let totalImported = tradeResults.imported + portfolioResults.imported + alertResults.imported;
+    let totalFailed = tradeResults.failed + portfolioResults.failed + alertResults.failed;
+    
+    logger.info(
+      "BATCH_IMPORT",
+      "Batch import cycle completed - Imported: " # Nat.toText(totalImported) # 
+      " Failed: " # Nat.toText(totalFailed),
+      "runBatchImport"
+    );
+  };
+
+  /**
+   * Start the batch import timer
+   */
+  private func startBatchImportTimer<system>() : async* () {
+    if (batchImportTimerId != 0) {
+      Timer.cancelTimer(batchImportTimerId);
+    };
+
+    batchImportTimerId := Timer.setTimer<system>(
+      #nanoseconds(IMPORT_INTERVAL_NS),
+      func() : async () {
+        await runBatchImport();
+        await* startBatchImportTimer();
+      }
+    );
+
+    logger.info(
+      "BATCH_IMPORT",
+      "Batch import timer started - Interval: " # Nat.toText(IMPORT_INTERVAL_NS / 1_000_000_000) # "s",
+      "startBatchImportTimer"
+    );
+  };
+
+  /**
+   * Manual batch import (admin function)
+   */
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, ArchiveError> {
+    if (not isMasterAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    await runBatchImport();
+    #ok("Manual batch import completed");
+  };
+
+  /**
+   * Start batch import system (admin function)
+   */
+  public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, ArchiveError> {
+    if (not isMasterAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    await* startBatchImportTimer();
+    #ok("Batch import system started");
+  };
+
+  /**
+   * Stop batch import system (admin function)
+   */
+  public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, ArchiveError> {
+    if (not isMasterAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    if (batchImportTimerId != 0) {
+      Timer.cancelTimer(batchImportTimerId);
+      batchImportTimerId := 0;
+      #ok("Batch import system stopped");
+    } else {
+      #ok("Batch import system was not running");
+    };
+  };
+
+  /**
+   * Get batch import status
+   */
+  public query func getBatchImportStatus() : async {
+    isRunning: Bool;
+    lastImportedTradeTimestamp: Int;
+    lastImportedPortfolioTimestamp: Int;
+    lastImportedPriceAlertId: Nat;
+    intervalSeconds: Nat;
+  } {
+    {
+      isRunning = batchImportTimerId != 0;
+      lastImportedTradeTimestamp = lastImportedTradeTimestamp;
+      lastImportedPortfolioTimestamp = lastImportedPortfolioTimestamp;
+      lastImportedPriceAlertId = lastImportedPriceAlertId;
+      intervalSeconds = IMPORT_INTERVAL_NS / 1_000_000_000;
+    };
+  };
+
+  /**
+   * Force catch-up import (admin function)
+   */
+  public shared ({ caller }) func catchUpImport() : async Result.Result<Text, ArchiveError> {
+    if (not isMasterAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    logger.info(
+      "BATCH_IMPORT",
+      "Starting catch-up import",
+      "catchUpImport"
+    );
+    
+    var totalImported = 0;
+    var totalFailed = 0;
+    var batchCount = 0;
+    
+    // Run multiple import batches up to limit
+    label exit_loop while (batchCount < MAX_CATCH_UP_BATCHES) {
+      let tradeResults = await importTradesBatch();
+      let portfolioResults = await importPortfolioSnapshotsBatch();
+      let alertResults = await importPriceAlertsBatch();
+      
+      let batchImported = tradeResults.imported + portfolioResults.imported + alertResults.imported;
+      let batchFailed = tradeResults.failed + portfolioResults.failed + alertResults.failed;
+      
+      totalImported += batchImported;
+      totalFailed += batchFailed;
+      batchCount += 1;
+      
+      // If no new data imported, we're caught up
+      if (batchImported == 0) {
+        break exit_loop;
+      };
+    };
+    
+    logger.info(
+      "BATCH_IMPORT",
+      "Catch-up import completed - Batches: " # Nat.toText(batchCount) # 
+      " Imported: " # Nat.toText(totalImported) # 
+      " Failed: " # Nat.toText(totalFailed),
+      "catchUpImport"
+    );
+    
+    #ok("Catch-up import completed: " # Nat.toText(totalImported) # " records imported, " # 
+        Nat.toText(totalFailed) # " failed");
+  };
+
+  //=========================================================================
+  // SYSTEM INITIALIZATION - START BATCH IMPORT TIMER
+  //=========================================================================
+
+  system func preupgrade() {
+    // Timer IDs are not stable, will be restarted in postupgrade
+    batchImportTimerId := 0;
+  };
+
+  system func postupgrade() {
+    // Restart the batch import timer after upgrade
+    ignore Timer.setTimer<system>(
+      #nanoseconds(10_000_000_000), // 10 seconds delay
+      func() : async () {
+        await* startBatchImportTimer();
+      }
+    );
   };
 
   // Setup authorization
