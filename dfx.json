@@ -28,6 +28,10 @@
       "main": "src/archives/portfolio_archive/portfolio_archive.mo",
       "type": "motoko"
     },
+    "price_archive": {
+      "main": "src/archives/price_archive/price_archive.mo",
+      "type": "motoko"
+    },
     "actorA": {
       "main": "examples/testActorA.mo",
       "type": "motoko"
