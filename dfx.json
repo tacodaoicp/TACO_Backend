@@ -20,6 +20,10 @@
       "main": "src/neuron_snapshot/neuronSnapshot.mo",
       "type": "motoko"
     },
+    "trading_archive": {
+      "main": "src/archives/trading_archive/trading_archive.mo",
+      "type": "motoko"
+    },
     "actorA": {
       "main": "examples/testActorA.mo",
       "type": "motoko"
