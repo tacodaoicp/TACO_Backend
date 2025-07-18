@@ -126,8 +126,8 @@ shared (deployer) actor class PortfolioArchive() = this {
   private func isAuthorized(caller : Principal, action : TradingArchiveTypes.AdminFunction) : Bool {
     switch (action) {
       case (#ArchiveData) { 
-        // Treasury and DAO backend can archive data
-        Principal.equal(caller, TREASURY_ID) or Principal.equal(caller, DAO_BACKEND_ID) or isAdmin(caller)
+        // Treasury, DAO backend, and this archive itself can archive data
+        Principal.equal(caller, TREASURY_ID) or Principal.equal(caller, DAO_BACKEND_ID) or Principal.equal(caller, this_canister_id()) or isAdmin(caller)
       };
       case (#QueryData) { true }; // Anyone can query
       case (#DeleteData or #UpdateConfig or #GetLogs or #GetMetrics) { 
@@ -318,7 +318,7 @@ shared (deployer) actor class PortfolioArchive() = this {
   private func importPortfolioSnapshotsBatch() : async { imported : Nat; failed : Nat } {
     try {
       let treasury = actor(Principal.toText(TREASURY_ID)) : actor {
-        getPortfolioHistory : shared (Nat) -> async Result.Result<{snapshots: [PortfolioSnapshot]}, Text>;
+        getPortfolioHistory : shared (Nat) -> async Result.Result<TreasuryTypes.PortfolioHistoryResponse, TreasuryTypes.PortfolioSnapshotError>;
       };
       
       let result = await treasury.getPortfolioHistory(BATCH_SIZE);
@@ -367,9 +367,14 @@ shared (deployer) actor class PortfolioArchive() = this {
           { imported = imported; failed = failed };
         };
         case (#err(error)) {
+          let errorMsg = switch (error) {
+            case (#NotAuthorized) { "Not authorized to access portfolio history" };
+            case (#InvalidLimit) { "Invalid limit for portfolio history request" };
+            case (#SystemError(msg)) { "System error: " # msg };
+          };
           logger.error(
             "BATCH_IMPORT",
-            "Failed to get portfolio history: " # debug_show(error),
+            "Failed to get portfolio history: " # errorMsg,
             "importPortfolioSnapshotsBatch"
           );
           { imported = 0; failed = 1 };
