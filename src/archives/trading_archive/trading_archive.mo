@@ -34,7 +34,6 @@ shared (deployer) actor class TradingArchive() = this {
   };
 
   // Type aliases for batch import
-  type PortfolioSnapshot = TreasuryTypes.PortfolioSnapshot;
   type PriceAlertLog = TreasuryTypes.PriceAlertLog;
   type TokenDetails = TreasuryTypes.TokenDetails;
   type TradeRecord = TreasuryTypes.TradeRecord;
@@ -43,14 +42,11 @@ shared (deployer) actor class TradingArchive() = this {
   type Value = TradingArchiveTypes.Value;
   type Block = TradingArchiveTypes.Block;
   type TradeBlockData = TradingArchiveTypes.TradeBlockData;
-  type PortfolioBlockData = TradingArchiveTypes.PortfolioBlockData;
   type CircuitBreakerBlockData = TradingArchiveTypes.CircuitBreakerBlockData;
   type PriceBlockData = TradingArchiveTypes.PriceBlockData;
   type TradingPauseBlockData = TradingArchiveTypes.TradingPauseBlockData;
-  type AllocationBlockData = TradingArchiveTypes.AllocationBlockData;
   type BlockFilter = TradingArchiveTypes.BlockFilter;
   type TradingMetrics = TradingArchiveTypes.TradingMetrics;
-  type PortfolioMetrics = TradingArchiveTypes.PortfolioMetrics;
   type ArchiveError = TradingArchiveTypes.ArchiveError;
   type ArchiveConfig = TradingArchiveTypes.ArchiveConfig;
   type ArchiveStatus = TradingArchiveTypes.ArchiveStatus;
@@ -488,8 +484,8 @@ shared (deployer) actor class TradingArchive() = this {
       let endTime = Option.get(filter.endTime, Time.now());
       
       let results = BTree.scanLimit(blocks, Nat.compare, 0, nextBlockIndex, #fwd, 1000);
-      for (entry in results.results.vals()) {
-        Vector.add(candidateBlocks, entry.1);
+      for ((_, block) in results.results.vals()) {
+        Vector.add(candidateBlocks, block);
       };
     } else {
       // Use indexes to find relevant blocks
@@ -549,34 +545,7 @@ shared (deployer) actor class TradingArchive() = this {
     });
   };
 
-  public query ({ caller }) func getPortfolioMetrics(startTime : Int, endTime : Int) : async Result.Result<PortfolioMetrics, ArchiveError> {
-    if (not isQueryAuthorized(caller)) {
-      return #err(#NotAuthorized);
-    };
 
-    // Calculate portfolio metrics from archived data
-    let portfolioBlockCount = switch (Map.get(blockTypeIndex, thash, "3portfolio")) {
-      case (?indices) { indices.size() };
-      case null { 0 };
-    };
-
-    let circuitBreakerCount = switch (Map.get(blockTypeIndex, thash, "3circuit")) {
-      case (?indices) { indices.size() };
-      case null { 0 };
-    };
-
-    #ok({
-      snapshots = portfolioBlockCount;
-      avgValueICP = 0; // Would calculate from portfolio data
-      valueGrowth = 0.0; // Would calculate from portfolio data
-      volatility = 0.0; // Would calculate from portfolio data
-      allocationChanges = switch (Map.get(blockTypeIndex, thash, "3allocation")) {
-        case (?indices) { indices.size() };
-        case null { 0 };
-      };
-      circuitBreakerEvents = circuitBreakerCount;
-    });
-  };
 
   // Admin Functions
 
@@ -663,7 +632,7 @@ shared (deployer) actor class TradingArchive() = this {
           
           for (trade in batchedTrades.vals()) {
             let tradeBlockData : TradeBlockData = {
-              trader = canister_ids.getCanisterId(#treasury); // Treasury is the trader
+              trader = TREASURY_ID; // Treasury is the trader
               tokenSold = trade.tokenSold;
               tokenBought = trade.tokenBought;
               amountSold = trade.amountSold;
@@ -721,11 +690,6 @@ shared (deployer) actor class TradingArchive() = this {
       { imported = 0; failed = 1 };
     };
   };
-
-  /**
-   * Import batch of portfolio snapshots from treasury
-   */
-
 
   /**
    * Import batch of price alerts from treasury
