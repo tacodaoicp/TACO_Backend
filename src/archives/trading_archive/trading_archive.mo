@@ -105,8 +105,8 @@ shared (deployer) actor class TradingArchive() = this {
   stable var nextBlockIndex : Nat = 0;
   stable var tipHash : ?Blob = null;
 
-  // Block type tracking
-  stable var supportedBlockTypes = ["3trade", "3portfolio", "3circuit", "3price", "3pause", "3allocation"];
+  // Block type tracking - focused on trading-related types
+  stable var supportedBlockTypes = ["3trade", "3circuit", "3price", "3pause"];
 
   // Indexes for efficient querying
   stable var blockTypeIndex = Map.new<Text, [Nat]>(); // Block type -> block indices
@@ -313,34 +313,7 @@ shared (deployer) actor class TradingArchive() = this {
     #ok(blockIndex);
   };
 
-  public shared ({ caller }) func archivePortfolioBlock(portfolio : PortfolioBlockData) : async Result.Result<Nat, ArchiveError> {
-    if (not isAuthorized(caller, #ArchiveData)) {
-      logger.warn("Archive", "Unauthorized portfolio archive attempt by: " # Principal.toText(caller), "archivePortfolioBlock");
-      return #err(#NotAuthorized);
-    };
 
-    let blockValue = TradingArchiveTypes.portfolioToValue(portfolio, null);
-    let blockIndex = nextBlockIndex;
-    let block = createBlock(blockValue, blockIndex);
-    
-    // Store block
-    ignore BTree.insert(blocks, Nat.compare, blockIndex, block);
-    
-    // Update indexes
-    addToIndex(blockTypeIndex, "3portfolio", blockIndex, thash);
-    addToIndex(timeIndex, timestampToDay(portfolio.timestamp), blockIndex, ihash);
-
-    for (token in portfolio.activeTokens.vals()) {
-      addToIndex(tokenIndex, token, blockIndex, phash);
-    };
-
-    nextBlockIndex += 1;
-
-    logger.info("Archive", "Archived portfolio block at index: " # Nat.toText(blockIndex) # 
-      " Value: " # Nat.toText(portfolio.totalValueICP) # " ICP", "archivePortfolioBlock");
-
-    #ok(blockIndex);
-  };
 
   public shared ({ caller }) func archiveCircuitBreakerBlock(circuitBreaker : CircuitBreakerBlockData) : async Result.Result<Nat, ArchiveError> {
     if (not isAuthorized(caller, #ArchiveData)) {
@@ -497,64 +470,7 @@ shared (deployer) actor class TradingArchive() = this {
     #ok(blockIndex);
   };
 
-  public shared ({ caller }) func archiveAllocationBlock(allocation : AllocationBlockData) : async Result.Result<Nat, ArchiveError> {
-    if (not isAuthorized(caller, #ArchiveData)) {
-      logger.warn("Archive", "Unauthorized allocation archive attempt by: " # Principal.toText(caller), "archiveAllocationBlock");
-      return #err(#NotAuthorized);
-    };
 
-    let timestamp = Time.now();
-    
-    let reasonText = switch (allocation.reason) {
-      case (#UserUpdate) { "user_update" };
-      case (#FollowAction) { "follow_action" };
-      case (#SystemRebalance) { "system_rebalance" };
-      case (#Emergency) { "emergency" };
-    };
-
-    let oldAllocationArray = #Array(Array.map(allocation.oldAllocation, func(alloc : DAO_types.Allocation) : Value = 
-      #Map([
-        ("token", TradingArchiveTypes.principalToValue(alloc.token)),
-        ("basis_points", #Nat(alloc.basisPoints))
-      ])
-    ));
-
-    let newAllocationArray = #Array(Array.map(allocation.newAllocation, func(alloc : DAO_types.Allocation) : Value = 
-      #Map([
-        ("token", TradingArchiveTypes.principalToValue(alloc.token)),
-        ("basis_points", #Nat(alloc.basisPoints))
-      ])
-    ));
-
-    let entries = [
-      ("btype", #Text("3allocation")),
-      ("ts", #Int(timestamp)),
-      ("user", TradingArchiveTypes.principalToValue(allocation.user)),
-      ("old_allocation", oldAllocationArray),
-      ("new_allocation", newAllocationArray),
-      ("voting_power", #Nat(allocation.votingPower)),
-      ("reason", #Text(reasonText)),
-    ];
-
-    let blockValue = #Map(entries);
-    let blockIndex = nextBlockIndex;
-    let block = createBlock(blockValue, blockIndex);
-    
-    // Store block
-    ignore BTree.insert(blocks, Nat.compare, blockIndex, block);
-    
-    // Update indexes
-    addToIndex(blockTypeIndex, "3allocation", blockIndex, thash);
-    addToIndex(traderIndex, allocation.user, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
-
-    nextBlockIndex += 1;
-
-    logger.info("Archive", "Archived allocation block at index: " # Nat.toText(blockIndex) # 
-      " for user: " # Principal.toText(allocation.user), "archiveAllocationBlock");
-
-    #ok(blockIndex);
-  };
 
   // Query Functions
 
@@ -708,7 +624,7 @@ shared (deployer) actor class TradingArchive() = this {
   
   // Tracking state for batch imports
   private stable var lastImportedTradeTimestamp : Int = 0;
-  private stable var lastImportedPortfolioTimestamp : Int = 0;
+
   private stable var lastImportedPriceAlertId : Nat = 0;
   private stable var batchImportTimerId : Nat = 0;
 
@@ -809,100 +725,7 @@ shared (deployer) actor class TradingArchive() = this {
   /**
    * Import batch of portfolio snapshots from treasury
    */
-  private func importPortfolioSnapshotsBatch() : async { imported: Nat; failed: Nat } {
-    try {
-      let portfolioResult = await treasuryCanister.getPortfolioHistory(BATCH_SIZE);
-      
-      switch (portfolioResult) {
-        case (#ok(response)) {
-          let snapshots = response.snapshots;
-          var imported = 0;
-          var failed = 0;
-          
-          // Filter snapshots newer than last imported
-          let newSnapshots = Array.filter<PortfolioSnapshot>(snapshots, func(snapshot) {
-            snapshot.timestamp > lastImportedPortfolioTimestamp
-          });
-          
-          // Get token details for active/paused token classification
-          let tokenDetails = await treasuryCanister.getTokenDetails();
-          
-          for (snapshot in newSnapshots.vals()) {
-            let activeTokens = Array.mapFilter<(Principal, TokenDetails), Principal>(
-              tokenDetails,
-              func(entry) = if (entry.1.Active and not entry.1.isPaused) { ?entry.0 } else { null }
-            );
-            
-            let pausedTokens = Array.mapFilter<(Principal, TokenDetails), Principal>(
-              tokenDetails,
-              func(entry) = if (entry.1.Active and entry.1.isPaused) { ?entry.0 } else { null }
-            );
-            
-            // Convert TreasuryTypes.SnapshotReason to TradingArchiveTypes.SnapshotReason
-            let mappedReason = switch (snapshot.snapshotReason) {
-              case (#Scheduled) { #Scheduled };
-              case (#PostTrade) { #PostTrade };
-              case (#PreTrade) { #PostTrade }; // Map PreTrade to PostTrade
-              case (#PriceUpdate) { #SystemEvent }; // Map PriceUpdate to SystemEvent
-              case (#Manual) { #ManualTrigger }; // Map Manual to ManualTrigger
-            };
-            
-            let portfolioBlockData : PortfolioBlockData = {
-              timestamp = snapshot.timestamp;
-              totalValueICP = snapshot.totalValueICP;
-              totalValueUSD = snapshot.totalValueUSD;
-              tokenCount = snapshot.tokens.size();
-              activeTokens = activeTokens;
-              pausedTokens = pausedTokens;
-              reason = mappedReason;
-            };
-            
-            let blockResult = await archivePortfolioBlock(portfolioBlockData);
-            
-            switch (blockResult) {
-              case (#ok(index)) {
-                imported += 1;
-                lastImportedPortfolioTimestamp := snapshot.timestamp;
-              };
-              case (#err(error)) {
-                failed += 1;
-                logger.error(
-                  "BATCH_IMPORT",
-                  "Failed to import portfolio snapshot: " # debug_show(error),
-                  "importPortfolioSnapshotsBatch"
-                );
-              };
-            };
-          };
-          
-          if (imported > 0) {
-            logger.info(
-              "BATCH_IMPORT",
-              "Imported " # Nat.toText(imported) # " portfolio snapshots, failed " # Nat.toText(failed),
-              "importPortfolioSnapshotsBatch"
-            );
-          };
-          
-          { imported = imported; failed = failed };
-        };
-        case (#err(error)) {
-          logger.error(
-            "BATCH_IMPORT",
-            "Failed to get portfolio history: " # debug_show(error),
-            "importPortfolioSnapshotsBatch"
-          );
-          { imported = 0; failed = 1 };
-        };
-      };
-    } catch (e) {
-      logger.error(
-        "BATCH_IMPORT",
-        "Exception in importPortfolioSnapshotsBatch: " # Error.message(e),
-        "importPortfolioSnapshotsBatch"
-      );
-      { imported = 0; failed = 1 };
-    };
-  };
+
 
   /**
    * Import batch of price alerts from treasury
@@ -977,14 +800,11 @@ shared (deployer) actor class TradingArchive() = this {
     // Import trades
     let tradeResults = await importTradesBatch();
     
-    // Import portfolio snapshots
-    let portfolioResults = await importPortfolioSnapshotsBatch();
-    
     // Import price alerts
     let alertResults = await importPriceAlertsBatch();
     
-    let totalImported = tradeResults.imported + portfolioResults.imported + alertResults.imported;
-    let totalFailed = tradeResults.failed + portfolioResults.failed + alertResults.failed;
+    let totalImported = tradeResults.imported + alertResults.imported;
+    let totalFailed = tradeResults.failed + alertResults.failed;
     
     logger.info(
       "BATCH_IMPORT",
@@ -1064,14 +884,12 @@ shared (deployer) actor class TradingArchive() = this {
   public query func getBatchImportStatus() : async {
     isRunning: Bool;
     lastImportedTradeTimestamp: Int;
-    lastImportedPortfolioTimestamp: Int;
     lastImportedPriceAlertId: Nat;
     intervalSeconds: Nat;
   } {
     {
       isRunning = batchImportTimerId != 0;
       lastImportedTradeTimestamp = lastImportedTradeTimestamp;
-      lastImportedPortfolioTimestamp = lastImportedPortfolioTimestamp;
       lastImportedPriceAlertId = lastImportedPriceAlertId;
       intervalSeconds = IMPORT_INTERVAL_NS / 1_000_000_000;
     };
@@ -1098,11 +916,10 @@ shared (deployer) actor class TradingArchive() = this {
     // Run multiple import batches up to limit
     label exit_loop while (batchCount < MAX_CATCH_UP_BATCHES) {
       let tradeResults = await importTradesBatch();
-      let portfolioResults = await importPortfolioSnapshotsBatch();
       let alertResults = await importPriceAlertsBatch();
       
-      let batchImported = tradeResults.imported + portfolioResults.imported + alertResults.imported;
-      let batchFailed = tradeResults.failed + portfolioResults.failed + alertResults.failed;
+      let batchImported = tradeResults.imported + alertResults.imported;
+      let batchFailed = tradeResults.failed + alertResults.failed;
       
       totalImported += batchImported;
       totalFailed += batchFailed;

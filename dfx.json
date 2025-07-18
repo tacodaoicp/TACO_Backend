@@ -24,6 +24,10 @@
       "main": "src/archives/trading_archive/trading_archive.mo",
       "type": "motoko"
     },
+    "portfolio_archive": {
+      "main": "src/archives/portfolio_archive/portfolio_archive.mo",
+      "type": "motoko"
+    },
     "actorA": {
       "main": "examples/testActorA.mo",
       "type": "motoko"
