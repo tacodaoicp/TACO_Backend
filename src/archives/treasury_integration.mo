@@ -5,9 +5,9 @@ import Array "mo:base/Array";
 import Float "mo:base/Float";
 import Error "mo:base/Error";
 
-import TradingArchiveTypes "./trading_archive_types";
-import TreasuryTypes "../../treasury/treasury_types";
-import CanisterIds "../../helper/CanisterIds";
+import TradingArchiveTypes "./archive_types";
+import TreasuryTypes "../treasury/treasury_types";
+import CanisterIds "../helper/CanisterIds";
 
 module {
   // Type aliases for convenience

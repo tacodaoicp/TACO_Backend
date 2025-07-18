@@ -19,7 +19,7 @@ import Blob "mo:base/Blob";
 import Option "mo:base/Option";
 
 import ICRC3 "mo:icrc3-mo/service";
-import TradingArchiveTypes "../trading_archive/trading_archive_types";
+import TradingArchiveTypes "../archive_types";
 import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
 import SpamProtection "../../helper/spam_protection";

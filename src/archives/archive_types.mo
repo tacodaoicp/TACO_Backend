@@ -4,7 +4,7 @@ import Result "mo:base/Result";
 import Array "mo:base/Array";
 import Float "mo:base/Float";
 import ICRC3 "mo:icrc3-mo/service";
-import TreasuryTypes "../../treasury/treasury_types";
+import TreasuryTypes "../treasury/treasury_types";
 
 module {
   // Re-export ICRC3 types for convenience
