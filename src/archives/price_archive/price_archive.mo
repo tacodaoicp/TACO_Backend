@@ -26,6 +26,7 @@ import DAO_types "../../DAO_backend/dao_types";
 import SpamProtection "../../helper/spam_protection";
 import Logger "../../helper/logger";
 import CanisterIds "../../helper/CanisterIds";
+import BatchImportTimer "../../helper/batch_import_timer";
 
 shared (deployer) actor class PriceArchive() = this {
 
@@ -500,12 +501,9 @@ shared (deployer) actor class PriceArchive() = this {
   
   // Tracking state for batch imports
   private stable var lastImportedTokenSync : Int = 0;
-  private stable var batchImportTimerId : Nat = 0;
 
-  // Batch import configuration
-  private let BATCH_SIZE : Nat = 50; // Conservative batch size
-  private let IMPORT_INTERVAL_NS : Nat = 1_800_000_000_000; // 30 minutes
-  private let MAX_CATCH_UP_BATCHES : Nat = 10; // Limit catch-up to prevent cycles exhaustion
+  // Initialize batch import timer with default configuration
+  private let batchTimer = BatchImportTimer.BatchImportTimer(logger, BatchImportTimer.DEFAULT_CONFIG, isMasterAdmin);
 
   // Treasury interface for batch imports
   private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(canister_ids.getCanisterId(#treasury)));
@@ -646,68 +644,49 @@ shared (deployer) actor class PriceArchive() = this {
     lastArchiveTime := lastImportedTokenSync;
   };
 
-  /**
-   * Start the batch import timer
-   */
-  private func startBatchImportTimer<system>() : async* () {
-    if (batchImportTimerId != 0) {
-      Timer.cancelTimer(batchImportTimerId);
-    };
-
-    batchImportTimerId := Timer.setTimer<system>(
-      #nanoseconds(IMPORT_INTERVAL_NS),
-      func() : async () {
-        await runBatchImport();
-        await* startBatchImportTimer();
-      }
-    );
-
-    logger.info(
-      "BATCH_IMPORT",
-      "Price batch import timer started - Interval: " # Nat.toText(IMPORT_INTERVAL_NS / 1_000_000_000) # "s",
-      "startBatchImportTimer"
-    );
-  };
+  // Timer functionality now handled by BatchImportTimer class
 
   /**
    * Manual batch import (admin function)
    */
-  public shared ({ caller }) func manualImport() : async Result.Result<Text, ArchiveError> {
-    if (not isMasterAdmin(caller)) {
-      return #err(#NotAuthorized);
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, ArchiveError> {
+    let result = await batchTimer.adminManualImport(caller, runBatchImport);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
     };
-    
-    let result = await importPriceChangesBatch();
-    #ok("Manual import completed: " # Nat.toText(result.imported) # " price changes imported, " # 
-        Nat.toText(result.failed) # " failed");
   };
 
   /**
    * Start batch import system (admin function)
    */
-  public shared ({ caller }) func startBatchImport() : async Result.Result<Text, ArchiveError> {
-    if (not isMasterAdmin(caller)) {
-      return #err(#NotAuthorized);
+  public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, ArchiveError> {
+    let result = await batchTimer.adminStart<system>(caller, runBatchImport);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
     };
-    
-    await* startBatchImportTimer();
-    #ok("Batch import system started");
   };
 
   /**
    * Stop batch import system (admin function)
    */
-  public shared ({ caller }) func stopBatchImport() : async Result.Result<Text, ArchiveError> {
-    if (not isMasterAdmin(caller)) {
-      return #err(#NotAuthorized);
+  public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, ArchiveError> {
+    let result = batchTimer.adminStop(caller);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
     };
-    
-    if (batchImportTimerId != 0) {
-      Timer.cancelTimer(batchImportTimerId);
-      batchImportTimerId := 0;
-      #ok("Batch import system stopped");
-    } else {
-      #ok("Batch import system was not running");
+  };
+
+  /**
+   * Run catch-up import (admin function)
+   */
+  public shared ({ caller }) func catchUpImport() : async Result.Result<Text, ArchiveError> {
+    let result = await batchTimer.runCatchUpImport(caller, importPriceChangesBatch);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
     };
   };
 
@@ -722,9 +701,9 @@ shared (deployer) actor class PriceArchive() = this {
     trackedTokens: Nat;
   } {
     {
-      isRunning = batchImportTimerId != 0;
+      isRunning = batchTimer.isRunning();
       lastImportedTokenSync = lastImportedTokenSync;
-      intervalSeconds = IMPORT_INTERVAL_NS / 1_000_000_000;
+      intervalSeconds = batchTimer.getIntervalSeconds();
       totalPriceUpdates = totalPriceUpdates;
       trackedTokens = Map.size(lastKnownPrices);
     };
@@ -735,18 +714,11 @@ shared (deployer) actor class PriceArchive() = this {
   //=========================================================================
 
   system func preupgrade() {
-    // Timer IDs are not stable, will be restarted in postupgrade
-    batchImportTimerId := 0;
+    batchTimer.preupgrade();
   };
 
   system func postupgrade() {
-    // Restart the batch import timer after upgrade
-    ignore Timer.setTimer<system>(
-      #nanoseconds(10_000_000_000), // 10 seconds delay
-      func() : async () {
-        await* startBatchImportTimer();
-      }
-    );
+    batchTimer.postupgrade<system>(runBatchImport);
   };
 
   // Setup authorization
