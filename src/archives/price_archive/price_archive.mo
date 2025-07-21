@@ -46,6 +46,14 @@ shared (deployer) actor class PriceArchive() = this {
   type TokenDetails = DAO_types.TokenDetails;
   type PricePoint = DAO_types.PricePoint;
 
+  // Price source for tracking where price came from
+  type PriceSource = {
+    #Treasury;
+    #Exchange: TreasuryTypes.ExchangeType;
+    #NTN;
+    #Oracle;
+  };
+
   // Logger
   let logger = Logger.Logger();
 
@@ -236,6 +244,8 @@ shared (deployer) actor class PriceArchive() = this {
     else { 3 } // 100+ ICP
   };
 
+
+
   // ICRC-3 Standard Endpoints
 
   public query func icrc3_get_archives(args : ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
@@ -293,7 +303,8 @@ shared (deployer) actor class PriceArchive() = this {
       return #err(#NotAuthorized);
     };
 
-    let blockValue = ArchiveTypes.priceToValue(price, null);
+    let timestamp = Time.now();
+    let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
     let blockIndex = nextBlockIndex;
     let block = createBlock(blockValue, blockIndex);
     
@@ -303,8 +314,8 @@ shared (deployer) actor class PriceArchive() = this {
     // Update indexes
     addToIndex(blockTypeIndex, "3price", blockIndex, thash);
     addToIndex(tokenIndex, price.token, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(price.timestamp), blockIndex, ihash);
-    addToIndex(priceRangeIndex, getPriceRangeBucket(price.newPrice.icpPrice), blockIndex, nhash);
+    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
+    addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, nhash);
 
     // Update statistics
     totalPriceUpdates += 1;
@@ -312,7 +323,7 @@ shared (deployer) actor class PriceArchive() = this {
 
     logger.info("Archive", "Archived price block at index: " # Nat.toText(blockIndex) # 
       " Token: " # Principal.toText(price.token) # 
-      " New Price: " # Nat.toText(price.newPrice.icpPrice) # " ICP", "archivePriceBlock");
+      " New Price: " # Nat.toText(price.priceICP) # " ICP", "archivePriceBlock");
 
     #ok(blockIndex);
   };
@@ -332,9 +343,17 @@ shared (deployer) actor class PriceArchive() = this {
       let startTime = Option.get(filter.startTime, 0);
       let endTime = Option.get(filter.endTime, Time.now());
       
-      let results = BTree.scanLimit(blocks, Nat.compare, 0, nextBlockIndex, #fwd, 1000);
-      for ((_, block) in results.results.vals()) {
-        Vector.add(candidateBlocks, block);
+      // Get blocks in range similar to icrc3_get_blocks pattern
+      let endIndex = Nat.min(1000, nextBlockIndex);
+      if (endIndex > 0) {
+        for (i in Iter.range(0, endIndex - 1)) {
+          switch (BTree.get(blocks, Nat.compare, i)) {
+            case (?block) {
+              Vector.add(candidateBlocks, block);
+            };
+            case null { /* Block not found */ };
+          };
+        };
       };
     } else {
       // Use indexes to find relevant blocks
@@ -387,11 +406,11 @@ shared (deployer) actor class PriceArchive() = this {
       };
     };
 
-    let blocks = Vector.toArray(candidateBlocks);
+    let resultBlocks = Vector.toArray(candidateBlocks);
     
     #ok({
-      blocks = blocks;
-      totalCount = blocks.size();
+      blocks = resultBlocks;
+      totalCount = resultBlocks.size();
       hasMore = false; // Simple implementation
       nextIndex = null;
     });
@@ -412,9 +431,9 @@ shared (deployer) actor class PriceArchive() = this {
       switch (Map.get(tokenIndex, phash, token)) {
         case (?indices) {
           var count = 0;
-          for (index in indices.vals()) {
+          label inner_loop for (index in indices.vals()) {
             if (count >= queryLimit) {
-              break;
+              break inner_loop;
             };
             
             switch (BTree.get(blocks, Nat.compare, index)) {
@@ -500,14 +519,11 @@ shared (deployer) actor class PriceArchive() = this {
   private func importPriceChangesBatch() : async { imported: Nat; failed: Nat } {
     try {
       // Get current token details from treasury
-      let tokensResult = await treasuryCanister.getTokenDetails();
+      let tokenDetails = await treasuryCanister.getTokenDetails();
+      var imported = 0;
+      var failed = 0;
       
-      switch (tokensResult) {
-        case (#ok(tokenDetails)) {
-          var imported = 0;
-          var failed = 0;
-          
-          for ((tokenPrincipal, details) in tokenDetails.vals()) {
+      for ((tokenPrincipal, details) in tokenDetails.vals()) {
             if (details.Active and details.lastTimeSynced > lastImportedTokenSync) {
               // Check if this is a price change
               let currentPrice = {
@@ -526,11 +542,11 @@ shared (deployer) actor class PriceArchive() = this {
                     
                     let priceBlock : PriceBlockData = {
                       token = tokenPrincipal;
-                      oldPrice = ?{icpPrice = lastPrice.icpPrice; usdPrice = lastPrice.usdPrice};
-                      newPrice = {icpPrice = currentPrice.icpPrice; usdPrice = currentPrice.usdPrice};
-                      timestamp = currentPrice.timestamp;
-                      source = #Treasury; // Indicates this came from treasury sync
-                      changePercent = ?changePercent;
+                      priceICP = currentPrice.icpPrice;
+                      priceUSD = currentPrice.usdPrice;
+                      source = #NTN;
+                      volume24h = null;
+                      change24h = ?changePercent;
                     };
                     
                     let archiveResult = await archivePriceBlock(priceBlock);
@@ -561,11 +577,11 @@ shared (deployer) actor class PriceArchive() = this {
                   
                   let priceBlock : PriceBlockData = {
                     token = tokenPrincipal;
-                    oldPrice = null;
-                    newPrice = {icpPrice = currentPrice.icpPrice; usdPrice = currentPrice.usdPrice};
-                    timestamp = currentPrice.timestamp;
-                    source = #Treasury;
-                    changePercent = null;
+                    priceICP = currentPrice.icpPrice;
+                    priceUSD = currentPrice.usdPrice;
+                    source = #NTN;
+                    volume24h = null;
+                    change24h = null;
                   };
                   
                   let archiveResult = await archivePriceBlock(priceBlock);
@@ -598,20 +614,6 @@ shared (deployer) actor class PriceArchive() = this {
           };
           
           { imported = imported; failed = failed };
-        };
-        case (#err(error)) {
-          let errorMsg = switch (error) {
-            case (#NotAuthorized) { "Not authorized to access token details" };
-            case (#SystemError(msg)) { "System error: " # msg };
-          };
-          logger.error(
-            "BATCH_IMPORT",
-            "Failed to get token details: " # errorMsg,
-            "importPriceChangesBatch"
-          );
-          { imported = 0; failed = 1 };
-        };
-      };
     } catch (e) {
       logger.error(
         "BATCH_IMPORT",

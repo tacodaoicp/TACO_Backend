@@ -325,6 +325,47 @@ module {
     #Map(entriesWithPhash);
   };
 
+  // Convert price data to ICRC3 Value format
+  public func priceToValue(price: PriceBlockData, timestamp: Int, phash: ?Blob) : Value {
+    let sourceText = switch (price.source) {
+      case (#Exchange(exch)) { 
+        switch (exch) {
+          case (#KongSwap) { "KongSwap" };
+          case (#ICPSwap) { "ICPSwap" };
+        };
+      };
+      case (#NTN) { "NTN" };
+      case (#Aggregated) { "Aggregated" };
+      case (#Oracle) { "Oracle" };
+    };
+
+    let entries = [
+      makeMapEntry("btype", #Text("3price")),
+      makeMapEntry("ts", intToValue(timestamp)),
+      makeMapEntry("token", principalToValue(price.token)),
+      makeMapEntry("price_icp", natToValue(price.priceICP)),
+      makeMapEntry("price_usd", floatToValue(price.priceUSD)),
+      makeMapEntry("source", textToValue(sourceText)),
+    ];
+    
+    let entriesWithVolume = switch (price.volume24h) {
+      case (?vol) { Array.append(entries, [makeMapEntry("volume_24h", natToValue(vol))]) };
+      case (null) { entries };
+    };
+    
+    let entriesWithChange = switch (price.change24h) {
+      case (?change) { Array.append(entriesWithVolume, [makeMapEntry("change_24h", floatToValue(change))]) };
+      case (null) { entriesWithVolume };
+    };
+    
+    let entriesWithPhash = switch (phash) {
+      case (?hash) { Array.append([makeMapEntry("phash", #Blob(hash))], entriesWithChange) };
+      case (null) { entriesWithChange };
+    };
+
+    #Map(entriesWithPhash);
+  };
+
   // Interface for ICRC3-compliant archive
   public type ICRC3ArchiveInterface = actor {
     // Standard ICRC3 endpoints
