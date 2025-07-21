@@ -18,7 +18,7 @@ module {
       false;
     };
 
-    public func isAuthorized(caller : Principal, function : ArchiveTypes.AdminFunction) : Bool {
+    public func isAuthorized(caller : Principal, _function : ArchiveTypes.AdminFunction) : Bool {
       if (isMasterAdmin(caller) or Principal.isController(caller)) {
         return true;
       };

@@ -29,7 +29,6 @@ module {
   ) {
     
     private var batchImportTimerId : Nat = 0;
-    private let BATCH_SIZE = config.batchSize;
     private let IMPORT_INTERVAL_NS = config.intervalNS;
     private let MAX_CATCH_UP_BATCHES = config.maxCatchUpBatches;
 

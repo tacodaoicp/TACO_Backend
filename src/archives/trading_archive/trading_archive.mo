@@ -28,6 +28,7 @@ import Logger "../../helper/logger";
 import CanisterIds "../../helper/CanisterIds";
 import BatchImportTimer "../../helper/batch_import_timer";
 import ArchiveAuthorization "../../helper/archive_authorization";
+import ArchiveICRC3 "../../helper/archive_icrc3";
 
 shared (deployer) actor class TradingArchive() = this {
 
@@ -145,6 +146,14 @@ shared (deployer) actor class TradingArchive() = this {
     isMasterAdmin
   );
 
+  // ICRC-3 functionality using abstraction
+  private let icrc3 = ArchiveICRC3.ArchiveICRC3(
+    func() : BTree.BTree<Nat, ArchiveTypes.Block> { blocks },
+    func() : Nat { nextBlockIndex },
+    this_canister_id,
+    supportedBlockTypes
+  );
+
   private func addToIndex<K>(index : Map.Map<K, [Nat]>, key : K, blockIndex : Nat, hash : Map.HashUtils<K>) {
     let existing = switch (Map.get(index, hash, key)) {
       case (?ids) { ids };
@@ -209,55 +218,21 @@ shared (deployer) actor class TradingArchive() = this {
 
   // ICRC-3 Standard Endpoints
 
+  // ICRC-3 Standard endpoints (using abstraction)
   public query func icrc3_get_archives(args : ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
-    // For now, this archive is the only one
-    // In the future, this could return multiple archive canisters
-    [{
-      canister_id = this_canister_id();
-      start = 0;
-      end = nextBlockIndex;
-    }];
+    icrc3.icrc3_get_archives(args);
   };
 
   public query func icrc3_get_tip_certificate() : async ?ICRC3.DataCertificate {
-    // This would need to implement proper certification
-    // For now, return None - certification would be implemented with IC certification
-    null;
+    icrc3.icrc3_get_tip_certificate();
   };
 
   public query func icrc3_get_blocks(args : ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
-    let results = Vector.new<Block>();
-    let archivedBlocks = Vector.new<ICRC3.ArchivedBlock>();
-
-    for (arg in args.vals()) {
-      let startIndex = arg.start;
-      let length = arg.length;
-      let endIndex = Nat.min(startIndex + length, nextBlockIndex);
-
-      for (i in Iter.range(startIndex, endIndex - 1)) {
-        switch (BTree.get(blocks, Nat.compare, i)) {
-          case (?block) {
-            Vector.add(results, block);
-          };
-          case null {
-            // Block not found in this archive
-          };
-        };
-      };
-    };
-
-    {
-      blocks = Vector.toArray(results);
-      log_length = nextBlockIndex;
-      archived_blocks = Vector.toArray(archivedBlocks);
-    };
+    icrc3.icrc3_get_blocks(args);
   };
 
   public query func icrc3_supported_block_types() : async [ICRC3.BlockType] {
-    Array.map<Text, ICRC3.BlockType>(supportedBlockTypes, func(btype) = {
-      block_type = btype;
-      url = "https://github.com/TACO-DAO/standards/blob/main/ICRC-3/" # btype # ".md";
-    });
+    icrc3.icrc3_supported_block_types();
   };
 
   // Custom Archiving Functions

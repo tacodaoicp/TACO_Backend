@@ -27,6 +27,7 @@ import Logger "../../helper/logger";
 import CanisterIds "../../helper/CanisterIds";
 import BatchImportTimer "../../helper/batch_import_timer";
 import ArchiveAuthorization "../../helper/archive_authorization";
+import ArchiveICRC3 "../../helper/archive_icrc3";
 
 shared (deployer) actor class PortfolioArchive() = this {
 
@@ -139,6 +140,14 @@ shared (deployer) actor class PortfolioArchive() = this {
   private func runBatchImport() : async () {
     ignore await importPortfolioSnapshotsBatch();
   };
+
+  // ICRC-3 functionality using abstraction
+  private let icrc3 = ArchiveICRC3.ArchiveICRC3(
+    func() : BTree.BTree<Nat, ArchiveTypes.Block> { blocks },
+    func() : Nat { nextBlockIndex },
+    this_canister_id,
+    ["3portfolio", "3allocation"]
+  );
 
   // Helper function to add entry to index
   private func addToIndex<K>(index : Map.Map<K, [Nat]>, key : K, blockIndex : Nat, hashUtils : Map.HashUtils<K>) {
@@ -264,52 +273,21 @@ shared (deployer) actor class PortfolioArchive() = this {
     #ok(blockIndex);
   };
 
-  // ICRC-3 Standard endpoints
+  // ICRC-3 Standard endpoints (using abstraction)
   public query func icrc3_get_blocks(args : ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
-    let results = Vector.new<Block>();
-    let archivedBlocks = Vector.new<ICRC3.ArchivedBlock>();
-
-    for (arg in args.vals()) {
-      let startIndex = arg.start;
-      let length = arg.length;
-      let endIndex = Nat.min(startIndex + length, nextBlockIndex);
-
-      for (i in Iter.range(startIndex, endIndex - 1)) {
-        switch (BTree.get(blocks, Nat.compare, i)) {
-          case (?block) {
-            Vector.add(results, block);
-          };
-          case null {
-            // Block not found in this archive
-          };
-        };
-      };
-    };
-
-    {
-      blocks = Vector.toArray(results);
-      log_length = nextBlockIndex;
-      archived_blocks = Vector.toArray(archivedBlocks);
-    };
+    icrc3.icrc3_get_blocks(args);
   };
 
   public query func icrc3_supported_block_types() : async [ICRC3.BlockType] {
-    [
-      { block_type = "3portfolio"; url = "https://github.com/dfinity/ICRC/tree/main/ICRCs/ICRC-3#portfolio" },
-      { block_type = "3allocation"; url = "https://github.com/dfinity/ICRC/tree/main/ICRCs/ICRC-3#allocation" }
-    ];
+    icrc3.icrc3_supported_block_types();
   };
 
   public query func icrc3_get_archives(args : ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
-    [{
-      canister_id = this_canister_id();
-      start = 0;
-      end = nextBlockIndex;
-    }];
+    icrc3.icrc3_get_archives(args);
   };
 
   public query func icrc3_get_tip_certificate() : async ?ICRC3.DataCertificate {
-    null;
+    icrc3.icrc3_get_tip_certificate();
   };
 
   // Batch import from treasury
