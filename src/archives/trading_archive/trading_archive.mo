@@ -138,6 +138,11 @@ shared (deployer) actor class TradingArchive() = this {
       return true;
     };
     
+    // CRITICAL: Allow self-authorization for batch imports/timers
+    if (caller == this_canister_id()) {
+      return true;
+    };
+    
     false;
   };
 

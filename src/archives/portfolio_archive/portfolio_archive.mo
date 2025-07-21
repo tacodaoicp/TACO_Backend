@@ -115,29 +115,36 @@ shared (deployer) actor class PortfolioArchive() = this {
   private let IMPORT_INTERVAL_NS = 30 * 60 * 1000000000; // 30 minutes
   private let MAX_CATCH_UP_BATCHES = 10;
 
-  // Authorization check
-  private func isAdmin(caller : Principal) : Bool {
-    switch (Array.find(masterAdmins, func(admin : Principal) : Bool { Principal.equal(admin, caller) })) {
-      case (?_) { true };
-      case null { false };
+  // Authorization helpers
+  private func isMasterAdmin(caller : Principal) : Bool {
+    for (admin in masterAdmins.vals()) {
+      if (admin == caller) {
+        return true;
+      };
     };
+    false;
   };
 
-  private func isAuthorized(caller : Principal, action : ArchiveTypes.AdminFunction) : Bool {
-    switch (action) {
-      case (#ArchiveData) { 
-        // Treasury, DAO backend, and this archive itself can archive data
-        Principal.equal(caller, TREASURY_ID) or Principal.equal(caller, DAO_BACKEND_ID) or Principal.equal(caller, this_canister_id()) or isAdmin(caller)
-      };
-      case (#QueryData) { true }; // Anyone can query
-      case (#DeleteData or #UpdateConfig or #GetLogs or #GetMetrics) { 
-        isAdmin(caller)
-      };
+  private func isAuthorized(caller : Principal, function : ArchiveTypes.AdminFunction) : Bool {
+    if (isMasterAdmin(caller) or Principal.isController(caller)) {
+      return true;
     };
+    
+    // Check if caller is Treasury or DAO
+    if (caller == TREASURY_ID or caller == DAO_BACKEND_ID) {
+      return true;
+    };
+    
+    // Allow self-authorization for batch imports
+    if (caller == this_canister_id()) {
+      return true;
+    };
+    
+    false;
   };
 
   private func isQueryAuthorized(caller : Principal) : Bool {
-    if (isAdmin(caller) or Principal.isController(caller)) {
+    if (isMasterAdmin(caller) or Principal.isController(caller)) {
       return true;
     };
     
