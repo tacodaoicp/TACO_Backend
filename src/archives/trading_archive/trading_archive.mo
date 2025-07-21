@@ -43,7 +43,6 @@ shared (deployer) actor class TradingArchive() = this {
   type Block = ArchiveTypes.Block;
   type TradeBlockData = ArchiveTypes.TradeBlockData;
   type CircuitBreakerBlockData = ArchiveTypes.CircuitBreakerBlockData;
-  type PriceBlockData = ArchiveTypes.PriceBlockData;
   type TradingPauseBlockData = ArchiveTypes.TradingPauseBlockData;
   type BlockFilter = ArchiveTypes.BlockFilter;
   type TradingMetrics = ArchiveTypes.TradingMetrics;
@@ -102,7 +101,7 @@ shared (deployer) actor class TradingArchive() = this {
   stable var tipHash : ?Blob = null;
 
   // Block type tracking - focused on trading-related types
-  stable var supportedBlockTypes = ["3trade", "3circuit", "3price", "3pause"];
+  stable var supportedBlockTypes = ["3trade", "3circuit", "3pause"];
 
   // Indexes for efficient querying
   stable var blockTypeIndex = Map.new<Text, [Nat]>(); // Block type -> block indices
@@ -358,64 +357,6 @@ shared (deployer) actor class TradingArchive() = this {
     #ok(blockIndex);
   };
 
-  public shared ({ caller }) func archivePriceBlock(price : PriceBlockData) : async Result.Result<Nat, ArchiveError> {
-    if (not isAuthorized(caller, #ArchiveData)) {
-      logger.warn("Archive", "Unauthorized price archive attempt by: " # Principal.toText(caller), "archivePriceBlock");
-      return #err(#NotAuthorized);
-    };
-
-    let timestamp = Time.now();
-    
-    let sourceText = switch (price.source) {
-      case (#Exchange(ex)) { 
-        switch (ex) {
-          case (#KongSwap) { "KongSwap" };
-          case (#ICPSwap) { "ICPSwap" };
-        };
-      };
-      case (#NTN) { "NTN" };
-      case (#Aggregated) { "Aggregated" };
-      case (#Oracle) { "Oracle" };
-    };
-
-    let entries = [
-      ("btype", #Text("3price")),
-      ("ts", #Int(timestamp)),
-      ("token", ArchiveTypes.principalToValue(price.token)),
-      ("price_icp", #Nat(price.priceICP)),
-      ("price_usd", #Text(Float.toText(price.priceUSD))),
-      ("source", #Text(sourceText)),
-    ];
-
-    let entriesWithVolume = switch (price.volume24h) {
-      case (?vol) { Array.append(entries, [("volume_24h", #Nat(vol))]) };
-      case null { entries };
-    };
-
-    let entriesWithChange = switch (price.change24h) {
-      case (?change) { Array.append(entriesWithVolume, [("change_24h", #Text(Float.toText(change)))]) };
-      case null { entriesWithVolume };
-    };
-
-    let blockValue = #Map(entriesWithChange);
-    let blockIndex = nextBlockIndex;
-    let block = createBlock(blockValue, blockIndex);
-    
-    // Store block
-    ignore BTree.insert(blocks, Nat.compare, blockIndex, block);
-    
-    // Update indexes
-    addToIndex(blockTypeIndex, "3price", blockIndex, thash);
-    addToIndex(tokenIndex, price.token, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
-
-    nextBlockIndex += 1;
-
-    logger.info("Archive", "Archived price block at index: " # Nat.toText(blockIndex) # 
-      " for token: " # Principal.toText(price.token), "archivePriceBlock");
-
-    #ok(blockIndex);
-  };
 
   public shared ({ caller }) func archiveTradingPauseBlock(pause : TradingPauseBlockData) : async Result.Result<Nat, ArchiveError> {
     if (not isAuthorized(caller, #ArchiveData)) {
