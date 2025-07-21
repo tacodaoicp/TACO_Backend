@@ -26,6 +26,7 @@ import SpamProtection "../../helper/spam_protection";
 import Logger "../../helper/logger";
 import CanisterIds "../../helper/CanisterIds";
 import BatchImportTimer "../../helper/batch_import_timer";
+import ArchiveAuthorization "../../helper/archive_authorization";
 
 shared (deployer) actor class PortfolioArchive() = this {
 
@@ -110,46 +111,25 @@ shared (deployer) actor class PortfolioArchive() = this {
   stable var lastPortfolioImportTime : Int = 0;
   stable var lastAllocationImportTime : Int = 0;
 
-  // Authorization helpers
+  // Initialize authorization helper
+  private let auth = ArchiveAuthorization.ArchiveAuthorization(
+    masterAdmins,
+    TREASURY_ID,
+    DAO_BACKEND_ID,
+    this_canister_id
+  );
+
+  // Authorization helper functions using abstraction
   private func isMasterAdmin(caller : Principal) : Bool {
-    for (admin in masterAdmins.vals()) {
-      if (admin == caller) {
-        return true;
-      };
-    };
-    false;
+    auth.isMasterAdmin(caller);
   };
 
   private func isAuthorized(caller : Principal, function : ArchiveTypes.AdminFunction) : Bool {
-    if (isMasterAdmin(caller) or Principal.isController(caller)) {
-      return true;
-    };
-    
-    // Check if caller is Treasury or DAO
-    if (caller == TREASURY_ID or caller == DAO_BACKEND_ID) {
-      return true;
-    };
-    
-    // Allow self-authorization for batch imports
-    if (caller == this_canister_id()) {
-      return true;
-    };
-    
-    false;
+    auth.isAuthorized(caller, function);
   };
 
   private func isQueryAuthorized(caller : Principal) : Bool {
-    if (isMasterAdmin(caller) or Principal.isController(caller)) {
-      return true;
-    };
-    
-    // Allow treasury and DAO to query
-    if (caller == TREASURY_ID or caller == DAO_BACKEND_ID) {
-      return true;
-    };
-    
-    // Allow public read access to portfolio data
-    true;
+    auth.isQueryAuthorized(caller);
   };
 
   // Initialize batch import timer with default configuration (after isMasterAdmin is defined)
