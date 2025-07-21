@@ -25,6 +25,7 @@ import DAO_types "../../DAO_backend/dao_types";
 import SpamProtection "../../helper/spam_protection";
 import Logger "../../helper/logger";
 import CanisterIds "../../helper/CanisterIds";
+import BatchImportTimer "../../helper/batch_import_timer";
 
 shared (deployer) actor class PortfolioArchive() = this {
 
@@ -108,12 +109,6 @@ shared (deployer) actor class PortfolioArchive() = this {
   // Batch import state
   stable var lastPortfolioImportTime : Int = 0;
   stable var lastAllocationImportTime : Int = 0;
-  stable var importTimerId : ?Nat = null;
-
-  // Batch import configuration
-  private let BATCH_SIZE = 50;
-  private let IMPORT_INTERVAL_NS = 30 * 60 * 1000000000; // 30 minutes
-  private let MAX_CATCH_UP_BATCHES = 10;
 
   // Authorization helpers
   private func isMasterAdmin(caller : Principal) : Bool {
@@ -157,6 +152,14 @@ shared (deployer) actor class PortfolioArchive() = this {
     true;
   };
 
+  // Initialize batch import timer with default configuration (after isMasterAdmin is defined)
+  private let batchTimer = BatchImportTimer.BatchImportTimer(logger, BatchImportTimer.DEFAULT_CONFIG, isMasterAdmin);
+
+  // Wrapper function for batch import that matches BatchImportTimer interface
+  private func runBatchImport() : async () {
+    ignore await importPortfolioSnapshotsBatch();
+  };
+
   // Helper function to add entry to index
   private func addToIndex<K>(index : Map.Map<K, [Nat]>, key : K, blockIndex : Nat, hashUtils : Map.HashUtils<K>) {
     let currentIndices = switch (Map.get(index, hashUtils, key)) {
@@ -167,13 +170,8 @@ shared (deployer) actor class PortfolioArchive() = this {
     Map.set(index, hashUtils, key, newIndices);
   };
 
-  // Create ICRC-3 block with proper parent hash calculation
+  // Create ICRC-3 block
   private func createBlock(value : Value, blockIndex : Nat) : Block {
-    let parentHash = if (blockIndex == 0) {
-      null
-    } else {
-      tipHash
-    };
 
     let blockText = debug_show(value);
     let blockHash = Text.hash(blockText);
@@ -192,7 +190,6 @@ shared (deployer) actor class PortfolioArchive() = this {
     {
       id = blockIndex;
       block = value;
-      parent_hash = parentHash;
     };
   };
 
@@ -342,7 +339,7 @@ shared (deployer) actor class PortfolioArchive() = this {
         getPortfolioHistory : shared (Nat) -> async Result.Result<TreasuryTypes.PortfolioHistoryResponse, TreasuryTypes.PortfolioSnapshotError>;
       };
       
-      let result = await treasury.getPortfolioHistory(BATCH_SIZE);
+      let result = await treasury.getPortfolioHistory(50); // Use default batch size
       
               switch (result) {
           case (#ok(response)) {
@@ -411,61 +408,65 @@ shared (deployer) actor class PortfolioArchive() = this {
     };
   };
 
-  // Timer for batch imports
-  private func scheduleNextImport() : async () {
-    let timerId = Timer.setTimer<system>(
-      #nanoseconds(IMPORT_INTERVAL_NS),
-      func() : async () {
-        ignore await importPortfolioSnapshotsBatch();
-        await scheduleNextImport();
-      }
-    );
-    importTimerId := ?timerId;
-  };
+  // Timer functionality now handled by BatchImportTimer class
 
   // Admin functions
-  public shared ({ caller }) func startBatchImport() : async Result.Result<Text, ArchiveError> {
-    if (not isAuthorized(caller, #UpdateConfig)) {
-      return #err(#NotAuthorized);
-    };
-
-    switch (importTimerId) {
-      case (?_) {
-        #err(#SystemError("Batch import already running"));
-      };
-      case null {
-        await scheduleNextImport();
-        logger.info("ADMIN", "Batch import started by: " # Principal.toText(caller), "startBatchImport");
-        #ok("Batch import started");
-      };
+  public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, ArchiveError> {
+    let result = await batchTimer.adminStart<system>(caller, runBatchImport);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
     };
   };
 
-  public shared ({ caller }) func stopBatchImport() : async Result.Result<Text, ArchiveError> {
-    if (not isAuthorized(caller, #UpdateConfig)) {
-      return #err(#NotAuthorized);
-    };
-
-    switch (importTimerId) {
-      case (?timerId) {
-        Timer.cancelTimer(timerId);
-        importTimerId := null;
-        logger.info("ADMIN", "Batch import stopped by: " # Principal.toText(caller), "stopBatchImport");
-        #ok("Batch import stopped");
-      };
-      case null {
-        #err(#SystemError("Batch import not running"));
-      };
+  public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, ArchiveError> {
+    let result = batchTimer.adminStop(caller);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
     };
   };
 
-  public shared ({ caller }) func manualImport() : async Result.Result<Text, ArchiveError> {
-    if (not isAuthorized(caller, #UpdateConfig)) {
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, ArchiveError> {
+    let result = await batchTimer.adminManualImport(caller, runBatchImport);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
+    };
+  };
+
+  /**
+   * Run catch-up import (admin function)
+   */
+  public shared ({ caller }) func catchUpImport() : async Result.Result<Text, ArchiveError> {
+    let result = await batchTimer.runCatchUpImport(caller, importPortfolioSnapshotsBatch);
+    switch (result) {
+      case (#ok(message)) { #ok(message) };
+      case (#err(message)) { #err(#NotAuthorized) };
+    };
+  };
+
+  /**
+   * Get batch import status
+   */
+  public shared ({ caller }) func getBatchImportStatus() : async Result.Result<{
+    isRunning: Bool;
+    intervalSeconds: Nat;
+    lastPortfolioImportTime: Int;
+    lastAllocationImportTime: Int;
+    totalBlocks: Nat;
+  }, ArchiveError> {
+    if (not isAuthorized(caller, #QueryData)) {
       return #err(#NotAuthorized);
     };
-
-    let result = await importPortfolioSnapshotsBatch();
-    #ok("Manual import completed. Imported: " # Nat.toText(result.imported) # ", Failed: " # Nat.toText(result.failed));
+    
+    #ok({
+      isRunning = batchTimer.isRunning();
+      intervalSeconds = batchTimer.getIntervalSeconds();
+      lastPortfolioImportTime = lastPortfolioImportTime;
+      lastAllocationImportTime = lastAllocationImportTime;
+      totalBlocks = nextBlockIndex;
+    });
   };
 
   public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveStatus, ArchiveError> {
@@ -483,24 +484,13 @@ shared (deployer) actor class PortfolioArchive() = this {
     });
   };
 
-  // Initialize batch import on deployment
+  // System upgrade handling
   system func preupgrade() {
-    // Cancel timer before upgrade
-    switch (importTimerId) {
-      case (?timerId) {
-        Timer.cancelTimer(timerId);
-      };
-      case null {};
-    };
+    batchTimer.preupgrade();
   };
 
   system func postupgrade() {
-    // Restart timer after upgrade
-    ignore Timer.setTimer<system>(
-      #nanoseconds(1000000000), // 1 second delay
-      func() : async () {
-        await scheduleNextImport();
-      }
-    );
+    batchTimer.postupgrade<system>(runBatchImport);
   };
 }
+
