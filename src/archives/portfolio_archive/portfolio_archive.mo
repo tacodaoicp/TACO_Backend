@@ -19,7 +19,7 @@ import Blob "mo:base/Blob";
 import Option "mo:base/Option";
 
 import ICRC3 "mo:icrc3-mo/service";
-import TradingArchiveTypes "../archive_types";
+import ArchiveTypes "../archive_types";
 import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
 import SpamProtection "../../helper/spam_protection";
@@ -37,16 +37,16 @@ shared (deployer) actor class PortfolioArchive() = this {
   type TokenDetails = TreasuryTypes.TokenDetails;
 
   // Type aliases for convenience
-  type Value = TradingArchiveTypes.Value;
-  type Block = TradingArchiveTypes.Block;
-  type PortfolioBlockData = TradingArchiveTypes.PortfolioBlockData;
-  type AllocationBlockData = TradingArchiveTypes.AllocationBlockData;
-  type BlockFilter = TradingArchiveTypes.BlockFilter;
-  type PortfolioMetrics = TradingArchiveTypes.PortfolioMetrics;
-  type ArchiveError = TradingArchiveTypes.ArchiveError;
-  type ArchiveConfig = TradingArchiveTypes.ArchiveConfig;
-  type ArchiveStatus = TradingArchiveTypes.ArchiveStatus;
-  type ArchiveQueryResult = TradingArchiveTypes.ArchiveQueryResult;
+  type Value = ArchiveTypes.Value;
+  type Block = ArchiveTypes.Block;
+  type PortfolioBlockData = ArchiveTypes.PortfolioBlockData;
+  type AllocationBlockData = ArchiveTypes.AllocationBlockData;
+  type BlockFilter = ArchiveTypes.BlockFilter;
+  type PortfolioMetrics = ArchiveTypes.PortfolioMetrics;
+  type ArchiveError = ArchiveTypes.ArchiveError;
+  type ArchiveConfig = ArchiveTypes.ArchiveConfig;
+  type ArchiveStatus = ArchiveTypes.ArchiveStatus;
+  type ArchiveQueryResult = ArchiveTypes.ArchiveQueryResult;
 
   // Logger
   let logger = Logger.Logger();
@@ -123,7 +123,7 @@ shared (deployer) actor class PortfolioArchive() = this {
     };
   };
 
-  private func isAuthorized(caller : Principal, action : TradingArchiveTypes.AdminFunction) : Bool {
+  private func isAuthorized(caller : Principal, action : ArchiveTypes.AdminFunction) : Bool {
     switch (action) {
       case (#ArchiveData) { 
         // Treasury, DAO backend, and this archive itself can archive data
@@ -182,7 +182,7 @@ shared (deployer) actor class PortfolioArchive() = this {
       return #err(#NotAuthorized);
     };
 
-    let blockValue = TradingArchiveTypes.portfolioToValue(portfolio, null);
+    let blockValue = ArchiveTypes.portfolioToValue(portfolio, null);
     let blockIndex = nextBlockIndex;
     let block = createBlock(blockValue, blockIndex);
     
@@ -224,14 +224,14 @@ shared (deployer) actor class PortfolioArchive() = this {
 
     let oldAllocationArray = #Array(Array.map(allocation.oldAllocation, func(alloc : DAO_types.Allocation) : Value = 
       #Map([
-        ("token", TradingArchiveTypes.principalToValue(alloc.token)),
+        ("token", ArchiveTypes.principalToValue(alloc.token)),
         ("basis_points", #Nat(alloc.basisPoints))
       ])
     ));
 
     let newAllocationArray = #Array(Array.map(allocation.newAllocation, func(alloc : DAO_types.Allocation) : Value = 
       #Map([
-        ("token", TradingArchiveTypes.principalToValue(alloc.token)),
+        ("token", ArchiveTypes.principalToValue(alloc.token)),
         ("basis_points", #Nat(alloc.basisPoints))
       ])
     ));
@@ -239,7 +239,7 @@ shared (deployer) actor class PortfolioArchive() = this {
     let entries = [
       ("btype", #Text("3allocation")),
       ("ts", #Int(timestamp)),
-      ("user", TradingArchiveTypes.principalToValue(allocation.user)),
+      ("user", ArchiveTypes.principalToValue(allocation.user)),
       ("old_allocation", oldAllocationArray),
       ("new_allocation", newAllocationArray),
       ("voting_power", #Nat(allocation.votingPower)),

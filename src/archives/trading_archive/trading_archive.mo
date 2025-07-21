@@ -20,7 +20,7 @@ import Option "mo:base/Option";
 import Hash "mo:base/Hash";
 
 import ICRC3 "mo:icrc3-mo/service";
-import TradingArchiveTypes "../archive_types";
+import ArchiveTypes "../archive_types";
 import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
 import SpamProtection "../../helper/spam_protection";
@@ -39,19 +39,19 @@ shared (deployer) actor class TradingArchive() = this {
   type TradeRecord = TreasuryTypes.TradeRecord;
 
   // Type aliases for convenience
-  type Value = TradingArchiveTypes.Value;
-  type Block = TradingArchiveTypes.Block;
-  type TradeBlockData = TradingArchiveTypes.TradeBlockData;
-  type CircuitBreakerBlockData = TradingArchiveTypes.CircuitBreakerBlockData;
-  type PriceBlockData = TradingArchiveTypes.PriceBlockData;
-  type TradingPauseBlockData = TradingArchiveTypes.TradingPauseBlockData;
-  type BlockFilter = TradingArchiveTypes.BlockFilter;
-  type TradingMetrics = TradingArchiveTypes.TradingMetrics;
-  type ArchiveError = TradingArchiveTypes.ArchiveError;
-  type ArchiveConfig = TradingArchiveTypes.ArchiveConfig;
-  type ArchiveStatus = TradingArchiveTypes.ArchiveStatus;
-  type TacoBlockType = TradingArchiveTypes.TacoBlockType;
-  type ArchiveQueryResult = TradingArchiveTypes.ArchiveQueryResult;
+  type Value = ArchiveTypes.Value;
+  type Block = ArchiveTypes.Block;
+  type TradeBlockData = ArchiveTypes.TradeBlockData;
+  type CircuitBreakerBlockData = ArchiveTypes.CircuitBreakerBlockData;
+  type PriceBlockData = ArchiveTypes.PriceBlockData;
+  type TradingPauseBlockData = ArchiveTypes.TradingPauseBlockData;
+  type BlockFilter = ArchiveTypes.BlockFilter;
+  type TradingMetrics = ArchiveTypes.TradingMetrics;
+  type ArchiveError = ArchiveTypes.ArchiveError;
+  type ArchiveConfig = ArchiveTypes.ArchiveConfig;
+  type ArchiveStatus = ArchiveTypes.ArchiveStatus;
+  type TacoBlockType = ArchiveTypes.TacoBlockType;
+  type ArchiveQueryResult = ArchiveTypes.ArchiveQueryResult;
 
   // Logger
   let logger = Logger.Logger();
@@ -129,7 +129,7 @@ shared (deployer) actor class TradingArchive() = this {
     false;
   };
 
-  private func isAuthorized(caller : Principal, function : TradingArchiveTypes.AdminFunction) : Bool {
+  private func isAuthorized(caller : Principal, function : ArchiveTypes.AdminFunction) : Bool {
     if (isMasterAdmin(caller) or Principal.isController(caller)) {
       return true;
     };
@@ -280,7 +280,7 @@ shared (deployer) actor class TradingArchive() = this {
     };
 
     let timestamp = Time.now();
-    let blockValue = TradingArchiveTypes.tradeToValue(trade, timestamp, null);
+    let blockValue = ArchiveTypes.tradeToValue(trade, timestamp, null);
     let blockIndex = nextBlockIndex;
     let block = createBlock(blockValue, blockIndex);
     
@@ -328,11 +328,11 @@ shared (deployer) actor class TradingArchive() = this {
       ("actual_value", #Text(Float.toText(circuitBreaker.actualValue))),
       ("system_response", #Text(circuitBreaker.systemResponse)),
       ("severity", #Text(circuitBreaker.severity)),
-      ("tokens_affected", #Array(Array.map(circuitBreaker.tokensAffected, TradingArchiveTypes.principalToValue))),
+      ("tokens_affected", #Array(Array.map(circuitBreaker.tokensAffected, ArchiveTypes.principalToValue))),
     ];
 
     let entriesWithTrigger = switch (circuitBreaker.triggerToken) {
-      case (?token) { Array.append(entries, [("trigger_token", TradingArchiveTypes.principalToValue(token))]) };
+      case (?token) { Array.append(entries, [("trigger_token", ArchiveTypes.principalToValue(token))]) };
       case null { entries };
     };
 
@@ -381,7 +381,7 @@ shared (deployer) actor class TradingArchive() = this {
     let entries = [
       ("btype", #Text("3price")),
       ("ts", #Int(timestamp)),
-      ("token", TradingArchiveTypes.principalToValue(price.token)),
+      ("token", ArchiveTypes.principalToValue(price.token)),
       ("price_icp", #Nat(price.priceICP)),
       ("price_usd", #Text(Float.toText(price.priceUSD))),
       ("source", #Text(sourceText)),
@@ -436,7 +436,7 @@ shared (deployer) actor class TradingArchive() = this {
     let entries = [
       ("btype", #Text("3pause")),
       ("ts", #Int(timestamp)),
-      ("token", TradingArchiveTypes.principalToValue(pause.token)),
+      ("token", ArchiveTypes.principalToValue(pause.token)),
       ("token_symbol", #Text(pause.tokenSymbol)),
       ("reason", #Text(reasonText)),
     ];
@@ -495,7 +495,7 @@ shared (deployer) actor class TradingArchive() = this {
       switch (filter.blockTypes) {
         case (?types) {
           for (btype in types.vals()) {
-            let btypeStr = TradingArchiveTypes.blockTypeToString(btype);
+            let btypeStr = ArchiveTypes.blockTypeToString(btype);
             switch (Map.get(blockTypeIndex, thash, btypeStr)) {
               case (?indices) {
                 for (idx in indices.vals()) {
