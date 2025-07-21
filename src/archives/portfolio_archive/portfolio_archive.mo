@@ -136,6 +136,20 @@ shared (deployer) actor class PortfolioArchive() = this {
     };
   };
 
+  private func isQueryAuthorized(caller : Principal) : Bool {
+    if (isAdmin(caller) or Principal.isController(caller)) {
+      return true;
+    };
+    
+    // Allow treasury and DAO to query
+    if (caller == TREASURY_ID or caller == DAO_BACKEND_ID) {
+      return true;
+    };
+    
+    // Allow public read access to portfolio data
+    true;
+  };
+
   // Helper function to add entry to index
   private func addToIndex<K>(index : Map.Map<K, [Nat]>, key : K, blockIndex : Nat, hashUtils : Map.HashUtils<K>) {
     let currentIndices = switch (Map.get(index, hashUtils, key)) {
@@ -447,7 +461,11 @@ shared (deployer) actor class PortfolioArchive() = this {
     #ok("Manual import completed. Imported: " # Nat.toText(result.imported) # ", Failed: " # Nat.toText(result.failed));
   };
 
-  public query func getArchiveStatus() : async Result.Result<ArchiveStatus, ArchiveError> {
+  public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveStatus, ArchiveError> {
+    if (not isQueryAuthorized(caller)) {
+      return #err(#NotAuthorized);
+    };
+
     #ok({
       totalBlocks = nextBlockIndex;
       oldestBlock = if (nextBlockIndex > 0) { ?0 } else { null };
