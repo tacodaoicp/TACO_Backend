@@ -221,45 +221,55 @@ module {
         return #err(#NotAuthorized);
       };
 
-      let resultBlocks = Vector.new<Block>();
-      let blockIndices = Vector.new<Nat>();
-
-      // Simple implementation - filter by block type first
-      switch (filter.blockTypes) {
-        case (?types) {
-          for (btype in types.vals()) {
-            let typeStr = ArchiveTypes.blockTypeToString(btype);
-            switch (Map.get(blockTypeIndex, thash, typeStr)) {
-              case (?indices) {
-                for (index in indices.vals()) {
-                  Vector.add(blockIndices, index);
-                };
-              };
-              case null {};
+      let candidateBlocks = Vector.new<Block>();
+      
+      // If no specific filters, get all blocks
+      if (filter.blockTypes == null and filter.tokens == null and filter.traders == null) {
+        // Get all blocks by iterating through stored indices
+        if (nextBlockIndex > 0) {
+          for (i in Iter.range(0, nextBlockIndex - 1)) {
+            switch (BTree.get(blocks, Nat.compare, i)) {
+              case (?block) { Vector.add(candidateBlocks, block) };
+              case null {}; // Skip missing blocks
             };
           };
         };
-        case null {
-          // Return all blocks (up to a reasonable limit)
-          for (i in Iter.range(0, Nat.min(nextBlockIndex, 1000) - 1)) {
-            Vector.add(blockIndices, i);
+      } else {
+        // Use indexes to find relevant blocks
+        let blockIndices = Vector.new<Nat>();
+        
+        // Filter by block type
+        switch (filter.blockTypes) {
+          case (?types) {
+            for (btype in types.vals()) {
+              let btypeStr = ArchiveTypes.blockTypeToString(btype);
+              switch (Map.get(blockTypeIndex, thash, btypeStr)) {
+                case (?indices) {
+                  for (idx in indices.vals()) {
+                    Vector.add(blockIndices, idx);
+                  };
+                };
+                case null {};
+              };
+            };
           };
-        };
-      };
-
-      // Get the blocks
-      for (index in Vector.vals(blockIndices)) {
-        switch (BTree.get(blocks, Nat.compare, index)) {
-          case (?block) { Vector.add(resultBlocks, block) };
           case null {};
+        };
+        
+        // Get blocks from indices
+        for (idx in Vector.vals(blockIndices)) {
+          switch (BTree.get(blocks, Nat.compare, idx)) {
+            case (?block) { Vector.add(candidateBlocks, block) };
+            case null {};
+          };
         };
       };
 
       #ok({
-        blocks = Vector.toArray(resultBlocks);
-        totalCount = Vector.size(blockIndices);
-        hasMore = Vector.size(blockIndices) >= 1000;
-        nextIndex = if (Vector.size(blockIndices) >= 1000) { ?1000 } else { null };
+        blocks = Vector.toArray(candidateBlocks);
+        totalCount = Vector.size(candidateBlocks);
+        hasMore = false;
+        nextIndex = null;
       });
     };
 

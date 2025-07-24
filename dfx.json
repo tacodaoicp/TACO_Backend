@@ -21,15 +21,15 @@
       "type": "motoko"
     },
     "trading_archive": {
-      "main": "src/archives/trading_archive/trading_archive.mo",
+      "main": "src/archives/trading_archive/trading_archive_v2.mo",
       "type": "motoko"
     },
     "portfolio_archive": {
-      "main": "src/archives/portfolio_archive/portfolio_archive.mo",
+      "main": "src/archives/portfolio_archive/portfolio_archive_v2.mo",
       "type": "motoko"
     },
     "price_archive": {
-      "main": "src/archives/price_archive/price_archive.mo",
+      "main": "src/archives/price_archive/price_archive_v2.mo",
       "type": "motoko"
     },
     "actorA": {

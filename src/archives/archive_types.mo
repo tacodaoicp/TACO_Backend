@@ -325,6 +325,39 @@ module {
     #Map(entriesWithPhash);
   };
 
+  // Convert circuit breaker data to ICRC3 Value format
+  public func circuitBreakerToValue(circuitBreaker: CircuitBreakerBlockData, timestamp: Int, phash: ?Blob) : Value {
+    let eventTypeText = switch (circuitBreaker.eventType) {
+      case (#PriceAlert) { "price_alert" };
+      case (#PortfolioBreaker) { "portfolio_breaker" };
+      case (#TradingPause) { "trading_pause" };
+      case (#SystemEmergency) { "system_emergency" };
+    };
+
+    let entries = [
+      makeMapEntry("btype", #Text("3circuit")),
+      makeMapEntry("ts", intToValue(timestamp)),
+      makeMapEntry("event_type", textToValue(eventTypeText)),
+      makeMapEntry("threshold_value", floatToValue(circuitBreaker.thresholdValue)),
+      makeMapEntry("actual_value", floatToValue(circuitBreaker.actualValue)),
+      makeMapEntry("system_response", textToValue(circuitBreaker.systemResponse)),
+      makeMapEntry("severity", textToValue(circuitBreaker.severity)),
+      makeMapEntry("tokens_affected", #Array(Array.map(circuitBreaker.tokensAffected, principalToValue))),
+    ];
+
+    let entriesWithTrigger = switch (circuitBreaker.triggerToken) {
+      case (?token) { Array.append(entries, [makeMapEntry("trigger_token", principalToValue(token))]) };
+      case null { entries };
+    };
+    
+    let entriesWithPhash = switch (phash) {
+      case (?hash) { Array.append([makeMapEntry("phash", #Blob(hash))], entriesWithTrigger) };
+      case null { entriesWithTrigger };
+    };
+
+    #Map(entriesWithPhash);
+  };
+
   // Convert price data to ICRC3 Value format
   public func priceToValue(price: PriceBlockData, timestamp: Int, phash: ?Blob) : Value {
     let sourceText = switch (price.source) {
@@ -361,6 +394,78 @@ module {
     let entriesWithPhash = switch (phash) {
       case (?hash) { Array.append([makeMapEntry("phash", #Blob(hash))], entriesWithChange) };
       case (null) { entriesWithChange };
+    };
+
+    #Map(entriesWithPhash);
+  };
+
+  // Convert trading pause data to ICRC3 Value format
+  public func tradingPauseToValue(pause: TradingPauseBlockData, timestamp: Int, phash: ?Blob) : Value {
+    let reasonText = switch (pause.reason) {
+      case (#PriceVolatility) { "price_volatility" };
+      case (#LiquidityIssue) { "liquidity_issue" };
+      case (#SystemMaintenance) { "system_maintenance" };
+      case (#CircuitBreaker) { "circuit_breaker" };
+      case (#AdminAction) { "admin_action" };
+    };
+
+    let entries = [
+      makeMapEntry("btype", #Text("3pause")),
+      makeMapEntry("ts", intToValue(timestamp)),
+      makeMapEntry("token", principalToValue(pause.token)),
+      makeMapEntry("token_symbol", textToValue(pause.tokenSymbol)),
+      makeMapEntry("reason", textToValue(reasonText)),
+    ];
+
+    let entriesWithDuration = switch (pause.duration) {
+      case (?dur) { Array.append(entries, [makeMapEntry("duration", intToValue(dur))]) };
+      case null { entries };
+    };
+    
+    let entriesWithPhash = switch (phash) {
+      case (?hash) { Array.append([makeMapEntry("phash", #Blob(hash))], entriesWithDuration) };
+      case null { entriesWithDuration };
+    };
+
+    #Map(entriesWithPhash);
+  };
+
+  // Convert allocation change data to ICRC3 Value format  
+  public func allocationToValue(allocation: AllocationBlockData, timestamp: Int, phash: ?Blob) : Value {
+    let reasonText = switch (allocation.reason) {
+      case (#UserUpdate) { "user_update" };
+      case (#FollowAction) { "follow_action" };
+      case (#SystemRebalance) { "system_rebalance" };
+      case (#Emergency) { "emergency" };
+    };
+
+    let oldAllocationArray = #Array(Array.map(allocation.oldAllocation, func(alloc : Allocation) : Value = 
+      #Map([
+        ("token", principalToValue(alloc.token)),
+        ("basis_points", natToValue(alloc.basisPoints))
+      ])
+    ));
+
+    let newAllocationArray = #Array(Array.map(allocation.newAllocation, func(alloc : Allocation) : Value = 
+      #Map([
+        ("token", principalToValue(alloc.token)),
+        ("basis_points", natToValue(alloc.basisPoints))
+      ])
+    ));
+
+    let entries = [
+      makeMapEntry("btype", #Text("3allocation")),
+      makeMapEntry("ts", intToValue(timestamp)),
+      makeMapEntry("user", principalToValue(allocation.user)),
+      makeMapEntry("old_allocation", oldAllocationArray),
+      makeMapEntry("new_allocation", newAllocationArray),
+      makeMapEntry("voting_power", natToValue(allocation.votingPower)),
+      makeMapEntry("reason", textToValue(reasonText)),
+    ];
+    
+    let entriesWithPhash = switch (phash) {
+      case (?hash) { Array.append([makeMapEntry("phash", #Blob(hash))], entries) };
+      case null { entries };
     };
 
     #Map(entriesWithPhash);

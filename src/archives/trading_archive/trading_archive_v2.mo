@@ -7,6 +7,7 @@ import Float "mo:base/Float";
 import Int "mo:base/Int";
 import Nat "mo:base/Nat";
 import Text "mo:base/Text";
+import Error "mo:base/Error";
 
 import ICRC3 "mo:icrc3-mo/service";
 import ArchiveTypes "../archive_types";
@@ -14,6 +15,7 @@ import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
 import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
+import Logger "../../helper/logger";
 
 shared (deployer) actor class TradingArchiveV2() = this {
 
@@ -144,29 +146,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
     };
 
     let timestamp = Time.now();
-    
-    let reasonText = switch (pause.reason) {
-      case (#PriceVolatility) { "price_volatility" };
-      case (#LiquidityIssue) { "liquidity_issue" };
-      case (#SystemMaintenance) { "system_maintenance" };
-      case (#CircuitBreaker) { "circuit_breaker" };
-      case (#AdminAction) { "admin_action" };
-    };
-
-    let entries = [
-      ("btype", #Text("3pause")),
-      ("ts", #Int(timestamp)),
-      ("token", ArchiveTypes.principalToValue(pause.token)),
-      ("token_symbol", #Text(pause.tokenSymbol)),
-      ("reason", #Text(reasonText)),
-    ];
-
-    let entriesWithDuration = switch (pause.duration) {
-      case (?dur) { Array.append(entries, [("duration", #Int(dur))]) };
-      case null { entries };
-    };
-
-    let blockValue = #Map(entriesWithDuration);
+    let blockValue = ArchiveTypes.tradingPauseToValue(pause, timestamp, null);
     
     // Use base class to store the block
     let blockIndex = base.storeBlock(
@@ -231,25 +211,23 @@ shared (deployer) actor class TradingArchiveV2() = this {
   // Specific batch import logic for trading data
   private func runTradingBatchImport() : async () {
     try {
-      // Import price alerts from treasury
-      let alerts = await treasuryCanister.getPriceAlerts(50);
+      // Import price alerts from treasury (offset: 0, limit: 50)
+      let alertsResult = await treasuryCanister.getPriceAlerts(0, 50);
       var imported = 0;
       
-      for (alert in alerts.vals()) {
-        let tradeData : TradeBlockData = {
-          trader = alert.user;
-          tokenSold = alert.token;
-          tokenBought = alert.token; // Price alert doesn't involve actual trading
-          amountSold = 0;
-          amountBought = 0;
-          exchange = #ICPSwap; // Default
-          success = true;
-          slippage = 0.0;
-          fee = 0;
-          error = null;
+      for (alert in alertsResult.alerts.vals()) {
+        // Create circuit breaker block for price alert
+        let circuitBreakerData : CircuitBreakerBlockData = {
+          eventType = #PriceAlert;
+          thresholdValue = alert.triggeredCondition.percentage;
+          actualValue = alert.priceData.actualChangePercent;
+          systemResponse = "Token paused from trading";
+          severity = "HIGH";
+          triggerToken = ?alert.token;
+          tokensAffected = [alert.token];
         };
         
-        let result = await archiveTradeBlock(tradeData);
+        let result = await archiveCircuitBreakerBlock(circuitBreakerData);
         switch (result) {
           case (#ok(_)) { imported += 1 };
           case (#err(e)) { 
@@ -260,7 +238,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
       
       base.logger.info("Batch Import", "Imported " # Nat.toText(imported) # " price alerts", "runTradingBatchImport");
     } catch (e) {
-      base.logger.error("Batch Import", "Batch import failed: " # debug_show(e), "runTradingBatchImport");
+      base.logger.error("Batch Import", "Batch import failed: " # Error.message(e), "runTradingBatchImport");
     };
   };
 
@@ -292,11 +270,11 @@ shared (deployer) actor class TradingArchiveV2() = this {
   // Lifecycle Functions (delegated to base class)
   //=========================================================================
 
-  public func preupgrade() {
+  system func preupgrade() {
     base.preupgrade();
   };
 
-  public func postupgrade() {
+  system func postupgrade() {
     base.postupgrade<system>(runTradingBatchImport);
   };
 } 
