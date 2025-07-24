@@ -7,6 +7,7 @@ import Float "mo:base/Float";
 import Int "mo:base/Int";
 import Nat "mo:base/Nat";
 import Text "mo:base/Text";
+import Error "mo:base/Error";
 
 import ICRC3 "mo:icrc3-mo/service";
 import ArchiveTypes "../archive_types";
@@ -14,6 +15,7 @@ import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
 import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
+import Logger "../../helper/logger";
 
 shared (deployer) actor class PriceArchiveV2() = this {
 
@@ -174,7 +176,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
         // Check if price has changed since last import
         let shouldImport = switch (Map.get(lastKnownPrices, Map.phash, token)) {
           case (?lastPrice) {
-            lastPrice.icpPrice != details.priceICP or lastPrice.usdPrice != details.priceUSD
+            lastPrice.icpPrice != details.priceInICP or lastPrice.usdPrice != details.priceInUSD
           };
           case null { true }; // First time seeing this token
         };
@@ -182,9 +184,9 @@ shared (deployer) actor class PriceArchiveV2() = this {
         if (shouldImport) {
           let priceData : PriceBlockData = {
             token = token;
-            priceICP = details.priceICP;
-            priceUSD = details.priceUSD;
-            source = #Treasury;
+            priceICP = details.priceInICP;
+            priceUSD = details.priceInUSD;
+            source = #Aggregated;
             volume24h = null;
             change24h = null;
           };
@@ -201,7 +203,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
       
       base.logger.info("Batch Import", "Imported " # Nat.toText(imported) # " price updates", "runPriceBatchImport");
     } catch (e) {
-      base.logger.error("Batch Import", "Price batch import failed: " # debug_show(e), "runPriceBatchImport");
+      base.logger.error("Batch Import", "Price batch import failed: " # Error.message(e), "runPriceBatchImport");
     };
   };
 
@@ -233,11 +235,11 @@ shared (deployer) actor class PriceArchiveV2() = this {
   // Lifecycle Functions (delegated to base class)
   //=========================================================================
 
-  public func preupgrade() {
+  system func preupgrade() {
     base.preupgrade();
   };
 
-  public func postupgrade() {
+  system func postupgrade() {
     base.postupgrade<system>(runPriceBatchImport);
   };
 } 
