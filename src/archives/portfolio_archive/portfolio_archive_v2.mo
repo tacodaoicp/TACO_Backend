@@ -2,6 +2,9 @@ import Time "mo:base/Time";
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Map "mo:map/Map";
+import Nat "mo:base/Nat";
+import Error "mo:base/Error";
+import Array "mo:base/Array";
 
 import ICRC3 "mo:icrc3-mo/service";
 import ArchiveTypes "../archive_types";
@@ -20,6 +23,7 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   type PortfolioBlockData = ArchiveTypes.PortfolioBlockData;
   type AllocationBlockData = ArchiveTypes.AllocationBlockData;
   type ArchiveError = ArchiveTypes.ArchiveError;
+  type TokenSnapshot = TreasuryTypes.TokenSnapshot;
   type PortfolioSnapshot = TreasuryTypes.PortfolioSnapshot;
 
   // Initialize the generic base class with portfolio-specific configuration
@@ -98,40 +102,13 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   //=========================================================================
 
   private func runPortfolioBatchImport() : async () {
+    // TODO: Implement portfolio batch import when treasury interface is available
+    // The treasury doesn't currently expose getPortfolioHistory method
     try {
-      let snapshots = await treasuryCanister.getPortfolioHistory(50);
-      var imported = 0;
-      
-      for (snapshot in snapshots.vals()) {
-        // Convert treasury snapshot to archive format
-        let portfolioData : PortfolioBlockData = {
-          timestamp = snapshot.timestamp;
-          totalValueICP = snapshot.totalValueICP;
-          totalValueUSD = snapshot.totalValueUSD;
-          tokenCount = snapshot.tokenCount;
-          activeTokens = snapshot.activeTokens;
-          pausedTokens = snapshot.pausedTokens;
-          reason = switch (snapshot.reason) {
-            case (#Scheduled) { #Scheduled };
-            case (#PostTrade) { #PostTrade };
-            case (#CircuitBreaker) { #CircuitBreaker };
-            case (#ManualTrigger) { #ManualTrigger };
-            case (#SystemEvent) { #SystemEvent };
-          };
-        };
-        
-        let result = await archivePortfolioBlock(portfolioData);
-        switch (result) {
-          case (#ok(_)) { imported += 1 };
-          case (#err(e)) { 
-            base.logger.error("Batch Import", "Failed to import portfolio snapshot: " # debug_show(e), "runPortfolioBatchImport");
-          };
-        };
-      };
-      
-      base.logger.info("Batch Import", "Imported " # Nat.toText(imported) # " portfolio snapshots", "runPortfolioBatchImport");
+      let imported = 0;
+      base.logger.info("Batch Import", "Imported " # Nat.toText(imported) # " portfolio snapshots (placeholder)", "runPortfolioBatchImport");
     } catch (e) {
-      base.logger.error("Batch Import", "Portfolio batch import failed: " # debug_show(e), "runPortfolioBatchImport");
+      base.logger.error("Batch Import", "Portfolio batch import failed: " # Error.message(e), "runPortfolioBatchImport");
     };
   };
 
@@ -167,11 +144,11 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   // Lifecycle Functions (delegated to base class)
   //=========================================================================
 
-  public func preupgrade() {
+  system func preupgrade() {
     base.preupgrade();
   };
 
-  public func postupgrade() {
+  system func postupgrade() {
     base.postupgrade<system>(runPortfolioBatchImport);
   };
 } 
