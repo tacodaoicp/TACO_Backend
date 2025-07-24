@@ -3359,7 +3359,7 @@ shared (deployer) actor class treasury() = this {
                 
                 // ICP FALLBACK STRATEGY: If we can't find a direct route, try selling for ICP instead
                 // This creates an ICP overweight that will be corrected in the next cycle
-                if (buyToken != ICPprincipal) {
+                if (buyToken != ICPprincipal and sellToken != ICPprincipal) {
                   Debug.print("Attempting ICP fallback route: " # Principal.toText(sellToken) # " -> ICP");
                   
                   // VERBOSE LOGGING: ICP fallback attempt
