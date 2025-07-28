@@ -55,9 +55,14 @@ shared (deployer) actor class TradingArchiveV2() = this {
   private stable var totalSuccessfulTrades : Nat = 0;
   private stable var totalVolume : Nat = 0;
 
+  // Tracking state for batch imports
+  private stable var lastImportedTradeTimestamp : Int = 0;
+  private stable var lastImportedPriceAlertId : Nat = 0;
+
   // Treasury interface for batch imports
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(canister_ids.getCanisterId(#treasury)));
+  private let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(TREASURY_ID));
 
   //=========================================================================
   // ICRC-3 Standard endpoints (delegated to base class)
@@ -208,38 +213,172 @@ shared (deployer) actor class TradingArchiveV2() = this {
   // Batch Import System (delegated to base class)
   //=========================================================================
 
-  // Specific batch import logic for trading data
-  private func runTradingBatchImport() : async () {
+  // Import batch of trades from treasury
+  private func importTradesBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // Import price alerts from treasury (offset: 0, limit: 50)
-      let alertsResult = await treasuryCanister.getPriceAlerts(0, 50);
-      var imported = 0;
+      let tradingStatusResult = await treasuryCanister.getTradingStatus();
       
-      for (alert in alertsResult.alerts.vals()) {
-        // Create circuit breaker block for price alert
-        let circuitBreakerData : CircuitBreakerBlockData = {
-          eventType = #PriceAlert;
-          thresholdValue = alert.triggeredCondition.percentage;
-          actualValue = alert.priceData.actualChangePercent;
-          systemResponse = "Token paused from trading";
-          severity = "HIGH";
-          triggerToken = ?alert.token;
-          tokensAffected = [alert.token];
+      switch (tradingStatusResult) {
+        case (#ok(status)) {
+          let trades = status.executedTrades;
+          var imported = 0;
+          var failed = 0;
+          
+          // Filter trades newer than last imported
+          let newTrades = Array.filter<TradeRecord>(trades, func(trade) {
+            trade.timestamp > lastImportedTradeTimestamp
+          });
+          
+          // Process trades in batches (limit to 50 per batch)
+          let batchSize = 50;
+          let batchedTrades = if (newTrades.size() > batchSize) {
+            Array.subArray(newTrades, 0, batchSize)
+          } else {
+            newTrades
+          };
+          
+          for (trade in batchedTrades.vals()) {
+            let tradeBlockData : TradeBlockData = {
+              trader = TREASURY_ID; // Treasury is the trader
+              tokenSold = trade.tokenSold;
+              tokenBought = trade.tokenBought;
+              amountSold = trade.amountSold;
+              amountBought = trade.amountBought;
+              exchange = trade.exchange;
+              success = trade.success;
+              slippage = trade.slippage;
+              fee = 0; // Treasury trades don't have explicit fees
+              error = trade.error;
+            };
+            
+            let blockResult = await archiveTradeBlock(tradeBlockData);
+            
+            switch (blockResult) {
+              case (#ok(index)) {
+                imported += 1;
+                lastImportedTradeTimestamp := trade.timestamp;
+              };
+              case (#err(error)) {
+                failed += 1;
+                base.logger.error(
+                  "BATCH_IMPORT",
+                  "Failed to import trade: " # debug_show(error),
+                  "importTradesBatch"
+                );
+              };
+            };
+          };
+          
+          if (imported > 0) {
+            base.logger.info(
+              "BATCH_IMPORT",
+              "Imported " # Nat.toText(imported) # " trades, failed " # Nat.toText(failed),
+              "importTradesBatch"
+            );
+          };
+          
+          { imported = imported; failed = failed };
         };
-        
-        let result = await archiveCircuitBreakerBlock(circuitBreakerData);
-        switch (result) {
-          case (#ok(_)) { imported += 1 };
-          case (#err(e)) { 
-            base.logger.error("Batch Import", "Failed to import price alert: " # debug_show(e), "runTradingBatchImport");
+        case (#err(error)) {
+          base.logger.error(
+            "BATCH_IMPORT", 
+            "Failed to get trading status: " # error,
+            "importTradesBatch"
+          );
+          { imported = 0; failed = 1 };
+        };
+      };
+    } catch (e) {
+      base.logger.error(
+        "BATCH_IMPORT",
+        "Exception in importTradesBatch: " # Error.message(e),
+        "importTradesBatch"
+      );
+      { imported = 0; failed = 1 };
+    };
+  };
+
+  // Import batch of price alerts from treasury
+  private func importPriceAlertsBatch() : async { imported: Nat; failed: Nat } {
+    try {
+      let alertsResult = await treasuryCanister.getPriceAlerts(lastImportedPriceAlertId, 50);
+      let alerts = alertsResult.alerts;
+      var imported = 0;
+      var failed = 0;
+      
+      for (alert in alerts.vals()) {
+        if (alert.id > lastImportedPriceAlertId) {
+          let circuitBreakerData : CircuitBreakerBlockData = {
+            eventType = #PriceAlert;
+            triggerToken = ?alert.token;
+            thresholdValue = alert.triggeredCondition.percentage;
+            actualValue = alert.priceData.actualChangePercent;
+            tokensAffected = [alert.token];
+            systemResponse = "Price alert triggered: " # alert.triggeredCondition.name;
+            severity = "Medium";
+          };
+          
+          let blockResult = await archiveCircuitBreakerBlock(circuitBreakerData);
+          
+          switch (blockResult) {
+            case (#ok(index)) {
+              imported += 1;
+              lastImportedPriceAlertId := alert.id;
+            };
+            case (#err(error)) {
+              failed += 1;
+              base.logger.error(
+                "BATCH_IMPORT",
+                "Failed to import price alert: " # debug_show(error),
+                "importPriceAlertsBatch"
+              );
+            };
           };
         };
       };
       
-      base.logger.info("Batch Import", "Imported " # Nat.toText(imported) # " price alerts", "runTradingBatchImport");
+      if (imported > 0) {
+        base.logger.info(
+          "BATCH_IMPORT",
+          "Imported " # Nat.toText(imported) # " price alerts, failed " # Nat.toText(failed),
+          "importPriceAlertsBatch"
+        );
+      };
+      
+      { imported = imported; failed = failed };
     } catch (e) {
-      base.logger.error("Batch Import", "Batch import failed: " # Error.message(e), "runTradingBatchImport");
+      base.logger.error(
+        "BATCH_IMPORT",
+        "Exception in importPriceAlertsBatch: " # Error.message(e),
+        "importPriceAlertsBatch"
+      );
+      { imported = 0; failed = 1 };
     };
+  };
+
+  // Specific batch import logic for trading data
+  private func runTradingBatchImport() : async () {
+    base.logger.info(
+      "BATCH_IMPORT",
+      "Starting batch import cycle",
+      "runTradingBatchImport"
+    );
+    
+    // Import trades
+    let tradeResults = await importTradesBatch();
+    
+    // Import price alerts
+    let alertResults = await importPriceAlertsBatch();
+    
+    let totalImported = tradeResults.imported + alertResults.imported;
+    let totalFailed = tradeResults.failed + alertResults.failed;
+    
+    base.logger.info(
+      "BATCH_IMPORT",
+      "Batch import cycle completed - Imported: " # Nat.toText(totalImported) # 
+      " Failed: " # Nat.toText(totalFailed),
+      "runTradingBatchImport"
+    );
   };
 
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
@@ -254,8 +393,35 @@ shared (deployer) actor class TradingArchiveV2() = this {
     await base.runManualBatchImport(caller, runTradingBatchImport);
   };
 
-  public query func getBatchImportStatus() : async {isRunning: Bool; intervalSeconds: Nat} {
-    base.getBatchImportStatus();
+  public query func getBatchImportStatus() : async {
+    isRunning: Bool; 
+    intervalSeconds: Nat;
+    lastImportedTradeTimestamp: Int;
+    lastImportedPriceAlertId: Nat;
+  } {
+    let baseStatus = base.getBatchImportStatus();
+    {
+      isRunning = baseStatus.isRunning;
+      intervalSeconds = baseStatus.intervalSeconds;
+      lastImportedTradeTimestamp = lastImportedTradeTimestamp;
+      lastImportedPriceAlertId = lastImportedPriceAlertId;
+    };
+  };
+
+  // Admin method to reset import timestamps and re-import all historical data
+  public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
+    // Only authorized users can call this method
+    if (not base.isAuthorized(caller, #UpdateConfig)) {
+      return #err("Unauthorized: Only admin can reset import timestamps");
+    };
+
+    // Reset tracking state
+    lastImportedTradeTimestamp := 0;
+    lastImportedPriceAlertId := 0;
+    
+    base.logger.info("Admin", "Import timestamps reset by " # Principal.toText(caller) # " - will re-import all historical data on next batch", "resetImportTimestamps");
+    
+    #ok("Import timestamps reset successfully. Next batch import will re-import all historical trading data.")
   };
 
   public shared ({ caller }) func catchUpImport() : async Result.Result<Text, Text> {

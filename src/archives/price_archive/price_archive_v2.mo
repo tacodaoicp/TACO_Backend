@@ -6,6 +6,7 @@ import Map "mo:map/Map";
 import Float "mo:base/Float";
 import Int "mo:base/Int";
 import Nat "mo:base/Nat";
+import Bool "mo:base/Bool";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
 
@@ -49,9 +50,13 @@ shared (deployer) actor class PriceArchiveV2() = this {
   private stable var totalPriceUpdates : Nat = 0;
   private stable var lastKnownPrices = Map.new<Principal, {icpPrice: Nat; usdPrice: Float; timestamp: Int}>();
 
+  // Tracking state for batch imports
+  private stable var lastImportedPriceTime : Int = 0;
+
   // Treasury interface for batch imports
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(canister_ids.getCanisterId(#treasury)));
+  private let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(TREASURY_ID));
 
   // Helper function to get price range bucket for indexing
   private func getPriceRangeBucket(priceICP : Nat) : Nat {
@@ -166,45 +171,102 @@ shared (deployer) actor class PriceArchiveV2() = this {
   //=========================================================================
 
   // Specific batch import logic for price data
-  private func runPriceBatchImport() : async () {
+  // Import historical price data from treasury
+  private func importPriceHistoryBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // Import price data from treasury
+      // Get all token details including past prices
       let tokenDetails = await treasuryCanister.getTokenDetails();
       var imported = 0;
+      var failed = 0;
+      
+      base.logger.info("Batch Import", "Retrieved " # Nat.toText(tokenDetails.size()) # " tokens from treasury", "importPriceHistoryBatch");
       
       for ((token, details) in tokenDetails.vals()) {
-        // Check if price has changed since last import
-        let shouldImport = switch (Map.get(lastKnownPrices, Map.phash, token)) {
+        base.logger.info("Batch Import", "Processing token " # Principal.toText(token) # " (" # details.tokenSymbol # ") with " # Nat.toText(details.pastPrices.size()) # " price points", "importPriceHistoryBatch");
+        // Get last known timestamp for this token
+        let lastKnownTime = switch (Map.get(lastKnownPrices, Map.phash, token)) {
+          case (?lastPrice) { lastPrice.timestamp };
+          case null { 0 };
+        };
+        
+        // Check if current price has changed since last import
+        let lastKnownPrice = Map.get(lastKnownPrices, Map.phash, token);
+        let shouldImport = switch (lastKnownPrice) {
           case (?lastPrice) {
-            lastPrice.icpPrice != details.priceInICP or lastPrice.usdPrice != details.priceInUSD
+            // Import if price changed or sync time is newer
+            lastPrice.icpPrice != details.priceInICP or 
+            lastPrice.usdPrice != details.priceInUSD or
+            details.lastTimeSynced > lastPrice.timestamp
           };
           case null { true }; // First time seeing this token
         };
-
+        
+        base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": shouldImport=" # Bool.toText(shouldImport) # " (currentICP=" # Nat.toText(details.priceInICP) # ", currentUSD=" # Float.toText(details.priceInUSD) # ")", "importPriceHistoryBatch");
+        
         if (shouldImport) {
           let priceData : PriceBlockData = {
             token = token;
             priceICP = details.priceInICP;
             priceUSD = details.priceInUSD;
-            source = #Aggregated;
+            source = #NTN;
             volume24h = null;
             change24h = null;
           };
           
           let result = await archivePriceBlock(priceData);
           switch (result) {
-            case (#ok(_)) { imported += 1 };
+            case (#ok(_)) { 
+              imported += 1;
+              // Update last known price for this token
+              Map.set(lastKnownPrices, Map.phash, token, {
+                icpPrice = details.priceInICP;
+                usdPrice = details.priceInUSD;
+                timestamp = details.lastTimeSynced;
+              });
+              lastImportedPriceTime := Int.max(lastImportedPriceTime, details.lastTimeSynced);
+            };
             case (#err(e)) { 
-              base.logger.error("Batch Import", "Failed to import price for " # Principal.toText(token) # ": " # debug_show(e), "runPriceBatchImport");
+              failed += 1;
+              base.logger.error("Batch Import", "Failed to import current price for " # Principal.toText(token) # ": " # debug_show(e), "importPriceHistoryBatch");
             };
           };
         };
       };
       
-      base.logger.info("Batch Import", "Imported " # Nat.toText(imported) # " price updates", "runPriceBatchImport");
+      if (imported > 0) {
+        base.logger.info(
+          "BATCH_IMPORT",
+          "Imported " # Nat.toText(imported) # " price history points, failed " # Nat.toText(failed),
+          "importPriceHistoryBatch"
+        );
+      };
+      
+      { imported = imported; failed = failed };
     } catch (e) {
-      base.logger.error("Batch Import", "Price batch import failed: " # Error.message(e), "runPriceBatchImport");
+      base.logger.error(
+        "BATCH_IMPORT",
+        "Exception in importPriceHistoryBatch: " # Error.message(e),
+        "importPriceHistoryBatch"
+      );
+      { imported = 0; failed = 1 };
     };
+  };
+
+  private func runPriceBatchImport() : async () {
+    base.logger.info(
+      "BATCH_IMPORT",
+      "Starting price batch import cycle",
+      "runPriceBatchImport"
+    );
+    
+    let result = await importPriceHistoryBatch();
+    
+    base.logger.info(
+      "BATCH_IMPORT",
+      "Price batch import completed - Imported: " # Nat.toText(result.imported) # 
+      " Failed: " # Nat.toText(result.failed),
+      "runPriceBatchImport"
+    );
   };
 
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
@@ -219,8 +281,33 @@ shared (deployer) actor class PriceArchiveV2() = this {
     await base.runManualBatchImport(caller, runPriceBatchImport);
   };
 
-  public query func getBatchImportStatus() : async {isRunning: Bool; intervalSeconds: Nat} {
-    base.getBatchImportStatus();
+  public query func getBatchImportStatus() : async {
+    isRunning: Bool; 
+    intervalSeconds: Nat;
+    lastImportedPriceTime: Int;
+  } {
+    let baseStatus = base.getBatchImportStatus();
+    {
+      isRunning = baseStatus.isRunning;
+      intervalSeconds = baseStatus.intervalSeconds;
+      lastImportedPriceTime = lastImportedPriceTime;
+    };
+  };
+
+  // Admin method to reset import timestamps and re-import all historical data
+  public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
+    // Only admin can call this method
+    if (not base.isAuthorized(caller, #UpdateConfig)) {
+      return #err("Unauthorized: Only admin can reset import timestamps");
+    };
+
+    // Reset tracking state
+    lastImportedPriceTime := 0;
+    lastKnownPrices := Map.new<Principal, {icpPrice: Nat; usdPrice: Float; timestamp: Int}>();
+    
+    base.logger.info("Admin", "Import timestamps reset by " # Principal.toText(caller) # " - will re-import all historical data on next batch", "resetImportTimestamps");
+    
+    #ok("Import timestamps reset successfully. Next batch import will re-import all historical price data.")
   };
 
   public shared ({ caller }) func catchUpImport() : async Result.Result<Text, Text> {

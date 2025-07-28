@@ -3,6 +3,7 @@ import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Map "mo:map/Map";
 import Nat "mo:base/Nat";
+import Int "mo:base/Int";
 import Error "mo:base/Error";
 import Array "mo:base/Array";
 
@@ -44,9 +45,13 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   private stable var userIndex = Map.new<Principal, [Nat]>();
   private stable var valueIndex = Map.new<Nat, [Nat]>();
 
+  // Tracking state for batch imports
+  private stable var lastPortfolioImportTime : Int = 0;
+
   // Treasury interface for batch imports
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(canister_ids.getCanisterId(#treasury)));
+  private let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(TREASURY_ID));
 
   //=========================================================================
   // ICRC-3 Standard endpoints (delegated to base class)
@@ -101,15 +106,93 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   // Batch Import System
   //=========================================================================
 
-  private func runPortfolioBatchImport() : async () {
-    // TODO: Implement portfolio batch import when treasury interface is available
-    // The treasury doesn't currently expose getPortfolioHistory method
+  // Import batch of portfolio snapshots from treasury
+  private func importPortfolioSnapshotsBatch() : async { imported: Nat; failed: Nat } {
     try {
-      let imported = 0;
-      base.logger.info("Batch Import", "Imported " # Nat.toText(imported) # " portfolio snapshots (placeholder)", "runPortfolioBatchImport");
+      let result = await treasuryCanister.getPortfolioHistory(50); // Get 50 snapshots
+      
+      switch (result) {
+        case (#ok(response)) {
+          var imported = 0;
+          var failed = 0;
+          
+          // Filter snapshots newer than last imported
+          let newSnapshots = Array.filter<TreasuryTypes.PortfolioSnapshot>(response.snapshots, func(snapshot) {
+            snapshot.timestamp > lastPortfolioImportTime
+          });
+          
+          for (snapshot in newSnapshots.vals()) {
+            let portfolioBlock : PortfolioBlockData = {
+              timestamp = snapshot.timestamp;
+              totalValueICP = snapshot.totalValueICP;
+              totalValueUSD = snapshot.totalValueUSD;
+              tokenCount = snapshot.tokens.size();
+              activeTokens = Array.map<TreasuryTypes.TokenSnapshot, Principal>(snapshot.tokens, func(token) = token.token);
+              pausedTokens = [];
+              reason = #Scheduled; // Default for imported snapshots
+            };
+            
+            let archiveResult = await archivePortfolioBlock(portfolioBlock);
+            switch (archiveResult) {
+              case (#ok(_)) {
+                imported += 1;
+                lastPortfolioImportTime := Int.max(lastPortfolioImportTime, snapshot.timestamp);
+              };
+              case (#err(error)) {
+                failed += 1;
+                base.logger.error(
+                  "BATCH_IMPORT",
+                  "Failed to import portfolio snapshot: " # debug_show(error),
+                  "importPortfolioSnapshotsBatch"
+                );
+              };
+            };
+          };
+          
+          if (imported > 0) {
+            base.logger.info(
+              "BATCH_IMPORT",
+              "Imported " # Nat.toText(imported) # " portfolio snapshots, failed " # Nat.toText(failed),
+              "importPortfolioSnapshotsBatch"
+            );
+          };
+          
+          { imported = imported; failed = failed };
+        };
+        case (#err(error)) {
+          base.logger.error(
+            "BATCH_IMPORT", 
+            "Failed to get portfolio history: " # debug_show(error),
+            "importPortfolioSnapshotsBatch"
+          );
+          { imported = 0; failed = 1 };
+        };
+      };
     } catch (e) {
-      base.logger.error("Batch Import", "Portfolio batch import failed: " # Error.message(e), "runPortfolioBatchImport");
+      base.logger.error(
+        "BATCH_IMPORT",
+        "Exception in importPortfolioSnapshotsBatch: " # Error.message(e),
+        "importPortfolioSnapshotsBatch"
+      );
+      { imported = 0; failed = 1 };
     };
+  };
+
+  private func runPortfolioBatchImport() : async () {
+    base.logger.info(
+      "BATCH_IMPORT",
+      "Starting portfolio batch import cycle",
+      "runPortfolioBatchImport"
+    );
+    
+    let result = await importPortfolioSnapshotsBatch();
+    
+    base.logger.info(
+      "BATCH_IMPORT",
+      "Portfolio batch import completed - Imported: " # Nat.toText(result.imported) # 
+      " Failed: " # Nat.toText(result.failed),
+      "runPortfolioBatchImport"
+    );
   };
 
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
@@ -124,8 +207,32 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
     await base.runManualBatchImport(caller, runPortfolioBatchImport);
   };
 
-  public query func getBatchImportStatus() : async {isRunning: Bool; intervalSeconds: Nat} {
-    base.getBatchImportStatus();
+  public query func getBatchImportStatus() : async {
+    isRunning: Bool; 
+    intervalSeconds: Nat;
+    lastPortfolioImportTime: Int;
+  } {
+    let baseStatus = base.getBatchImportStatus();
+    {
+      isRunning = baseStatus.isRunning;
+      intervalSeconds = baseStatus.intervalSeconds;
+      lastPortfolioImportTime = lastPortfolioImportTime;
+    };
+  };
+
+  // Admin method to reset import timestamps and re-import all historical data
+  public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
+    // Only authorized users can call this method
+    if (not base.isAuthorized(caller, #UpdateConfig)) {
+      return #err("Unauthorized: Only admin can reset import timestamps");
+    };
+
+    // Reset tracking state
+    lastPortfolioImportTime := 0;
+    
+    base.logger.info("Admin", "Import timestamps reset by " # Principal.toText(caller) # " - will re-import all historical data on next batch", "resetImportTimestamps");
+    
+    #ok("Import timestamps reset successfully. Next batch import will re-import all historical portfolio data.")
   };
 
   //=========================================================================
