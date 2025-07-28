@@ -189,25 +189,19 @@ shared (deployer) actor class PriceArchiveV2() = this {
           case null { 0 };
         };
         
-        // Check if current price has changed since last import
-        let lastKnownPrice = Map.get(lastKnownPrices, Map.phash, token);
-        let shouldImport = switch (lastKnownPrice) {
-          case (?lastPrice) {
-            // Import if price changed or sync time is newer
-            lastPrice.icpPrice != details.priceInICP or 
-            lastPrice.usdPrice != details.priceInUSD or
-            details.lastTimeSynced > lastPrice.timestamp
-          };
-          case null { true }; // First time seeing this token
-        };
+        // Filter price points newer than last imported from pastPrices
+        let newPricePoints = Array.filter<TreasuryTypes.PricePoint>(details.pastPrices, func(point) {
+          point.time > lastKnownTime
+        });
         
-        base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": shouldImport=" # Bool.toText(shouldImport) # " (currentICP=" # Nat.toText(details.priceInICP) # ", currentUSD=" # Float.toText(details.priceInUSD) # ")", "importPriceHistoryBatch");
+        base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": lastKnownTime=" # Int.toText(lastKnownTime) # ", filtered to " # Nat.toText(newPricePoints.size()) # " new price points from " # Nat.toText(details.pastPrices.size()) # " total", "importPriceHistoryBatch");
         
-        if (shouldImport) {
+        // Import each new price point from historical data
+        for (pricePoint in newPricePoints.vals()) {
           let priceData : PriceBlockData = {
             token = token;
-            priceICP = details.priceInICP;
-            priceUSD = details.priceInUSD;
+            priceICP = pricePoint.icpPrice;
+            priceUSD = pricePoint.usdPrice;
             source = #NTN;
             volume24h = null;
             change24h = null;
@@ -219,15 +213,15 @@ shared (deployer) actor class PriceArchiveV2() = this {
               imported += 1;
               // Update last known price for this token
               Map.set(lastKnownPrices, Map.phash, token, {
-                icpPrice = details.priceInICP;
-                usdPrice = details.priceInUSD;
-                timestamp = details.lastTimeSynced;
+                icpPrice = pricePoint.icpPrice;
+                usdPrice = pricePoint.usdPrice;
+                timestamp = pricePoint.time;
               });
-              lastImportedPriceTime := Int.max(lastImportedPriceTime, details.lastTimeSynced);
+              lastImportedPriceTime := Int.max(lastImportedPriceTime, pricePoint.time);
             };
             case (#err(e)) { 
               failed += 1;
-              base.logger.error("Batch Import", "Failed to import current price for " # Principal.toText(token) # ": " # debug_show(e), "importPriceHistoryBatch");
+              base.logger.error("Batch Import", "Failed to import price for " # Principal.toText(token) # " at time " # Int.toText(pricePoint.time) # ": " # debug_show(e), "importPriceHistoryBatch");
             };
           };
         };
