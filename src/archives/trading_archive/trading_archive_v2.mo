@@ -16,6 +16,7 @@ import DAO_types "../../DAO_backend/dao_types";
 import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
 import Logger "../../helper/logger";
+import BatchImportTimer "../../helper/batch_import_timer";
 
 shared (deployer) actor class TradingArchiveV2() = this {
 
@@ -356,7 +357,19 @@ shared (deployer) actor class TradingArchiveV2() = this {
     };
   };
 
-  // Specific batch import logic for trading data
+  // Three-tier timer system - trade import function
+  private func importTradesOnly() : async {imported: Nat; failed: Nat} {
+    base.logger.info("INNER_LOOP", "Starting trade import batch", "importTradesOnly");
+    await importTradesBatch();
+  };
+  
+  // Three-tier timer system - circuit breaker import function  
+  private func importCircuitBreakersOnly() : async {imported: Nat; failed: Nat} {
+    base.logger.info("INNER_LOOP", "Starting circuit breaker import batch", "importCircuitBreakersOnly");
+    await importPriceAlertsBatch();
+  };
+
+  // Legacy compatibility - combined import
   private func runTradingBatchImport() : async () {
     base.logger.info(
       "BATCH_IMPORT",
@@ -381,18 +394,41 @@ shared (deployer) actor class TradingArchiveV2() = this {
     );
   };
 
+  // Advanced batch import using three-tier timer system
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
+    await base.startAdvancedBatchImportSystem<system>(caller, ?importTradesOnly, ?importCircuitBreakersOnly, null);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func startLegacyBatchImportSystem() : async Result.Result<Text, Text> {
     await base.startBatchImportSystem<system>(caller, runTradingBatchImport);
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
     base.stopBatchImportSystem(caller);
   };
-
-  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
-    await base.runManualBatchImport(caller, runTradingBatchImport);
+  
+  // Emergency stop all timers
+  public shared ({ caller }) func stopAllTimers() : async Result.Result<Text, Text> {
+    base.stopAllTimers(caller);
   };
 
+  // Advanced manual import using three-tier timer system
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runAdvancedManualBatchImport<system>(caller, ?importTradesOnly, ?importCircuitBreakersOnly, null);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func runLegacyManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runManualBatchImport(caller, runTradingBatchImport);
+  };
+  
+  // Timer configuration
+  public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
+    base.setMaxInnerLoopIterations(caller, iterations);
+  };
+
+  // Legacy status for compatibility
   public query func getBatchImportStatus() : async {
     isRunning: Bool; 
     intervalSeconds: Nat;
@@ -406,6 +442,11 @@ shared (deployer) actor class TradingArchiveV2() = this {
       lastImportedTradeTimestamp = lastImportedTradeTimestamp;
       lastImportedPriceAlertId = lastImportedPriceAlertId;
     };
+  };
+  
+  // Comprehensive three-tier timer status
+  public query func getTimerStatus() : async BatchImportTimer.TimerStatus {
+    base.getTimerStatus();
   };
 
   // Admin method to reset import timestamps and re-import all historical data

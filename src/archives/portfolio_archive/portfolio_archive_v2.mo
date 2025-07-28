@@ -13,6 +13,7 @@ import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
 import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
+import BatchImportTimer "../../helper/batch_import_timer";
 
 shared (deployer) actor class PortfolioArchiveV2() = this {
 
@@ -178,6 +179,13 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
     };
   };
 
+  // Three-tier timer system - portfolio import function
+  private func importPortfolioOnly() : async {imported: Nat; failed: Nat} {
+    base.logger.info("INNER_LOOP", "Starting portfolio import batch", "importPortfolioOnly");
+    await importPortfolioSnapshotsBatch();
+  };
+
+  // Legacy compatibility - combined import
   private func runPortfolioBatchImport() : async () {
     base.logger.info(
       "BATCH_IMPORT",
@@ -195,18 +203,41 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
     );
   };
 
+  // Advanced batch import using three-tier timer system
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
+    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importPortfolioOnly);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func startLegacyBatchImportSystem() : async Result.Result<Text, Text> {
     await base.startBatchImportSystem<system>(caller, runPortfolioBatchImport);
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
     base.stopBatchImportSystem(caller);
   };
-
-  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
-    await base.runManualBatchImport(caller, runPortfolioBatchImport);
+  
+  // Emergency stop all timers
+  public shared ({ caller }) func stopAllTimers() : async Result.Result<Text, Text> {
+    base.stopAllTimers(caller);
   };
 
+  // Advanced manual import using three-tier timer system
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importPortfolioOnly);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func runLegacyManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runManualBatchImport(caller, runPortfolioBatchImport);
+  };
+  
+  // Timer configuration
+  public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
+    base.setMaxInnerLoopIterations(caller, iterations);
+  };
+
+  // Legacy status for compatibility
   public query func getBatchImportStatus() : async {
     isRunning: Bool; 
     intervalSeconds: Nat;
@@ -218,6 +249,11 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
       intervalSeconds = baseStatus.intervalSeconds;
       lastPortfolioImportTime = lastPortfolioImportTime;
     };
+  };
+  
+  // Comprehensive three-tier timer status
+  public query func getTimerStatus() : async BatchImportTimer.TimerStatus {
+    base.getTimerStatus();
   };
 
   // Admin method to reset import timestamps and re-import all historical data

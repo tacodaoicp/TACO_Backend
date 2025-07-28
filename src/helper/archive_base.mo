@@ -316,26 +316,64 @@ module {
     };
 
     //=========================================================================
-    // Batch Import System (delegated to timer abstraction)
+    // Batch Import System (three-tier timer architecture)
     //=========================================================================
 
+    // Legacy compatibility - single import function
     public func startBatchImportSystem<system>(caller : Principal, importFunction : () -> async ()) : async Result.Result<Text, Text> {
       await batchTimer.adminStart<system>(caller, importFunction);
+    };
+
+    // Advanced - multiple import functions for trading archive
+    public func startAdvancedBatchImportSystem<system>(
+      caller : Principal,
+      tradeImport: ?(() -> async {imported: Nat; failed: Nat}),
+      circuitBreakerImport: ?(() -> async {imported: Nat; failed: Nat}),
+      generalImport: ?(() -> async {imported: Nat; failed: Nat})
+    ) : async Result.Result<Text, Text> {
+      await batchTimer.adminStartAdvanced<system>(caller, tradeImport, circuitBreakerImport, generalImport);
     };
 
     public func stopBatchImportSystem(caller : Principal) : Result.Result<Text, Text> {
       batchTimer.adminStop(caller);
     };
 
+    // Emergency stop - cancels all running timers
+    public func stopAllTimers(caller : Principal) : Result.Result<Text, Text> {
+      batchTimer.adminStopAll(caller);
+    };
+
+    // Legacy compatibility - single import function
     public func runManualBatchImport(caller : Principal, importFunction : () -> async ()) : async Result.Result<Text, Text> {
       await batchTimer.adminManualImport(caller, importFunction);
     };
 
+    // Advanced manual import - multiple import functions
+    public func runAdvancedManualBatchImport<system>(
+      caller : Principal,
+      tradeImport: ?(() -> async {imported: Nat; failed: Nat}),
+      circuitBreakerImport: ?(() -> async {imported: Nat; failed: Nat}),
+      generalImport: ?(() -> async {imported: Nat; failed: Nat})
+    ) : async Result.Result<Text, Text> {
+      await batchTimer.adminManualImportAdvanced<system>(caller, tradeImport, circuitBreakerImport, generalImport);
+    };
+
+    // Configuration
+    public func setMaxInnerLoopIterations(caller : Principal, iterations : Nat) : Result.Result<Text, Text> {
+      batchTimer.setMaxInnerLoopIterations(caller, iterations);
+    };
+
+    // Status - legacy compatibility
     public func getBatchImportStatus() : {isRunning: Bool; intervalSeconds: Nat} {
       {
         isRunning = batchTimer.isRunning();
         intervalSeconds = batchTimer.getIntervalSeconds();
       };
+    };
+
+    // Status - comprehensive three-tier timer status
+    public func getTimerStatus() : BatchImportTimer.TimerStatus {
+      batchTimer.getTimerStatus();
     };
 
     public func catchUpImport(

@@ -17,6 +17,7 @@ import DAO_types "../../DAO_backend/dao_types";
 import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
 import Logger "../../helper/logger";
+import BatchImportTimer "../../helper/batch_import_timer";
 
 shared (deployer) actor class PriceArchiveV2() = this {
 
@@ -246,6 +247,13 @@ shared (deployer) actor class PriceArchiveV2() = this {
     };
   };
 
+  // Three-tier timer system - price import function
+  private func importPriceOnly() : async {imported: Nat; failed: Nat} {
+    base.logger.info("INNER_LOOP", "Starting price import batch", "importPriceOnly");
+    await importPriceHistoryBatch();
+  };
+
+  // Legacy compatibility - combined import
   private func runPriceBatchImport() : async () {
     base.logger.info(
       "BATCH_IMPORT",
@@ -263,18 +271,41 @@ shared (deployer) actor class PriceArchiveV2() = this {
     );
   };
 
+  // Advanced batch import using three-tier timer system
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
+    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importPriceOnly);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func startLegacyBatchImportSystem() : async Result.Result<Text, Text> {
     await base.startBatchImportSystem<system>(caller, runPriceBatchImport);
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
     base.stopBatchImportSystem(caller);
   };
-
-  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
-    await base.runManualBatchImport(caller, runPriceBatchImport);
+  
+  // Emergency stop all timers
+  public shared ({ caller }) func stopAllTimers() : async Result.Result<Text, Text> {
+    base.stopAllTimers(caller);
   };
 
+  // Advanced manual import using three-tier timer system
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importPriceOnly);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func runLegacyManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runManualBatchImport(caller, runPriceBatchImport);
+  };
+  
+  // Timer configuration
+  public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
+    base.setMaxInnerLoopIterations(caller, iterations);
+  };
+
+  // Legacy status for compatibility
   public query func getBatchImportStatus() : async {
     isRunning: Bool; 
     intervalSeconds: Nat;
@@ -286,6 +317,11 @@ shared (deployer) actor class PriceArchiveV2() = this {
       intervalSeconds = baseStatus.intervalSeconds;
       lastImportedPriceTime = lastImportedPriceTime;
     };
+  };
+  
+  // Comprehensive three-tier timer status
+  public query func getTimerStatus() : async BatchImportTimer.TimerStatus {
+    base.getTimerStatus();
   };
 
   // Admin method to reset import timestamps and re-import all historical data
