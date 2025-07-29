@@ -284,6 +284,22 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
     base.getArchiveStatus(caller);
   };
 
+  // Public archive statistics (no authorization required)
+  public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
+    let totalBlocks = base.nextBlockIndex;
+    let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
+    let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
+    
+    {
+      totalBlocks = totalBlocks;
+      oldestBlock = oldestBlock;
+      newestBlock = newestBlock;
+      supportedBlockTypes = ["portfolio"];
+      storageUsed = 0;
+      lastArchiveTime = lastPortfolioImportTime;
+    }
+  };
+
   public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
     base.getLogs(count, caller);
   };

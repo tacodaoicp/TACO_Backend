@@ -206,6 +206,22 @@ shared (deployer) actor class TradingArchiveV2() = this {
     base.getArchiveStatus(caller);
   };
 
+  // Public archive statistics (no authorization required)
+  public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
+    let totalBlocks = base.nextBlockIndex;
+    let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
+    let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
+    
+    {
+      totalBlocks = totalBlocks;
+      oldestBlock = oldestBlock;
+      newestBlock = newestBlock;
+      supportedBlockTypes = ["trade", "circuit_breaker"];
+      storageUsed = 0;
+      lastArchiveTime = lastImportedTradeTimestamp;
+    }
+  };
+
   public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
     base.getLogs(count, caller);
   };
