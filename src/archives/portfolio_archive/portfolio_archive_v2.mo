@@ -14,6 +14,7 @@ import DAO_types "../../DAO_backend/dao_types";
 import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
 import BatchImportTimer "../../helper/batch_import_timer";
+import Logger "../../helper/logger";
 
 shared (deployer) actor class PortfolioArchiveV2() = this {
 
@@ -281,6 +282,10 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
 
   public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveTypes.ArchiveStatus, ArchiveError> {
     base.getArchiveStatus(caller);
+  };
+
+  public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
+    base.getLogs(count, caller);
   };
 
   //=========================================================================
