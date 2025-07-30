@@ -286,7 +286,17 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
 
   // Public archive statistics (no authorization required)
   public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
-    let totalBlocks = base.nextBlockIndex;
+    // Try to get block count by testing if blocks exist
+    let testBlocks = base.icrc3_get_blocks([{start = 0; length = 10}]);
+    let actualBlockCount = testBlocks.blocks.size();
+    
+    // Use the larger of nextBlockIndex or actual block count found
+    let totalBlocks = if (actualBlockCount > 0 and actualBlockCount > base.nextBlockIndex) {
+      actualBlockCount; // Use actual count if we found blocks and it's higher
+    } else {
+      base.nextBlockIndex; // Use nextBlockIndex as fallback
+    };
+    
     let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
     let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
     
