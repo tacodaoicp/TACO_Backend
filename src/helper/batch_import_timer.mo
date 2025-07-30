@@ -273,6 +273,10 @@ module {
               case (?_) { "StartCircuitBreakerImport" };
               case null { "Done" };
             };
+            // If we're done completely, set middleLoopRunning to false
+            if (middleLoopCurrentState == "Done") {
+              middleLoopRunning := false;
+            };
             await* scheduleMiddleLoop<system>(0); // Continue immediately
           } else {
             await* scheduleMiddleLoop<system>(config.middleLoopDelayNS);
@@ -286,6 +290,7 @@ module {
         case ("MonitoringCircuitBreakerImport") {
           if (not innerLoopRunning) {
             middleLoopCurrentState := "Done";
+            middleLoopRunning := false;
           } else {
             await* scheduleMiddleLoop<system>(config.middleLoopDelayNS);
           };
@@ -300,6 +305,7 @@ module {
         case ("MonitoringImport") {
           if (not innerLoopRunning) {
             middleLoopCurrentState := "Done";
+            middleLoopRunning := false;
           } else {
             await* scheduleMiddleLoop<system>(config.middleLoopDelayNS);
           };
@@ -400,7 +406,7 @@ module {
             // Continue on error, but with delay
             if (innerLoopCurrentBatch < maxInnerLoopIterations) {
               await* scheduleInnerLoop<system>(config.innerLoopDelayNS);
-            } else {
+      } else {
               innerLoopRunning := false;
               innerLoopCurrentType := "None";
             };
@@ -434,7 +440,7 @@ module {
       
       #ok("Batch import system started")
     };
-    
+
     public func adminStartAdvanced<system>(
       caller: Principal,
       tradeImport: ?(() -> async {imported: Nat; failed: Nat}),
@@ -457,7 +463,7 @@ module {
       };
       
       stopOuterLoopTimer();
-      #ok("Batch import system stopped")
+        #ok("Batch import system stopped")
     };
     
     public func adminStopAll(caller: Principal) : Result.Result<Text, Text> {
@@ -483,7 +489,7 @@ module {
       
       // For backwards compatibility, convert single import function
       let compatFunction = func() : async {imported: Nat; failed: Nat} {
-        await importFunction();
+      await importFunction();
         {imported = 1; failed = 0};
       };
       
@@ -571,7 +577,7 @@ module {
       
       logger.info("TIMER_LIFECYCLE", "All timers cancelled for upgrade", "preupgrade");
     };
-    
+
     public func postupgrade<system>(importFunction: () -> async ()) {
       // Reset state variables to "not running" states
       middleLoopCurrentState := "Done";
@@ -588,15 +594,15 @@ module {
         
         setImportFunctions(null, null, ?compatFunction);
         
-        ignore Timer.setTimer<system>(
-          #nanoseconds(10_000_000_000), // 10 seconds delay
-          func() : async () {
+      ignore Timer.setTimer<system>(
+        #nanoseconds(10_000_000_000), // 10 seconds delay
+        func() : async () {
             await* startOuterLoopTimer<system>();
-          }
-        );
-      };
+        }
+      );
     };
-    
+    };
+
     //=========================================================================
     // LEGACY COMPATIBILITY (maintained for existing code)
     //=========================================================================
