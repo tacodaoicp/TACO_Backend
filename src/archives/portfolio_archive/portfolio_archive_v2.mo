@@ -87,11 +87,17 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
 
     let blockValue = ArchiveTypes.portfolioToValue(portfolio, null);
     
+    // Extract Principal IDs from detailed tokens for indexing
+    let tokenPrincipals = Array.map<ArchiveTypes.DetailedTokenSnapshot, Principal>(
+      portfolio.tokens, 
+      func(token) = token.token
+    );
+    
     // Use base class to store the block
     let blockIndex = base.storeBlock(
       blockValue,
       "3portfolio",
-      portfolio.activeTokens,
+      tokenPrincipals,
       portfolio.timestamp
     );
     
@@ -124,14 +130,37 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
           });
           
           for (snapshot in newSnapshots.vals()) {
+            // Convert treasury TokenSnapshots to archive DetailedTokenSnapshots (excluding symbol)
+            let detailedTokens = Array.map<TreasuryTypes.TokenSnapshot, ArchiveTypes.DetailedTokenSnapshot>(
+              snapshot.tokens, 
+              func(token) : ArchiveTypes.DetailedTokenSnapshot = {
+                token = token.token;
+                balance = token.balance;
+                decimals = token.decimals;
+                priceInICP = token.priceInICP;
+                priceInUSD = token.priceInUSD;
+                valueInICP = token.valueInICP;
+                valueInUSD = token.valueInUSD;
+              }
+            );
+
+            // Map Treasury SnapshotReason to Archive SnapshotReason
+            let archiveReason = switch (snapshot.snapshotReason) {
+              case (#Manual) { #ManualTrigger };
+              case (#PostTrade) { #PostTrade };
+              case (#PreTrade) { #PostTrade };  // Map PreTrade to PostTrade as closest match
+              case (#PriceUpdate) { #SystemEvent };  // Generic system event
+              case (#Scheduled) { #Scheduled };
+            };
+
             let portfolioBlock : PortfolioBlockData = {
               timestamp = snapshot.timestamp;
               totalValueICP = snapshot.totalValueICP;
               totalValueUSD = snapshot.totalValueUSD;
               tokenCount = snapshot.tokens.size();
-              activeTokens = Array.map<TreasuryTypes.TokenSnapshot, Principal>(snapshot.tokens, func(token) = token.token);
-              pausedTokens = [];
-              reason = #Scheduled; // Default for imported snapshots
+              tokens = detailedTokens;  // Store full token details
+              pausedTokens = [];        // No paused token data from treasury
+              reason = archiveReason;   // Use mapped reason
             };
             
             let archiveResult = await archivePortfolioBlock(portfolioBlock);

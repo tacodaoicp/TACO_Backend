@@ -78,13 +78,24 @@ module {
     error: ?Text;
   };
 
+  // Detailed token information stored in portfolio archives (excluding symbol since it can be looked up)
+  public type DetailedTokenSnapshot = {
+    token: Principal;
+    balance: Nat;           // Absolute token amount
+    decimals: Nat;
+    priceInICP: Nat;        // Price at snapshot time (e8s)
+    priceInUSD: Float;      // Price at snapshot time
+    valueInICP: Nat;        // balance * priceInICP
+    valueInUSD: Float;      // balance * priceInUSD
+  };
+
   public type PortfolioBlockData = {
     timestamp: Int;
     totalValueICP: Nat;
     totalValueUSD: Float;
     tokenCount: Nat;
-    activeTokens: [Principal];
-    pausedTokens: [Principal];
+    tokens: [DetailedTokenSnapshot];  // Full token details instead of just Principal IDs
+    pausedTokens: [Principal];        // Keep as-is since we don't have detailed data for paused tokens
     reason: SnapshotReason;
   };
 
@@ -293,9 +304,23 @@ module {
     #Map(entriesWithError);
   };
 
+  // Convert detailed token snapshot to ICRC3 Value format
+  private func detailedTokenToValue(token: DetailedTokenSnapshot) : Value {
+    let tokenEntries = [
+      makeMapEntry("token", principalToValue(token.token)),
+      makeMapEntry("balance", natToValue(token.balance)),
+      makeMapEntry("decimals", natToValue(token.decimals)),
+      makeMapEntry("price_in_icp", natToValue(token.priceInICP)),
+      makeMapEntry("price_in_usd", floatToValue(token.priceInUSD)),
+      makeMapEntry("value_in_icp", natToValue(token.valueInICP)),
+      makeMapEntry("value_in_usd", floatToValue(token.valueInUSD)),
+    ];
+    #Map(tokenEntries);
+  };
+
   // Convert portfolio data to ICRC3 Value format
   public func portfolioToValue(portfolio: PortfolioBlockData, phash: ?Blob) : Value {
-    let activeTokensArray = #Array(Array.map(portfolio.activeTokens, principalToValue));
+    let detailedTokensArray = #Array(Array.map(portfolio.tokens, detailedTokenToValue));
     let pausedTokensArray = #Array(Array.map(portfolio.pausedTokens, principalToValue));
     
     let reasonText = switch (portfolio.reason) {
@@ -312,7 +337,7 @@ module {
       makeMapEntry("total_value_icp", natToValue(portfolio.totalValueICP)),
       makeMapEntry("total_value_usd", floatToValue(portfolio.totalValueUSD)),
       makeMapEntry("token_count", natToValue(portfolio.tokenCount)),
-      makeMapEntry("active_tokens", activeTokensArray),
+      makeMapEntry("tokens", detailedTokensArray),  // Changed from active_tokens to tokens with detailed data
       makeMapEntry("paused_tokens", pausedTokensArray),
       makeMapEntry("reason", textToValue(reasonText)),
     ];
