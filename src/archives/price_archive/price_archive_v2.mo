@@ -191,27 +191,40 @@ shared (deployer) actor class PriceArchiveV2() = this {
   // Import historical price data from treasury
   private func importPriceHistoryBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // Get all token details including past prices
-      let tokenDetails = await treasuryCanister.getTokenDetails();
+      // Get the earliest timestamp we need to import from across all tokens
+      var earliestTimestamp = Time.now(); // Start with current time
+      for ((token, lastPrice) in Map.entries(lastKnownPrices)) {
+        if (lastPrice.timestamp < earliestTimestamp) {
+          earliestTimestamp := lastPrice.timestamp;
+        };
+      };
+      
+      // If no previous prices, start from 0 (get all history)
+      if (Map.size(lastKnownPrices) == 0) {
+        earliestTimestamp := 0;
+      };
+      
+      // Use new efficient method that filters on server-side
+      let tokenDetails = await treasuryCanister.getTokenDetailsSince(earliestTimestamp);
       var imported = 0;
       var failed = 0;
       
-      base.logger.info("Batch Import", "Retrieved " # Nat.toText(tokenDetails.size()) # " tokens from treasury", "importPriceHistoryBatch");
+      base.logger.info("Batch Import", "Retrieved " # Nat.toText(tokenDetails.size()) # " tokens from treasury with price history since " # Int.toText(earliestTimestamp), "importPriceHistoryBatch");
       
       for ((token, details) in tokenDetails.vals()) {
-        base.logger.info("Batch Import", "Processing token " # Principal.toText(token) # " (" # details.tokenSymbol # ") with " # Nat.toText(details.pastPrices.size()) # " price points", "importPriceHistoryBatch");
+        base.logger.info("Batch Import", "Processing token " # Principal.toText(token) # " (" # details.tokenSymbol # ") with " # Nat.toText(details.pastPrices.size()) # " filtered price points", "importPriceHistoryBatch");
         // Get last known timestamp for this token
         let lastKnownTime = switch (Map.get(lastKnownPrices, Map.phash, token)) {
           case (?lastPrice) { lastPrice.timestamp };
           case null { 0 };
         };
         
-        // Filter price points newer than last imported from pastPrices
+        // Further filter by specific token's timestamp (server filtered globally, now filter per token)
         let newPricePoints = Array.filter<TreasuryTypes.PricePoint>(details.pastPrices, func(point) {
           point.time > lastKnownTime
         });
         
-        base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": lastKnownTime=" # Int.toText(lastKnownTime) # ", filtered to " # Nat.toText(newPricePoints.size()) # " new price points from " # Nat.toText(details.pastPrices.size()) # " total", "importPriceHistoryBatch");
+        base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": lastKnownTime=" # Int.toText(lastKnownTime) # ", final filtered to " # Nat.toText(newPricePoints.size()) # " new price points", "importPriceHistoryBatch");
         
         // Import each new price point from historical data
         for (pricePoint in newPricePoints.vals()) {

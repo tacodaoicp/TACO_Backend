@@ -233,18 +233,17 @@ shared (deployer) actor class TradingArchiveV2() = this {
   // Import batch of trades from treasury
   private func importTradesBatch() : async { imported: Nat; failed: Nat } {
     try {
-      let tradingStatusResult = await treasuryCanister.getTradingStatus();
+      // Use new efficient method that filters on server-side
+      let tradingStatusResult = await treasuryCanister.getTradingStatusSince(lastImportedTradeTimestamp);
       
       switch (tradingStatusResult) {
         case (#ok(status)) {
-          let trades = status.executedTrades;
+          let trades = status.executedTrades; // Already filtered by timestamp
           var imported = 0;
           var failed = 0;
           
-          // Filter trades newer than last imported
-          let newTrades = Array.filter<TradeRecord>(trades, func(trade) {
-            trade.timestamp > lastImportedTradeTimestamp
-          });
+          // No need to filter client-side anymore - server already filtered
+          let newTrades = trades;
           
           // Process trades in batches (limit to 50 per batch)
           let batchSize = 50;

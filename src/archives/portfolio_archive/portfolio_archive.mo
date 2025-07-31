@@ -294,10 +294,11 @@ shared (deployer) actor class PortfolioArchive() = this {
   private func importPortfolioSnapshotsBatch() : async { imported : Nat; failed : Nat } {
     try {
       let treasury = actor(Principal.toText(TREASURY_ID)) : actor {
-        getPortfolioHistory : shared (Nat) -> async Result.Result<TreasuryTypes.PortfolioHistoryResponse, TreasuryTypes.PortfolioSnapshotError>;
+        getPortfolioHistorySince : shared (Int, Nat) -> async Result.Result<TreasuryTypes.PortfolioHistoryResponse, TreasuryTypes.PortfolioSnapshotError>;
       };
       
-      let result = await treasury.getPortfolioHistory(50); // Use default batch size
+      // Use new efficient method that filters on server-side
+      let result = await treasury.getPortfolioHistorySince(lastPortfolioImportTime, 50);
       
               switch (result) {
           case (#ok(response)) {
@@ -305,12 +306,26 @@ shared (deployer) actor class PortfolioArchive() = this {
             var failed = 0;
             
             for (snapshot in response.snapshots.vals()) {
+            // Convert treasury TokenSnapshots to archive DetailedTokenSnapshots
+            let detailedTokens = Array.map<TreasuryTypes.TokenSnapshot, ArchiveTypes.DetailedTokenSnapshot>(
+              snapshot.tokens,
+              func(token) : ArchiveTypes.DetailedTokenSnapshot = {
+                token = token.token;
+                balance = token.balance;
+                decimals = token.decimals;
+                priceInICP = token.priceInICP;
+                priceInUSD = token.priceInUSD;
+                valueInICP = token.valueInICP;
+                valueInUSD = token.valueInUSD;
+              }
+            );
+
             let portfolioBlock : PortfolioBlockData = {
               timestamp = snapshot.timestamp;
               totalValueICP = snapshot.totalValueICP;
               totalValueUSD = snapshot.totalValueUSD;
               tokenCount = snapshot.tokens.size();
-              activeTokens = Array.map<TreasuryTypes.TokenSnapshot, Principal>(snapshot.tokens, func(token) = token.token);
+              tokens = detailedTokens; // Use the required field name
               pausedTokens = [];
               reason = #Scheduled; // Default for imported snapshots
             };

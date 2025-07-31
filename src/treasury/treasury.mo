@@ -1068,6 +1068,172 @@ shared (deployer) actor class treasury() = this {
     Iter.toArray(Map.entries(tokenDetailsMap));
   };
 
+  //=========================================================================
+  // EFFICIENT TIMESTAMP-FILTERED METHODS FOR ARCHIVES
+  //=========================================================================
+
+  /**
+   * Get trading status with trades filtered by timestamp (for archive efficiency)
+   * Returns only trades newer than the specified timestamp
+   */
+  public shared query func getTradingStatusSince(sinceTimestamp: Int) : async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text> {
+    
+    // Filter trades by timestamp - only return trades newer than sinceTimestamp
+    let filteredTrades = Vector.new<TradeRecord>();
+    for (trade in Vector.vals(rebalanceState.lastTrades)) {
+      if (trade.timestamp > sinceTimestamp) {
+        Vector.add(filteredTrades, trade);
+      };
+    };
+
+    // Calculate total portfolio value (same as original method)
+    var totalValueICP = 0;
+    var totalValueUSD : Float = 0;
+    let currentAllocs = Vector.new<(Principal, Nat)>();
+
+    // First pass - calculate totals
+    for ((principal, details) in Map.entries(tokenDetailsMap)) {
+        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        totalValueICP += valueInICP;
+        totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
+    };
+
+    // Second pass - calculate allocations
+    for ((principal, details) in Map.entries(tokenDetailsMap)) {
+        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        if (valueInICP > 0) {
+            let basisPoints = (valueInICP * 10000) / totalValueICP;
+            Vector.add(currentAllocs, (principal, basisPoints));
+        };
+    };
+
+    // Calculate metrics from filtered trade history only
+    var totalSlippage : Float = 0;
+    var impactCount = 0;  
+    for (trade in Vector.vals(filteredTrades)) {
+      if (trade.success) {
+        totalSlippage += trade.slippage;
+        impactCount += 1;
+      };
+    };
+
+    let avgSlippage = if (impactCount > 0) {
+      totalSlippage / Float.fromInt(impactCount);
+    } else { 0.0 };
+
+    let totalAttempts = rebalanceState.metrics.totalTradesExecuted + rebalanceState.metrics.totalTradesFailed + rebalanceState.metrics.totalTradesSkipped;
+    
+    let successRate = if (rebalanceState.metrics.totalTradesExecuted + rebalanceState.metrics.totalTradesFailed > 0) {
+      Float.fromInt(rebalanceState.metrics.totalTradesExecuted) / Float.fromInt(rebalanceState.metrics.totalTradesExecuted + rebalanceState.metrics.totalTradesFailed);
+    } else { 0.0 };
+
+    let skipRate = if (totalAttempts > 0) {
+      Float.fromInt(rebalanceState.metrics.totalTradesSkipped) / Float.fromInt(totalAttempts);
+    } else { 0.0 };
+
+    #ok({
+      rebalanceStatus = rebalanceState.status;
+      executedTrades = Vector.toArray(filteredTrades); // Return only filtered trades
+      portfolioState = {
+        totalValueICP = totalValueICP;
+        totalValueUSD = totalValueUSD;
+        currentAllocations = Vector.toArray(currentAllocs);
+        targetAllocations = Iter.toArray(Map.entries(currentAllocations));
+      };
+      metrics = {
+        lastUpdate = rebalanceState.metrics.lastPriceUpdate;
+        totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted;
+        totalTradesFailed = rebalanceState.metrics.totalTradesFailed;
+        totalTradesSkipped = rebalanceState.metrics.totalTradesSkipped;
+        skipBreakdown = {
+          noPairsFound = rebalanceState.metrics.skipBreakdown.noPairsFound;
+          noExecutionPath = rebalanceState.metrics.skipBreakdown.noExecutionPath;
+          tokensFiltered = rebalanceState.metrics.skipBreakdown.tokensFiltered;
+          pausedTokens = rebalanceState.metrics.skipBreakdown.pausedTokens;
+          insufficientCandidates = rebalanceState.metrics.skipBreakdown.insufficientCandidates;
+        };
+        avgSlippage = avgSlippage;
+        successRate = successRate;
+        skipRate = skipRate;
+      };
+    });
+  };
+
+  /**
+   * Get portfolio history filtered by timestamp (for archive efficiency)
+   * Returns only snapshots newer than the specified timestamp
+   */
+  public shared query ({ caller }) func getPortfolioHistorySince(sinceTimestamp: Int, limit: Nat) : async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError> {
+    // Allow any authenticated caller (not anonymous)
+    if (Principal.isAnonymous(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (limit == 0 or limit > 2000) {
+      return #err(#InvalidLimit);
+    };
+
+    // Filter snapshots by timestamp first
+    let allSnapshots = Vector.toArray(portfolioSnapshots);
+    let filteredSnapshots = Array.filter<PortfolioSnapshot>(allSnapshots, func(snapshot) {
+      snapshot.timestamp > sinceTimestamp
+    });
+    
+    let totalFilteredCount = filteredSnapshots.size();
+    
+    // Apply limit to filtered results (get most recent ones)
+    let limitedSnapshots = if (totalFilteredCount > limit) {
+      let startIndex = totalFilteredCount - limit;
+      Array.subArray(filteredSnapshots, startIndex, limit)
+    } else {
+      filteredSnapshots
+    };
+
+    let response : PortfolioHistoryResponse = {
+      snapshots = limitedSnapshots;
+      totalCount = totalFilteredCount;
+    };
+
+    #ok(response);
+  };
+
+  /**
+   * Get token details with price history filtered by timestamp (for archive efficiency)
+   * Returns only price points newer than the specified timestamp per token
+   */
+  public query func getTokenDetailsSince(sinceTimestamp: Int) : async [(Principal, TokenDetails)] {
+    let result = Vector.new<(Principal, TokenDetails)>();
+    
+    for ((principal, details) in Map.entries(tokenDetailsMap)) {
+      // Filter pastPrices by timestamp
+      let filteredPrices = Array.filter<PricePoint>(details.pastPrices, func(pricePoint) {
+        pricePoint.time > sinceTimestamp
+      });
+      
+      // Create new TokenDetails with filtered price history
+      let filteredDetails : TokenDetails = {
+        Active = details.Active;
+        isPaused = details.isPaused;
+        epochAdded = details.epochAdded;
+        tokenName = details.tokenName;
+        tokenSymbol = details.tokenSymbol;
+        tokenDecimals = details.tokenDecimals;
+        tokenTransferFee = details.tokenTransferFee;
+        balance = details.balance;
+        priceInICP = details.priceInICP;
+        priceInUSD = details.priceInUSD;
+        tokenType = details.tokenType;
+        pastPrices = filteredPrices; // Only include prices newer than sinceTimestamp
+        lastTimeSynced = details.lastTimeSynced;
+        pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+      };
+      
+      Vector.add(result, (principal, filteredDetails));
+    };
+
+    Vector.toArray(result);
+  };
+
   public query func getTokenPriceHistory(tokens : [Principal]) : async Result.Result<[(Principal, [PricePoint])], Text> {
 
     let result = Vector.new<(Principal, [PricePoint])>();

@@ -483,5 +483,10 @@ module {
     getTradingStatus : shared query () -> async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text>;
     getPortfolioHistory : shared query (Nat) -> async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError>;
     getPriceAlerts : shared query (Nat, Nat) -> async { alerts : [PriceAlertLog]; totalCount : Nat };
+    
+    // New efficient timestamp-filtered methods for archives
+    getTradingStatusSince : shared query (Int) -> async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text>;
+    getPortfolioHistorySince : shared query (Int, Nat) -> async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError>;
+    getTokenDetailsSince : shared query (Int) -> async [(Principal, TokenDetails)];
   };
 };
