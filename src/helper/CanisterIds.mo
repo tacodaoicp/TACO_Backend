@@ -39,8 +39,8 @@ module CanisterId {
             (#Production, #treasury, Principal.fromText("v6t5d-6yaaa-aaaan-qzzja-cai")),
             (#Production, #validation, Principal.fromText("th44n-iyaaa-aaaan-qzz5a-cai")),
             (#Production, #trading_archive, Principal.fromText("jmze3-hiaaa-aaaan-qz4xq-cai")),
-            (#Production, #portfolio_archive, Principal.fromText("aaaaa-aa")),
-            (#Production, #price_archive, Principal.fromText("aaaaa-aa"))
+            (#Production, #portfolio_archive, Principal.fromText("bl7x7-wiaaa-aaaan-qz5bq-cai")),
+            (#Production, #price_archive, Principal.fromText("bm6rl-3qaaa-aaaan-qz5ba-cai"))
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {
