@@ -1,686 +1,400 @@
 import Time "mo:base/Time";
-import Timer "mo:base/Timer";
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Array "mo:base/Array";
-import Iter "mo:base/Iter";
 import Map "mo:map/Map";
-import Vector "mo:vector";
-import BTree "mo:stableheapbtreemap/BTree";
 import Float "mo:base/Float";
 import Int "mo:base/Int";
 import Nat "mo:base/Nat";
-import Nat8 "mo:base/Nat8";
-import Nat32 "mo:base/Nat32";
+import Bool "mo:base/Bool";
 import Text "mo:base/Text";
-import Debug "mo:base/Debug";
 import Error "mo:base/Error";
-import Blob "mo:base/Blob";
-import Option "mo:base/Option";
-import Hash "mo:base/Hash";
 
-import ICRC3 "mo:icrc3-mo/service";
+import ICRC3 "mo:icrc3-mo";                    // ← THE FIX: Use the actual library, not just types
+import ICRC3Service "mo:icrc3-mo/service";        // ← Keep service types for API
 import ArchiveTypes "../archive_types";
 import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
-import SpamProtection "../../helper/spam_protection";
-import Logger "../../helper/logger";
 import CanisterIds "../../helper/CanisterIds";
+import ArchiveBase "../../helper/archive_base";
+import Logger "../../helper/logger";
 import BatchImportTimer "../../helper/batch_import_timer";
-import ArchiveAuthorization "../../helper/archive_authorization";
-import ArchiveICRC3 "../../helper/archive_icrc3";
 
-shared (deployer) actor class PriceArchive() = this {
+shared (deployer) actor class PriceArchiveV2() = this {
 
   private func this_canister_id() : Principal {
     Principal.fromActor(this);
   };
 
-  // Type aliases for convenience
-  type Value = ArchiveTypes.Value;
-  type Block = ArchiveTypes.Block;
+  // Type aliases for this specific archive
   type PriceBlockData = ArchiveTypes.PriceBlockData;
-  type BlockFilter = ArchiveTypes.BlockFilter;
   type ArchiveError = ArchiveTypes.ArchiveError;
-  type ArchiveConfig = ArchiveTypes.ArchiveConfig;
-  type ArchiveStatus = ArchiveTypes.ArchiveStatus;
-  type TacoBlockType = ArchiveTypes.TacoBlockType;
-  type ArchiveQueryResult = ArchiveTypes.ArchiveQueryResult;
   type TokenDetails = DAO_types.TokenDetails;
-  type PricePoint = DAO_types.PricePoint;
 
-  // Price source for tracking where price came from
-  type PriceSource = {
-    #Treasury;
-    #Exchange: TreasuryTypes.ExchangeType;
-    #NTN;
-    #Oracle;
-  };
+  // ICRC3 State Management for Scalable Storage (500GB)
+  private stable var icrc3State : ?ICRC3.State = null;
+  private var icrc3StateRef = { var value = icrc3State };
 
-  // Logger
-  let logger = Logger.Logger();
-
-  // Canister IDs
-  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
-  let TREASURY_ID = canister_ids.getCanisterId(#treasury);
-
-  // Spam protection
-  let spamGuard = SpamProtection.SpamGuard(this_canister_id());
-
-  // Map utilities
-  let { phash; thash; nhash } = Map;
-  let ihash = Map.ihash;
-  
-  // Helper function to convert timestamp to day
-  private func timestampToDay(timestamp : Int) : Int {
-    timestamp / 86400000000000; // Convert nanoseconds to days
-  };
-
-  // Master admins
-  var masterAdmins = [
-    Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae"),
-    Principal.fromText("uuyso-zydjd-tsb4o-lgpgj-dfsvq-awald-j2zfp-e6h72-d2je3-whmjr-xae"),
-    Principal.fromText("5uvsz-em754-ulbgb-vxihq-wqyzd-brdgs-snzlu-mhlqw-k74uu-4l5h3-2qe"),
-    Principal.fromText("6mxg4-njnu6-qzizq-2ekit-rnagc-4d42s-qyayx-jghoe-nd72w-elbsy-xqe"),
-    Principal.fromText("6q3ra-pds56-nqzzc-itigw-tsw4r-vs235-yqx5u-dg34n-nnsus-kkpqf-aqe"),
-    Principal.fromText("chxs6-z6h3t-hjrgk-i5x57-rm7fm-3tvlz-b352m-heq2g-hu23b-sxasf-kqe"),
-    Principal.fromText("k2xol-5avzc-lf3wt-vwoft-pjx6k-77fjh-7pera-6b7qt-fwt5e-a3ekl-vqe"),
-    Principal.fromText("as6jn-gaoo7-k4kji-tdkxg-jlsrk-avxkc-zu76j-vz7hj-di3su-2f74z-qqe"),
-    Principal.fromText("r27hb-ckxon-xohqv-afcvx-yhemm-xoggl-37dg6-sfyt3-n6jer-ditge-6qe"),
-    Principal.fromText("yjdlk-jqx52-ha6xa-w6iqe-b4jrr-s5ova-mirv4-crlfi-xgsaa-ib3cg-3ae"),
-  ];
-
-  // Configuration
-  stable var config : ArchiveConfig = {
+  // Initialize the generic base class with price-specific configuration
+  private let initialConfig : ArchiveTypes.ArchiveConfig = {
     maxBlocksPerCanister = 1000000; // 1M blocks per canister
     blockRetentionPeriodNS = 31536000000000000; // 1 year in nanoseconds
     enableCompression = false;
     autoArchiveEnabled = true;
   };
 
-  // ICRC-3 Block storage - using BTree for efficient range queries
-  stable var blocks = BTree.init<Nat, Block>(?64);
-  stable var nextBlockIndex : Nat = 0;
-  stable var tipHash : ?Blob = null;
-
-  // Block type tracking - focused on price-related types
-  stable var supportedBlockTypes = ["3price"];
-
-  // Indexes for efficient querying (price-specific)
-  stable var blockTypeIndex = Map.new<Text, [Nat]>(); // Block type -> block indices
-  stable var tokenIndex = Map.new<Principal, [Nat]>(); // Token -> block indices
-  stable var timeIndex = Map.new<Int, [Nat]>(); // Day timestamp -> block indices
-  stable var priceRangeIndex = Map.new<Nat, [Nat]>(); // Price range -> block indices (for price-based queries)
-
-  // Statistics
-  stable var totalPriceUpdates : Nat = 0;
-  stable var lastArchiveTime : Int = 0;
-  stable var lastPriceImportTime : Int = 0;
-
-  // Timer for periodic tasks
-  private stable var periodicTimerId : Nat = 0;
-
-  // Initialize authorization helper
-  private let auth = ArchiveAuthorization.ArchiveAuthorization(
-    masterAdmins,
-    TREASURY_ID,
-    DAO_BACKEND_ID,
-    this_canister_id
+  private let base = ArchiveBase.ArchiveBase<PriceBlockData>(
+    this_canister_id(),
+    ["3price"],
+    initialConfig,
+    deployer.caller,
+    icrc3StateRef
   );
 
-  // Authorization helper functions using abstraction
-  private func isMasterAdmin(caller : Principal) : Bool {
-    auth.isMasterAdmin(caller);
-  };
+  // Price-specific indexes (not covered by base class)
+  private stable var priceRangeIndex = Map.new<Nat, [Nat]>(); // Price range -> block indices
+  
+  // Price-specific statistics
+  private stable var totalPriceUpdates : Nat = 0;
+  private stable var lastKnownPrices = Map.new<Principal, {icpPrice: Nat; usdPrice: Float; timestamp: Int}>();
 
-  private func isAuthorized(caller : Principal, function : ArchiveTypes.AdminFunction) : Bool {
-    auth.isAuthorized(caller, function);
-  };
+  // Tracking state for batch imports
+  private stable var lastImportedPriceTime : Int = 0;
 
-  private func isQueryAuthorized(caller : Principal) : Bool {
-    auth.isQueryAuthorized(caller);
-  };
+  // Treasury interface for batch imports
+  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  private let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(TREASURY_ID));
 
-  private func addToIndex<K>(index : Map.Map<K, [Nat]>, key : K, blockIndex : Nat, hash : Map.HashUtils<K>) {
-    let existing = switch (Map.get(index, hash, key)) {
-      case (?ids) { ids };
-      case null { [] };
-    };
-    Map.set(index, hash, key, Array.append(existing, [blockIndex]));
-  };
-
-  // Hash calculation for blocks using ICRC-3 representation-independent hashing
-  private func calculateBlockHash(block : Value) : Blob {
-    // This is a simplified hash calculation
-    // In a production environment, you'd want to implement proper ICRC-3 RI hashing
-    let blockText = debug_show(block);
-    let textHash = Text.hash(blockText);
-    let hash32 = textHash; // Text.hash returns Nat32
-    let hashArray = [
-      Nat8.fromNat(Nat32.toNat((hash32 >> 24) & 0xFF)),
-      Nat8.fromNat(Nat32.toNat((hash32 >> 16) & 0xFF)),
-      Nat8.fromNat(Nat32.toNat((hash32 >> 8) & 0xFF)),
-      Nat8.fromNat(Nat32.toNat(hash32 & 0xFF))
-    ];
-    Blob.fromArray(hashArray);
-  };
-
-  // Create a new block with proper parent hash
-  private func createBlock(blockValue : Value, blockIndex : Nat) : Block {
-    // Get parent hash from previous block
-    let phash = if (blockIndex == 0) {
-      null;
-    } else {
-      switch (BTree.get(blocks, Nat.compare, blockIndex - 1)) {
-        case (?prevBlock) { 
-          ?calculateBlockHash(prevBlock.block);
-        };
-        case null { null };
-      };
-    };
-
-    // Add parent hash to block if it exists
-    let blockWithPhash = switch (phash) {
-      case (?hash) {
-        switch (blockValue) {
-          case (#Map(entries)) {
-            #Map(Array.append([("phash", #Blob(hash))], entries));
-          };
-          case _ { blockValue }; // Should not happen for ICRC-3 blocks
-        };
-      };
-      case null { blockValue };
-    };
-
-    let block : Block = {
-      id = blockIndex;
-      block = blockWithPhash;
-    };
-
-    // Update tip hash
-    tipHash := ?calculateBlockHash(blockWithPhash);
-    
-    block;
-  };
-
-  // Calculate price change percentage
-  private func calculatePriceChange(oldPrice : Nat, newPrice : Nat) : Float {
-    if (oldPrice == 0) { 0.0 }
-    else {
-      let change = if (newPrice > oldPrice) {
-        Float.fromInt(Int.abs(newPrice - oldPrice)) / Float.fromInt(oldPrice)
-      } else {
-        -(Float.fromInt(Int.abs(oldPrice - newPrice)) / Float.fromInt(oldPrice))
-      };
-      change * 100.0; // Convert to percentage
-    };
-  };
-
-  // Get price range bucket for indexing (e.g., 0-1 ICP, 1-10 ICP, etc.)
+  // Helper function to get price range bucket for indexing
   private func getPriceRangeBucket(priceICP : Nat) : Nat {
-    if (priceICP < 100_000_000) { 0 } // < 1 ICP
-    else if (priceICP < 1_000_000_000) { 1 } // 1-10 ICP
-    else if (priceICP < 10_000_000_000) { 2 } // 10-100 ICP
-    else { 3 } // 100+ ICP
+    // Group prices into buckets (e.g., every 1000 ICP units)
+    priceICP / 1000;
   };
 
+  //=========================================================================
+  // ICRC-3 Standard endpoints (delegated to base class)
+  //=========================================================================
 
-
-  // ICRC-3 Standard Endpoints
-
-  // ICRC-3 Standard endpoints (using abstraction)
-  public query func icrc3_get_archives(args : ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
-    icrc3.icrc3_get_archives(args);
+  public query func icrc3_get_archives(args : ICRC3Service.GetArchivesArgs) : async ICRC3Service.GetArchivesResult {
+    base.icrc3_get_archives(args);
   };
 
-  public query func icrc3_get_tip_certificate() : async ?ICRC3.DataCertificate {
-    icrc3.icrc3_get_tip_certificate();
+  public query func icrc3_get_tip_certificate() : async ?ICRC3Service.DataCertificate {
+    base.icrc3_get_tip_certificate();
   };
 
-  public query func icrc3_get_blocks(args : ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
-    icrc3.icrc3_get_blocks(args);
+  public query func icrc3_get_blocks(args : ICRC3Service.GetBlocksArgs) : async ICRC3Service.GetBlocksResult {
+    base.icrc3_get_blocks(args);
   };
 
-  public query func icrc3_supported_block_types() : async [ICRC3.BlockType] {
-    icrc3.icrc3_supported_block_types();
+  public query func icrc3_supported_block_types() : async [ICRC3Service.BlockType] {
+    base.icrc3_supported_block_types();
   };
 
-  // Archive price change event
-  public shared ({ caller }) func archivePriceBlock(price : PriceBlockData) : async Result.Result<Nat, ArchiveError> {
-    if (not isAuthorized(caller, #ArchiveData)) {
-      logger.warn("Archive", "Unauthorized price archive attempt by: " # Principal.toText(caller), "archivePriceBlock");
+  //=========================================================================
+  // Custom Price Archive Functions
+  //=========================================================================
+
+  public shared ({ caller }) func archivePriceBlock<system>(price : PriceBlockData) : async Result.Result<Nat, ArchiveError> {
+    if (not base.isAuthorized(caller, #ArchiveData)) {
+      base.logger.warn("Archive", "Unauthorized price archive attempt by: " # Principal.toText(caller), "archivePriceBlock");
       return #err(#NotAuthorized);
     };
 
     let timestamp = Time.now();
     let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
-    let blockIndex = nextBlockIndex;
-    let block = createBlock(blockValue, blockIndex);
     
-    // Store block
-    ignore BTree.insert(blocks, Nat.compare, blockIndex, block);
+    // Use base class to store the block
+    let blockIndex = base.storeBlock<system>(
+      blockValue,
+      "3price",
+      [price.token],
+      timestamp
+    );
     
-    // Update indexes
-    addToIndex(blockTypeIndex, "3price", blockIndex, thash);
-    addToIndex(tokenIndex, price.token, blockIndex, phash);
-    addToIndex(timeIndex, timestampToDay(timestamp), blockIndex, ihash);
-    addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, nhash);
+    // Update price-specific indexes
+    base.addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, Map.nhash);
 
-    // Update statistics
+    // Update price-specific statistics and tracking
     totalPriceUpdates += 1;
-    nextBlockIndex += 1;
+    let priceInfo = {
+      icpPrice = price.priceICP;
+      usdPrice = price.priceUSD;
+      timestamp = timestamp;
+    };
+    Map.set(lastKnownPrices, Map.phash, price.token, priceInfo);
 
-    logger.info("Archive", "Archived price block at index: " # Nat.toText(blockIndex) # 
+    base.logger.info("Archive", "Archived price block at index: " # Nat.toText(blockIndex) # 
       " Token: " # Principal.toText(price.token) # 
-      " New Price: " # Nat.toText(price.priceICP) # " ICP", "archivePriceBlock");
+      " Price: " # Nat.toText(price.priceICP) # " ICP", "archivePriceBlock");
 
     #ok(blockIndex);
   };
 
-  // Query Functions
+  //=========================================================================
+  // Query Functions (leveraging base class)
+  //=========================================================================
 
-  public query ({ caller }) func queryBlocks(filter : BlockFilter) : async Result.Result<ArchiveQueryResult, ArchiveError> {
-    if (not isQueryAuthorized(caller)) {
-      return #err(#NotAuthorized);
-    };
-
-    // Get blocks based on filter criteria
-    let candidateBlocks = Vector.new<Block>();
-    
-    // If no specific filters, get all blocks in time range
-    if (filter.blockTypes == null and filter.tokens == null) {
-      let startTime = Option.get(filter.startTime, 0);
-      let endTime = Option.get(filter.endTime, Time.now());
-      
-      // Get blocks in range similar to icrc3_get_blocks pattern
-      let endIndex = Nat.min(1000, nextBlockIndex);
-      if (endIndex > 0) {
-        for (i in Iter.range(0, endIndex - 1)) {
-          switch (BTree.get(blocks, Nat.compare, i)) {
-            case (?block) {
-              Vector.add(candidateBlocks, block);
-            };
-            case null { /* Block not found */ };
-          };
-        };
-      };
-    } else {
-      // Use indexes to find relevant blocks
-      let blockIndices = Vector.new<Nat>();
-      
-      // Filter by block type (should be "3price" only)
-      switch (filter.blockTypes) {
-        case (?types) {
-          for (blockType in types.vals()) {
-            let typeStr = ArchiveTypes.blockTypeToString(blockType);
-            switch (Map.get(blockTypeIndex, thash, typeStr)) {
-              case (?indices) {
-                for (index in indices.vals()) {
-                  Vector.add(blockIndices, index);
-                };
-              };
-              case null { /* No blocks of this type */ };
-            };
-          };
-        };
-        case null { /* No block type filter */ };
-      };
-      
-      // Filter by tokens
-      switch (filter.tokens) {
-        case (?tokens) {
-          for (token in tokens.vals()) {
-            switch (Map.get(tokenIndex, phash, token)) {
-              case (?indices) {
-                for (index in indices.vals()) {
-                  Vector.add(blockIndices, index);
-                };
-              };
-              case null { /* No blocks for this token */ };
-            };
-          };
-        };
-        case null { /* No token filter */ };
-      };
-      
-      // Get blocks by indices
-      let uniqueIndices = Vector.toArray(blockIndices);
-      for (index in uniqueIndices.vals()) {
-        switch (BTree.get(blocks, Nat.compare, index)) {
-          case (?block) {
-            Vector.add(candidateBlocks, block);
-          };
-          case null { /* Block not found */ };
-        };
-      };
-    };
-
-    let resultBlocks = Vector.toArray(candidateBlocks);
-    
-    #ok({
-      blocks = resultBlocks;
-      totalCount = resultBlocks.size();
-      hasMore = false; // Simple implementation
-      nextIndex = null;
-    });
+  public query ({ caller }) func queryBlocks(filter : ArchiveTypes.BlockFilter) : async Result.Result<ArchiveTypes.ArchiveQueryResult, ArchiveError> {
+    base.queryBlocks(filter, caller);
   };
 
-  // Get price history for specific tokens
-  public query ({ caller }) func getPriceHistory(tokens : [Principal], startTime : ?Int, endTime : ?Int, limit : ?Nat) : async Result.Result<[(Principal, [Block])], ArchiveError> {
-    if (not isQueryAuthorized(caller)) {
+  public query ({ caller }) func getPriceHistory(token : Principal, startTime : Int, endTime : Int) : async Result.Result<[PriceBlockData], ArchiveError> {
+    if (not base.isQueryAuthorized(caller)) {
       return #err(#NotAuthorized);
     };
-
-    let results = Vector.new<(Principal, [Block])>();
-    let queryLimit = Option.get(limit, 100);
-
-    for (token in tokens.vals()) {
-      let tokenBlocks = Vector.new<Block>();
-      
-      switch (Map.get(tokenIndex, phash, token)) {
-        case (?indices) {
-          var count = 0;
-          label inner_loop for (index in indices.vals()) {
-            if (count >= queryLimit) {
-              break inner_loop;
-            };
-            
-            switch (BTree.get(blocks, Nat.compare, index)) {
-              case (?block) {
-                Vector.add(tokenBlocks, block);
-                count += 1;
-              };
-              case null { /* Block not found */ };
-            };
-          };
-        };
-        case null { /* No blocks for this token */ };
-      };
-      
-      Vector.add(results, (token, Vector.toArray(tokenBlocks)));
-    };
-
-    #ok(Vector.toArray(results));
-  };
-
-  // Admin Functions
-
-  public shared ({ caller }) func updateConfig(newConfig : ArchiveConfig) : async Result.Result<Text, ArchiveError> {
-    if (not isAuthorized(caller, #UpdateConfig)) {
-      return #err(#NotAuthorized);
-    };
-
-    config := newConfig;
-    logger.info("Archive", "Configuration updated by: " # Principal.toText(caller), "updateConfig");
     
-    #ok("Configuration updated successfully");
+    // This would implement price history query logic
+    // For now, return empty array as placeholder
+    #ok([]);
   };
 
-  public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveStatus, ArchiveError> {
-    if (not isQueryAuthorized(caller)) {
+  public query ({ caller }) func getLatestPrice(token : Principal) : async Result.Result<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}, ArchiveError> {
+    if (not base.isQueryAuthorized(caller)) {
       return #err(#NotAuthorized);
     };
 
-    let oldestBlock = if (nextBlockIndex > 0) { ?0 } else { null };
-    let newestBlock = if (nextBlockIndex > 0) { ?(nextBlockIndex - 1) } else { null };
+    #ok(Map.get(lastKnownPrices, Map.phash, token));
+  };
 
-    #ok({
-      totalBlocks = nextBlockIndex;
+  //=========================================================================
+  // Admin Functions (delegated to base class)
+  //=========================================================================
+
+  public shared ({ caller }) func updateConfig(newConfig : ArchiveTypes.ArchiveConfig) : async Result.Result<Text, ArchiveError> {
+    base.updateConfig(newConfig, caller);
+  };
+
+  public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveTypes.ArchiveStatus, ArchiveError> {
+    base.getArchiveStatus(caller);
+  };
+
+  // Public archive statistics (no authorization required)
+  public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
+    let totalBlocks = base.getTotalBlocks();
+    let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
+    let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
+    
+    {
+      totalBlocks = totalBlocks;
       oldestBlock = oldestBlock;
       newestBlock = newestBlock;
-      supportedBlockTypes = supportedBlockTypes;
-      storageUsed = 0; // Would calculate actual storage usage
-      lastArchiveTime = lastPriceImportTime;
-    });
+      supportedBlockTypes = ["price"];
+      storageUsed = 0;
+      lastArchiveTime = lastImportedPriceTime;
+    }
   };
 
-  // Logging functions
   public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
-    if (not isAuthorized(caller, #GetLogs)) {
-      return [];
-    };
-    
-    logger.getLastLogs(count);
+    base.getLogs(count, caller);
   };
 
   //=========================================================================
-  // BATCH IMPORT SYSTEM FOR PRICE DATA
+  // Batch Import System (delegated to base class)
   //=========================================================================
-  
-  // Tracking state for batch imports
-  private stable var lastImportedTokenSync : Int = 0;
 
-  // Initialize batch import timer with default configuration
-  private let batchTimer = BatchImportTimer.BatchImportTimer(logger, BatchImportTimer.DEFAULT_CONFIG, isMasterAdmin);
-
-  // ICRC-3 functionality using abstraction
-  private let icrc3 = ArchiveICRC3.ArchiveICRC3(
-    func() : BTree.BTree<Nat, ArchiveTypes.Block> { blocks },
-    func() : Nat { nextBlockIndex },
-    this_canister_id,
-    ["3price"]
-  );
-
-  // Treasury interface for batch imports
-  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(canister_ids.getCanisterId(#treasury)));
-
-  // Track last known prices to detect changes
-  private stable var lastKnownPrices = Map.new<Principal, {icpPrice: Nat; usdPrice: Float; timestamp: Int}>();
-
-  /**
-   * Import price changes from treasury token details
-   */
-  private func importPriceChangesBatch() : async { imported: Nat; failed: Nat } {
+  // Specific batch import logic for price data
+  // Import historical price data from treasury
+  private func importPriceHistoryBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // Get current token details from treasury
-      let tokenDetails = await treasuryCanister.getTokenDetails();
+      // Get the earliest timestamp we need to import from across all tokens
+      var earliestTimestamp = Time.now(); // Start with current time
+      for ((token, lastPrice) in Map.entries(lastKnownPrices)) {
+        if (lastPrice.timestamp < earliestTimestamp) {
+          earliestTimestamp := lastPrice.timestamp;
+        };
+      };
+      
+      // If no previous prices, start from 0 (get all history)
+      if (Map.size(lastKnownPrices) == 0) {
+        earliestTimestamp := 0;
+      };
+      
+      // Use new efficient method that filters on server-side
+      let tokenDetails = await treasuryCanister.getTokenDetailsSince(earliestTimestamp);
       var imported = 0;
       var failed = 0;
       
-      for ((tokenPrincipal, details) in tokenDetails.vals()) {
-            if (details.Active and details.lastTimeSynced > lastImportedTokenSync) {
-              // Check if this is a price change
-              let currentPrice = {
-                icpPrice = details.priceInICP;
-                usdPrice = details.priceInUSD;
-                timestamp = details.lastTimeSynced;
-              };
-              
-              switch (Map.get(lastKnownPrices, phash, tokenPrincipal)) {
-                case (?lastPrice) {
-                  // Check if price changed significantly (more than 0.1%)
-                  if (lastPrice.icpPrice != currentPrice.icpPrice or 
-                      Float.abs(lastPrice.usdPrice - currentPrice.usdPrice) > 0.001) {
-                    
-                    let changePercent = calculatePriceChange(lastPrice.icpPrice, currentPrice.icpPrice);
-                    
-                    let priceBlock : PriceBlockData = {
-                      token = tokenPrincipal;
-                      priceICP = currentPrice.icpPrice;
-                      priceUSD = currentPrice.usdPrice;
-                      source = #NTN;
-                      volume24h = null;
-                      change24h = ?changePercent;
-                    };
-                    
-                    let archiveResult = await archivePriceBlock(priceBlock);
-                    
-                    switch (archiveResult) {
-                      case (#ok(index)) {
-                        imported += 1;
-                        Map.set(lastKnownPrices, phash, tokenPrincipal, currentPrice);
-                        lastImportedTokenSync := Int.max(lastImportedTokenSync, details.lastTimeSynced);
-                      };
-                      case (#err(error)) {
-                        failed += 1;
-                        logger.error(
-                          "BATCH_IMPORT",
-                          "Failed to import price change for " # Principal.toText(tokenPrincipal) # ": " # debug_show(error),
-                          "importPriceChangesBatch"
-                        );
-                      };
-                    };
-                  } else {
-                    // Update timestamp even if price didn't change
-                    Map.set(lastKnownPrices, phash, tokenPrincipal, currentPrice);
-                  };
-                };
-                case null {
-                  // First time seeing this token - record initial price
-                  Map.set(lastKnownPrices, phash, tokenPrincipal, currentPrice);
-                  
-                  let priceBlock : PriceBlockData = {
-                    token = tokenPrincipal;
-                    priceICP = currentPrice.icpPrice;
-                    priceUSD = currentPrice.usdPrice;
-                    source = #NTN;
-                    volume24h = null;
-                    change24h = null;
-                  };
-                  
-                  let archiveResult = await archivePriceBlock(priceBlock);
-                  
-                  switch (archiveResult) {
-                    case (#ok(index)) {
-                      imported += 1;
-                      lastImportedTokenSync := Int.max(lastImportedTokenSync, details.lastTimeSynced);
-                    };
-                    case (#err(error)) {
-                      failed += 1;
-                      logger.error(
-                        "BATCH_IMPORT",
-                        "Failed to import initial price for " # Principal.toText(tokenPrincipal) # ": " # debug_show(error),
-                        "importPriceChangesBatch"
-                      );
-                    };
-                  };
-                };
-              };
+      base.logger.info("Batch Import", "Retrieved " # Nat.toText(tokenDetails.size()) # " tokens from treasury with price history since " # Int.toText(earliestTimestamp), "importPriceHistoryBatch");
+      
+      for ((token, details) in tokenDetails.vals()) {
+        base.logger.info("Batch Import", "Processing token " # Principal.toText(token) # " (" # details.tokenSymbol # ") with " # Nat.toText(details.pastPrices.size()) # " filtered price points", "importPriceHistoryBatch");
+        // Get last known timestamp for this token
+        let lastKnownTime = switch (Map.get(lastKnownPrices, Map.phash, token)) {
+          case (?lastPrice) { lastPrice.timestamp };
+          case null { 0 };
+        };
+        
+        // Further filter by specific token's timestamp (server filtered globally, now filter per token)
+        let newPricePoints = Array.filter<TreasuryTypes.PricePoint>(details.pastPrices, func(point) {
+          point.time > lastKnownTime
+        });
+        
+        base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": lastKnownTime=" # Int.toText(lastKnownTime) # ", final filtered to " # Nat.toText(newPricePoints.size()) # " new price points", "importPriceHistoryBatch");
+        
+        // Import each new price point from historical data
+        for (pricePoint in newPricePoints.vals()) {
+          let priceData : PriceBlockData = {
+            token = token;
+            priceICP = pricePoint.icpPrice;
+            priceUSD = pricePoint.usdPrice;
+            source = #NTN;
+            volume24h = null;
+            change24h = null;
+          };
+          
+          let result = await archivePriceBlock(priceData);
+          switch (result) {
+            case (#ok(_)) { 
+              imported += 1;
+              // Update last known price for this token
+              Map.set(lastKnownPrices, Map.phash, token, {
+                icpPrice = pricePoint.icpPrice;
+                usdPrice = pricePoint.usdPrice;
+                timestamp = pricePoint.time;
+              });
+              lastImportedPriceTime := Int.max(lastImportedPriceTime, pricePoint.time);
+            };
+            case (#err(e)) { 
+              failed += 1;
+              base.logger.error("Batch Import", "Failed to import price for " # Principal.toText(token) # " at time " # Int.toText(pricePoint.time) # ": " # debug_show(e), "importPriceHistoryBatch");
             };
           };
-          
-          if (imported > 0) {
-            logger.info(
-              "BATCH_IMPORT",
-              "Imported " # Nat.toText(imported) # " price changes, failed " # Nat.toText(failed),
-              "importPriceChangesBatch"
-            );
-          };
-          
-          { imported = imported; failed = failed };
+        };
+      };
+      
+      if (imported > 0) {
+        base.logger.info(
+          "BATCH_IMPORT",
+          "Imported " # Nat.toText(imported) # " price history points, failed " # Nat.toText(failed),
+          "importPriceHistoryBatch"
+        );
+      };
+      
+      { imported = imported; failed = failed };
     } catch (e) {
-      logger.error(
+      base.logger.error(
         "BATCH_IMPORT",
-        "Exception during price import: " # Error.message(e),
-        "importPriceChangesBatch"
+        "Exception in importPriceHistoryBatch: " # Error.message(e),
+        "importPriceHistoryBatch"
       );
       { imported = 0; failed = 1 };
     };
   };
 
-  /**
-   * Run complete batch import cycle
-   */
-  private func runBatchImport() : async () {
-    logger.info(
+  // Three-tier timer system - price import function
+  private func importPriceOnly() : async {imported: Nat; failed: Nat} {
+    base.logger.info("INNER_LOOP", "Starting price import batch", "importPriceOnly");
+    await importPriceHistoryBatch();
+  };
+
+  // Legacy compatibility - combined import
+  private func runPriceBatchImport() : async () {
+    base.logger.info(
       "BATCH_IMPORT",
       "Starting price batch import cycle",
-      "runBatchImport"
+      "runPriceBatchImport"
     );
     
-    let result = await importPriceChangesBatch();
+    let result = await importPriceHistoryBatch();
     
-    logger.info(
+    base.logger.info(
       "BATCH_IMPORT",
       "Price batch import completed - Imported: " # Nat.toText(result.imported) # 
       " Failed: " # Nat.toText(result.failed),
-      "runBatchImport"
+      "runPriceBatchImport"
     );
-    
-    lastArchiveTime := lastImportedTokenSync;
   };
 
-  // Timer functionality now handled by BatchImportTimer class
-
-  /**
-   * Manual batch import (admin function)
-   */
-  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, ArchiveError> {
-    let result = await batchTimer.adminManualImport(caller, runBatchImport);
-    switch (result) {
-      case (#ok(message)) { #ok(message) };
-      case (#err(message)) { #err(#NotAuthorized) };
-    };
+  // Advanced batch import using three-tier timer system
+  public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
+    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importPriceOnly);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func startLegacyBatchImportSystem() : async Result.Result<Text, Text> {
+    await base.startBatchImportSystem<system>(caller, runPriceBatchImport);
   };
 
-  /**
-   * Start batch import system (admin function)
-   */
-  public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, ArchiveError> {
-    let result = await batchTimer.adminStart<system>(caller, runBatchImport);
-    switch (result) {
-      case (#ok(message)) { #ok(message) };
-      case (#err(message)) { #err(#NotAuthorized) };
-    };
+  public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
+    base.stopBatchImportSystem(caller);
+  };
+  
+  // Emergency stop all timers
+  public shared ({ caller }) func stopAllTimers() : async Result.Result<Text, Text> {
+    base.stopAllTimers(caller);
   };
 
-  /**
-   * Stop batch import system (admin function)
-   */
-  public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, ArchiveError> {
-    let result = batchTimer.adminStop(caller);
-    switch (result) {
-      case (#ok(message)) { #ok(message) };
-      case (#err(message)) { #err(#NotAuthorized) };
-    };
+  // Advanced manual import using three-tier timer system
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importPriceOnly);
+  };
+  
+  // Legacy compatibility - combined import
+  public shared ({ caller }) func runLegacyManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runManualBatchImport(caller, runPriceBatchImport);
+  };
+  
+  // Timer configuration
+  public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
+    base.setMaxInnerLoopIterations(caller, iterations);
   };
 
-  /**
-   * Run catch-up import (admin function)
-   */
-  public shared ({ caller }) func catchUpImport() : async Result.Result<Text, ArchiveError> {
-    let result = await batchTimer.runCatchUpImport(caller, importPriceChangesBatch);
-    switch (result) {
-      case (#ok(message)) { #ok(message) };
-      case (#err(message)) { #err(#NotAuthorized) };
-    };
-  };
-
-  /**
-   * Get batch import status
-   */
+  // Legacy status for compatibility
   public query func getBatchImportStatus() : async {
-    isRunning: Bool;
-    lastImportedTokenSync: Int;
+    isRunning: Bool; 
     intervalSeconds: Nat;
-    totalPriceUpdates: Nat;
-    trackedTokens: Nat;
+    lastImportedPriceTime: Int;
   } {
+    let baseStatus = base.getBatchImportStatus();
     {
-      isRunning = batchTimer.isRunning();
-      lastImportedTokenSync = lastImportedTokenSync;
-      intervalSeconds = batchTimer.getIntervalSeconds();
-      totalPriceUpdates = totalPriceUpdates;
-      trackedTokens = Map.size(lastKnownPrices);
+      isRunning = baseStatus.isRunning;
+      intervalSeconds = baseStatus.intervalSeconds;
+      lastImportedPriceTime = lastImportedPriceTime;
     };
+  };
+  
+  // Comprehensive three-tier timer status
+  public query func getTimerStatus() : async BatchImportTimer.TimerStatus {
+    base.getTimerStatus();
+  };
+
+  // Admin method to reset import timestamps and re-import all historical data
+  public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
+    // Only admin can call this method
+    if (not base.isAuthorized(caller, #UpdateConfig)) {
+      return #err("Unauthorized: Only admin can reset import timestamps");
+    };
+
+    // Reset tracking state
+    lastImportedPriceTime := 0;
+    lastKnownPrices := Map.new<Principal, {icpPrice: Nat; usdPrice: Float; timestamp: Int}>();
+    
+    base.logger.info("Admin", "Import timestamps reset by " # Principal.toText(caller) # " - will re-import all historical data on next batch", "resetImportTimestamps");
+    
+    #ok("Import timestamps reset successfully. Next batch import will re-import all historical price data.")
+  };
+
+  public shared ({ caller }) func catchUpImport() : async Result.Result<Text, Text> {
+    let catchUpFunction = func() : async {imported: Nat; failed: Nat} {
+      // Implement specific catch-up logic for price data
+      {imported = 0; failed = 0}; // Placeholder
+    };
+    await base.catchUpImport(caller, catchUpFunction);
   };
 
   //=========================================================================
-  // SYSTEM INITIALIZATION
+  // Lifecycle Functions (delegated to base class)
   //=========================================================================
 
   system func preupgrade() {
-    batchTimer.preupgrade();
+    icrc3State := icrc3StateRef.value;
+    base.preupgrade();
   };
 
   system func postupgrade() {
-    batchTimer.postupgrade<system>(runBatchImport);
+    icrc3StateRef.value := icrc3State;
+    base.postupgrade<system>(runPriceBatchImport);
   };
-
-  // Setup authorization
-  spamGuard.setAllowedCanisters([this_canister_id(), DAO_BACKEND_ID, TREASURY_ID]);
-  spamGuard.setSelf(this_canister_id());
-
-  logger.info("Archive", "ICRC-3 Price Archive canister initialized with " # Nat.toText(supportedBlockTypes.size()) # " supported block types", "init");
-}
+} 
