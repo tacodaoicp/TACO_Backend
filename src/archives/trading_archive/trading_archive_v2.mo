@@ -9,7 +9,8 @@ import Nat "mo:base/Nat";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
 
-import ICRC3 "mo:icrc3-mo/service";
+import ICRC3 "mo:icrc3-mo";                    // ← THE FIX: Use actual library
+import ICRC3Service "mo:icrc3-mo/service";    // ← Keep service types 
 import ArchiveTypes "../archive_types";
 import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
@@ -42,10 +43,16 @@ shared (deployer) actor class TradingArchiveV2() = this {
     autoArchiveEnabled = true;
   };
 
+  // ICRC3 State for scalable storage
+  private stable var icrc3State : ?ICRC3.State = null;
+  private var icrc3StateRef = { var value = icrc3State };
+
   private let base = ArchiveBase.ArchiveBase<TradeBlockData>(
     this_canister_id(),
     ["3trade", "3circuit", "3pause"],
-    initialConfig
+    initialConfig,
+    deployer.caller,
+    icrc3StateRef
   );
 
   // Trading-specific indexes (not covered by base class)
@@ -69,19 +76,19 @@ shared (deployer) actor class TradingArchiveV2() = this {
   // ICRC-3 Standard endpoints (delegated to base class)
   //=========================================================================
 
-  public query func icrc3_get_archives(args : ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
+  public query func icrc3_get_archives(args : ICRC3Service.GetArchivesArgs) : async ICRC3Service.GetArchivesResult {
     base.icrc3_get_archives(args);
   };
 
-  public query func icrc3_get_tip_certificate() : async ?ICRC3.DataCertificate {
+  public query func icrc3_get_tip_certificate() : async ?ICRC3Service.DataCertificate {
     base.icrc3_get_tip_certificate();
   };
 
-  public query func icrc3_get_blocks(args : ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
+  public query func icrc3_get_blocks(args : ICRC3Service.GetBlocksArgs) : async ICRC3Service.GetBlocksResult {
     base.icrc3_get_blocks(args);
   };
 
-  public query func icrc3_supported_block_types() : async [ICRC3.BlockType] {
+  public query func icrc3_supported_block_types() : async [ICRC3Service.BlockType] {
     base.icrc3_supported_block_types();
   };
 
@@ -89,7 +96,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
   // Custom Trading Archive Functions
   //=========================================================================
 
-  public shared ({ caller }) func archiveTradeBlock(trade : TradeBlockData) : async Result.Result<Nat, ArchiveError> {
+  public shared ({ caller }) func archiveTradeBlock<system>(trade : TradeBlockData) : async Result.Result<Nat, ArchiveError> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       base.logger.warn("Archive", "Unauthorized trade archive attempt by: " # Principal.toText(caller), "archiveTradeBlock");
       return #err(#NotAuthorized);
@@ -99,7 +106,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
     let blockValue = ArchiveTypes.tradeToValue(trade, timestamp, null);
     
     // Use base class to store the block
-    let blockIndex = base.storeBlock(
+    let blockIndex = base.storeBlock<system>(
       blockValue,
       "3trade",
       [trade.tokenSold, trade.tokenBought],
@@ -122,7 +129,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
     #ok(blockIndex);
   };
 
-  public shared ({ caller }) func archiveCircuitBreakerBlock(circuitBreaker : CircuitBreakerBlockData) : async Result.Result<Nat, ArchiveError> {
+  public shared ({ caller }) func archiveCircuitBreakerBlock<system>(circuitBreaker : CircuitBreakerBlockData) : async Result.Result<Nat, ArchiveError> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       base.logger.warn("Archive", "Unauthorized circuit breaker archive attempt by: " # Principal.toText(caller), "archiveCircuitBreakerBlock");
       return #err(#NotAuthorized);
@@ -132,7 +139,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
     let blockValue = ArchiveTypes.circuitBreakerToValue(circuitBreaker, timestamp, null);
     
     // Use base class to store the block
-    let blockIndex = base.storeBlock(
+    let blockIndex = base.storeBlock<system>(
       blockValue,
       "3circuit",
       circuitBreaker.tokensAffected,
@@ -145,7 +152,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
     #ok(blockIndex);
   };
 
-  public shared ({ caller }) func archiveTradingPauseBlock(pause : TradingPauseBlockData) : async Result.Result<Nat, ArchiveError> {
+  public shared ({ caller }) func archiveTradingPauseBlock<system>(pause : TradingPauseBlockData) : async Result.Result<Nat, ArchiveError> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       base.logger.warn("Archive", "Unauthorized trading pause archive attempt by: " # Principal.toText(caller), "archiveTradingPauseBlock");
       return #err(#NotAuthorized);
@@ -155,7 +162,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
     let blockValue = ArchiveTypes.tradingPauseToValue(pause, timestamp, null);
     
     // Use base class to store the block
-    let blockIndex = base.storeBlock(
+    let blockIndex = base.storeBlock<system>(
       blockValue,
       "3pause",
       [pause.token],
@@ -208,7 +215,8 @@ shared (deployer) actor class TradingArchiveV2() = this {
 
   // Public archive statistics (no authorization required)
   public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
-    let totalBlocks = base.nextBlockIndex;
+    // Get total blocks directly from ICRC3 library stats
+    let totalBlocks = base.getTotalBlocks();
     let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
     let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
     
@@ -493,10 +501,14 @@ shared (deployer) actor class TradingArchiveV2() = this {
   //=========================================================================
 
   system func preupgrade() {
+    // Save ICRC3 state before upgrade
+    icrc3State := icrc3StateRef.value;
     base.preupgrade();
   };
 
   system func postupgrade() {
+    // Restore ICRC3 state after upgrade  
+    icrc3StateRef.value := icrc3State;
     base.postupgrade<system>(runTradingBatchImport);
   };
 } 
