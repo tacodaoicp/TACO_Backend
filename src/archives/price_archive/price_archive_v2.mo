@@ -10,7 +10,8 @@ import Bool "mo:base/Bool";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
 
-import ICRC3 "mo:icrc3-mo/service";
+import ICRC3 "mo:icrc3-mo";                    // ← THE FIX: Use the actual library, not just types
+import ICRC3Service "mo:icrc3-mo/service";        // ← Keep service types for API
 import ArchiveTypes "../archive_types";
 import TreasuryTypes "../../treasury/treasury_types";
 import DAO_types "../../DAO_backend/dao_types";
@@ -30,6 +31,10 @@ shared (deployer) actor class PriceArchiveV2() = this {
   type ArchiveError = ArchiveTypes.ArchiveError;
   type TokenDetails = DAO_types.TokenDetails;
 
+  // ICRC3 State Management for Scalable Storage (500GB)
+  private stable var icrc3State : ?ICRC3.State = null;
+  private var icrc3StateRef = { var value = icrc3State };
+
   // Initialize the generic base class with price-specific configuration
   private let initialConfig : ArchiveTypes.ArchiveConfig = {
     maxBlocksPerCanister = 1000000; // 1M blocks per canister
@@ -41,7 +46,9 @@ shared (deployer) actor class PriceArchiveV2() = this {
   private let base = ArchiveBase.ArchiveBase<PriceBlockData>(
     this_canister_id(),
     ["3price"],
-    initialConfig
+    initialConfig,
+    deployer.caller,
+    icrc3StateRef
   );
 
   // Price-specific indexes (not covered by base class)
@@ -69,19 +76,19 @@ shared (deployer) actor class PriceArchiveV2() = this {
   // ICRC-3 Standard endpoints (delegated to base class)
   //=========================================================================
 
-  public query func icrc3_get_archives(args : ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
+  public query func icrc3_get_archives(args : ICRC3Service.GetArchivesArgs) : async ICRC3Service.GetArchivesResult {
     base.icrc3_get_archives(args);
   };
 
-  public query func icrc3_get_tip_certificate() : async ?ICRC3.DataCertificate {
+  public query func icrc3_get_tip_certificate() : async ?ICRC3Service.DataCertificate {
     base.icrc3_get_tip_certificate();
   };
 
-  public query func icrc3_get_blocks(args : ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
+  public query func icrc3_get_blocks(args : ICRC3Service.GetBlocksArgs) : async ICRC3Service.GetBlocksResult {
     base.icrc3_get_blocks(args);
   };
 
-  public query func icrc3_supported_block_types() : async [ICRC3.BlockType] {
+  public query func icrc3_supported_block_types() : async [ICRC3Service.BlockType] {
     base.icrc3_supported_block_types();
   };
 
@@ -89,7 +96,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
   // Custom Price Archive Functions
   //=========================================================================
 
-  public shared ({ caller }) func archivePriceBlock(price : PriceBlockData) : async Result.Result<Nat, ArchiveError> {
+  public shared ({ caller }) func archivePriceBlock<system>(price : PriceBlockData) : async Result.Result<Nat, ArchiveError> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       base.logger.warn("Archive", "Unauthorized price archive attempt by: " # Principal.toText(caller), "archivePriceBlock");
       return #err(#NotAuthorized);
@@ -99,7 +106,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
     let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
     
     // Use base class to store the block
-    let blockIndex = base.storeBlock(
+    let blockIndex = base.storeBlock<system>(
       blockValue,
       "3price",
       [price.token],
@@ -165,7 +172,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
 
   // Public archive statistics (no authorization required)
   public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
-    let totalBlocks = base.nextBlockIndex;
+    let totalBlocks = base.getTotalBlocks();
     let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
     let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
     
@@ -382,10 +389,12 @@ shared (deployer) actor class PriceArchiveV2() = this {
   //=========================================================================
 
   system func preupgrade() {
+    icrc3State := icrc3StateRef.value;
     base.preupgrade();
   };
 
   system func postupgrade() {
+    icrc3StateRef.value := icrc3State;
     base.postupgrade<system>(runPriceBatchImport);
   };
 } 
