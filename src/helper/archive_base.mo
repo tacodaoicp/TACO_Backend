@@ -80,6 +80,12 @@ module {
     // Configuration
     public var config : ArchiveConfig = initialConfig;
 
+    // Create ICRC3 Environment with correct Store type from the library  
+    private let icrc3Environment = {
+      get_certificate_store = null : ?(() -> ICRC3.CertTree.Store);
+      updated_certification = null : ?((Blob, Nat) -> Bool);
+    };
+
     // ICRC3 Library - Scalable Storage (up to 500GB)
     private let icrc3 = ICRC3.ICRC3(
       icrc3StateRef.value,              // stored state
@@ -98,7 +104,7 @@ module {
           { block_type = blockType; url = "https://github.com/ICRC-3/icrc3-mo" }
         });
       },
-      null,                                      // environment (use defaults)
+      ?icrc3Environment,                         // provide proper environment
       func(newState : ICRC3.State) {             // state change callback
         icrc3StateRef.value := ?newState;
       }
