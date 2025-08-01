@@ -1681,53 +1681,102 @@ shared (deployer) actor class treasury() = this {
       return null;
     };
     
-    // Find min and max prices in the window
-    var minPrice = currentPrice;
-    var maxPrice = currentPrice;
+    // Create array of all price points with timestamps (including current)
+    let allPrices = Array.append(relevantPrices, [{
+      icpPrice = currentPrice;
+      usdPrice = 0.0; // Not used in this analysis
+      time = currentTime;
+    }]);
     
-    for (point in relevantPrices.vals()) {
-      if (point.icpPrice < minPrice) {
-        minPrice := point.icpPrice;
-      };
-      if (point.icpPrice > maxPrice) {
-        maxPrice := point.icpPrice;
-      };
-    };
+    // Sort by timestamp (oldest first)
+    let sortedPrices = Array.sort(allPrices, func(a: PricePoint, b: PricePoint) : { #less; #equal; #greater } {
+      if (a.time < b.time) { #less }
+      else if (a.time > b.time) { #greater }
+      else { #equal }
+    });
     
-    // Calculate percentage changes and check if any exceed threshold
-    let changes = [
-      {
-        fromPrice = currentPrice;
-        toPrice = minPrice;
-        changeType = #CurrentToMin;
-      },
-      {
-        fromPrice = currentPrice;
-        toPrice = maxPrice;
-        changeType = #CurrentToMax;
-      },
-      {
-        fromPrice = minPrice;
-        toPrice = maxPrice;
-        changeType = #MinToMax;
-      }
-    ];
-    
-    for (change in changes.vals()) {
-      let percentageChange = calculatePercentageChange(change.fromPrice, change.toPrice);
-      let directionMatches = switch (condition.direction) {
-        case (#Up) { change.toPrice > change.fromPrice };
-        case (#Down) { change.toPrice < change.fromPrice };
+    switch (condition.direction) {
+      case (#Down) {
+        // For DROP detection: Find min first, then find max in range [window_start, min_time]
+        
+        // Find minimum price and its time
+        var minPrice = currentPrice;
+        var minPriceTime = currentTime;
+        
+        for (point in sortedPrices.vals()) {
+          if (point.icpPrice < minPrice) {
+            minPrice := point.icpPrice;
+            minPriceTime := point.time;
+          };
+        };
+        
+        // Find maximum price in the range [window_start, min_time]
+        var maxPriceBeforeMin = minPrice; // Default to min if no earlier values
+        
+        for (point in sortedPrices.vals()) {
+          if (point.time <= minPriceTime) {
+            if (point.icpPrice > maxPriceBeforeMin) {
+              maxPriceBeforeMin := point.icpPrice;
+            };
+          };
+        };
+        
+        // Calculate drop percentage: (max_before_min - min) / max_before_min
+        if (maxPriceBeforeMin > minPrice) {
+          let dropPercentage = calculatePercentageChange(maxPriceBeforeMin, minPrice);
+          
+          if (Float.abs(dropPercentage) >= condition.percentage) {
+            return ?{
+              currentPrice = currentPrice;
+              minPriceInWindow = minPrice;
+              maxPriceInWindow = maxPriceBeforeMin;
+              windowStartTime = windowStartTime;
+              actualChangePercent = Float.abs(dropPercentage);
+              changeType = #MinToMax;
+            };
+          };
+        };
       };
       
-      if (directionMatches and Float.abs(percentageChange) >= condition.percentage) {
-        return ?{
-          currentPrice = currentPrice;
-          minPriceInWindow = minPrice;
-          maxPriceInWindow = maxPrice;
-          windowStartTime = windowStartTime;
-          actualChangePercent = Float.abs(percentageChange);
-          changeType = change.changeType;
+      case (#Up) {
+        // For CLIMB detection: Find max first, then find min in range [window_start, max_time]
+        
+        // Find maximum price and its time
+        var maxPrice = currentPrice;
+        var maxPriceTime = currentTime;
+        
+        for (point in sortedPrices.vals()) {
+          if (point.icpPrice > maxPrice) {
+            maxPrice := point.icpPrice;
+            maxPriceTime := point.time;
+          };
+        };
+        
+        // Find minimum price in the range [window_start, max_time]
+        var minPriceBeforeMax = maxPrice; // Default to max if no earlier values
+        
+        for (point in sortedPrices.vals()) {
+          if (point.time <= maxPriceTime) {
+            if (point.icpPrice < minPriceBeforeMax) {
+              minPriceBeforeMax := point.icpPrice;
+            };
+          };
+        };
+        
+        // Calculate climb percentage: (max - min_before_max) / min_before_max
+        if (minPriceBeforeMax > 0 and maxPrice > minPriceBeforeMax) {
+          let climbPercentage = calculatePercentageChange(minPriceBeforeMax, maxPrice);
+          
+          if (Float.abs(climbPercentage) >= condition.percentage) {
+            return ?{
+              currentPrice = currentPrice;
+              minPriceInWindow = minPriceBeforeMax;
+              maxPriceInWindow = maxPrice;
+              windowStartTime = windowStartTime;
+              actualChangePercent = Float.abs(climbPercentage);
+              changeType = #MinToMax;
+            };
+          };
         };
       };
     };
@@ -2554,55 +2603,130 @@ shared (deployer) actor class treasury() = this {
     // Get current portfolio value
     let currentValue = getCurrentPortfolioValue(condition.valueType);
     
-    // Find min and max portfolio values in the window
-    var minValue = currentValue;
-    var maxValue = currentValue;
+    // Create array of all values with timestamps (including current)
+    let allSnapshots = Array.append(relevantSnapshots, [{
+      timestamp = currentTime;
+      totalValueICP = switch (condition.valueType) {
+        case (#ICP) { Int.abs(Float.toInt(currentValue * 100_000_000.0)) };
+        case (#USD) { 0 }; // Not used for USD
+      };
+      totalValueUSD = switch (condition.valueType) {
+        case (#USD) { currentValue };
+        case (#ICP) { 0.0 }; // Not used for ICP
+      };
+      tokens = []; // Not needed for this analysis
+      snapshotReason = #Manual; // Not relevant
+    }]);
     
-    for (snapshot in relevantSnapshots.vals()) {
-      let snapshotValue = switch (condition.valueType) {
-        case (#ICP) { Float.fromInt(snapshot.totalValueICP) / 100_000_000.0 }; // Convert e8s to ICP
-        case (#USD) { snapshot.totalValueUSD };
+    // Sort by timestamp (oldest first)
+    let sortedSnapshots = Array.sort(allSnapshots, func(a: PortfolioSnapshot, b: PortfolioSnapshot) : { #less; #equal; #greater } {
+      if (a.timestamp < b.timestamp) { #less }
+      else if (a.timestamp > b.timestamp) { #greater }
+      else { #equal }
+    });
+    
+    switch (condition.direction) {
+      case (#Down) {
+        // For DROP detection: Find min first, then find max in range [window_start, min_time]
+        
+        // Find minimum value and its time
+        var minValue = currentValue;
+        var minValueTime = currentTime;
+        
+        for (snapshot in sortedSnapshots.vals()) {
+          let snapshotValue = switch (condition.valueType) {
+            case (#ICP) { Float.fromInt(snapshot.totalValueICP) / 100_000_000.0 };
+            case (#USD) { snapshot.totalValueUSD };
+          };
+          
+          if (snapshotValue < minValue) {
+            minValue := snapshotValue;
+            minValueTime := snapshot.timestamp;
+          };
+        };
+        
+        // Find maximum value in the range [window_start, min_time]
+        var maxValueBeforeMin = minValue; // Default to min if no earlier values
+        
+        for (snapshot in sortedSnapshots.vals()) {
+          if (snapshot.timestamp <= minValueTime) {
+            let snapshotValue = switch (condition.valueType) {
+              case (#ICP) { Float.fromInt(snapshot.totalValueICP) / 100_000_000.0 };
+              case (#USD) { snapshot.totalValueUSD };
+            };
+            
+            if (snapshotValue > maxValueBeforeMin) {
+              maxValueBeforeMin := snapshotValue;
+            };
+          };
+        };
+        
+        // Calculate drop percentage: (max_before_min - min) / max_before_min
+        if (maxValueBeforeMin > minValue) {
+          let dropPercentage = ((maxValueBeforeMin - minValue) / maxValueBeforeMin) * 100.0;
+          
+          if (dropPercentage >= condition.percentage) {
+            return ?{
+              currentValue = currentValue;
+              minValueInWindow = minValue;
+              maxValueInWindow = maxValueBeforeMin;
+              windowStartTime = windowStartTime;
+              actualChangePercent = dropPercentage;
+              valueType = condition.valueType;
+            };
+          };
+        };
       };
       
-      if (snapshotValue < minValue) {
-        minValue := snapshotValue;
-      };
-      if (snapshotValue > maxValue) {
-        maxValue := snapshotValue;
-      };
-    };
-    
-    // Calculate percentage changes and check if any exceed threshold
-    let changes = [
-      {
-        fromValue = currentValue;
-        toValue = minValue;
-      },
-      {
-        fromValue = currentValue;
-        toValue = maxValue;
-      },
-      {
-        fromValue = minValue;
-        toValue = maxValue;
-      }
-    ];
-    
-    for (change in changes.vals()) {
-      let percentageChange = calculatePortfolioPercentageChange(change.fromValue, change.toValue);
-      let directionMatches = switch (condition.direction) {
-        case (#Up) { change.toValue > change.fromValue };
-        case (#Down) { change.toValue < change.fromValue };
-      };
-      
-      if (directionMatches and Float.abs(percentageChange) >= condition.percentage) {
-        return ?{
-          currentValue = currentValue;
-          minValueInWindow = minValue;
-          maxValueInWindow = maxValue;
-          windowStartTime = windowStartTime;
-          actualChangePercent = Float.abs(percentageChange);
-          valueType = condition.valueType;
+      case (#Up) {
+        // For CLIMB detection: Find max first, then find min in range [window_start, max_time]
+        
+        // Find maximum value and its time
+        var maxValue = currentValue;
+        var maxValueTime = currentTime;
+        
+        for (snapshot in sortedSnapshots.vals()) {
+          let snapshotValue = switch (condition.valueType) {
+            case (#ICP) { Float.fromInt(snapshot.totalValueICP) / 100_000_000.0 };
+            case (#USD) { snapshot.totalValueUSD };
+          };
+          
+          if (snapshotValue > maxValue) {
+            maxValue := snapshotValue;
+            maxValueTime := snapshot.timestamp;
+          };
+        };
+        
+        // Find minimum value in the range [window_start, max_time]
+        var minValueBeforeMax = maxValue; // Default to max if no earlier values
+        
+        for (snapshot in sortedSnapshots.vals()) {
+          if (snapshot.timestamp <= maxValueTime) {
+            let snapshotValue = switch (condition.valueType) {
+              case (#ICP) { Float.fromInt(snapshot.totalValueICP) / 100_000_000.0 };
+              case (#USD) { snapshot.totalValueUSD };
+            };
+            
+            if (snapshotValue < minValueBeforeMax) {
+              minValueBeforeMax := snapshotValue;
+            };
+          };
+        };
+        
+        // Calculate climb percentage: (max - min_before_max) / min_before_max
+        if (minValueBeforeMax > 0.0 and maxValue > minValueBeforeMax) {
+          let climbPercentage = ((maxValue - minValueBeforeMax) / minValueBeforeMax) * 100.0;
+          
+          if (climbPercentage >= condition.percentage) {
+            return ?{
+              currentValue = currentValue;
+              minValueInWindow = minValueBeforeMax;
+              maxValueInWindow = maxValue;
+              windowStartTime = windowStartTime;
+              actualChangePercent = climbPercentage;
+              valueType = condition.valueType;
+            };
+          };
         };
       };
     };
@@ -3523,7 +3647,7 @@ shared (deployer) actor class treasury() = this {
                 
                 // ICP FALLBACK STRATEGY: If we can't find a direct route, try selling for ICP instead
                 // This creates an ICP overweight that will be corrected in the next cycle
-                if (buyToken != ICPprincipal) {
+                if (buyToken != ICPprincipal and sellToken != ICPprincipal) {
                   Debug.print("Attempting ICP fallback route: " # Principal.toText(sellToken) # " -> ICP");
                   
                   // VERBOSE LOGGING: ICP fallback attempt
