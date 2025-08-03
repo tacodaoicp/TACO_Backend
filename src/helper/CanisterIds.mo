@@ -48,7 +48,7 @@ module CanisterId {
             (#Production, #portfolio_archive, Principal.fromText("bl7x7-wiaaa-aaaan-qz5bq-cai")),
             (#Production, #price_archive, Principal.fromText("bm6rl-3qaaa-aaaan-qz5ba-cai")),
             (#Production, #dao_admin_archive, Principal.fromText("aaaaa-aa")),
-            (#Production, #dao_governance_archive, Principal.fromText("aaaaa-aa"))
+            (#Production, #dao_governance_archive, Principal.fromText("aaaaa-aa")),
             (#Production, #dao_allocation_archive, Principal.fromText("aaaaa-aa"))
         ];
         
