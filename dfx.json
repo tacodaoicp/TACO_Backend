@@ -36,6 +36,14 @@
       "main": "src/archives/dao_admin_archive/dao_admin_archive.mo",
       "type": "motoko"
     },
+    "dao_allocation_archive": {
+      "main": "src/archives/dao_allocation_archive/dao_allocation_archive.mo",
+      "type": "motoko"
+    },
+    "dao_governance_archive": {
+      "main": "src/archives/dao_governance_archive/dao_governance_archive.mo",
+      "type": "motoko"
+    },
     "actorA": {
       "main": "examples/testActorA.mo",
       "type": "motoko"

@@ -14,6 +14,7 @@ module CanisterId {
         #portfolio_archive;
         #price_archive;
         #dao_admin_archive;
+        #dao_governance_archive;
     };
     
     // Define the environments
@@ -34,6 +35,7 @@ module CanisterId {
             (#Staging, #portfolio_archive, Principal.fromText("lrekt-uaaaa-aaaan-qz4ya-cai")),
             (#Staging, #price_archive, Principal.fromText("l7gh3-pqaaa-aaaan-qz4za-cai")),
             (#Staging, #dao_admin_archive, Principal.fromText("b6ygs-xaaaa-aaaan-qz5ca-cai")),
+            (#Staging, #dao_governance_archive, Principal.fromText("bzzag-2yaaa-aaaan-qz5cq-cai")),
 
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),
@@ -43,7 +45,8 @@ module CanisterId {
             (#Production, #trading_archive, Principal.fromText("jmze3-hiaaa-aaaan-qz4xq-cai")),
             (#Production, #portfolio_archive, Principal.fromText("bl7x7-wiaaa-aaaan-qz5bq-cai")),
             (#Production, #price_archive, Principal.fromText("bm6rl-3qaaa-aaaan-qz5ba-cai")),
-            (#Production, #dao_admin_archive, Principal.fromText("aaaaa-aa"))
+            (#Production, #dao_admin_archive, Principal.fromText("aaaaa-aa")),
+            (#Production, #dao_governance_archive, Principal.fromText("aaaaa-aa"))
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {

@@ -1,0 +1,348 @@
+import Time "mo:base/Time";
+import Principal "mo:base/Principal";
+import Result "mo:base/Result";
+import Array "mo:base/Array";
+import Map "mo:map/Map";
+import Int "mo:base/Int";
+import Nat "mo:base/Nat";
+import Text "mo:base/Text";
+import Error "mo:base/Error";
+import Debug "mo:base/Debug";
+import Blob "mo:base/Blob";
+
+import ICRC3 "mo:icrc3-mo";
+import ICRC3Service "mo:icrc3-mo/service";
+import ArchiveTypes "../archive_types";
+import DAOTypes "../../DAO_backend/dao_types";
+import CanisterIds "../../helper/CanisterIds";
+import ArchiveBase "../../helper/archive_base";
+import Logger "../../helper/logger";
+import BatchImportTimer "../../helper/batch_import_timer";
+
+shared (deployer) actor class DAOGovernanceArchive() = this {
+
+  private func this_canister_id() : Principal {
+    Principal.fromActor(this);
+  };
+
+  // Type aliases for this specific archive
+  type VotingPowerBlockData = ArchiveTypes.VotingPowerBlockData;
+  type NeuronUpdateBlockData = ArchiveTypes.NeuronUpdateBlockData;
+  type ArchiveError = ArchiveTypes.ArchiveError;
+  type VotingPowerChangeType = ArchiveTypes.VotingPowerChangeType;
+  type NeuronUpdateType = ArchiveTypes.NeuronUpdateType;
+
+  // Initialize the generic base class with governance-specific configuration
+  private let initialConfig : ArchiveTypes.ArchiveConfig = {
+    maxBlocksPerCanister = 1500000; // 1.5M blocks per canister (governance events are important but less frequent)
+    blockRetentionPeriodNS = 126144000000000000; // 4 years in nanoseconds (governance history is critical)
+    enableCompression = false;
+    autoArchiveEnabled = true;
+  };
+
+  // ICRC3 State for scalable storage
+  private stable var icrc3State : ?ICRC3.State = null;
+  private var icrc3StateRef = { var value = icrc3State };
+
+  private let base = ArchiveBase.ArchiveBase<VotingPowerBlockData>(
+    this_canister_id(),
+    ["3voting_power", "3neuron_update"],
+    initialConfig,
+    deployer.caller,
+    icrc3StateRef
+  );
+
+  // Governance-specific indexes
+  private stable var userIndex = Map.new<Principal, [Nat]>(); // User -> block indices
+  private stable var neuronIndex = Map.new<Text, [Nat]>(); // Neuron ID (as Text) -> block indices
+  private stable var changeTypeIndex = Map.new<Text, [Nat]>(); // Change type -> block indices
+  private stable var updateTypeIndex = Map.new<Text, [Nat]>(); // Update type -> block indices
+
+  // Governance-specific statistics
+  private stable var totalVotingPowerChanges : Nat = 0;
+  private stable var totalNeuronUpdates : Nat = 0;
+  private stable var totalVotingPowerGained : Nat = 0;
+  private stable var totalVotingPowerLost : Nat = 0;
+  private stable var activeNeuronCount : Nat = 0;
+
+  // Tracking state for batch imports (we'll add "since" methods to DAO_backend later)
+  private stable var lastImportedVotingPowerTimestamp : Int = 0;
+  private stable var lastImportedNeuronUpdateId : Nat = 0;
+
+  // DAO_backend interface for batch imports
+  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  private let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+  private let daoCanister : DAOTypes.Self = actor (Principal.toText(DAO_BACKEND_ID));
+
+  //=========================================================================
+  // ICRC-3 Standard endpoints (delegated to base class)
+  //=========================================================================
+
+  public query func icrc3_get_archives(args : ICRC3Service.GetArchivesArgs) : async ICRC3Service.GetArchivesResult {
+    base.icrc3_get_archives(args);
+  };
+
+  public query func icrc3_get_tip_certificate() : async ?ICRC3Service.DataCertificate {
+    base.icrc3_get_tip_certificate();
+  };
+
+  public query func icrc3_get_blocks(args : ICRC3Service.GetBlocksArgs) : async ICRC3Service.GetBlocksResult {
+    base.icrc3_get_blocks(args);
+  };
+
+  public query func icrc3_supported_block_types() : async [ICRC3Service.BlockType] {
+    base.icrc3_supported_block_types();
+  };
+
+  //=========================================================================
+  // Custom Governance Archive Functions
+  //=========================================================================
+
+  public shared ({ caller }) func archiveVotingPowerChange<system>(change : VotingPowerBlockData) : async Result.Result<Nat, ArchiveError> {
+    if (not base.isAuthorized(caller, #ArchiveData)) {
+      return #err(#NotAuthorized);
+    };
+
+    let blockValue = ArchiveTypes.votingPowerToValue(change, change.timestamp, null);
+    let blockIndex = base.storeBlock<system>(
+      blockValue,
+      "3voting_power",
+      [], // No specific tokens for voting power changes
+      change.timestamp
+    );
+
+    // Update custom indexes
+    updateUserIndex(change.user, blockIndex);
+    updateChangeTypeIndex(getVotingPowerChangeTypeString(change.changeType), blockIndex);
+    
+    // Index by neurons involved
+    for (neuron in change.neurons.vals()) {
+      updateNeuronIndex(neuronIdToText(neuron.neuronId), blockIndex);
+    };
+
+    // Update statistics
+    totalVotingPowerChanges += 1;
+    if (change.newVotingPower > change.oldVotingPower) {
+      totalVotingPowerGained += (change.newVotingPower - change.oldVotingPower);
+    } else {
+      totalVotingPowerLost += (change.oldVotingPower - change.newVotingPower);
+    };
+
+    #ok(blockIndex);
+  };
+
+  public shared ({ caller }) func archiveNeuronUpdate<system>(update : NeuronUpdateBlockData) : async Result.Result<Nat, ArchiveError> {
+    if (not base.isAuthorized(caller, #ArchiveData)) {
+      return #err(#NotAuthorized);
+    };
+
+    let blockValue = ArchiveTypes.neuronUpdateToValue(update, update.timestamp, null);
+    let blockIndex = base.storeBlock<system>(
+      blockValue,
+      "3neuron_update",
+      [], // No specific tokens for neuron updates
+      update.timestamp
+    );
+
+    // Update custom indexes
+    updateNeuronIndex(neuronIdToText(update.neuronId), blockIndex);
+    updateUpdateTypeIndex(getNeuronUpdateTypeString(update.updateType), blockIndex);
+    
+    // Index by affected users
+    for (user in update.affectedUsers.vals()) {
+      updateUserIndex(user, blockIndex);
+    };
+
+    // Update statistics
+    totalNeuronUpdates += 1;
+    switch (update.updateType) {
+      case (#Added) { activeNeuronCount += 1 };
+      case (#Removed) { if (activeNeuronCount > 0) activeNeuronCount -= 1 };
+      case (_) { /* No change to neuron count */ };
+    };
+
+    #ok(blockIndex);
+  };
+
+  //=========================================================================
+  // Batch Import System (Placeholder - needs DAO_backend "since" methods)
+  //=========================================================================
+
+  // Future: Import voting power changes from DAO_backend
+  public shared ({ caller }) func importVotingPowerChanges<system>() : async Result.Result<Text, Text> {
+    if (not base.isAuthorized(caller, #ArchiveData)) {
+      return #err("Not authorized");
+    };
+
+    // TODO: Implement once DAO_backend has getVotingPowerChangesSince method
+    // For now, return placeholder
+    #ok("Voting power changes import not yet implemented - needs DAO_backend integration");
+  };
+
+  // Future: Import neuron updates from DAO_backend  
+  public shared ({ caller }) func importNeuronUpdates<system>() : async Result.Result<Text, Text> {
+    if (not base.isAuthorized(caller, #ArchiveData)) {
+      return #err("Not authorized");
+    };
+
+    // TODO: Implement once DAO_backend has getNeuronUpdatesSince method
+    // For now, return placeholder
+    #ok("Neuron updates import not yet implemented - needs DAO_backend integration");
+  };
+
+  //=========================================================================
+  // Query Functions
+  //=========================================================================
+
+  public query func getVotingPowerChangesByUser(user : Principal, limit : Nat) : async Result.Result<[VotingPowerBlockData], ArchiveError> {
+    switch (Map.get(userIndex, Map.phash, user)) {
+      case (?blockIndices) {
+        let limitedIndices = if (Array.size(blockIndices) > limit) {
+          Array.tabulate<Nat>(limit, func(i) = blockIndices[i]);
+        } else {
+          blockIndices;
+        };
+        
+        // For now, return empty array (proper ICRC3 block querying to be implemented)
+        #ok([]);
+      };
+      case null { #ok([]) };
+    };
+  };
+
+  public query func getNeuronUpdatesByNeuron(neuronId : Blob, limit : Nat) : async Result.Result<[NeuronUpdateBlockData], ArchiveError> {
+    let neuronIdText = neuronIdToText(neuronId);
+    switch (Map.get(neuronIndex, Map.thash, neuronIdText)) {
+      case (?blockIndices) {
+        let limitedIndices = if (Array.size(blockIndices) > limit) {
+          Array.tabulate<Nat>(limit, func(i) = blockIndices[i]);
+        } else {
+          blockIndices;
+        };
+        
+        // For now, return empty array (proper ICRC3 block querying to be implemented)
+        #ok([]);
+      };
+      case null { #ok([]) };
+    };
+  };
+
+  public query func getGovernanceMetrics() : async {
+    totalVotingPowerInSystem: Nat;
+    totalActiveUsers: Nat;
+    activeNeuronCount: Nat;
+    averageVotingPowerPerUser: Nat;
+  } {
+    // These would need to be calculated from current state
+    // For now, return placeholder values
+    {
+      totalVotingPowerInSystem = totalVotingPowerGained;
+      totalActiveUsers = Map.size(userIndex);
+      activeNeuronCount = activeNeuronCount;
+      averageVotingPowerPerUser = if (Map.size(userIndex) > 0) { totalVotingPowerGained / Map.size(userIndex) } else { 0 };
+    };
+  };
+
+  public query func getArchiveStats() : async {
+    totalBlocks: Nat;
+    totalVotingPowerChanges: Nat;
+    totalNeuronUpdates: Nat;
+    totalVotingPowerGained: Nat;
+    totalVotingPowerLost: Nat;
+    activeNeuronCount: Nat;
+    lastImportedVotingPowerTimestamp: Int;
+    lastImportedNeuronUpdateId: Nat;
+  } {
+    {
+      totalBlocks = base.getTotalBlocks();
+      totalVotingPowerChanges = totalVotingPowerChanges;
+      totalNeuronUpdates = totalNeuronUpdates;
+      totalVotingPowerGained = totalVotingPowerGained;
+      totalVotingPowerLost = totalVotingPowerLost;
+      activeNeuronCount = activeNeuronCount;
+      lastImportedVotingPowerTimestamp = lastImportedVotingPowerTimestamp;
+      lastImportedNeuronUpdateId = lastImportedNeuronUpdateId;
+    };
+  };
+
+  //=========================================================================
+  // Timer Management (Future implementation)
+  //=========================================================================
+
+  system func timer(setGlobalTimer : Nat64 -> ()) : async () {
+    // Future: Import from DAO_backend every 15 minutes (governance events are less frequent)
+    // ignore await importVotingPowerChanges<system>();
+    // ignore await importNeuronUpdates<system>();
+    setGlobalTimer(1_000_000_000 * 900); // 15 minutes
+  };
+
+  //=========================================================================
+  // Lifecycle Management
+  //=========================================================================
+
+  system func preupgrade() {
+    base.preupgrade();
+  };
+
+  system func postupgrade() {
+    icrc3State := null;
+  };
+
+  //=========================================================================
+  // Private Helper Functions
+  //=========================================================================
+
+  private func updateUserIndex(user : Principal, blockIndex : Nat) {
+    let existing = switch (Map.get(userIndex, Map.phash, user)) {
+      case (?indices) { indices };
+      case null { [] };
+    };
+    Map.set(userIndex, Map.phash, user, Array.append(existing, [blockIndex]));
+  };
+
+  private func updateNeuronIndex(neuronIdText : Text, blockIndex : Nat) {
+    let existing = switch (Map.get(neuronIndex, Map.thash, neuronIdText)) {
+      case (?indices) { indices };
+      case null { [] };
+    };
+    Map.set(neuronIndex, Map.thash, neuronIdText, Array.append(existing, [blockIndex]));
+  };
+
+  private func updateChangeTypeIndex(changeType : Text, blockIndex : Nat) {
+    let existing = switch (Map.get(changeTypeIndex, Map.thash, changeType)) {
+      case (?indices) { indices };
+      case null { [] };
+    };
+    Map.set(changeTypeIndex, Map.thash, changeType, Array.append(existing, [blockIndex]));
+  };
+
+  private func updateUpdateTypeIndex(updateType : Text, blockIndex : Nat) {
+    let existing = switch (Map.get(updateTypeIndex, Map.thash, updateType)) {
+      case (?indices) { indices };
+      case null { [] };
+    };
+    Map.set(updateTypeIndex, Map.thash, updateType, Array.append(existing, [blockIndex]));
+  };
+
+  private func getVotingPowerChangeTypeString(changeType : VotingPowerChangeType) : Text {
+    switch (changeType) {
+      case (#NeuronSnapshot) { "NeuronSnapshot" };
+      case (#ManualRefresh) { "ManualRefresh" };
+      case (#SystemUpdate) { "SystemUpdate" };
+    };
+  };
+
+  private func getNeuronUpdateTypeString(updateType : NeuronUpdateType) : Text {
+    switch (updateType) {
+      case (#Added) { "Added" };
+      case (#Removed) { "Removed" };
+      case (#VotingPowerChanged) { "VotingPowerChanged" };
+      case (#StateChanged) { "StateChanged" };
+    };
+  };
+
+  private func neuronIdToText(neuronId : Blob) : Text {
+    // Convert Blob to Text for indexing (simple debug representation)
+    debug_show(neuronId);
+  };
+};

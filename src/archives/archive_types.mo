@@ -37,6 +37,10 @@ module {
     #Pause;         // "3pause" - Trading pause events
     #Allocation;    // "3allocation" - Portfolio allocation changes
     #Admin;         // "3admin" - Administrative actions
+    #AllocationChange; // "3allocation_change" - User allocation transitions
+    #FollowAction;  // "3follow_action" - Follow/unfollow relationships
+    #VotingPower;   // "3voting_power" - Voting power changes
+    #NeuronUpdate;  // "3neuron_update" - Neuron state updates
   };
 
   // Convert block type to string identifier
@@ -49,6 +53,10 @@ module {
       case (#Pause) { "3pause" };
       case (#Allocation) { "3allocation" };
       case (#Admin) { "3admin" };
+      case (#AllocationChange) { "3allocation_change" };
+      case (#FollowAction) { "3follow_action" };
+      case (#VotingPower) { "3voting_power" };
+      case (#NeuronUpdate) { "3neuron_update" };
     };
   };
 
@@ -189,6 +197,77 @@ module {
     #UpdateMaxPortfolioSnapshots: {oldLimit: Nat; newLimit: Nat};
     #SetTestMode: {isTestMode: Bool};
     #ClearSystemLogs;
+  };
+
+  // Allocation change tracking for dao_allocation_archive
+  public type AllocationChangeBlockData = {
+    id: Nat;
+    timestamp: Int;
+    user: Principal;
+    changeType: AllocationChangeType;
+    oldAllocations: [DAOTypes.Allocation];
+    newAllocations: [DAOTypes.Allocation]; 
+    votingPower: Nat;
+    maker: Principal;
+    reason: ?Text; // For manual changes
+  };
+
+  public type AllocationChangeType = {
+    #UserUpdate: {userInitiated: Bool};
+    #FollowAction: {followedUser: Principal};
+    #SystemRebalance;
+    #VotingPowerChange;
+  };
+
+  // Follow/unfollow action tracking for dao_allocation_archive
+  public type FollowActionBlockData = {
+    id: Nat;
+    timestamp: Int;
+    follower: Principal;
+    followed: Principal;
+    action: FollowActionType;
+    previousFollowCount: Nat;
+    newFollowCount: Nat;
+  };
+
+  public type FollowActionType = {
+    #Follow;
+    #Unfollow;
+  };
+
+  // Voting power changes for dao_governance_archive
+  public type VotingPowerBlockData = {
+    id: Nat;
+    timestamp: Int;
+    user: Principal;
+    changeType: VotingPowerChangeType;
+    oldVotingPower: Nat;
+    newVotingPower: Nat;
+    neurons: [DAOTypes.NeuronVP];
+  };
+
+  public type VotingPowerChangeType = {
+    #NeuronSnapshot; // Regular neuron snapshot update
+    #ManualRefresh; // User-triggered refresh
+    #SystemUpdate; // System-triggered update
+  };
+
+  // Neuron updates for dao_governance_archive
+  public type NeuronUpdateBlockData = {
+    id: Nat;
+    timestamp: Int;
+    updateType: NeuronUpdateType;
+    neuronId: Blob;
+    oldVotingPower: ?Nat;
+    newVotingPower: ?Nat;
+    affectedUsers: [Principal]; // Users whose voting power changed
+  };
+
+  public type NeuronUpdateType = {
+    #Added;
+    #Removed;
+    #VotingPowerChanged;
+    #StateChanged;
   };
 
   // Supporting types
@@ -808,5 +887,119 @@ module {
       case (#MaxFollowed(n)) { #Text("MaxFollowed(" # debug_show(n) # ")") };
       case (#LogAdmin(p)) { #Text("LogAdmin(" # Principal.toText(p) # ")") };
     };
+  };
+
+  // Helper functions for converting new block data types to Value format
+
+  // Convert AllocationChangeBlockData to Value
+  public func allocationChangeToValue(change: AllocationChangeBlockData, _timestamp: Int, _parentHash: ?Blob) : Value {
+    #Map([
+      ("id", #Nat(change.id)),
+      ("timestamp", #Int(change.timestamp)),
+      ("user", principalToValue(change.user)),
+      ("changeType", allocationChangeTypeToValue(change.changeType)),
+      ("oldAllocations", #Array(Array.map(change.oldAllocations, allocationToValueHelper))),
+      ("newAllocations", #Array(Array.map(change.newAllocations, allocationToValueHelper))),
+      ("votingPower", #Nat(change.votingPower)),
+      ("maker", principalToValue(change.maker)),
+      ("reason", switch (change.reason) { case (?r) { #Text(r) }; case null { #Text("") }; })
+    ]);
+  };
+
+  // Convert FollowActionBlockData to Value
+  public func followActionToValue(action: FollowActionBlockData, _timestamp: Int, _parentHash: ?Blob) : Value {
+    #Map([
+      ("id", #Nat(action.id)),
+      ("timestamp", #Int(action.timestamp)),
+      ("follower", principalToValue(action.follower)),
+      ("followed", principalToValue(action.followed)),
+      ("action", followActionTypeToValue(action.action)),
+      ("previousFollowCount", #Nat(action.previousFollowCount)),
+      ("newFollowCount", #Nat(action.newFollowCount))
+    ]);
+  };
+
+  // Convert VotingPowerBlockData to Value
+  public func votingPowerToValue(power: VotingPowerBlockData, _timestamp: Int, _parentHash: ?Blob) : Value {
+    #Map([
+      ("id", #Nat(power.id)),
+      ("timestamp", #Int(power.timestamp)),
+      ("user", principalToValue(power.user)),
+      ("changeType", votingPowerChangeTypeToValue(power.changeType)),
+      ("oldVotingPower", #Nat(power.oldVotingPower)),
+      ("newVotingPower", #Nat(power.newVotingPower)),
+      ("neurons", #Array(Array.map(power.neurons, neuronVPToValue)))
+    ]);
+  };
+
+  // Convert NeuronUpdateBlockData to Value
+  public func neuronUpdateToValue(update: NeuronUpdateBlockData, _timestamp: Int, _parentHash: ?Blob) : Value {
+    #Map([
+      ("id", #Nat(update.id)),
+      ("timestamp", #Int(update.timestamp)),
+      ("updateType", neuronUpdateTypeToValue(update.updateType)),
+      ("neuronId", #Blob(update.neuronId)),
+      ("oldVotingPower", switch (update.oldVotingPower) { case (?n) { #Nat(n) }; case null { #Nat(0) }; }),
+      ("newVotingPower", switch (update.newVotingPower) { case (?n) { #Nat(n) }; case null { #Nat(0) }; }),
+      ("affectedUsers", #Array(Array.map(update.affectedUsers, principalToValue)))
+    ]);
+  };
+
+  // Helper conversion functions for new types
+  private func allocationChangeTypeToValue(changeType: AllocationChangeType) : Value {
+    switch (changeType) {
+      case (#UserUpdate(details)) { 
+        #Map([
+          ("type", #Text("UserUpdate")),
+          ("userInitiated", boolToValue(details.userInitiated))
+        ]);
+      };
+      case (#FollowAction(details)) { 
+        #Map([
+          ("type", #Text("FollowAction")),
+          ("followedUser", principalToValue(details.followedUser))
+        ]);
+      };
+      case (#SystemRebalance) { #Map([("type", #Text("SystemRebalance"))]); };
+      case (#VotingPowerChange) { #Map([("type", #Text("VotingPowerChange"))]); };
+    };
+  };
+
+  private func followActionTypeToValue(actionType: FollowActionType) : Value {
+    switch (actionType) {
+      case (#Follow) { #Text("Follow") };
+      case (#Unfollow) { #Text("Unfollow") };
+    };
+  };
+
+  private func votingPowerChangeTypeToValue(changeType: VotingPowerChangeType) : Value {
+    switch (changeType) {
+      case (#NeuronSnapshot) { #Text("NeuronSnapshot") };
+      case (#ManualRefresh) { #Text("ManualRefresh") };
+      case (#SystemUpdate) { #Text("SystemUpdate") };
+    };
+  };
+
+  private func neuronUpdateTypeToValue(updateType: NeuronUpdateType) : Value {
+    switch (updateType) {
+      case (#Added) { #Text("Added") };
+      case (#Removed) { #Text("Removed") };
+      case (#VotingPowerChanged) { #Text("VotingPowerChanged") };
+      case (#StateChanged) { #Text("StateChanged") };
+    };
+  };
+
+  private func allocationToValueHelper(allocation: DAOTypes.Allocation) : Value {
+    #Map([
+      ("token", principalToValue(allocation.token)),
+      ("basisPoints", #Nat(allocation.basisPoints))
+    ]);
+  };
+
+  private func neuronVPToValue(neuron: DAOTypes.NeuronVP) : Value {
+    #Map([
+      ("neuronId", #Blob(neuron.neuronId)),
+      ("votingPower", #Nat(neuron.votingPower))
+    ]);
   };
 } 

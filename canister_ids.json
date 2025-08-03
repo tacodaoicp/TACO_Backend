@@ -6,6 +6,12 @@
   "dao_admin_archive": {
     "staging": "b6ygs-xaaaa-aaaan-qz5ca-cai"
   },
+  "dao_allocation_archive": {
+    "ic": "bq2l2-mqaaa-aaaan-qz5da-cai"
+  },
+  "dao_governance_archive": {
+    "staging": "bzzag-2yaaa-aaaan-qz5cq-cai"
+  },
   "neuronSnapshot": {
     "ic": "vzs3x-taaaa-aaaan-qzzjq-cai",
     "staging": "tgqd4-eqaaa-aaaai-atifa-cai"
