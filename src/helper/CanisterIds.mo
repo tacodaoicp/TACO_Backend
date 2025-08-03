@@ -13,6 +13,7 @@ module CanisterId {
         #trading_archive;
         #portfolio_archive;
         #price_archive;
+        #dao_admin_archive;
     };
     
     // Define the environments
