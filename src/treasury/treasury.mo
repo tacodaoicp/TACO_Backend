@@ -210,6 +210,11 @@ shared (deployer) actor class treasury() = this {
   type PortfolioCircuitBreakerError = TreasuryTypes.PortfolioCircuitBreakerError;
   type PortfolioCircuitBreakerUpdate = TreasuryTypes.PortfolioCircuitBreakerUpdate;
 
+  // Admin action logging type aliases
+  type TreasuryAdminActionType = TreasuryTypes.TreasuryAdminActionType;
+  type TreasuryAdminActionRecord = TreasuryTypes.TreasuryAdminActionRecord;
+  type TreasuryAdminActionsSinceResponse = TreasuryTypes.TreasuryAdminActionsSinceResponse;
+
   // Actor references
   let dao = actor (DAOText) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
@@ -335,6 +340,11 @@ shared (deployer) actor class treasury() = this {
   stable var nextPortfolioCircuitBreakerId : Nat = 1;
   stable var maxPortfolioCircuitBreakerLogs = 500; // Maximum number of circuit breaker logs to store
 
+  // Admin action logging storage
+  stable var treasuryAdminActionCounter: Nat = 0;
+  stable var treasuryAdminActions = Vector.new<TreasuryAdminActionRecord>();
+  stable var maxTreasuryAdminActionsStored: Nat = 10000; // Keep last 10k actions before archiving
+
   private func isMasterAdmin(caller : Principal) : Bool {
     for (admin in masterAdmins.vals()) {
       if (admin == caller) {
@@ -342,6 +352,75 @@ shared (deployer) actor class treasury() = this {
       };
     };
     false;
+  };
+
+  // Treasury admin action logging function
+  private func logTreasuryAdminAction(
+    admin: Principal,
+    actionType: TreasuryAdminActionType,
+    reason: Text,
+    success: Bool,
+    errorMessage: ?Text
+  ) {
+    treasuryAdminActionCounter += 1;
+    let record: TreasuryAdminActionRecord = {
+      id = treasuryAdminActionCounter;
+      timestamp = now();
+      admin = admin;
+      actionType = actionType;
+      reason = reason;
+      success = success;
+      errorMessage = errorMessage;
+    };
+    
+    Vector.add(treasuryAdminActions, record);
+    
+    // Keep only the most recent actions (before archiving takes over)
+    // Use standard treasury pattern for consistency
+    if (Vector.size(treasuryAdminActions) > maxTreasuryAdminActionsStored) {
+      Vector.reverse(treasuryAdminActions);
+      while (Vector.size(treasuryAdminActions) > maxTreasuryAdminActionsStored) {
+        ignore Vector.removeLast(treasuryAdminActions);
+      };
+      Vector.reverse(treasuryAdminActions);
+    };
+    
+    // Still log to text logger for immediate debugging
+    let actionDesc = getTreasuryActionDescription(actionType);
+    let statusText = if (success) "SUCCESS" else "FAILED";
+    logger.info("TreasuryAdminAction", 
+      statusText # " - " # actionDesc # " by " # Principal.toText(admin) # 
+      (if (reason != "") " | Reason: " # reason else "") #
+      (switch (errorMessage) { case (?err) " | Error: " # err; case null "" }),
+      "logTreasuryAdminAction"
+    );
+  };
+
+  // Helper function to get human-readable action descriptions
+  private func getTreasuryActionDescription(actionType: TreasuryAdminActionType) : Text {
+    switch (actionType) {
+      case (#StartRebalancing) "Start Trading Bot";
+      case (#StopRebalancing) "Stop Trading Bot";
+      case (#ResetRebalanceState) "Reset Trading State";
+      case (#UpdateRebalanceConfig(_)) "Update Trading Config";
+      case (#PauseTokenManual(details)) "Manual Token Pause: " # Principal.toText(details.token);
+      case (#UnpauseToken(details)) "Unpause Token: " # Principal.toText(details.token);
+      case (#ClearAllTradingPauses) "Clear All Trading Pauses";
+      case (#AddTriggerCondition(details)) "Add Price Alert (ID: " # Nat.toText(details.conditionId) # ")";
+      case (#RemoveTriggerCondition(details)) "Remove Price Alert (ID: " # Nat.toText(details.conditionId) # ")";
+      case (#UpdateTriggerCondition(details)) "Update Price Alert (ID: " # Nat.toText(details.conditionId) # ")";
+      case (#SetTriggerConditionActive(details)) "Set Price Alert Active (ID: " # Nat.toText(details.conditionId) # ", Active: " # Bool.toText(details.isActive) # ")";
+      case (#ClearPriceAlerts) "Clear All Price Alerts";
+      case (#AddPortfolioCircuitBreaker(details)) "Add Portfolio Circuit Breaker (ID: " # Nat.toText(details.conditionId) # ")";
+      case (#RemovePortfolioCircuitBreaker(details)) "Remove Portfolio Circuit Breaker (ID: " # Nat.toText(details.conditionId) # ")";
+      case (#UpdatePortfolioCircuitBreaker(details)) "Update Portfolio Circuit Breaker (ID: " # Nat.toText(details.conditionId) # ")";
+      case (#SetPortfolioCircuitBreakerActive(details)) "Set Portfolio Circuit Breaker Active (ID: " # Nat.toText(details.conditionId) # ", Active: " # Bool.toText(details.isActive) # ")";
+      case (#UpdatePausedTokenThreshold(details)) "Update Paused Token Threshold: " # Nat.toText(details.oldThreshold) # " → " # Nat.toText(details.newThreshold);
+      case (#ClearPortfolioCircuitBreakerLogs) "Clear Portfolio Circuit Breaker Logs";
+      case (#UpdateMaxPortfolioSnapshots(details)) "Update Max Portfolio Snapshots: " # Nat.toText(details.oldLimit) # " → " # Nat.toText(details.newLimit);
+      case (#SetTestMode(details)) "Set Test Mode: " # Bool.toText(details.isTestMode);
+      case (#ClearSystemLogs) "Clear System Logs";
+    }
   };
 
   // Helper function to increment skip counters
@@ -512,6 +591,16 @@ shared (deployer) actor class treasury() = this {
       };
       
       Debug.print("Rebalancing started");
+      
+      // Log the successful admin action
+      logTreasuryAdminAction(
+        caller,
+        #StartRebalancing,
+        "Rebalancing started programmatically", // Default reason for programmatic calls
+        true,
+        null
+      );
+      
       #ok("Rebalancing started");
     } catch (e) {
       rebalanceState := {
@@ -523,6 +612,16 @@ shared (deployer) actor class treasury() = this {
         };
       };
       Debug.print("Failed to start trading: " # Error.message(e));
+      
+      // Log the failed admin action
+      logTreasuryAdminAction(
+        caller,
+        #StartRebalancing,
+        "Failed to start rebalancing",
+        false,
+        ?Error.message(e)
+      );
+      
       #err(#SystemError("Failed to start trading: " # Error.message(e)));
     };
   };
@@ -5883,5 +5982,37 @@ shared (deployer) actor class treasury() = this {
      (isMasterAdmin(caller) or Principal.isController(caller)) and arg.size() < 50000;
   };
   */
+
+  // Query method for treasury admin actions since timestamp (for archiving)
+  public shared query ({ caller }) func getTreasuryAdminActionsSince(
+    sinceTimestamp: Int, 
+    limit: Nat
+  ) : async Result.Result<TreasuryAdminActionsSinceResponse, TradingPauseError> {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (limit == 0 or limit > 1000) {
+      return #err(#SystemError("Invalid limit: must be between 1 and 1000"));
+    };
+
+    let allActions = Vector.toArray(treasuryAdminActions);
+    let filteredActions = Array.filter<TreasuryAdminActionRecord>(allActions, func(action) {
+      action.timestamp > sinceTimestamp
+    });
+    
+    let totalFilteredCount = filteredActions.size();
+    let limitedActions = if (totalFilteredCount > limit) {
+      Array.subArray(filteredActions, 0, limit)
+    } else {
+      filteredActions
+    };
+
+    #ok({
+      actions = limitedActions;
+      totalCount = totalFilteredCount;
+    })
+  };
+
 };
 

@@ -473,6 +473,55 @@ module {
     #SystemError : Text;
   };
 
+  // Admin action logging types for structured archiving
+  public type TreasuryAdminActionType = {
+    // Rebalancing Control
+    #StartRebalancing;
+    #StopRebalancing;
+    #ResetRebalanceState;
+    #UpdateRebalanceConfig: {oldConfig: Text; newConfig: Text}; // JSON representation
+    
+    // Token Trading Pauses
+    #PauseTokenManual: {token: Principal; pauseType: Text};
+    #UnpauseToken: {token: Principal};
+    #ClearAllTradingPauses;
+    
+    // Price Alerts/Triggers
+    #AddTriggerCondition: {conditionId: Nat; conditionType: Text; details: Text};
+    #RemoveTriggerCondition: {conditionId: Nat};
+    #UpdateTriggerCondition: {conditionId: Nat; oldCondition: Text; newCondition: Text};
+    #SetTriggerConditionActive: {conditionId: Nat; isActive: Bool};
+    #ClearPriceAlerts;
+    
+    // Portfolio Circuit Breakers
+    #AddPortfolioCircuitBreaker: {conditionId: Nat; conditionType: Text; details: Text};
+    #RemovePortfolioCircuitBreaker: {conditionId: Nat};
+    #UpdatePortfolioCircuitBreaker: {conditionId: Nat; oldCondition: Text; newCondition: Text};
+    #SetPortfolioCircuitBreakerActive: {conditionId: Nat; isActive: Bool};
+    #UpdatePausedTokenThreshold: {oldThreshold: Nat; newThreshold: Nat};
+    #ClearPortfolioCircuitBreakerLogs;
+    
+    // System Configuration
+    #UpdateMaxPortfolioSnapshots: {oldLimit: Nat; newLimit: Nat};
+    #SetTestMode: {isTestMode: Bool};
+    #ClearSystemLogs;
+  };
+  
+  public type TreasuryAdminActionRecord = {
+    id: Nat;
+    timestamp: Int;
+    admin: Principal;
+    actionType: TreasuryAdminActionType;
+    reason: Text;
+    success: Bool;
+    errorMessage: ?Text;
+  };
+  
+  public type TreasuryAdminActionsSinceResponse = {
+    actions: [TreasuryAdminActionRecord];
+    totalCount: Nat;
+  };
+
   public type Self = actor {
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Principal, Nat8)], Bool) -> async (Bool, ?[(Principal, Nat64)]);
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
@@ -488,5 +537,6 @@ module {
     getTradingStatusSince : shared query (Int) -> async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text>;
     getPortfolioHistorySince : shared query (Int, Nat) -> async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError>;
     getTokenDetailsSince : shared query (Int) -> async [(Principal, TokenDetails)];
+    getTreasuryAdminActionsSince : shared query (Int, Nat) -> async Result.Result<TreasuryAdminActionsSinceResponse, TradingPauseError>;
   };
 };
