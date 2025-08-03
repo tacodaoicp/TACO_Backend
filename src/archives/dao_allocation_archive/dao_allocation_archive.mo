@@ -105,7 +105,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
     let blockIndex = base.storeBlock<system>(
       blockValue,
       "3allocation_change",
-      Array.map(change.newAllocations, func(a: DAOTypes.Allocation) = a.token), // Index by involved tokens
+      Array.map(change.newAllocations, func(a: DAOTypes.Allocation) : Principal { a.token }), // Index by involved tokens
       change.timestamp
     );
 
