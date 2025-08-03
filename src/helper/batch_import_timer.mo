@@ -21,9 +21,9 @@ module {
 
   // Default configuration
   public let DEFAULT_CONFIG : BatchImportConfig = {
-    batchSize = 50;
+    batchSize = 100;
     outerLoopIntervalNS = 1_800_000_000_000; // 30 minutes
-    maxInnerLoopIterations = 10;
+    maxInnerLoopIterations = 100;
     middleLoopDelayNS = 10_000_000_000; // 10 seconds
     innerLoopDelayNS = 10_000_000_000; // 10 seconds
   };

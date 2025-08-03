@@ -124,8 +124,8 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   // Import batch of portfolio snapshots from treasury
   private func importPortfolioSnapshotsBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // Use new efficient method that filters on server-side
-      let result = await treasuryCanister.getPortfolioHistorySince(lastPortfolioImportTime, 50);
+      // Use new efficient method that filters on server-side (100 per batch × 100 batches = 10,000 per cycle)
+      let result = await treasuryCanister.getPortfolioHistorySince(lastPortfolioImportTime, 100);
       
       switch (result) {
         case (#ok(response)) {

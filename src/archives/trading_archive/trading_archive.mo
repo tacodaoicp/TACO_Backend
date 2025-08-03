@@ -256,8 +256,8 @@ shared (deployer) actor class TradingArchiveV2() = this {
           // No need to filter client-side anymore - server already filtered
           let newTrades = trades;
           
-          // Process trades in batches (limit to 50 per batch)
-          let batchSize = 50;
+          // Process trades in batches (100 per batch × 100 batches = 10,000 per cycle)
+          let batchSize = 100;
           let batchedTrades = if (newTrades.size() > batchSize) {
             Array.subArray(newTrades, 0, batchSize)
           } else {
