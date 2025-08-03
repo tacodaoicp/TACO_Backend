@@ -32,7 +32,8 @@ module CanisterId {
             (#Staging, #trading_archive, Principal.fromText("jlycp-kqaaa-aaaan-qz4xa-cai")),
             (#Staging, #portfolio_archive, Principal.fromText("lrekt-uaaaa-aaaan-qz4ya-cai")),
             (#Staging, #price_archive, Principal.fromText("l7gh3-pqaaa-aaaan-qz4za-cai")),
-            
+            (#Staging, #dao_admin_archive, Principal.fromText("b6ygs-xaaaa-aaaan-qz5ca-cai")),
+
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),
             (#Production, #neuronSnapshot, Principal.fromText("vzs3x-taaaa-aaaan-qzzjq-cai")),
@@ -40,7 +41,8 @@ module CanisterId {
             (#Production, #validation, Principal.fromText("th44n-iyaaa-aaaan-qzz5a-cai")),
             (#Production, #trading_archive, Principal.fromText("jmze3-hiaaa-aaaan-qz4xq-cai")),
             (#Production, #portfolio_archive, Principal.fromText("bl7x7-wiaaa-aaaan-qz5bq-cai")),
-            (#Production, #price_archive, Principal.fromText("bm6rl-3qaaa-aaaan-qz5ba-cai"))
+            (#Production, #price_archive, Principal.fromText("bm6rl-3qaaa-aaaan-qz5ba-cai")),
+            (#Production, #dao_admin_archive, Principal.fromText("aaaaa-aa"))
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {
