@@ -32,6 +32,10 @@
       "main": "src/archives/price_archive/price_archive.mo",
       "type": "motoko"
     },
+    "dao_admin_archive": {
+      "main": "src/archives/dao_admin_archive/dao_admin_archive.mo",
+      "type": "motoko"
+    },
     "actorA": {
       "main": "examples/testActorA.mo",
       "type": "motoko"

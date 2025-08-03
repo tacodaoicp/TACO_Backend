@@ -1,10 +1,13 @@
-import Time "mo:base/Time";
+
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Array "mo:base/Array";
 import Float "mo:base/Float";
+import Nat "mo:base/Nat";
+import Int "mo:base/Int";
 import ICRC3 "mo:icrc3-mo/service";
 import TreasuryTypes "../treasury/treasury_types";
+import DAOTypes "../DAO_backend/dao_types";
 
 module {
   // Re-export ICRC3 types for convenience
@@ -33,6 +36,7 @@ module {
     #Price;         // "3price" - Price history entries
     #Pause;         // "3pause" - Trading pause events
     #Allocation;    // "3allocation" - Portfolio allocation changes
+    #Admin;         // "3admin" - Administrative actions
   };
 
   // Convert block type to string identifier
@@ -44,6 +48,7 @@ module {
       case (#Price) { "3price" };
       case (#Pause) { "3pause" };
       case (#Allocation) { "3allocation" };
+      case (#Admin) { "3admin" };
     };
   };
 
@@ -131,6 +136,59 @@ module {
     newAllocation: [Allocation];
     votingPower: Nat;
     reason: AllocationChangeReason;
+  };
+
+  // Administrative actions from both DAO_backend and Treasury
+  public type AdminActionBlockData = {
+    id: Nat;
+    timestamp: Int;
+    admin: Principal;
+    canister: AdminCanisterSource;
+    actionType: AdminActionVariant;
+    reason: Text;
+    success: Bool;
+    errorMessage: ?Text;
+  };
+
+  public type AdminCanisterSource = {
+    #DAO_backend;
+    #Treasury;
+  };
+
+  // Unified admin action types covering both DAO and Treasury operations
+  public type AdminActionVariant = {
+    // DAO_backend actions
+    #TokenAdd: {token: Principal; tokenType: DAOTypes.TokenType; viaGovernance: Bool};
+    #TokenRemove: {token: Principal};
+    #TokenPause: {token: Principal};
+    #TokenUnpause: {token: Principal};
+    #SystemStateChange: {oldState: DAOTypes.SystemState; newState: DAOTypes.SystemState};
+    #ParameterUpdate: {parameter: DAOTypes.SystemParameter; oldValue: Text; newValue: Text};
+    #AdminPermissionGrant: {targetAdmin: Principal; function: Text; durationDays: Nat};
+    #AdminAdd: {newAdmin: Principal};
+    #AdminRemove: {removedAdmin: Principal};
+    // Treasury actions
+    #StartRebalancing;
+    #StopRebalancing;
+    #ResetRebalanceState;
+    #UpdateRebalanceConfig: {oldConfig: Text; newConfig: Text};
+    #PauseTokenManual: {token: Principal; pauseType: Text};
+    #UnpauseToken: {token: Principal};
+    #ClearAllTradingPauses;
+    #AddTriggerCondition: {conditionId: Nat; conditionType: Text; details: Text};
+    #RemoveTriggerCondition: {conditionId: Nat};
+    #UpdateTriggerCondition: {conditionId: Nat; oldCondition: Text; newCondition: Text};
+    #SetTriggerConditionActive: {conditionId: Nat; isActive: Bool};
+    #ClearPriceAlerts;
+    #AddPortfolioCircuitBreaker: {conditionId: Nat; conditionType: Text; details: Text};
+    #RemovePortfolioCircuitBreaker: {conditionId: Nat};
+    #UpdatePortfolioCircuitBreaker: {conditionId: Nat; oldCondition: Text; newCondition: Text};
+    #SetPortfolioCircuitBreakerActive: {conditionId: Nat; isActive: Bool};
+    #UpdatePausedTokenThreshold: {oldThreshold: Nat; newThreshold: Nat};
+    #ClearPortfolioCircuitBreakerLogs;
+    #UpdateMaxPortfolioSnapshots: {oldLimit: Nat; newLimit: Nat};
+    #SetTestMode: {isTestMode: Bool};
+    #ClearSystemLogs;
   };
 
   // Supporting types
@@ -520,5 +578,235 @@ module {
     // Admin endpoints
     updateConfig: shared (ArchiveConfig) -> async Result.Result<Text, ArchiveError>;
     getArchiveStatus: query () -> async Result.Result<ArchiveStatus, ArchiveError>;
+  };
+
+  // Helper function to convert AdminActionBlockData to Value format
+  public func adminActionToValue(action: AdminActionBlockData, _timestamp: Int, _parentHash: ?Blob) : Value {
+    #Map([
+      ("id", #Nat(action.id)),
+      ("timestamp", #Int(action.timestamp)),
+      ("admin", principalToValue(action.admin)),
+      ("canister", canisterSourceToValue(action.canister)),
+      ("actionType", actionVariantToValue(action.actionType)),
+      ("reason", #Text(action.reason)),
+      ("success", boolToValue(action.success)),
+      ("errorMessage", switch (action.errorMessage) {
+        case (?msg) { #Text(msg) };
+        case null { #Text("") };
+      })
+    ]);
+  };
+
+  // Helper function to convert AdminCanisterSource to Value
+  public func canisterSourceToValue(source: AdminCanisterSource) : Value {
+    switch (source) {
+      case (#DAO_backend) { #Text("DAO_backend") };
+      case (#Treasury) { #Text("Treasury") };
+    };
+  };
+
+  // Helper function to convert AdminActionVariant to Value
+  public func actionVariantToValue(actionType: AdminActionVariant) : Value {
+    switch (actionType) {
+      case (#TokenAdd(details)) { 
+        #Map([
+          ("type", #Text("TokenAdd")),
+          ("token", principalToValue(details.token)),
+          ("tokenType", tokenTypeToValue(details.tokenType)),
+          ("viaGovernance", boolToValue(details.viaGovernance))
+        ]);
+      };
+      case (#TokenRemove(details)) { 
+        #Map([
+          ("type", #Text("TokenRemove")),
+          ("token", principalToValue(details.token))
+        ]);
+      };
+      case (#TokenPause(details)) { 
+        #Map([
+          ("type", #Text("TokenPause")),
+          ("token", principalToValue(details.token))
+        ]);
+      };
+      case (#TokenUnpause(details)) { 
+        #Map([
+          ("type", #Text("TokenUnpause")),
+          ("token", principalToValue(details.token))
+        ]);
+      };
+      case (#SystemStateChange(details)) { 
+        #Map([
+          ("type", #Text("SystemStateChange")),
+          ("oldState", systemStateToValue(details.oldState)),
+          ("newState", systemStateToValue(details.newState))
+        ]);
+      };
+      case (#ParameterUpdate(details)) { 
+        #Map([
+          ("type", #Text("ParameterUpdate")),
+          ("parameter", systemParameterToValue(details.parameter)),
+          ("oldValue", #Text(details.oldValue)),
+          ("newValue", #Text(details.newValue))
+        ]);
+      };
+      case (#AdminPermissionGrant(details)) { 
+        #Map([
+          ("type", #Text("AdminPermissionGrant")),
+          ("targetAdmin", principalToValue(details.targetAdmin)),
+          ("function", #Text(details.function)),
+          ("durationDays", #Nat(details.durationDays))
+        ]);
+      };
+      case (#AdminAdd(details)) { 
+        #Map([
+          ("type", #Text("AdminAdd")),
+          ("newAdmin", principalToValue(details.newAdmin))
+        ]);
+      };
+      case (#AdminRemove(details)) { 
+        #Map([
+          ("type", #Text("AdminRemove")),
+          ("removedAdmin", principalToValue(details.removedAdmin))
+        ]);
+      };
+      // Treasury actions
+      case (#StartRebalancing) { #Map([("type", #Text("StartRebalancing"))]); };
+      case (#StopRebalancing) { #Map([("type", #Text("StopRebalancing"))]); };
+      case (#ResetRebalanceState) { #Map([("type", #Text("ResetRebalanceState"))]); };
+      case (#UpdateRebalanceConfig(details)) { 
+        #Map([
+          ("type", #Text("UpdateRebalanceConfig")),
+          ("oldConfig", #Text(details.oldConfig)),
+          ("newConfig", #Text(details.newConfig))
+        ]);
+      };
+      case (#PauseTokenManual(details)) { 
+        #Map([
+          ("type", #Text("PauseTokenManual")),
+          ("token", principalToValue(details.token)),
+          ("pauseType", #Text(details.pauseType))
+        ]);
+      };
+      case (#UnpauseToken(details)) { 
+        #Map([
+          ("type", #Text("UnpauseToken")),
+          ("token", principalToValue(details.token))
+        ]);
+      };
+      case (#ClearAllTradingPauses) { #Map([("type", #Text("ClearAllTradingPauses"))]); };
+      case (#AddTriggerCondition(details)) { 
+        #Map([
+          ("type", #Text("AddTriggerCondition")),
+          ("conditionId", #Nat(details.conditionId)),
+          ("conditionType", #Text(details.conditionType)),
+          ("details", #Text(details.details))
+        ]);
+      };
+      case (#RemoveTriggerCondition(details)) { 
+        #Map([
+          ("type", #Text("RemoveTriggerCondition")),
+          ("conditionId", #Nat(details.conditionId))
+        ]);
+      };
+      case (#UpdateTriggerCondition(details)) { 
+        #Map([
+          ("type", #Text("UpdateTriggerCondition")),
+          ("conditionId", #Nat(details.conditionId)),
+          ("oldCondition", #Text(details.oldCondition)),
+          ("newCondition", #Text(details.newCondition))
+        ]);
+      };
+      case (#SetTriggerConditionActive(details)) { 
+        #Map([
+          ("type", #Text("SetTriggerConditionActive")),
+          ("conditionId", #Nat(details.conditionId)),
+          ("isActive", boolToValue(details.isActive))
+        ]);
+      };
+      case (#ClearPriceAlerts) { #Map([("type", #Text("ClearPriceAlerts"))]); };
+      case (#AddPortfolioCircuitBreaker(details)) { 
+        #Map([
+          ("type", #Text("AddPortfolioCircuitBreaker")),
+          ("conditionId", #Nat(details.conditionId)),
+          ("conditionType", #Text(details.conditionType)),
+          ("details", #Text(details.details))
+        ]);
+      };
+      case (#RemovePortfolioCircuitBreaker(details)) { 
+        #Map([
+          ("type", #Text("RemovePortfolioCircuitBreaker")),
+          ("conditionId", #Nat(details.conditionId))
+        ]);
+      };
+      case (#UpdatePortfolioCircuitBreaker(details)) { 
+        #Map([
+          ("type", #Text("UpdatePortfolioCircuitBreaker")),
+          ("conditionId", #Nat(details.conditionId)),
+          ("oldCondition", #Text(details.oldCondition)),
+          ("newCondition", #Text(details.newCondition))
+        ]);
+      };
+      case (#SetPortfolioCircuitBreakerActive(details)) { 
+        #Map([
+          ("type", #Text("SetPortfolioCircuitBreakerActive")),
+          ("conditionId", #Nat(details.conditionId)),
+          ("isActive", boolToValue(details.isActive))
+        ]);
+      };
+      case (#UpdatePausedTokenThreshold(details)) { 
+        #Map([
+          ("type", #Text("UpdatePausedTokenThreshold")),
+          ("oldThreshold", #Nat(details.oldThreshold)),
+          ("newThreshold", #Nat(details.newThreshold))
+        ]);
+      };
+      case (#ClearPortfolioCircuitBreakerLogs) { #Map([("type", #Text("ClearPortfolioCircuitBreakerLogs"))]); };
+      case (#UpdateMaxPortfolioSnapshots(details)) { 
+        #Map([
+          ("type", #Text("UpdateMaxPortfolioSnapshots")),
+          ("oldLimit", #Nat(details.oldLimit)),
+          ("newLimit", #Nat(details.newLimit))
+        ]);
+      };
+      case (#SetTestMode(details)) { 
+        #Map([
+          ("type", #Text("SetTestMode")),
+          ("isTestMode", boolToValue(details.isTestMode))
+        ]);
+      };
+      case (#ClearSystemLogs) { #Map([("type", #Text("ClearSystemLogs"))]); };
+    };
+  };
+
+  // Helper functions for converting DAO types to Value
+  public func tokenTypeToValue(tokenType: DAOTypes.TokenType) : Value {
+    switch (tokenType) {
+      case (#ICP) { #Text("ICP") };
+      case (#ICRC12) { #Text("ICRC12") };
+      case (#ICRC3) { #Text("ICRC3") };
+    };
+  };
+
+  public func systemStateToValue(state: DAOTypes.SystemState) : Value {
+    switch (state) {
+      case (#Active) { #Text("Active") };
+      case (#Paused) { #Text("Paused") };
+      case (#Emergency) { #Text("Emergency") };
+    };
+  };
+
+  public func systemParameterToValue(param: DAOTypes.SystemParameter) : Value {
+    switch (param) {
+      case (#FollowDepth(n)) { #Text("FollowDepth(" # debug_show(n) # ")") };
+      case (#MaxFollowers(n)) { #Text("MaxFollowers(" # debug_show(n) # ")") };
+      case (#MaxPastAllocations(n)) { #Text("MaxPastAllocations(" # debug_show(n) # ")") };
+      case (#SnapshotInterval(n)) { #Text("SnapshotInterval(" # debug_show(n) # ")") };
+      case (#MaxTotalUpdates(n)) { #Text("MaxTotalUpdates(" # debug_show(n) # ")") };
+      case (#MaxAllocationsPerDay(n)) { #Text("MaxAllocationsPerDay(" # debug_show(n) # ")") };
+      case (#AllocationWindow(n)) { #Text("AllocationWindow(" # debug_show(n) # ")") };
+      case (#MaxFollowUnfollowActionsPerDay(n)) { #Text("MaxFollowUnfollowActionsPerDay(" # debug_show(n) # ")") };
+      case (#MaxFollowed(n)) { #Text("MaxFollowed(" # debug_show(n) # ")") };
+      case (#LogAdmin(p)) { #Text("LogAdmin(" # Principal.toText(p) # ")") };
+    };
   };
 } 
