@@ -1,0 +1,275 @@
+# TACO DAO Archive Implementation Plan
+
+## Executive Summary
+We are extending our existing ICRC-3 based archive infrastructure to comprehensively archive all DAO_backend operations and administrative actions across the system, ensuring complete governance transparency and audit trails.
+
+## Current Archive Infrastructure Analysis
+
+### Existing Generic Infrastructure (✅ Complete)
+- **ArchiveBase**: Generic ICRC-3 implementation with 500GB scalable storage
+- **Authorization System**: Master admins + function-specific permissions
+- **Batch Import Timers**: Three-tier architecture for efficient data import
+- **Indexing**: Multiple indexes (block type, token, time, user-specific)
+- **Spam Protection & Logging**: Built-in security and monitoring
+
+### Existing Archive Implementations (✅ Working)
+1. **trading_archive**: Trades, circuit breakers, trading pauses
+   - Data source: `treasury.getTradingStatusSince()`
+   
+2. **portfolio_archive**: Portfolio snapshots with detailed token data
+   - Data source: `treasury.getPortfolioHistorySince()`
+   
+3. **price_archive**: Price history and market data
+   - Data source: `treasury.getTokenDetailsSince()`
+
+### Treasury "Since" Method Pattern (✅ Established)
+All archives use server-side filtered data:
+- Batch processing (100 items per batch)
+- Timestamp tracking with lastImported* variables
+- Chronological ordering before archiving
+
+## New Data Sources Identified
+
+### DAO_backend Data Analysis
+**Core User Operations** (✅ Tracked, needs archiving):
+- Allocation changes: old → new allocations with voting power context
+- Follow/unfollow actions: relationship management with timestamps
+- Voting power updates: neuron changes affecting aggregate power
+- Balance history snapshots: hourly allocation vs actual balance comparison
+
+**Administrative Operations** (❌ NOT structured, needs logging):
+- Token management: add/remove/pause/unpause with reasons
+- System state changes: Active/Paused/Emergency transitions
+- Configuration updates: parameter changes with before/after values
+- Permission management: admin grants/revocations
+
+### Treasury Admin Data (❌ NOT structured, needs logging)
+**Configuration Changes**:
+- Rebalance config updates (13+ trading parameters)
+- Price alert conditions and thresholds
+- Circuit breaker rules and limits
+- Portfolio snapshot settings
+
+**Token Pausing Systems** (3 distinct systems identified):
+1. **Manual Admin Pause**: DAO interface → isPaused flag → synced to treasury
+2. **Automatic Sync Failure**: Treasury detects failure → pausedDueToSyncFailure
+3. **Automatic Price Alert**: Price volatility → tradingPauses map entry
+
+## Data Overlap Analysis
+
+### DAO Balance History vs Portfolio Archive
+**NO significant overlap** - they serve different purposes:
+- **Portfolio Archive**: Treasury's view of actual token balances + prices
+- **DAO Balance History**: User allocation preferences vs actual balances
+- **Unique Value**: Balance history contains allocation preference data not available elsewhere
+
+### Administrative Logging Gap
+**Current State**: Only text logging via logger.info() - not queryable or archivable
+**Missing**: Structured data with timestamps, principals, before/after states, reasons
+
+## Proposed Archive Structure (4 New Archives)
+
+### 1. dao_allocation_archive
+**Purpose**: User allocation and relationship changes
+**Block Types**: `3allocation_change`, `3follow_action`
+**Data**: 
+- Allocation transitions with voting power context
+- Follow/unfollow relationships with timestamps
+- Balance history snapshots (hourly allocation vs balance comparisons)
+
+### 2. dao_governance_archive  
+**Purpose**: Voting power and neuron mechanics
+**Block Types**: `3voting_power`, `3neuron_update`
+**Data**:
+- Voting power refreshes and changes
+- Neuron state updates affecting aggregate power
+- System-wide governance metrics
+
+### 3. dao_admin_archive
+**Purpose**: DAO administrative actions
+**Block Types**: `3admin_action`
+**Data**:
+- Token management (add/remove/pause/unpause) with required reasons
+- System state changes with admin principals and justifications
+- Configuration parameter updates with before/after values
+- Permission grants/revocations
+
+### 4. treasury_admin_archive
+**Purpose**: Treasury configuration and automatic actions
+**Block Types**: `3config_change`, `3auto_pause`, `3manual_action`
+**Data**:
+- Rebalance configuration updates with field-by-field changes
+- Automatic token pausing (sync failures, price alerts) with trigger details
+- Manual treasury admin actions with required reasons
+- Circuit breaker activations and threshold changes
+
+## Token Pausing Systems (Complete Understanding)
+
+### System 1: Manual Admin Pause
+```
+Admin UI → DAO_backend.pauseToken(reason) → isPaused = true → sync to treasury
+```
+
+### System 2: Automatic Sync Failure
+```
+Treasury sync fails → pausedDueToSyncFailure = true → trading stops
+```
+
+### System 3: Automatic Price Alert
+```
+Price volatility → pauseTokenFromTrading() → tradingPauses[token] → trading stops
+```
+
+### Treasury Combined Check
+```motoko
+isTokenPausedFromTrading() checks:
+- details.isPaused (System 1)
+- details.pausedDueToSyncFailure (System 2)  
+- tradingPauses[token] != null (System 3)
+```
+
+## Implementation Plan
+
+### Phase 1: DAO_backend Structured Logging (PRIORITY)
+
+#### 1.1 Data Structures (dao_types.mo)
+```motoko
+public type AdminActionType = {
+  #TokenAdd: {token: Principal; tokenType: TokenType; viaGovernance: Bool};
+  #TokenRemove: {token: Principal};
+  #TokenPause: {token: Principal};
+  #TokenUnpause: {token: Principal};
+  #SystemStateChange: {oldState: SystemState; newState: SystemState};
+  #ParameterUpdate: {parameter: SystemParameter; oldValue: Text; newValue: Text};
+  #AdminPermissionGrant: {targetAdmin: Principal; function: Text; durationDays: Nat};
+  #AdminAdd: {newAdmin: Principal};
+  #AdminRemove: {removedAdmin: Principal};
+};
+
+public type AdminActionRecord = {
+  id: Nat;
+  timestamp: Int;
+  admin: Principal;
+  actionType: AdminActionType;
+  reason: Text;  // Required for all admin actions
+  success: Bool;
+  errorMessage: ?Text;
+};
+```
+
+#### 1.2 Storage & Core Functions (DAO.mo)
+- `stable var adminActions = Vector.new<AdminActionRecord>()`
+- `stable var adminActionCounter: Nat = 0`
+- `logAdminAction()` - core logging function
+- `getActionDescription()` - human readable descriptions
+
+#### 1.3 Backward Compatible API Design
+**Keep existing** `addToken(token, tokenType)` for DAO governance
+**Add new** `addTokenWithReason(token, tokenType, reason)` for admin interface
+**Update signatures** for all other admin functions to require reason parameter
+
+#### 1.4 Query Method for Archives
+```motoko
+getAdminActionsSince(sinceTimestamp: Int, limit: Nat) : async Result.Result<AdminActionsSinceResponse, AuthorizationError>
+```
+
+### Phase 2: Treasury Structured Logging
+
+#### 2.1 Data Structures (treasury_types.mo)
+```motoko
+public type TreasuryAdminActionType = {
+  #RebalanceConfigUpdate: {changedFields: [Text]; oldConfig: RebalanceConfig; newConfig: RebalanceConfig};
+  #TokenSyncFailure: {token: Principal; failureDetails: Text};
+  #TokenSyncRecovery: {token: Principal; recoveryMethod: Text};
+  #TokenPriceAlertPause: {token: Principal; conditionId: Nat; alertDetails: Text};
+  #TokenPriceAlertUnpause: {token: Principal; method: Text};
+  #CircuitBreakerTrigger: {tokensAffected: [Principal]; triggerType: Text; thresholdData: Text};
+  // ... other treasury actions
+};
+```
+
+#### 2.2 Implementation Pattern
+Similar to DAO_backend but treasury-specific:
+- Structured logging for all config updates
+- Automatic event logging for pausing systems
+- Required reasons for manual admin actions
+
+### Phase 3: Archive Canister Implementation
+
+#### 3.1 Archive Types Extension (archive_types.mo)
+Add new block data types for DAO operations:
+- `AllocationChangeBlockData`
+- `VotingPowerBlockData` 
+- `AdminActionBlockData`
+- `TreasuryConfigBlockData`
+
+#### 3.2 Archive Canister Creation
+Using existing `ArchiveBase` infrastructure:
+- 4 new archive canisters with appropriate block type support
+- Batch import timers connecting to new "since" methods
+- Proper indexing for efficient queries
+
+### Phase 4: Admin Interface Updates
+
+#### 4.1 Confirmation Dialogs
+All admin actions require reason confirmation:
+```typescript
+async function confirmAdminAction(actionName: string, actionFunction: (reason: string) => Promise<any>) {
+  const reason = await showReasonDialog({
+    title: `Confirm ${actionName}`,
+    message: `Please provide a reason for this action:`,
+    required: true,
+    minLength: 10
+  });
+  if (reason) return await actionFunction(reason);
+}
+```
+
+#### 4.2 Interface Updates
+- DAO admin interface: Use new `*WithReason` methods
+- Treasury admin interface: Update to require reasons
+- Archive viewing interfaces: Display new structured data
+
+### Phase 5: Deployment & Testing
+
+#### 5.1 Gradual Rollout
+1. Deploy structured logging updates to existing canisters
+2. Test admin interfaces with reason requirements
+3. Deploy new archive canisters
+4. Enable batch import systems
+5. Verify complete audit trail functionality
+
+#### 5.2 Data Migration
+- Existing archives continue working unchanged
+- New structured logging starts from deployment timestamp
+- Historical text logs remain accessible via existing logger system
+
+## Benefits Achieved
+
+### Governance Transparency
+- Complete audit trail of every admin action with reasons
+- Clear attribution of automatic vs manual actions
+- Historical context for all configuration changes
+
+### Operational Excellence  
+- Comprehensive token pausing system visibility
+- Structured data enables automated monitoring and alerting
+- Easy forensic analysis of system state changes
+
+### Archive Infrastructure Maturity
+- Consistent patterns across all system components
+- Scalable ICRC-3 foundation supports massive data growth
+- Domain-separated archives enable focused queries and analysis
+
+## Success Metrics
+- ✅ 100% admin actions logged with structured data and reasons
+- ✅ All 3 token pausing systems fully tracked and archivable
+- ✅ Zero loss of existing archive functionality during rollout
+- ✅ Admin interfaces require and capture meaningful reasons
+- ✅ Complete audit trail from user actions to system responses
+
+---
+
+**Total Implementation**: 4 new archives + 2 enhanced canisters + updated admin UIs
+**Timeline**: Phased rollout with DAO_backend structured logging as foundation
+**Risk**: Low - builds on proven archive infrastructure with backward compatibility

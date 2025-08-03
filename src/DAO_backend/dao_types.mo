@@ -182,6 +182,34 @@ module {
     totalWorthInUSD : Float;
   };
 
+  // Admin action logging types for structured archiving
+  public type AdminActionType = {
+    #TokenAdd: {token: Principal; tokenType: TokenType; viaGovernance: Bool};
+    #TokenRemove: {token: Principal};
+    #TokenPause: {token: Principal};
+    #TokenUnpause: {token: Principal};
+    #SystemStateChange: {oldState: SystemState; newState: SystemState};
+    #ParameterUpdate: {parameter: SystemParameter; oldValue: Text; newValue: Text};
+    #AdminPermissionGrant: {targetAdmin: Principal; function: Text; durationDays: Nat};
+    #AdminAdd: {newAdmin: Principal};
+    #AdminRemove: {removedAdmin: Principal};
+  };
+
+  public type AdminActionRecord = {
+    id: Nat;
+    timestamp: Int;
+    admin: Principal;
+    actionType: AdminActionType;
+    reason: Text;
+    success: Bool;
+    errorMessage: ?Text;
+  };
+
+  public type AdminActionsSinceResponse = {
+    actions: [AdminActionRecord];
+    totalCount: Nat;
+  };
+
   public type Self = actor {
     updateAllocation : shared ([Allocation]) -> async Result.Result<Text, UpdateError>;
     getAggregateAllocation : shared query () -> async [(Principal, Nat)];
@@ -199,16 +227,17 @@ module {
     };
     addAdmin : shared (Principal) -> async Result.Result<Text, AuthorizationError>;
     removeAdmin : shared (Principal) -> async Result.Result<Text, AuthorizationError>;
-    updateSystemState : shared (SystemState) -> async Result.Result<Text, AuthorizationError>;
+    updateSystemState : shared (SystemState, Text) -> async Result.Result<Text, AuthorizationError>;
     updateSpamParameters : shared ({
       allowedCalls : ?Nat;
       allowedSilentWarnings : ?Nat;
       timeWindowSpamCheck : ?Int;
     }) -> async Result.Result<Text, AuthorizationError>;
     addToken : shared (Principal, TokenType) -> async Result.Result<Text, AuthorizationError>;
-    removeToken : shared (Principal) -> async Result.Result<Text, AuthorizationError>;
-    pauseToken : shared (Principal) -> async Result.Result<Text, AuthorizationError>;
-    unpauseToken : shared (Principal) -> async Result.Result<Text, AuthorizationError>;
+    addTokenWithReason : shared (Principal, TokenType, Text) -> async Result.Result<Text, AuthorizationError>;
+    removeToken : shared (Principal, Text) -> async Result.Result<Text, AuthorizationError>;
+    pauseToken : shared (Principal, Text) -> async Result.Result<Text, AuthorizationError>;
+    unpauseToken : shared (Principal, Text) -> async Result.Result<Text, AuthorizationError>;
     grantAdminPermission : shared (Principal, SpamProtection.AdminFunction, Nat) -> async Result.Result<Text, AuthorizationError>;
     getAdminPermissions : shared () -> async [(Principal, [SpamProtection.AdminPermission])];
     votingPowerMetrics : shared () -> async Result.Result<{ totalVotingPower : Nat; totalVotingPowerByHotkeySetters : Nat; allocatedVotingPower : Nat }, AuthorizationError>;
@@ -217,5 +246,6 @@ module {
     syncTokenDetailsFromTreasury : shared () -> async Result.Result<Text, SyncError>;
     getSystemParameters : shared () -> async [SystemParameter];
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
+    getAdminActionsSince : shared query (Int, Nat) -> async Result.Result<AdminActionsSinceResponse, AuthorizationError>;
   };
 };

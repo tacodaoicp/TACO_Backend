@@ -2,6 +2,7 @@ import Principal "mo:base/Principal";
 import Map "mo:map/Map";
 import Nat "mo:base/Nat";
 import Int "mo:base/Int";
+import Text "mo:base/Text";
 import Iter "mo:base/Iter";
 import Error "mo:base/Error";
 import Debug "mo:base/Debug";
@@ -60,6 +61,12 @@ shared (deployer) actor class ContinuousDAO() = this {
   type NeuronAllocation = DAO_types.NeuronAllocation;
   type NeuronAllocationMap = DAO_types.NeuronAllocationMap;
   type HistoricBalanceAllocation = DAO_types.HistoricBalanceAllocation;
+  
+  // Admin action logging types
+  type AdminActionType = DAO_types.AdminActionType;
+  type AdminActionRecord = DAO_types.AdminActionRecord;
+  type AdminActionsSinceResponse = DAO_types.AdminActionsSinceResponse;
+  
   // Constants
   let BASIS_POINTS_TOTAL = 10000;
   stable var SNAPSHOT_INTERVAL = 900_000_000_000; // 15 minutes in nanoseconds
@@ -196,6 +203,11 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   stable var systemState : SystemState = #Paused;
 
+  // Admin action logging storage
+  stable var adminActionCounter: Nat = 0;
+  stable var adminActions = Vector.new<AdminActionRecord>();
+  stable var maxAdminActionsStored: Nat = 10000; // Keep last 10k actions before archiving
+
   // Neuron snapshot interface
   let neuronSnapshot = actor (Principal.toText(NEURON_SNAPSHOT_ID)) : NeuronSnapshot.Self;
 
@@ -217,166 +229,271 @@ shared (deployer) actor class ContinuousDAO() = this {
     false;
   };
 
+  // Admin action logging functions
+  private func logAdminAction(
+    admin: Principal,
+    actionType: AdminActionType,
+    reason: Text,
+    success: Bool,
+    errorMessage: ?Text
+  ) {
+    adminActionCounter += 1;
+    let record: AdminActionRecord = {
+      id = adminActionCounter;
+      timestamp = Time.now();
+      admin = admin;
+      actionType = actionType;
+      reason = reason;
+      success = success;
+      errorMessage = errorMessage;
+    };
+    
+    Vector.add(adminActions, record);
+    
+    // Keep only the most recent actions (before archiving takes over)
+    if (Vector.size(adminActions) > maxAdminActionsStored) {
+      // Remove the oldest action (first element) by shifting all elements
+      let currentSize = Vector.size(adminActions);
+      if (currentSize > 0) {
+        // Create new vector with recent actions
+        let newActions = Vector.new<AdminActionRecord>();
+        for (i in Iter.range(1, currentSize - 1)) {
+          Vector.add(newActions, Vector.get(adminActions, i));
+        };
+        adminActions := newActions;
+      };
+    };
+    
+    // Still log to text logger for immediate debugging
+    let actionDesc = getActionDescription(actionType);
+    let statusText = if (success) "SUCCESS" else "FAILED";
+    logger.info("AdminAction", 
+      "[" # statusText # "] " # actionDesc # " by " # Principal.toText(admin) # 
+      " - Reason: " # reason, "logAdminAction");
+  };
+
+  private func getActionDescription(actionType: AdminActionType): Text {
+    switch (actionType) {
+      case (#TokenAdd(details)) {
+        let viaText = if (details.viaGovernance) " (via DAO Governance)" else " (via Admin Interface)";
+        "Add token " # Principal.toText(details.token) # viaText;
+      };
+      case (#TokenRemove(details)) "Remove token " # Principal.toText(details.token);
+      case (#TokenPause(details)) "Pause token " # Principal.toText(details.token);
+      case (#TokenUnpause(details)) "Unpause token " # Principal.toText(details.token);
+      case (#SystemStateChange(details)) "Change system state from " # debug_show(details.oldState) # " to " # debug_show(details.newState);
+      case (#ParameterUpdate(details)) "Update " # debug_show(details.parameter) # " from " # details.oldValue # " to " # details.newValue;
+      case (#AdminPermissionGrant(details)) "Grant " # details.function # " permission to " # Principal.toText(details.targetAdmin);
+      case (#AdminAdd(details)) "Add admin " # Principal.toText(details.newAdmin);
+      case (#AdminRemove(details)) "Remove admin " # Principal.toText(details.removedAdmin);
+    };
+  };
+
+  private func getDefaultTokenDetails(): TokenDetails {
+    {
+      Active = false;
+      isPaused = false;
+      epochAdded = Time.now();
+      tokenName = "";
+      tokenSymbol = "";
+      tokenDecimals = 0;
+      tokenTransferFee = 0;
+      balance = 0;
+      priceInICP = 0;
+      priceInUSD = 0.0;
+      tokenType = #ICRC12;
+      pastPrices = [];
+      lastTimeSynced = 0;
+      pausedDueToSyncFailure = false;
+    };
+  };
+
   // Adds new token to DAO. Fetches metadata from token's ledger canister.
+  // BACKWARD COMPATIBLE - delegates to addTokenWithReason with default reason
   public shared ({ caller }) func addToken(token : Principal, tokenType : TokenType) : async Result.Result<Text, AuthorizationError> {
+    // Call the new implementation with default reason for DAO governance compatibility
+    await addTokenWithReason(token, tokenType, "DAO Governance Vote");
+  };
+
+  // Adds new token to DAO with required reason. Fetches metadata from token's ledger canister.
+  public shared ({ caller }) func addTokenWithReason(token : Principal, tokenType : TokenType, reason : Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #addToken)) {
-      logger.warn("Admin", "Unauthorized addToken attempt by: " # Principal.toText(caller), "addToken");
+      logAdminAction(caller, #TokenAdd({token; tokenType; viaGovernance = false}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
-    logger.info("Admin", "Adding token " # Principal.toText(token) # " by " # Principal.toText(caller), "addToken");
-
-    let metadata = if (token == Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai")) {
-      {
-        tokenName = "ICP";
-        tokenSymbol = "ICP";
-        tokenDecimals = 8;
-        tokenTransferFee = 10000;
-        tokenType = #ICP;
-      };
-    } else {
-      let ledger = actor (Principal.toText(token)) : ICRC1.FullInterface;
-      let metadata = await ledger.icrc1_metadata();
-
-      // Initialize with defaults
-      var name = "";
-      var symbol = "";
-      var decimals = 0;
-      var fee = 0;
-
-      // Process metadata entries
-      for ((key, value) in metadata.vals()) {
-        switch (key, value) {
-          case ("icrc1:name", #Text(val)) { name := val };
-          case ("icrc1:symbol", #Text(val)) { symbol := val };
-          case ("icrc1:decimals", #Nat(val)) { decimals := val };
-          case ("icrc1:decimals", #Int(val)) { decimals := Int.abs(val) };
-          case ("icrc1:fee", #Nat(val)) { fee := val };
-          case ("icrc1:fee", #Int(val)) { fee := Int.abs(val) };
-          case _ { /* ignore other fields */ };
-        };
-      };
-
-      if (name == "" or symbol == "") {
-        logger.error("Admin", "Invalid metadata for token " # Principal.toText(token) # ": missing name or symbol", "addToken");
-        return #err(#UnexpectedError("Invalid metadata: missing name or symbol"));
-      };
-
-      {
-        tokenName = name;
-        tokenSymbol = symbol;
-        tokenDecimals = decimals;
-        tokenTransferFee = fee;
-        tokenType = tokenType;
-      };
+    // Validate reason is not empty for explicit admin calls
+    if (Text.size(reason) == 0) {
+      return #err(#UnexpectedError("Reason is required for admin actions"));
     };
 
-    // Check if token already exists
-    switch (Map.get(tokenDetailsMap, phash, token)) {
-      case (?details) {
-        if (details.Active) {
-          Map.set(tokenDetailsMap, phash, token, { metadata with Active = details.Active; isPaused = details.isPaused; epochAdded = details.epochAdded; balance = details.balance; priceInICP = details.priceInICP; priceInUSD = details.priceInUSD; pastPrices = details.pastPrices; lastTimeSynced = details.lastTimeSynced; pausedDueToSyncFailure = details.pausedDueToSyncFailure });
-          logger.warn("Admin", "Token " # Principal.toText(token) # " already exists", "addToken");
-          return #err(#UnexpectedError("Token already exists"));
-        } else {
-          Map.set(tokenDetailsMap, phash, token, { metadata with Active = true; isPaused = false; epochAdded = Time.now(); balance = 0; priceInICP = 0; priceInUSD = 0.0; pastPrices = []; lastTimeSynced = 0; pausedDueToSyncFailure = false });
-          logger.info("Admin", "Reactivated token " # Principal.toText(token), "addToken");
-        };
-      };
-      case null {
-        Map.set(
-          tokenDetailsMap,
-          phash,
-          token,
-          {
-            metadata with
-            Active = true;
-            isPaused = false;
-            epochAdded = Time.now();
-            balance = 0;
-            priceInICP = 0;
-            priceInUSD = 0.0;
-            pastPrices = [];
-            lastTimeSynced = 0;
-            pausedDueToSyncFailure = false;
-          },
-        );
-      };
-    };
-    activeTokenCount := 0;
-    for ((_, details) in Map.entries(tokenDetailsMap)) {
-      if (details.Active) {
-        activeTokenCount += 1;
-      };
-    };
+    // Determine if this is via governance (default reason) or direct admin interface
+    let viaGovernance = reason == "DAO Governance Vote";
 
     try {
-      ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
-      logger.info("Admin", "Synced token details with treasury", "addToken");
-    } catch (e) {
-      logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "addToken");
-    };
-    /*try {
-      ignore await mintingVault.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
-      logger.info("Admin", "Synced token details with minting vault", "addToken");
-    } catch (e) {
-      logger.warn("Admin", "Failed to sync token details with minting vault: " # Error.message(e), "addToken");
-    };*/
+      let metadata = if (token == Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai")) {
+        {
+          tokenName = "ICP";
+          tokenSymbol = "ICP";
+          tokenDecimals = 8;
+          tokenTransferFee = 10000;
+          tokenType = #ICP;
+        };
+      } else {
+        let ledger = actor (Principal.toText(token)) : ICRC1.FullInterface;
+        let metadata = await ledger.icrc1_metadata();
 
-    logger.info("Admin", "Token " # Principal.toText(token) # " added successfully", "addToken");
-    #ok("Token added successfully");
+        // Initialize with defaults
+        var name = "";
+        var symbol = "";
+        var decimals = 0;
+        var fee = 0;
+
+        // Process metadata entries
+        for ((key, value) in metadata.vals()) {
+          switch (key, value) {
+            case ("icrc1:name", #Text(val)) { name := val };
+            case ("icrc1:symbol", #Text(val)) { symbol := val };
+            case ("icrc1:decimals", #Nat(val)) { decimals := val };
+            case ("icrc1:decimals", #Int(val)) { decimals := Int.abs(val) };
+            case ("icrc1:fee", #Nat(val)) { fee := val };
+            case ("icrc1:fee", #Int(val)) { fee := Int.abs(val) };
+            case _ { /* ignore other fields */ };
+          };
+        };
+
+        if (name == "" or symbol == "") {
+          let errorMsg = "Invalid metadata: missing name or symbol";
+          logAdminAction(caller, #TokenAdd({token; tokenType; viaGovernance}), reason, false, ?errorMsg);
+          return #err(#UnexpectedError(errorMsg));
+        };
+
+        {
+          tokenName = name;
+          tokenSymbol = symbol;
+          tokenDecimals = decimals;
+          tokenTransferFee = fee;
+          tokenType = tokenType;
+        };
+      };
+
+      // Check if token already exists
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) {
+          if (details.Active) {
+            Map.set(tokenDetailsMap, phash, token, { metadata with Active = details.Active; isPaused = details.isPaused; epochAdded = details.epochAdded; balance = details.balance; priceInICP = details.priceInICP; priceInUSD = details.priceInUSD; pastPrices = details.pastPrices; lastTimeSynced = details.lastTimeSynced; pausedDueToSyncFailure = details.pausedDueToSyncFailure });
+            let errorMsg = "Token already exists";
+            logAdminAction(caller, #TokenAdd({token; tokenType; viaGovernance}), reason, false, ?errorMsg);
+            return #err(#UnexpectedError(errorMsg));
+          } else {
+            Map.set(tokenDetailsMap, phash, token, { metadata with Active = true; isPaused = false; epochAdded = Time.now(); balance = 0; priceInICP = 0; priceInUSD = 0.0; pastPrices = []; lastTimeSynced = 0; pausedDueToSyncFailure = false });
+          };
+        };
+        case null {
+          Map.set(
+            tokenDetailsMap,
+            phash,
+            token,
+            {
+              metadata with
+              Active = true;
+              isPaused = false;
+              epochAdded = Time.now();
+              balance = 0;
+              priceInICP = 0;
+              priceInUSD = 0.0;
+              pastPrices = [];
+              lastTimeSynced = 0;
+              pausedDueToSyncFailure = false;
+            },
+          );
+        };
+      };
+      
+      activeTokenCount := 0;
+      for ((_, details) in Map.entries(tokenDetailsMap)) {
+        if (details.Active) {
+          activeTokenCount += 1;
+        };
+      };
+
+      try {
+        ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+      } catch (e) {
+        // Don't fail the whole operation for sync issues, just log
+        logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "addTokenWithReason");
+      };
+
+      // Log successful action
+      let finalTokenDetails = switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) { details };
+        case null { getDefaultTokenDetails() }; // Should not happen but handle gracefully
+      };
+      
+      logAdminAction(caller, #TokenAdd({token; tokenType; viaGovernance}), reason, true, null);
+      #ok("Token added successfully");
+      
+    } catch (e) {
+      let errorMsg = Error.message(e);
+      logAdminAction(caller, #TokenAdd({token; tokenType; viaGovernance}), reason, false, ?errorMsg);
+      #err(#UnexpectedError(errorMsg));
+    };
   };
 
   // Chosen to not remove the token from the existing allocations of people, instead only remove it from aggregateAllocation.
   // This allows the user to get notified about the need for a new allocation, as one of the tokens is not active anymore.
-  public shared ({ caller }) func removeToken(token : Principal) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func removeToken(token : Principal, reason : Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #removeToken)) {
-      logger.warn("Admin", "Unauthorized removeToken attempt by: " # Principal.toText(caller), "removeToken");
+      logAdminAction(caller, #TokenRemove({token}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
-    logger.info("Admin", "Removing token " # Principal.toText(token) # " by " # Principal.toText(caller), "removeToken");
+    // Validate reason is not empty
+    if (Text.size(reason) == 0) {
+      return #err(#UnexpectedError("Reason is required for admin actions"));
+    };
 
-    // Check if token exists
-    switch (Map.get(tokenDetailsMap, phash, token)) {
-      case (null) {
-        logger.info("Admin", "Token " # Principal.toText(token) # " doesn't exist", "removeToken");
-        return #ok("Token doesn't exist");
-      };
-      case (?details) {
-        // Remove from tokenDetailsMap
-        Map.set(tokenDetailsMap, phash, token, { details with Active = false; isPaused = false; epochAdded = 0 });
-        logger.info("Admin", "Token " # Principal.toText(token) # " marked as inactive", "removeToken");
+    try {
+      // Check if token exists
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (null) {
+          // Token doesn't exist - this is actually OK, not an error
+          logAdminAction(caller, #TokenRemove({token}), reason, true, null);
+          return #ok("Token doesn't exist");
+        };
+        case (?details) {
+          // Remove from tokenDetailsMap
+          Map.set(tokenDetailsMap, phash, token, { details with Active = false; isPaused = false; epochAdded = 0 });
 
-        // Remove from aggregateAllocation if present
-        if (Map.has(aggregateAllocation, phash, token)) {
-          Map.delete(aggregateAllocation, phash, token);
-          logger.info("Admin", "Token " # Principal.toText(token) # " removed from aggregate allocation", "removeToken");
+          // Remove from aggregateAllocation if present
+          if (Map.has(aggregateAllocation, phash, token)) {
+            Map.delete(aggregateAllocation, phash, token);
+          };
         };
       };
-    };
-    activeTokenCount := 0;
-    for ((_, details) in Map.entries(tokenDetailsMap)) {
-      if (details.Active) {
-        activeTokenCount += 1;
+      
+      activeTokenCount := 0;
+      for ((_, details) in Map.entries(tokenDetailsMap)) {
+        if (details.Active) {
+          activeTokenCount += 1;
+        };
       };
-    };
-    try {
-      ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
-      logger.info("Admin", "Synced token details with treasury", "removeToken");
-    } catch (e) {
-      logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "removeToken");
-    };
+      
+      try {
+        ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+      } catch (e) {
+        // Don't fail the whole operation for sync issues, just log
+        logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "removeToken");
+      };
 
-    /*try {
-      ignore await mintingVault.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
-      logger.info("Admin", "Synced token details with minting vault", "removeToken");
+      logAdminAction(caller, #TokenRemove({token}), reason, true, null);
+      #ok("Token removed successfully");
+      
     } catch (e) {
-      logger.warn("Admin", "Failed to sync token details with minting vault: " # Error.message(e), "removeToken");
-    };*/
-
-    logger.info("Admin", "Token " # Principal.toText(token) # " removed successfully", "removeToken");
-    #ok("Token removed successfully");
+      let errorMsg = Error.message(e);
+      logAdminAction(caller, #TokenRemove({token}), reason, false, ?errorMsg);
+      #err(#UnexpectedError(errorMsg));
+    };
   };
 
   // Pausing means the trasury wont trade using that token. Seemed more natural to add the pausing logic here as it also removes and adds tokens.
@@ -598,7 +715,6 @@ shared (deployer) actor class ContinuousDAO() = this {
           allocations = currentAllocations;
           totalWorthInICP = totalWorthInICP;
           totalWorthInUSD = totalWorthInUSD;
-          lastTimeSynced = timenow;
         },
       );
       lastBalanceHistoryUpdate := timenow;
@@ -2822,4 +2938,38 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
   */
+
+  // Query method for admin actions since timestamp (for archiving)
+  public shared query ({ caller }) func getAdminActionsSince(
+    sinceTimestamp: Int, 
+    limit: Nat
+  ) : async Result.Result<AdminActionsSinceResponse, AuthorizationError> {
+    if (not isAdmin(caller, #getAdminActions)) {
+      return #err(#NotAdmin);
+    };
+
+    if (limit == 0 or limit > 1000) {
+      return #err(#UnexpectedError("Invalid limit: must be between 1 and 1000"));
+    };
+
+    let allActions = Vector.toArray(adminActions);
+    let filteredActions = Array.filter<AdminActionRecord>(allActions, func(action) {
+      action.timestamp > sinceTimestamp
+    });
+    
+    let totalFilteredCount = filteredActions.size();
+    let limitedActions = if (totalFilteredCount > limit) {
+      Array.subArray(filteredActions, 0, limit)
+    } else {
+      filteredActions
+    };
+
+    let response: AdminActionsSinceResponse = {
+      actions = limitedActions;
+      totalCount = totalFilteredCount;
+    };
+
+    #ok(response);
+  };
+
 };

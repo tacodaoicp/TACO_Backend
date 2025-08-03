@@ -25,6 +25,7 @@ module {
     #updateMintingVaultConfig;
     #setTacoAddress;
     #getLogs;
+    #getAdminActions;
     #clearLogs;
     #startRebalancing;
     #stopRebalancing;
