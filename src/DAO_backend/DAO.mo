@@ -279,6 +279,7 @@ shared (deployer) actor class ContinuousDAO() = this {
       case (#TokenUnpause(details)) "Unpause token " # Principal.toText(details.token);
       case (#SystemStateChange(details)) "Change system state from " # debug_show(details.oldState) # " to " # debug_show(details.newState);
       case (#ParameterUpdate(details)) "Update " # debug_show(details.parameter) # " from " # details.oldValue # " to " # details.newValue;
+      case (#SpamConfigUpdate(details)) "Spam configuration: " # details.description;
       case (#AdminPermissionGrant(details)) "Grant " # details.function # " permission to " # Principal.toText(details.targetAdmin);
       case (#AdminAdd(details)) "Add admin " # Principal.toText(details.newAdmin);
       case (#AdminRemove(details)) "Remove admin " # Principal.toText(details.removedAdmin);
@@ -493,9 +494,10 @@ shared (deployer) actor class ContinuousDAO() = this {
   };
 
   // Pausing means the trasury wont trade using that token. Seemed more natural to add the pausing logic here as it also removes and adds tokens.
-  public shared ({ caller }) func pauseToken(token : Principal) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func pauseToken(token : Principal, reason: Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #pauseToken)) {
       logger.warn("Admin", "Unauthorized pauseToken attempt by: " # Principal.toText(caller), "pauseToken");
+      logAdminAction(caller, #TokenPause({token}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
@@ -505,15 +507,18 @@ shared (deployer) actor class ContinuousDAO() = this {
     switch (Map.get(tokenDetailsMap, phash, token)) {
       case (null) {
         logger.info("Admin", "Token " # Principal.toText(token) # " doesn't exist", "pauseToken");
+        logAdminAction(caller, #TokenPause({token}), reason, true, null);
         return #ok("Token doesn't exist");
       };
       case (?details) {
         if (details.isPaused) {
           logger.info("Admin", "Token " # Principal.toText(token) # " is already paused", "pauseToken");
+          logAdminAction(caller, #TokenPause({token}), reason, true, null);
           return #ok("Token is already paused");
         };
         if (not details.Active) {
           logger.warn("Admin", "Token " # Principal.toText(token) # " is not active", "pauseToken");
+          logAdminAction(caller, #TokenPause({token}), reason, false, ?"Token is not active");
           return #err(#UnexpectedError("Token is not active"));
         };
         Map.set(tokenDetailsMap, phash, token, { details with isPaused = true });
@@ -524,8 +529,11 @@ shared (deployer) actor class ContinuousDAO() = this {
     try {
       ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
       logger.info("Admin", "Synced token details with treasury", "pauseToken");
+      logAdminAction(caller, #TokenPause({token}), reason, true, null);
     } catch (e) {
       logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "pauseToken");
+      logAdminAction(caller, #TokenPause({token}), reason, false, ?Error.message(e));
+      return #err(#UnexpectedError("Failed to sync with treasury: " # Error.message(e)));
     };
 
     /*try {
@@ -538,9 +546,10 @@ shared (deployer) actor class ContinuousDAO() = this {
     #ok("Token paused successfully");
   };
 
-  public shared ({ caller }) func unpauseToken(token : Principal) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func unpauseToken(token : Principal, reason: Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #unpauseToken)) {
       logger.warn("Admin", "Unauthorized unpauseToken attempt by: " # Principal.toText(caller), "unpauseToken");
+      logAdminAction(caller, #TokenUnpause({token}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
@@ -550,11 +559,13 @@ shared (deployer) actor class ContinuousDAO() = this {
     switch (Map.get(tokenDetailsMap, phash, token)) {
       case (null) {
         logger.info("Admin", "Token " # Principal.toText(token) # " doesn't exist", "unpauseToken");
+        logAdminAction(caller, #TokenUnpause({token}), reason, true, null);
         return #ok("Token doesn't exist");
       };
       case (?details) {
         if (not details.isPaused) {
           logger.info("Admin", "Token " # Principal.toText(token) # " is not paused", "unpauseToken");
+          logAdminAction(caller, #TokenUnpause({token}), reason, true, null);
           return #ok("Token is not paused");
         };
         Map.set(tokenDetailsMap, phash, token, { details with isPaused = false });
@@ -563,8 +574,11 @@ shared (deployer) actor class ContinuousDAO() = this {
         try {
           ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
           logger.info("Admin", "Synced token details with treasury", "unpauseToken");
+          logAdminAction(caller, #TokenUnpause({token}), reason, true, null);
         } catch (e) {
           logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "unpauseToken");
+          logAdminAction(caller, #TokenUnpause({token}), reason, false, ?Error.message(e));
+          return #err(#UnexpectedError("Failed to sync with treasury: " # Error.message(e)));
         };
 
         /*try {
@@ -1981,11 +1995,13 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
-  public shared ({ caller }) func updateSystemState(newState : SystemState) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func updateSystemState(newState : SystemState, reason: Text) : async Result.Result<Text, AuthorizationError> {
     if (not Principal.isController(caller) and not isAdmin(caller, #updateSystemState) and sns_governance_canister_id != ?caller) {
+      logAdminAction(caller, #SystemStateChange({oldState = systemState; newState}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
+    let oldState = systemState;
     let stateText = switch (newState) {
       case (#Active) { "Active" };
       case (#Paused) { "Paused" };
@@ -1996,6 +2012,7 @@ shared (deployer) actor class ContinuousDAO() = this {
 
     systemState := newState;
     logger.info("Admin", "System state updated to " # stateText # " successfully", "updateSystemState");
+    logAdminAction(caller, #SystemStateChange({oldState; newState}), reason, true, null);
     #ok("System state updated successfully");
   };
 
@@ -2345,8 +2362,11 @@ shared (deployer) actor class ContinuousDAO() = this {
   ) : async Result.Result<Text, AuthorizationError> {
     if (isAdmin(caller, #updateSpamParameters)) {
       spamGuard.updateSpamParameters(params);
+      // Log this as spam configuration update
+      logAdminAction(caller, #SpamConfigUpdate({description = "Spam parameters updated"}), "System configuration update", true, null);
       #ok("Spam parameters updated successfully");
     } else {
+      logAdminAction(caller, #SpamConfigUpdate({description = "Spam parameters update attempted"}), "Unauthorized attempt", false, ?"Not authorized");
       #err(#NotAdmin);
     };
   };

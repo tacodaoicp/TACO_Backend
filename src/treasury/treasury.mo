@@ -635,6 +635,7 @@ shared (deployer) actor class treasury() = this {
   public shared ({ caller }) func stopRebalancing() : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #stopRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       Debug.print("Not authorized to stop rebalancing: " # debug_show(caller));
+      logTreasuryAdminAction(caller, #StopRebalancing, "Unauthorized attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -667,6 +668,7 @@ shared (deployer) actor class treasury() = this {
     };
 
     Debug.print("Rebalancing stopped" # debug_show(rebalanceState));
+    logTreasuryAdminAction(caller, #StopRebalancing, "Rebalancing stopped programmatically", true, null);
     #ok("Rebalancing stopped");
   };
 
@@ -679,6 +681,7 @@ shared (deployer) actor class treasury() = this {
   public shared ({ caller }) func resetRebalanceState() : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #stopRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       Debug.print("Not authorized to reset rebalance state: " # debug_show(caller));
+      logTreasuryAdminAction(caller, #ResetRebalanceState, "Unauthorized attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -721,6 +724,7 @@ shared (deployer) actor class treasury() = this {
     };
 
     Debug.print("Rebalance state reset complete");
+    logTreasuryAdminAction(caller, #ResetRebalanceState, "Rebalance state reset programmatically", true, null);
     #ok("Rebalance state reset to initial values");
   };
 
@@ -2036,18 +2040,25 @@ shared (deployer) actor class treasury() = this {
     reason : Text
   ) : async Result.Result<Text, TradingPauseError> {
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      logTreasuryAdminAction(caller, #PauseTokenManual({token; pauseType = "manual"}), reason, false, ?"Not authorized");
       return #err(#NotAuthorized);
     };
 
     // Check if token exists in our system
     let tokenDetails = switch (Map.get(tokenDetailsMap, phash, token)) {
       case (?details) { details };
-      case null { return #err(#TokenNotFound) };
+      case null { 
+        logTreasuryAdminAction(caller, #PauseTokenManual({token; pauseType = "manual"}), reason, false, ?"Token not found");
+        return #err(#TokenNotFound) 
+      };
     };
 
     // Check if already paused
     switch (Map.get(tradingPauses, phash, token)) {
-      case (?_) { return #err(#TokenAlreadyPaused) };
+      case (?_) { 
+        logTreasuryAdminAction(caller, #PauseTokenManual({token; pauseType = "manual"}), reason, false, ?"Token already paused");
+        return #err(#TokenAlreadyPaused) 
+      };
       case null {};
     };
 
@@ -2061,8 +2072,10 @@ shared (deployer) actor class treasury() = this {
     let success = pauseTokenFromTrading(token, pauseReason);
     
     if (success) {
+      logTreasuryAdminAction(caller, #PauseTokenManual({token; pauseType = "manual"}), reason, true, null);
       #ok("Token " # tokenDetails.tokenSymbol # " paused from trading successfully");
     } else {
+      logTreasuryAdminAction(caller, #PauseTokenManual({token; pauseType = "manual"}), reason, false, ?"Failed to pause token");
       #err(#SystemError("Failed to pause token"));
     };
   };
@@ -2075,6 +2088,7 @@ shared (deployer) actor class treasury() = this {
    */
   public shared ({ caller }) func clearAllTradingPauses() : async Result.Result<Text, TradingPauseError> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller)) {
+      logTreasuryAdminAction(caller, #ClearAllTradingPauses, "Unauthorized attempt", false, ?"Not authorized");
       return #err(#NotAuthorized);
     };
 
@@ -2089,6 +2103,7 @@ shared (deployer) actor class treasury() = this {
       "clearAllTradingPauses"
     );
 
+    logTreasuryAdminAction(caller, #ClearAllTradingPauses, "Emergency clear of all trading pauses", true, null);
     #ok("Cleared " # Nat.toText(clearedCount) # " trading pauses");
   };
 
