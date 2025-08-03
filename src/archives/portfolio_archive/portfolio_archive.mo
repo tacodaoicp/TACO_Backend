@@ -135,7 +135,12 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
           // No need to filter client-side anymore - server already filtered
           let newSnapshots = response.snapshots;
           
-          for (snapshot in newSnapshots.vals()) {
+          // Sort snapshots chronologically (oldest first) for proper block ordering
+          let sortedSnapshots = Array.sort<TreasuryTypes.PortfolioSnapshot>(newSnapshots, func(a, b) {
+            Int.compare(a.timestamp, b.timestamp)
+          });
+          
+          for (snapshot in sortedSnapshots.vals()) {
             // Convert treasury TokenSnapshots to archive DetailedTokenSnapshots (excluding symbol)
             let detailedTokens = Array.map<TreasuryTypes.TokenSnapshot, ArchiveTypes.DetailedTokenSnapshot>(
               snapshot.tokens, 

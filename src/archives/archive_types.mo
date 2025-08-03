@@ -76,6 +76,7 @@ module {
     slippage: Float;
     fee: Nat;
     error: ?Text;
+    timestamp: Int; // Original event timestamp (not import time!)
   };
 
   // Detailed token information stored in portfolio archives (excluding symbol since it can be looked up)
@@ -107,6 +108,7 @@ module {
     tokensAffected: [Principal];
     systemResponse: Text;
     severity: Text;
+    timestamp: Int; // Original event timestamp (not import time!)
   };
 
   public type PriceBlockData = {
@@ -116,6 +118,7 @@ module {
     source: PriceSource;
     volume24h: ?Nat;
     change24h: ?Float;
+    timestamp: Int; // Original event timestamp (not import time!)
   };
 
   public type TradingPauseBlockData = {
@@ -123,6 +126,7 @@ module {
     tokenSymbol: Text;
     reason: TradingPauseReason;
     duration: ?Int;
+    timestamp: Int; // Original event timestamp (not import time!)
   };
 
   public type AllocationBlockData = {
