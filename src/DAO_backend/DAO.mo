@@ -251,17 +251,13 @@ shared (deployer) actor class ContinuousDAO() = this {
     Vector.add(adminActions, record);
     
     // Keep only the most recent actions (before archiving takes over)
+    // Use standard treasury pattern for consistency
     if (Vector.size(adminActions) > maxAdminActionsStored) {
-      // Remove the oldest action (first element) by shifting all elements
-      let currentSize = Vector.size(adminActions);
-      if (currentSize > 0) {
-        // Create new vector with recent actions
-        let newActions = Vector.new<AdminActionRecord>();
-        for (i in Iter.range(1, currentSize - 1)) {
-          Vector.add(newActions, Vector.get(adminActions, i));
-        };
-        adminActions := newActions;
+      Vector.reverse(adminActions);
+      while (Vector.size(adminActions) > maxAdminActionsStored) {
+        ignore Vector.removeLast(adminActions);
       };
+      Vector.reverse(adminActions);
     };
     
     // Still log to text logger for immediate debugging
