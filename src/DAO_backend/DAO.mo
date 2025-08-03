@@ -279,7 +279,6 @@ shared (deployer) actor class ContinuousDAO() = this {
       case (#TokenUnpause(details)) "Unpause token " # Principal.toText(details.token);
       case (#SystemStateChange(details)) "Change system state from " # debug_show(details.oldState) # " to " # debug_show(details.newState);
       case (#ParameterUpdate(details)) "Update " # debug_show(details.parameter) # " from " # details.oldValue # " to " # details.newValue;
-      case (#SpamConfigUpdate(details)) "Spam configuration: " # details.description;
       case (#AdminPermissionGrant(details)) "Grant " # details.function # " permission to " # Principal.toText(details.targetAdmin);
       case (#AdminAdd(details)) "Add admin " # Principal.toText(details.newAdmin);
       case (#AdminRemove(details)) "Remove admin " # Principal.toText(details.removedAdmin);
@@ -2362,11 +2361,8 @@ shared (deployer) actor class ContinuousDAO() = this {
   ) : async Result.Result<Text, AuthorizationError> {
     if (isAdmin(caller, #updateSpamParameters)) {
       spamGuard.updateSpamParameters(params);
-      // Log this as spam configuration update
-      logAdminAction(caller, #SpamConfigUpdate({description = "Spam parameters updated"}), "System configuration update", true, null);
       #ok("Spam parameters updated successfully");
     } else {
-      logAdminAction(caller, #SpamConfigUpdate({description = "Spam parameters update attempted"}), "Unauthorized attempt", false, ?"Not authorized");
       #err(#NotAdmin);
     };
   };
