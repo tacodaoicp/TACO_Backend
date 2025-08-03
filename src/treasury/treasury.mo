@@ -736,6 +736,7 @@ shared (deployer) actor class treasury() = this {
    */
   public shared ({ caller }) func updateRebalanceConfig(updates : UpdateConfig, rebalanceStateNew : ?Bool) : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = ""}), "Unauthorized attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -985,11 +986,13 @@ shared (deployer) actor class treasury() = this {
 
     // Return any validation errors
     if (Text.size(validationErrors) > 0) {
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = ""}), "Configuration validation failed", false, ?validationErrors);
       return #err(#ConfigError(validationErrors));
     };
 
     // If no changes were requested, return early
     if (not hasChanges) {
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = ""}), "No changes requested", true, null);
       return #ok("No changes requested to rebalance configuration");
     };
 
@@ -1026,6 +1029,7 @@ shared (deployer) actor class treasury() = this {
 
     };
 
+    logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = "updated"}), "Rebalance configuration updated", true, null);
     #ok("Rebalance configuration updated successfully");
   };
 
@@ -1356,9 +1360,13 @@ shared (deployer) actor class treasury() = this {
    * Only callable by DAO.
    */
   public shared ({ caller }) func setTest(a : Bool) : async () {
-    assert (caller == DAOPrincipal);
+    if (caller != DAOPrincipal) {
+      logTreasuryAdminAction(caller, #SetTestMode({isTestMode = a}), "Unauthorized attempt", false, ?"Only DAO can set test mode");
+      assert (false); // Keep original assert behavior
+    };
     test := a;
     Debug.print("Test is set");
+    logTreasuryAdminAction(caller, #SetTestMode({isTestMode = a}), "Test mode updated", true, null);
   };
 
   //=========================================================================
@@ -2007,13 +2015,17 @@ shared (deployer) actor class treasury() = this {
    */
   public shared ({ caller }) func unpauseTokenFromTrading(token : Principal) : async Result.Result<Text, TradingPauseError> {
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      logTreasuryAdminAction(caller, #UnpauseToken({token}), "Unauthorized attempt", false, ?"Not authorized");
       return #err(#NotAuthorized);
     };
 
     // Check if token is currently paused
     let pauseRecord = switch (Map.remove(tradingPauses, phash, token)) {
       case (?record) { record };
-      case null { return #err(#TokenNotPaused) };
+      case null { 
+        logTreasuryAdminAction(caller, #UnpauseToken({token}), "Token was not paused", false, ?"Token not paused");
+        return #err(#TokenNotPaused) 
+      };
     };
 
     logger.info(
@@ -2026,6 +2038,7 @@ shared (deployer) actor class treasury() = this {
       "unpauseTokenFromTrading"
     );
 
+    logTreasuryAdminAction(caller, #UnpauseToken({token}), "Token unpaused from trading", true, null);
     #ok("Token " # pauseRecord.tokenSymbol # " unpaused from trading successfully");
   };
 
