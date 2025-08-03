@@ -349,6 +349,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
             tokensAffected = [alert.token];
             systemResponse = "Price alert triggered: " # alert.triggeredCondition.name;
             severity = "Medium";
+            timestamp = alert.timestamp; // Use original alert timestamp
           };
           
           let blockResult = await archiveCircuitBreakerBlock(circuitBreakerData);
