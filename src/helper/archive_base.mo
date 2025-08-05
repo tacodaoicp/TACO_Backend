@@ -122,7 +122,8 @@ module {
       masterAdmins,
       TREASURY_ID,
       DAO_BACKEND_ID,
-      func() { canisterPrincipal }
+      func() { canisterPrincipal },
+      canister_ids.isKnownCanister
     );
 
     // Authorization helper functions

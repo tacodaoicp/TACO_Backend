@@ -346,12 +346,15 @@ shared (deployer) actor class treasury() = this {
   stable var maxTreasuryAdminActionsStored: Nat = 10000; // Keep last 10k actions before archiving
 
   private func isMasterAdmin(caller : Principal) : Bool {
+    // Check if caller is a human master admin
     for (admin in masterAdmins.vals()) {
       if (admin == caller) {
         return true;
       };
     };
-    false;
+    
+    // Check if caller is one of our own canisters
+    canister_ids.isKnownCanister(caller);
   };
 
   // Treasury admin action logging function

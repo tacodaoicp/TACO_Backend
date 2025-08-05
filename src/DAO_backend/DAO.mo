@@ -108,6 +108,7 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+
   let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
 
   //spamGuard.setAllowedCanisters([Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai")]);
@@ -231,12 +232,15 @@ shared (deployer) actor class ContinuousDAO() = this {
   private stable var snapshotTimerId : Nat = 0;
 
   private func isMasterAdmin(caller : Principal) : Bool {
+    // Check if caller is a human master admin
     for (admin in masterAdmins.vals()) {
       if (admin == caller) {
         return true;
       };
     };
-    false;
+    
+    // Check if caller is one of our own canisters
+    canister_ids.isKnownCanister(caller);
   };
 
   // Admin action logging functions
@@ -2999,8 +3003,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<AllocationChangesSinceResponse, AuthorizationError> {
-    // Allow any authenticated caller (not anonymous) - matches treasury pattern
-    if (Principal.isAnonymous(caller)) {
+    // Allow master admins and our own canisters (secure approach)
+    if (not isMasterAdmin(caller)) {
       return #err(#NotAdmin);
     };
 
@@ -3050,8 +3054,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<FollowActionsSinceResponse, AuthorizationError> {
-    // Allow any authenticated caller (not anonymous) - matches treasury pattern
-    if (Principal.isAnonymous(caller)) {
+    // Allow master admins and our own canisters (secure approach)
+    if (not isMasterAdmin(caller)) {
       return #err(#NotAdmin);
     };
 
@@ -3100,8 +3104,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<VotingPowerChangesSinceResponse, AuthorizationError> {
-    // Allow any authenticated caller (not anonymous) - matches treasury pattern
-    if (Principal.isAnonymous(caller)) {
+    // Allow master admins and our own canisters (secure approach)
+    if (not isMasterAdmin(caller)) {
       return #err(#NotAdmin);
     };
 
@@ -3149,8 +3153,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<NeuronUpdatesSinceResponse, AuthorizationError> {
-    // Allow any authenticated caller (not anonymous) - matches treasury pattern
-    if (Principal.isAnonymous(caller)) {
+    // Allow master admins and our own canisters (secure approach)
+    if (not isMasterAdmin(caller)) {
       return #err(#NotAdmin);
     };
 

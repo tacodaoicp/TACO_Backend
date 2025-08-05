@@ -6,16 +6,20 @@ module {
     masterAdmins: [Principal],
     treasuryId: Principal,
     daoBackendId: Principal,
-    getCanisterId: () -> Principal
+    getCanisterId: () -> Principal,
+    isKnownCanister: (Principal) -> Bool
   ) {
     
     public func isMasterAdmin(caller : Principal) : Bool {
+      // Check if caller is a human master admin
       for (admin in masterAdmins.vals()) {
         if (admin == caller) {
           return true;
         };
       };
-      false;
+      
+      // Check if caller is one of our own canisters
+      isKnownCanister(caller);
     };
 
     public func isAuthorized(caller : Principal, _function : ArchiveTypes.AdminFunction) : Bool {

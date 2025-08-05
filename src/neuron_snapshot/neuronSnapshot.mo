@@ -116,13 +116,18 @@ shared deployer actor class neuronSnapshot() = this {
   };
 
   private func isMasterAdmin(caller : Principal) : Bool {
+    // Check single master admin
     if (caller == masterAdmin) { return true; };
+    
+    // Check if caller is a human master admin
     for (admin in masterAdmins.vals()) {
       if (admin == caller) {
         return true;
       };
     };
-    false;
+    
+    // Check if caller is one of our own canisters
+    canister_ids.isKnownCanister(caller);
   };
 
   public shared ({ caller }) func setTest(enabled : Bool) : async () {
