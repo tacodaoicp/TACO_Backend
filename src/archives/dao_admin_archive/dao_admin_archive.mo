@@ -303,6 +303,11 @@ shared (deployer) actor class DAOAdminArchive() = this {
   // Lifecycle Management
   //=========================================================================
 
+  // Timer status for frontend compatibility
+  public query func getTimerStatus() : async BatchImportTimer.TimerStatus {
+    base.getTimerStatus();
+  };
+
   system func preupgrade() {
     base.preupgrade();
   };
