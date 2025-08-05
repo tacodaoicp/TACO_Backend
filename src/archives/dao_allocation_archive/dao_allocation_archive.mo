@@ -201,6 +201,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
             };
           };
           
+          Debug.print("DAO Allocation Archive: Imported " # Nat.toText(importedCount) # " allocation changes");
           #ok("Successfully imported " # Nat.toText(importedCount) # " allocation changes");
         };
         case (#err(e)) {
@@ -256,6 +257,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
           //   // Would implement unfollow handling here
           // };
           
+          Debug.print("DAO Allocation Archive: Imported " # Nat.toText(importedCount) # " follow actions");
           #ok("Successfully imported " # Nat.toText(importedCount) # " follow actions");
         };
         case (#err(e)) {
@@ -319,23 +321,18 @@ shared (deployer) actor class DAOAllocationArchive() = this {
     };
   };
 
-  public query func getArchiveStats() : async {
-    totalBlocks: Nat;
-    totalAllocationChanges: Nat;
-    totalFollowActions: Nat;
-    totalFollowCount: Nat;
-    totalUnfollowCount: Nat;
-    lastImportedAllocationTimestamp: Int;
-    lastImportedFollowTimestamp: Int;
-  } {
+  public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
+    let totalBlocks = base.getTotalBlocks();
+    let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
+    let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
+    
     {
-      totalBlocks = base.getTotalBlocks();
-      totalAllocationChanges = totalAllocationChanges;
-      totalFollowActions = totalFollowActions;
-      totalFollowCount = totalFollowCount;
-      totalUnfollowCount = totalUnfollowCount;
-      lastImportedAllocationTimestamp = lastImportedAllocationTimestamp;
-      lastImportedFollowTimestamp = lastImportedFollowTimestamp;
+      totalBlocks = totalBlocks;
+      oldestBlock = oldestBlock;
+      newestBlock = newestBlock;
+      supportedBlockTypes = ["3allocation_change", "3follow_action"];
+      storageUsed = 0;
+      lastArchiveTime = Int.max(lastImportedAllocationTimestamp, lastImportedFollowTimestamp);
     };
   };
 
@@ -348,10 +345,35 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   //=========================================================================
 
   // Batch import function for both allocation changes and follow actions
-  private func importBatchData<system>() : async () {
-    // Import both allocation changes and follow actions
-    ignore await importAllocationChanges<system>();
-    ignore await importFollowActions<system>();
+  private func importBatchData<system>() : async {imported: Nat; failed: Nat} {
+    var totalImported = 0;
+    var totalFailed = 0;
+    
+    // Import allocation changes
+    switch (await importAllocationChanges<system>()) {
+      case (#ok(message)) {
+        if (Text.contains(message, #text "imported 0")) {
+          // No items imported
+        } else {
+          totalImported += 1;
+        };
+      };
+      case (#err(_)) { totalFailed += 1; };
+    };
+    
+    // Import follow actions
+    switch (await importFollowActions<system>()) {
+      case (#ok(message)) {
+        if (Text.contains(message, #text "imported 0")) {
+          // No items imported
+        } else {
+          totalImported += 1;
+        };
+      };
+      case (#err(_)) { totalFailed += 1; };
+    };
+    
+    {imported = totalImported; failed = totalFailed};
   };
 
   // Frontend compatibility methods - matching treasury archive signatures
@@ -372,7 +394,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   };
 
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
-    await base.startBatchImportSystem<system>(caller, importBatchData);
+    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importBatchData);
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
@@ -384,7 +406,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   };
 
   public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
-    await base.runManualBatchImport(caller, importBatchData);
+    await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importBatchData);
   };
 
   public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {

@@ -170,6 +170,7 @@ shared (deployer) actor class DAOAdminArchive() = this {
               };
             };
           };
+          Debug.print("DAO Admin Archive: Imported " # Nat.toText(importedCount) # " DAO admin actions from DAO_backend");
           #ok("Imported " # Nat.toText(importedCount) # " DAO admin actions");
         };
         case (#err(error)) {
@@ -216,6 +217,7 @@ shared (deployer) actor class DAOAdminArchive() = this {
               };
             };
           };
+          Debug.print("DAO Admin Archive: Imported " # Nat.toText(importedCount) # " Treasury admin actions");
           #ok("Imported " # Nat.toText(importedCount) # " Treasury admin actions");
         };
         case (#err(error)) {
@@ -268,23 +270,18 @@ shared (deployer) actor class DAOAdminArchive() = this {
     };
   };
 
-  public query func getArchiveStats() : async {
-    totalBlocks: Nat;
-    totalAdminActions: Nat;
-    totalSuccessfulActions: Nat;
-    totalDAOActions: Nat;
-    totalTreasuryActions: Nat;
-    lastImportedDAOActionId: Nat;
-    lastImportedTreasuryActionId: Nat;
-  } {
+  public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
+    let totalBlocks = base.getTotalBlocks();
+    let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
+    let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
+    
     {
-      totalBlocks = base.getTotalBlocks();
-      totalAdminActions = totalAdminActions;
-      totalSuccessfulActions = totalSuccessfulActions;
-      totalDAOActions = totalDAOActions;
-      totalTreasuryActions = totalTreasuryActions;
-      lastImportedDAOActionId = lastImportedDAOActionId;
-      lastImportedTreasuryActionId = lastImportedTreasuryActionId;
+      totalBlocks = totalBlocks;
+      oldestBlock = oldestBlock;
+      newestBlock = newestBlock;
+      supportedBlockTypes = ["3admin"];
+      storageUsed = 0;
+      lastArchiveTime = 0; // Will be updated when we have actual timestamps
     };
   };
 
@@ -296,10 +293,36 @@ shared (deployer) actor class DAOAdminArchive() = this {
   // Lifecycle Management
   //=========================================================================
 
-  // Batch import function for admin actions
-  private func importBatchAdminActions<system>() : async () {
-    ignore await importDAOAdminActions<system>();
-    ignore await importTreasuryAdminActions<system>();
+  // Batch import function for admin actions  
+  private func importBatchAdminActions<system>() : async {imported: Nat; failed: Nat} {
+    var totalImported = 0;
+    var totalFailed = 0;
+    
+    // Import DAO admin actions
+    switch (await importDAOAdminActions<system>()) {
+      case (#ok(message)) {
+        if (Text.contains(message, #text "Imported 0")) {
+          // No items imported
+        } else {
+          totalImported += 1;
+        };
+      };
+      case (#err(_)) { totalFailed += 1; };
+    };
+    
+    // Import Treasury admin actions
+    switch (await importTreasuryAdminActions<system>()) {
+      case (#ok(message)) {
+        if (Text.contains(message, #text "Imported 0")) {
+          // No items imported
+        } else {
+          totalImported += 1;
+        };
+      };
+      case (#err(_)) { totalFailed += 1; };
+    };
+    
+    {imported = totalImported; failed = totalFailed};
   };
 
   // Frontend compatibility methods - matching treasury archive signatures
@@ -320,7 +343,7 @@ shared (deployer) actor class DAOAdminArchive() = this {
   };
 
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
-    await base.startBatchImportSystem<system>(caller, importBatchAdminActions);
+    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importBatchAdminActions);
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
@@ -332,7 +355,7 @@ shared (deployer) actor class DAOAdminArchive() = this {
   };
 
   public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
-    await base.runManualBatchImport(caller, importBatchAdminActions);
+    await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importBatchAdminActions);
   };
 
   public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {

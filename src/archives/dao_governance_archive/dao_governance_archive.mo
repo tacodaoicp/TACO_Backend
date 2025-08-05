@@ -214,6 +214,10 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
             };
           };
           
+          Debug.print("DAO Governance Archive: Imported " # Nat.toText(importedCount) # " voting power changes");
+          if (importedCount > 0) {
+            lastImportedVotingPowerTimestamp := Time.now();
+          };
           #ok("Successfully imported " # Nat.toText(importedCount) # " voting power changes");
         };
         case (#err(e)) {
@@ -264,6 +268,10 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
             };
           };
           
+          Debug.print("DAO Governance Archive: Imported " # Nat.toText(importedCount) # " neuron updates");
+          if (importedCount > 0) {
+            lastImportedNeuronTimestamp := Time.now();
+          };
           #ok("Successfully imported " # Nat.toText(importedCount) # " neuron updates");
         };
         case (#err(e)) {
@@ -328,25 +336,18 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
     };
   };
 
-  public query func getArchiveStats() : async {
-    totalBlocks: Nat;
-    totalVotingPowerChanges: Nat;
-    totalNeuronUpdates: Nat;
-    totalVotingPowerGained: Nat;
-    totalVotingPowerLost: Nat;
-    activeNeuronCount: Nat;
-    lastImportedVotingPowerTimestamp: Int;
-    lastImportedNeuronTimestamp: Int;
-  } {
+  public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
+    let totalBlocks = base.getTotalBlocks();
+    let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
+    let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
+    
     {
-      totalBlocks = base.getTotalBlocks();
-      totalVotingPowerChanges = totalVotingPowerChanges;
-      totalNeuronUpdates = totalNeuronUpdates;
-      totalVotingPowerGained = totalVotingPowerGained;
-      totalVotingPowerLost = totalVotingPowerLost;
-      activeNeuronCount = activeNeuronCount;
-      lastImportedVotingPowerTimestamp = lastImportedVotingPowerTimestamp;
-      lastImportedNeuronTimestamp = lastImportedNeuronTimestamp;
+      totalBlocks = totalBlocks;
+      oldestBlock = oldestBlock;
+      newestBlock = newestBlock;
+      supportedBlockTypes = ["3voting_power", "3neuron_update"];
+      storageUsed = 0;
+      lastArchiveTime = Int.max(lastImportedVotingPowerTimestamp, lastImportedNeuronTimestamp);
     };
   };
 
@@ -359,10 +360,36 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
   //=========================================================================
 
   // Batch import function for both voting power changes and neuron updates
-  private func importBatchData<system>() : async () {
-    // Import both voting power changes and neuron updates
-    ignore await importVotingPowerChanges<system>();
-    ignore await importNeuronUpdates<system>();
+  private func importBatchData<system>() : async {imported: Nat; failed: Nat} {
+    var totalImported = 0;
+    var totalFailed = 0;
+    
+    // Import voting power changes
+    switch (await importVotingPowerChanges<system>()) {
+      case (#ok(message)) {
+        // Extract count from message "Successfully imported X voting power changes"
+        if (Text.contains(message, #text "imported 0")) {
+          // No items imported
+        } else {
+          totalImported += 1; // For now, count operations, not individual items
+        };
+      };
+      case (#err(_)) { totalFailed += 1; };
+    };
+    
+    // Import neuron updates  
+    switch (await importNeuronUpdates<system>()) {
+      case (#ok(message)) {
+        if (Text.contains(message, #text "imported 0")) {
+          // No items imported
+        } else {
+          totalImported += 1;
+        };
+      };
+      case (#err(_)) { totalFailed += 1; };
+    };
+    
+    {imported = totalImported; failed = totalFailed};
   };
 
   // Frontend compatibility methods - matching treasury archive signatures
@@ -383,7 +410,7 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
   };
 
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
-    await base.startBatchImportSystem<system>(caller, importBatchData);
+    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importBatchData);
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
@@ -395,7 +422,7 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
   };
 
   public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
-    await base.runManualBatchImport(caller, importBatchData);
+    await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importBatchData);
   };
 
   public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
