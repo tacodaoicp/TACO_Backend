@@ -289,23 +289,61 @@ shared (deployer) actor class DAOAdminArchive() = this {
   };
 
   //=========================================================================
-  // Timer Management
+  // Timer Management - Using BatchImportTimer system instead of system timer
   //=========================================================================
-
-  system func timer(setGlobalTimer : Nat64 -> ()) : async () {
-    // Import from both canisters every 5 minutes
-    ignore await importDAOAdminActions<system>();
-    ignore await importTreasuryAdminActions<system>();
-    setGlobalTimer(1_000_000_000 * 300); // 5 minutes
-  };
 
   //=========================================================================
   // Lifecycle Management
   //=========================================================================
 
-  // Timer status for frontend compatibility
+  // Batch import function for admin actions
+  private func importBatchAdminActions<system>() : async () {
+    ignore await importDAOAdminActions<system>();
+    ignore await importTreasuryAdminActions<system>();
+  };
+
+  // Frontend compatibility methods - matching treasury archive signatures
+  public query func getBatchImportStatus() : async {isRunning: Bool; intervalSeconds: Nat} {
+    base.getBatchImportStatus();
+  };
+
   public query func getTimerStatus() : async BatchImportTimer.TimerStatus {
     base.getTimerStatus();
+  };
+
+  public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveTypes.ArchiveStatus, ArchiveError> {
+    base.getArchiveStatus(caller);
+  };
+
+  public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
+    base.getLogs(count, caller);
+  };
+
+  public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
+    await base.startBatchImportSystem<system>(caller, importBatchAdminActions);
+  };
+
+  public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
+    base.stopBatchImportSystem(caller);
+  };
+
+  public shared ({ caller }) func stopAllTimers() : async Result.Result<Text, Text> {
+    base.stopAllTimers(caller);
+  };
+
+  public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
+    await base.runManualBatchImport(caller, importBatchAdminActions);
+  };
+
+  public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
+    base.setMaxInnerLoopIterations(caller, iterations);
+  };
+
+  public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
+    // Reset all import timestamps to re-import from beginning
+    lastImportedDAOActionId := 0;
+    lastImportedTreasuryActionId := 0;
+    #ok("Import timestamps reset successfully");
   };
 
   system func preupgrade() {
