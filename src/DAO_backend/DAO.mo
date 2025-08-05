@@ -2999,7 +2999,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<AllocationChangesSinceResponse, AuthorizationError> {
-    if (not isAdmin(caller, #getAllocationChanges)) {
+    // Allow any authenticated caller (not anonymous) - matches treasury pattern
+    if (Principal.isAnonymous(caller)) {
       return #err(#NotAdmin);
     };
 
@@ -3049,7 +3050,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<FollowActionsSinceResponse, AuthorizationError> {
-    if (not isAdmin(caller, #getFollowActions)) {
+    // Allow any authenticated caller (not anonymous) - matches treasury pattern
+    if (Principal.isAnonymous(caller)) {
       return #err(#NotAdmin);
     };
 
@@ -3098,7 +3100,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<VotingPowerChangesSinceResponse, AuthorizationError> {
-    if (not isAdmin(caller, #getVotingPowerChanges)) {
+    // Allow any authenticated caller (not anonymous) - matches treasury pattern
+    if (Principal.isAnonymous(caller)) {
       return #err(#NotAdmin);
     };
 
@@ -3146,7 +3149,8 @@ shared (deployer) actor class ContinuousDAO() = this {
     sinceTimestamp: Int, 
     limit: Nat
   ) : async Result.Result<NeuronUpdatesSinceResponse, AuthorizationError> {
-    if (not isAdmin(caller, #getNeuronUpdates)) {
+    // Allow any authenticated caller (not anonymous) - matches treasury pattern
+    if (Principal.isAnonymous(caller)) {
       return #err(#NotAdmin);
     };
 

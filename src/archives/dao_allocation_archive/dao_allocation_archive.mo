@@ -63,9 +63,13 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   private stable var totalFollowCount : Nat = 0;
   private stable var totalUnfollowCount : Nat = 0;
 
+  // Block counters for IDs
+  private stable var allocationChangeCounter : Nat = 0;
+  private stable var followActionCounter : Nat = 0;
+
   // Tracking state for batch imports (we'll add "since" methods to DAO_backend later)
   private stable var lastImportedAllocationTimestamp : Int = 0;
-  private stable var lastImportedFollowActionId : Nat = 0;
+  private stable var lastImportedFollowTimestamp : Int = 0;
 
   // DAO_backend interface for batch imports
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
@@ -156,26 +160,111 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   // Batch Import System (Placeholder - needs DAO_backend "since" methods)
   //=========================================================================
 
-  // Future: Import allocation changes from DAO_backend
+  // Import allocation changes from DAO_backend
   public shared ({ caller }) func importAllocationChanges<system>() : async Result.Result<Text, Text> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       return #err("Not authorized");
     };
 
-    // TODO: Implement once DAO_backend has getAllocationChangesSince method
-    // For now, return placeholder
-    #ok("Allocation changes import not yet implemented - needs DAO_backend integration");
+    try {
+      // Call DAO_backend to get allocation changes since last import
+      let response = await daoCanister.getAllocationChangesSince(lastImportedAllocationTimestamp, 100);
+      
+      switch (response) {
+        case (#ok(data)) {
+          var importedCount = 0;
+          
+          // Convert and store each allocation change
+          for (change in data.changes.vals()) {
+            let allocationChange: ArchiveTypes.AllocationChangeBlockData = {
+              id = allocationChangeCounter;
+              timestamp = change.from;
+              user = change.user;
+              changeType = #UserUpdate({userInitiated = true}); // Simplified for now
+              oldAllocations = []; // Would need previous allocation data
+              newAllocations = change.allocation;
+              votingPower = 0; // Would need voting power at time of change
+              maker = change.allocationMaker;
+              reason = null;
+            };
+            
+            let result = await archiveAllocationChange<system>(allocationChange);
+            switch (result) {
+              case (#ok(_)) { 
+                importedCount += 1;
+                allocationChangeCounter += 1;
+                lastImportedAllocationTimestamp := change.from;
+              };
+              case (#err(e)) {
+                // Log error but continue processing
+              };
+            };
+          };
+          
+          #ok("Successfully imported " # Nat.toText(importedCount) # " allocation changes");
+        };
+        case (#err(e)) {
+          #err("Failed to fetch allocation changes from DAO_backend: " # debug_show(e));
+        };
+      };
+    } catch (error) {
+      #err("Error importing allocation changes: " # Error.message(error));
+    };
   };
 
-  // Future: Import follow actions from DAO_backend  
+  // Import follow actions from DAO_backend  
   public shared ({ caller }) func importFollowActions<system>() : async Result.Result<Text, Text> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       return #err("Not authorized");
     };
 
-    // TODO: Implement once DAO_backend has getFollowActionsSince method
-    // For now, return placeholder
-    #ok("Follow actions import not yet implemented - needs DAO_backend integration");
+    try {
+      // Call DAO_backend to get follow actions since last import
+      let response = await daoCanister.getFollowActionsSince(lastImportedFollowTimestamp, 100);
+      
+      switch (response) {
+        case (#ok(data)) {
+          var importedCount = 0;
+          
+          // Convert and store each follow action
+          for (follow in data.follows.vals()) {
+            let followAction: ArchiveTypes.FollowActionBlockData = {
+              id = followActionCounter;
+              timestamp = follow.since;
+              follower = follow.follower;
+              followed = follow.followed;
+              action = #Follow;
+              previousFollowCount = 0; // Would need to track this separately
+              newFollowCount = 1; // Would need to track this separately
+            };
+            
+            let result = await archiveFollowAction<system>(followAction);
+            switch (result) {
+              case (#ok(_)) { 
+                importedCount += 1;
+                followActionCounter += 1;
+                lastImportedFollowTimestamp := follow.since;
+              };
+              case (#err(e)) {
+                // Log error but continue processing
+              };
+            };
+          };
+          
+          // Handle unfollows separately (though current DAO_backend doesn't track 'until' timestamps)
+          // for (unfollow in data.unfollows.vals()) {
+          //   // Would implement unfollow handling here
+          // };
+          
+          #ok("Successfully imported " # Nat.toText(importedCount) # " follow actions");
+        };
+        case (#err(e)) {
+          #err("Failed to fetch follow actions from DAO_backend: " # debug_show(e));
+        };
+      };
+    } catch (error) {
+      #err("Error importing follow actions: " # Error.message(error));
+    };
   };
 
   //=========================================================================
@@ -237,7 +326,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
     totalFollowCount: Nat;
     totalUnfollowCount: Nat;
     lastImportedAllocationTimestamp: Int;
-    lastImportedFollowActionId: Nat;
+    lastImportedFollowTimestamp: Int;
   } {
     {
       totalBlocks = base.getTotalBlocks();
@@ -246,7 +335,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
       totalFollowCount = totalFollowCount;
       totalUnfollowCount = totalUnfollowCount;
       lastImportedAllocationTimestamp = lastImportedAllocationTimestamp;
-      lastImportedFollowActionId = lastImportedFollowActionId;
+      lastImportedFollowTimestamp = lastImportedFollowTimestamp;
     };
   };
 

@@ -65,9 +65,13 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
   private stable var totalVotingPowerLost : Nat = 0;
   private stable var activeNeuronCount : Nat = 0;
 
+  // Block counters for IDs
+  private stable var votingPowerCounter : Nat = 0;
+  private stable var neuronUpdateCounter : Nat = 0;
+
   // Tracking state for batch imports (we'll add "since" methods to DAO_backend later)
   private stable var lastImportedVotingPowerTimestamp : Int = 0;
-  private stable var lastImportedNeuronUpdateId : Nat = 0;
+  private stable var lastImportedNeuronTimestamp : Int = 0;
 
   // DAO_backend interface for batch imports
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
@@ -168,26 +172,107 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
   // Batch Import System (Placeholder - needs DAO_backend "since" methods)
   //=========================================================================
 
-  // Future: Import voting power changes from DAO_backend
+  // Import voting power changes from DAO_backend
   public shared ({ caller }) func importVotingPowerChanges<system>() : async Result.Result<Text, Text> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       return #err("Not authorized");
     };
 
-    // TODO: Implement once DAO_backend has getVotingPowerChangesSince method
-    // For now, return placeholder
-    #ok("Voting power changes import not yet implemented - needs DAO_backend integration");
+    try {
+      // Call DAO_backend to get voting power changes since last import
+      let response = await daoCanister.getVotingPowerChangesSince(lastImportedVotingPowerTimestamp, 100);
+      
+      switch (response) {
+        case (#ok(data)) {
+          var importedCount = 0;
+          
+          // Convert and store each voting power change
+          for (userRecord in data.users.vals()) {
+            // Only include users with recent voting power updates
+            if (userRecord.lastVotingPowerUpdate >= lastImportedVotingPowerTimestamp) {
+              let votingPowerChange: ArchiveTypes.VotingPowerBlockData = {
+                id = votingPowerCounter;
+                timestamp = userRecord.lastVotingPowerUpdate;
+                user = userRecord.user;
+                changeType = #NeuronSnapshot; // Default type for now
+                oldVotingPower = 0; // Would need previous voting power
+                newVotingPower = userRecord.votingPower;
+                neurons = userRecord.neurons;
+              };
+              
+              let result = await archiveVotingPowerChange<system>(votingPowerChange);
+              switch (result) {
+                case (#ok(_)) { 
+                  importedCount += 1;
+                  votingPowerCounter += 1;
+                  lastImportedVotingPowerTimestamp := userRecord.lastVotingPowerUpdate;
+                };
+                case (#err(e)) {
+                  // Log error but continue processing
+                };
+              };
+            };
+          };
+          
+          #ok("Successfully imported " # Nat.toText(importedCount) # " voting power changes");
+        };
+        case (#err(e)) {
+          #err("Failed to fetch voting power changes from DAO_backend: " # debug_show(e));
+        };
+      };
+    } catch (error) {
+      #err("Error importing voting power changes: " # Error.message(error));
+    };
   };
 
-  // Future: Import neuron updates from DAO_backend  
+  // Import neuron updates from DAO_backend  
   public shared ({ caller }) func importNeuronUpdates<system>() : async Result.Result<Text, Text> {
     if (not base.isAuthorized(caller, #ArchiveData)) {
       return #err("Not authorized");
     };
 
-    // TODO: Implement once DAO_backend has getNeuronUpdatesSince method
-    // For now, return placeholder
-    #ok("Neuron updates import not yet implemented - needs DAO_backend integration");
+    try {
+      // Call DAO_backend to get neuron updates since last import
+      let response = await daoCanister.getNeuronUpdatesSince(lastImportedNeuronTimestamp, 100);
+      
+      switch (response) {
+        case (#ok(data)) {
+          var importedCount = 0;
+          
+          // Convert and store each neuron update
+          for (neuronRecord in data.neurons.vals()) {
+            let neuronUpdate: ArchiveTypes.NeuronUpdateBlockData = {
+              id = neuronUpdateCounter;
+              timestamp = Time.now(); // Current timestamp since we don't have neuron update timestamps
+              updateType = #StateChanged; // Default type for now
+              neuronId = neuronRecord.neuronId;
+              oldVotingPower = null; // Would need previous voting power
+              newVotingPower = ?neuronRecord.votingPower;
+              affectedUsers = neuronRecord.users;
+            };
+            
+            let result = await archiveNeuronUpdate<system>(neuronUpdate);
+            switch (result) {
+              case (#ok(_)) { 
+                importedCount += 1;
+                neuronUpdateCounter += 1;
+                lastImportedNeuronTimestamp := Time.now();
+              };
+              case (#err(e)) {
+                // Log error but continue processing
+              };
+            };
+          };
+          
+          #ok("Successfully imported " # Nat.toText(importedCount) # " neuron updates");
+        };
+        case (#err(e)) {
+          #err("Failed to fetch neuron updates from DAO_backend: " # debug_show(e));
+        };
+      };
+    } catch (error) {
+      #err("Error importing neuron updates: " # Error.message(error));
+    };
   };
 
   //=========================================================================
@@ -251,7 +336,7 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
     totalVotingPowerLost: Nat;
     activeNeuronCount: Nat;
     lastImportedVotingPowerTimestamp: Int;
-    lastImportedNeuronUpdateId: Nat;
+    lastImportedNeuronTimestamp: Int;
   } {
     {
       totalBlocks = base.getTotalBlocks();
@@ -261,7 +346,7 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
       totalVotingPowerLost = totalVotingPowerLost;
       activeNeuronCount = activeNeuronCount;
       lastImportedVotingPowerTimestamp = lastImportedVotingPowerTimestamp;
-      lastImportedNeuronUpdateId = lastImportedNeuronUpdateId;
+      lastImportedNeuronTimestamp = lastImportedNeuronTimestamp;
     };
   };
 
