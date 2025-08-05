@@ -210,6 +210,61 @@ module {
     totalCount: Nat;
   };
 
+  // Response types for existing DAO data (no new storage needed)
+  public type AllocationChangesSinceResponse = {
+    changes: [PastAllocationRecord];
+    totalCount: Nat;
+  };
+
+  public type PastAllocationRecord = {
+    user: Principal;
+    from: Int;
+    to: Int;
+    allocation: [Allocation];
+    allocationMaker: Principal;
+  };
+
+  public type FollowActionsSinceResponse = {
+    follows: [FollowRecord];
+    unfollows: [UnfollowRecord];
+    totalCount: Nat;
+  };
+
+  public type FollowRecord = {
+    follower: Principal;
+    followed: Principal;
+    since: Int;
+  };
+
+  public type UnfollowRecord = {
+    follower: Principal;
+    followed: Principal;
+    until: Int; // When the follow ended
+  };
+
+  public type VotingPowerChangesSinceResponse = {
+    users: [UserVotingPowerRecord];
+    totalCount: Nat;
+  };
+
+  public type UserVotingPowerRecord = {
+    user: Principal;
+    votingPower: Nat;
+    lastVotingPowerUpdate: Int;
+    neurons: [NeuronVP];
+  };
+
+  public type NeuronUpdatesSinceResponse = {
+    neurons: [NeuronRecord];
+    totalCount: Nat;
+  };
+
+  public type NeuronRecord = {
+    neuronId: Blob;
+    votingPower: Nat;
+    users: [Principal]; // Users who have this neuron
+  };
+
   public type Self = actor {
     updateAllocation : shared ([Allocation]) -> async Result.Result<Text, UpdateError>;
     getAggregateAllocation : shared query () -> async [(Principal, Nat)];
@@ -247,5 +302,9 @@ module {
     getSystemParameters : shared () -> async [SystemParameter];
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
     getAdminActionsSince : shared query (Int, Nat) -> async Result.Result<AdminActionsSinceResponse, AuthorizationError>;
+    getAllocationChangesSince : shared query (Int, Nat) -> async Result.Result<AllocationChangesSinceResponse, AuthorizationError>;
+    getFollowActionsSince : shared query (Int, Nat) -> async Result.Result<FollowActionsSinceResponse, AuthorizationError>;
+    getVotingPowerChangesSince : shared query (Int, Nat) -> async Result.Result<VotingPowerChangesSinceResponse, AuthorizationError>;
+    getNeuronUpdatesSince : shared query (Int, Nat) -> async Result.Result<NeuronUpdatesSinceResponse, AuthorizationError>;
   };
 };

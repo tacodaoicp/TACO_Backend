@@ -26,6 +26,10 @@ module {
     #setTacoAddress;
     #getLogs;
     #getAdminActions;
+    #getAllocationChanges;
+    #getFollowActions;
+    #getVotingPowerChanges;
+    #getNeuronUpdates;
     #clearLogs;
     #startRebalancing;
     #stopRebalancing;

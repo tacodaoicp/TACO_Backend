@@ -3,6 +3,7 @@ import Map "mo:map/Map";
 import Nat "mo:base/Nat";
 import Int "mo:base/Int";
 import Text "mo:base/Text";
+import Order "mo:base/Order";
 import Iter "mo:base/Iter";
 import Error "mo:base/Error";
 import Debug "mo:base/Debug";
@@ -66,6 +67,15 @@ shared (deployer) actor class ContinuousDAO() = this {
   type AdminActionType = DAO_types.AdminActionType;
   type AdminActionRecord = DAO_types.AdminActionRecord;
   type AdminActionsSinceResponse = DAO_types.AdminActionsSinceResponse;
+  type AllocationChangesSinceResponse = DAO_types.AllocationChangesSinceResponse;
+  type PastAllocationRecord = DAO_types.PastAllocationRecord;
+  type FollowActionsSinceResponse = DAO_types.FollowActionsSinceResponse;
+  type FollowRecord = DAO_types.FollowRecord;
+  type UnfollowRecord = DAO_types.UnfollowRecord;
+  type VotingPowerChangesSinceResponse = DAO_types.VotingPowerChangesSinceResponse;
+  type UserVotingPowerRecord = DAO_types.UserVotingPowerRecord;
+  type NeuronUpdatesSinceResponse = DAO_types.NeuronUpdatesSinceResponse;
+  type NeuronRecord = DAO_types.NeuronRecord;
   
   // Constants
   let BASIS_POINTS_TOTAL = 10000;
@@ -2979,6 +2989,219 @@ shared (deployer) actor class ContinuousDAO() = this {
     let response: AdminActionsSinceResponse = {
       actions = limitedActions;
       totalCount = totalFilteredCount;
+    };
+
+    #ok(response);
+  };
+
+  // Query method for allocation changes since timestamp (for dao_allocation_archive)
+  public shared query ({ caller }) func getAllocationChangesSince(
+    sinceTimestamp: Int, 
+    limit: Nat
+  ) : async Result.Result<AllocationChangesSinceResponse, AuthorizationError> {
+    if (not isAdmin(caller, #getAllocationChanges)) {
+      return #err(#NotAdmin);
+    };
+
+    if (limit == 0 or limit > 500) {
+      return #err(#UnexpectedError("Invalid limit: must be between 1 and 500"));
+    };
+
+    // Collect past allocations from all users
+    var allChanges : [PastAllocationRecord] = [];
+    for ((user, userState) in Map.entries(userStates)) {
+      for (pastAlloc in userState.pastAllocations.vals()) {
+        if (pastAlloc.from > sinceTimestamp) {
+          let change: PastAllocationRecord = {
+            user = user;
+            from = pastAlloc.from;
+            to = pastAlloc.to;
+            allocation = pastAlloc.allocation;
+            allocationMaker = pastAlloc.allocationMaker;
+          };
+          allChanges := Array.append(allChanges, [change]);
+        };
+      };
+    };
+
+    // Sort by timestamp (most recent first)
+    allChanges := Array.sort(allChanges, func(a: PastAllocationRecord, b: PastAllocationRecord) : Order.Order {
+      Int.compare(b.from, a.from)
+    });
+    
+    let totalCount = allChanges.size();
+    let limitedChanges = if (totalCount > limit) {
+      Array.subArray(allChanges, 0, limit)
+    } else {
+      allChanges
+    };
+
+    let response: AllocationChangesSinceResponse = {
+      changes = limitedChanges;
+      totalCount = totalCount;
+    };
+
+    #ok(response);
+  };
+
+  // Query method for follow actions since timestamp (for dao_allocation_archive)
+  public shared query ({ caller }) func getFollowActionsSince(
+    sinceTimestamp: Int, 
+    limit: Nat
+  ) : async Result.Result<FollowActionsSinceResponse, AuthorizationError> {
+    if (not isAdmin(caller, #getFollowActions)) {
+      return #err(#NotAdmin);
+    };
+
+    if (limit == 0 or limit > 200) {
+      return #err(#UnexpectedError("Invalid limit: must be between 1 and 200"));
+    };
+
+    var allFollows : [FollowRecord] = [];
+    var allUnfollows : [UnfollowRecord] = [];
+
+    // Collect current follows from all users
+    for ((user, userState) in Map.entries(userStates)) {
+      for (follow in userState.allocationFollows.vals()) {
+        if (follow.since > sinceTimestamp) {
+          let followRecord: FollowRecord = {
+            follower = user;
+            followed = follow.follow;
+            since = follow.since;
+          };
+          allFollows := Array.append(allFollows, [followRecord]);
+        };
+      };
+    };
+
+    // Note: We don't currently track unfollow timestamps in the existing data structure
+    // This would require enhancing the data model if we need unfollows
+
+    let totalCount = allFollows.size() + allUnfollows.size();
+    let limitedFollows = if (allFollows.size() > limit) {
+      Array.subArray(allFollows, 0, limit)
+    } else {
+      allFollows
+    };
+
+    let response: FollowActionsSinceResponse = {
+      follows = limitedFollows;
+      unfollows = allUnfollows; // Empty for now
+      totalCount = totalCount;
+    };
+
+    #ok(response);
+  };
+
+  // Query method for voting power changes since timestamp (for dao_governance_archive)
+  public shared query ({ caller }) func getVotingPowerChangesSince(
+    sinceTimestamp: Int, 
+    limit: Nat
+  ) : async Result.Result<VotingPowerChangesSinceResponse, AuthorizationError> {
+    if (not isAdmin(caller, #getVotingPowerChanges)) {
+      return #err(#NotAdmin);
+    };
+
+    if (limit == 0 or limit > 300) {
+      return #err(#UnexpectedError("Invalid limit: must be between 1 and 300"));
+    };
+
+    var userRecords : [UserVotingPowerRecord] = [];
+
+    // Collect users who had voting power updates since timestamp
+    for ((user, userState) in Map.entries(userStates)) {
+      if (userState.lastVotingPowerUpdate > sinceTimestamp) {
+        let userRecord: UserVotingPowerRecord = {
+          user = user;
+          votingPower = userState.votingPower;
+          lastVotingPowerUpdate = userState.lastVotingPowerUpdate;
+          neurons = userState.neurons;
+        };
+        userRecords := Array.append(userRecords, [userRecord]);
+      };
+    };
+
+    // Sort by timestamp (most recent first)
+    userRecords := Array.sort(userRecords, func(a: UserVotingPowerRecord, b: UserVotingPowerRecord) : Order.Order {
+      Int.compare(b.lastVotingPowerUpdate, a.lastVotingPowerUpdate)
+    });
+    
+    let totalCount = userRecords.size();
+    let limitedRecords = if (totalCount > limit) {
+      Array.subArray(userRecords, 0, limit)
+    } else {
+      userRecords
+    };
+
+    let response: VotingPowerChangesSinceResponse = {
+      users = limitedRecords;
+      totalCount = totalCount;
+    };
+
+    #ok(response);
+  };
+
+  // Query method for neuron updates since timestamp (for dao_governance_archive)
+  public shared query ({ caller }) func getNeuronUpdatesSince(
+    sinceTimestamp: Int, 
+    limit: Nat
+  ) : async Result.Result<NeuronUpdatesSinceResponse, AuthorizationError> {
+    if (not isAdmin(caller, #getNeuronUpdates)) {
+      return #err(#NotAdmin);
+    };
+
+    if (limit == 0 or limit > 100) {
+      return #err(#UnexpectedError("Invalid limit: must be between 1 and 100"));
+    };
+
+    var neuronRecords : [NeuronRecord] = [];
+    var neuronMap = Map.new<Blob, {votingPower: Nat; users: [Principal]}>();
+
+    // Collect all unique neurons and their users (only if user had updates since timestamp)
+    for ((user, userState) in Map.entries(userStates)) {
+      if (userState.lastVotingPowerUpdate > sinceTimestamp) {
+        for (neuron in userState.neurons.vals()) {
+          switch (Map.get(neuronMap, Map.bhash, neuron.neuronId)) {
+            case (?existing) {
+              // Add user to existing neuron record
+              let updatedUsers = Array.append(existing.users, [user]);
+              Map.set(neuronMap, Map.bhash, neuron.neuronId, {
+                votingPower = neuron.votingPower; // Use latest voting power
+                users = updatedUsers;
+              });
+            };
+            case null {
+              // Create new neuron record
+              Map.set(neuronMap, Map.bhash, neuron.neuronId, {
+                votingPower = neuron.votingPower;
+                users = [user];
+              });
+            };
+          };
+        };
+      };
+    };
+
+    // Convert map to array
+    for ((neuronId, neuronData) in Map.entries(neuronMap)) {
+      let neuronRecord: NeuronRecord = {
+        neuronId = neuronId;
+        votingPower = neuronData.votingPower;
+        users = neuronData.users;
+      };
+      neuronRecords := Array.append(neuronRecords, [neuronRecord]);
+    };
+    
+    let totalCount = neuronRecords.size();
+    let limitedRecords = if (totalCount > limit) {
+      Array.subArray(neuronRecords, 0, limit)
+    } else {
+      neuronRecords
+    };
+
+    let response: NeuronUpdatesSinceResponse = {
+      neurons = limitedRecords;
+      totalCount = totalCount;
     };
 
     #ok(response);
