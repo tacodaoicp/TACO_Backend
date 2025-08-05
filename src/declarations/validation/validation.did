@@ -1,0 +1,15 @@
+type ValidationResult = 
+ variant {
+   Err: text;
+   Ok: text;
+ };
+type TokenType = 
+ variant {
+   ICP;
+   ICRC12;
+   ICRC3;
+ };
+service : {
+  validate_addToken: (token: principal, tokenType: TokenType) ->
+   (ValidationResult);
+}
