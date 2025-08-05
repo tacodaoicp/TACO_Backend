@@ -393,7 +393,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
 
   public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
     // Reset all import timestamps to re-import from beginning
-    lastImportedAllocationChangeId := 0;
+    lastImportedAllocationTimestamp := 0;
     lastImportedFollowTimestamp := 0;
     #ok("Import timestamps reset successfully");
   };

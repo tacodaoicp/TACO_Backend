@@ -404,7 +404,7 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
 
   public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
     // Reset all import timestamps to re-import from beginning
-    lastImportedVotingPowerChangeId := 0;
+    lastImportedVotingPowerTimestamp := 0;
     lastImportedNeuronTimestamp := 0;
     #ok("Import timestamps reset successfully");
   };
