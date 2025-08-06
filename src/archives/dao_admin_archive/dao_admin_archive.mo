@@ -2,6 +2,7 @@ import Time "mo:base/Time";
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Array "mo:base/Array";
+import Order "mo:base/Order";
 import Map "mo:map/Map";
 import Int "mo:base/Int";
 import Nat "mo:base/Nat";
@@ -146,7 +147,13 @@ shared (deployer) actor class DAOAdminArchive() = this {
       switch (response) {
         case (#ok(data)) {
           var importedCount = 0;
-          for (action in data.actions.vals()) {
+          
+          // Sort actions by timestamp to ensure oldest-first ordering (defensive measure)
+          let sortedActions = Array.sort(data.actions, func(a: DAOTypes.AdminActionRecord, b: DAOTypes.AdminActionRecord) : Order.Order {
+            Int.compare(a.timestamp, b.timestamp)
+          });
+          
+          for (action in sortedActions.vals()) {
             if (action.id > lastImportedDAOActionId) {
               let blockData : AdminActionBlockData = {
                 id = action.id;
@@ -193,7 +200,13 @@ shared (deployer) actor class DAOAdminArchive() = this {
       switch (response) {
         case (#ok(data)) {
           var importedCount = 0;
-          for (action in data.actions.vals()) {
+          
+          // Sort actions by timestamp to ensure oldest-first ordering (defensive measure)
+          let sortedActions = Array.sort(data.actions, func(a: TreasuryTypes.TreasuryAdminActionRecord, b: TreasuryTypes.TreasuryAdminActionRecord) : Order.Order {
+            Int.compare(a.timestamp, b.timestamp)
+          });
+          
+          for (action in sortedActions.vals()) {
             if (action.id > lastImportedTreasuryActionId) {
               let blockData : AdminActionBlockData = {
                 id = action.id;

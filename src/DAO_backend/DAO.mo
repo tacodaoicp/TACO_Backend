@@ -263,7 +263,7 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
     
     Vector.add(adminActions, record);
-    
+
     // Keep only the most recent actions (before archiving takes over)
     // Use standard treasury pattern for consistency
     if (Vector.size(adminActions) > maxAdminActionsStored) {
@@ -2308,7 +2308,7 @@ shared (deployer) actor class ContinuousDAO() = this {
  * Allows configuration of trading intervals, sizes, and safety limits
  * Only callable by admins with the updateTreasuryConfig permission.
  */
-  public shared ({ caller }) func updateTreasuryConfig(updates : TreasuryTypes.UpdateConfig, rebalanceState : ?Bool) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func updateTreasuryConfig(updates : TreasuryTypes.UpdateConfig, rebalanceState : ?Bool, reason : ?Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #updateTreasuryConfig)) {
       return #err(#NotAdmin);
     };
@@ -2316,7 +2316,7 @@ shared (deployer) actor class ContinuousDAO() = this {
     let treasury = actor (Principal.toText(treasuryPrincipal)) : TreasuryTypes.Self;
 
     try {
-      let result = await treasury.updateRebalanceConfig(updates, rebalanceState);
+      let result = await treasury.updateRebalanceConfig(updates, rebalanceState, reason);
 
       switch (result) {
         case (#ok(message)) {
@@ -2628,7 +2628,7 @@ shared (deployer) actor class ContinuousDAO() = this {
       };
       #updateSystemParameter : () -> SystemParameter;
       #updateSystemState : () -> SystemState;      
-      #updateTreasuryConfig : () -> (TreasuryTypes.UpdateConfig, ?Bool);
+      #updateTreasuryConfig : () -> (TreasuryTypes.UpdateConfig, ?Bool, ?Text);
       #votingPowerMetrics : () -> ();
     };
     arg : Blob;
@@ -2979,8 +2979,13 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
 
     let allActions = Vector.toArray(adminActions);
-    let filteredActions = Array.filter<AdminActionRecord>(allActions, func(action) {
+    var filteredActions = Array.filter<AdminActionRecord>(allActions, func(action) {
       action.timestamp > sinceTimestamp
+    });
+    
+    // Sort by timestamp (oldest first for proper archive ordering)
+    filteredActions := Array.sort(filteredActions, func(a: AdminActionRecord, b: AdminActionRecord) : Order.Order {
+      Int.compare(a.timestamp, b.timestamp)
     });
     
     let totalFilteredCount = filteredActions.size();

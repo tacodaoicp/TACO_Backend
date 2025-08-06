@@ -103,6 +103,7 @@ import Nat8 "mo:base/Nat8";
 import NTN "../helper/ntn";
 import Float "mo:base/Float";
 import Array "mo:base/Array";
+import Order "mo:base/Order";
 import KongSwap "../swap/kong_swap";
 import ICPSwap "../swap/icp_swap";
 import swaptypes "../swap/swap_types";
@@ -6058,8 +6059,13 @@ shared (deployer) actor class treasury() = this {
     };
 
     let allActions = Vector.toArray(treasuryAdminActions);
-    let filteredActions = Array.filter<TreasuryAdminActionRecord>(allActions, func(action) {
+    var filteredActions = Array.filter<TreasuryAdminActionRecord>(allActions, func(action) {
       action.timestamp > sinceTimestamp
+    });
+    
+    // Sort by timestamp (oldest first for proper archive ordering)
+    filteredActions := Array.sort(filteredActions, func(a: TreasuryAdminActionRecord, b: TreasuryAdminActionRecord) : Order.Order {
+      Int.compare(a.timestamp, b.timestamp)
     });
     
     let totalFilteredCount = filteredActions.size();
