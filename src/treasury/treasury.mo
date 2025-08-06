@@ -732,14 +732,37 @@ shared (deployer) actor class treasury() = this {
   };
 
   /**
+   * Serialize RebalanceConfig to a structured, parseable text format
+   * Format: field_name=value|field_name=value|...
+   * This format is easy to parse and display in GUI with diffing capabilities
+   */
+  private func serializeRebalanceConfig(config : RebalanceConfig) : Text {
+    "rebalanceIntervalNS=" # debug_show(config.rebalanceIntervalNS) #
+    "|maxTradeAttemptsPerInterval=" # debug_show(config.maxTradeAttemptsPerInterval) #
+    "|minTradeValueICP=" # debug_show(config.minTradeValueICP) #
+    "|maxTradeValueICP=" # debug_show(config.maxTradeValueICP) #
+    "|portfolioRebalancePeriodNS=" # debug_show(config.portfolioRebalancePeriodNS) #
+    "|maxSlippageBasisPoints=" # debug_show(config.maxSlippageBasisPoints) #
+    "|maxTradesStored=" # debug_show(config.maxTradesStored) #
+    "|maxKongswapAttempts=" # debug_show(config.maxKongswapAttempts) #
+    "|shortSyncIntervalNS=" # debug_show(config.shortSyncIntervalNS) #
+    "|longSyncIntervalNS=" # debug_show(config.longSyncIntervalNS) #
+    "|tokenSyncTimeoutNS=" # debug_show(config.tokenSyncTimeoutNS)
+  };
+
+  /**
    * Update the rebalancing configuration parameters
    *
    * Allows adjustment of trading intervals, sizes, and safety limits
    * Only callable by DAO or controller.
    */
-  public shared ({ caller }) func updateRebalanceConfig(updates : UpdateConfig, rebalanceStateNew : ?Bool) : async Result.Result<Text, RebalanceError> {
+  public shared ({ caller }) func updateRebalanceConfig(updates : UpdateConfig, rebalanceStateNew : ?Bool, reason : ?Text) : async Result.Result<Text, RebalanceError> {
+    // Capture old configuration before any changes for audit trail
+    let oldConfig = rebalanceConfig;
+    let oldConfigText = serializeRebalanceConfig(oldConfig);
+
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
-      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = ""}), "Unauthorized attempt", false, ?"Not authorized");
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "Unauthorized attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -989,13 +1012,13 @@ shared (deployer) actor class treasury() = this {
 
     // Return any validation errors
     if (Text.size(validationErrors) > 0) {
-      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = ""}), "Configuration validation failed", false, ?validationErrors);
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "Configuration validation failed", false, ?validationErrors);
       return #err(#ConfigError(validationErrors));
     };
 
     // If no changes were requested, return early
     if (not hasChanges) {
-      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = ""}), "No changes requested", true, null);
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "No changes requested", true, null);
       return #ok("No changes requested to rebalance configuration");
     };
 
@@ -1032,7 +1055,10 @@ shared (deployer) actor class treasury() = this {
 
     };
 
-    logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = ""; newConfig = "updated"}), "Rebalance configuration updated", true, null);
+    // Serialize new configuration for audit trail (old config was captured at the beginning)
+    let newConfigText = serializeRebalanceConfig(updatedConfig);
+    
+    logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = newConfigText}), "Rebalance configuration updated", true, reason);
     #ok("Rebalance configuration updated successfully");
   };
 
@@ -6003,7 +6029,7 @@ shared (deployer) actor class treasury() = this {
       #stopRebalancing : () -> ();
       #resetRebalanceState : () -> ();
       #syncTokenDetailsFromDAO : () -> [(Principal, TokenDetails)];
-      #updateRebalanceConfig : () -> (UpdateConfig, ?Bool);
+      #updateRebalanceConfig : () -> (UpdateConfig, ?Bool, ?Text);
       #updateMaxPortfolioSnapshots : () -> ();
       #getMaxPriceHistoryEntries : () -> Nat;
       #getTokenPriceHistory : () -> [Principal];

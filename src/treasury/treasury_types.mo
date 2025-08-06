@@ -528,7 +528,7 @@ module {
     getCurrentAllocations : shared () -> async [Allocation];
     setTest : shared (Bool) -> async ();
     syncTokenDetailsFromDAO : shared ([(Principal, TokenDetails)]) -> async Result.Result<Text, SyncErrorTreasury>;
-    updateRebalanceConfig : shared (UpdateConfig, ?Bool) -> async Result.Result<Text, SyncErrorTreasury>;
+    updateRebalanceConfig : shared (UpdateConfig, ?Bool, ?Text) -> async Result.Result<Text, SyncErrorTreasury>;
     getTradingStatus : shared query () -> async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text>;
     getPortfolioHistory : shared query (Nat) -> async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError>;
     getPriceAlerts : shared query (Nat, Nat) -> async { alerts : [PriceAlertLog]; totalCount : Nat };
