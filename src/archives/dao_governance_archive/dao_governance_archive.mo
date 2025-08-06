@@ -336,6 +336,101 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
     };
   };
 
+  // Helper function to parse ICRC3 block and extract voting power data
+  private func parseBlockForVotingPower(block : ICRC3Service.Block, targetUser : Principal, maxTimestamp : Int) : (?Nat, ?Int) {
+    // The ICRC3 Block has structure {block : Value; id : Nat}
+    // The block.block field contains our Value data
+    switch (block.block) {
+      case (#Map(entries)) {
+        var blockUser : ?Principal = null;
+        var newVotingPower : ?Nat = null;
+        var blockTimestamp : ?Int = null;
+        var isVotingPowerBlock : Bool = false;
+        
+        // Extract the relevant fields from the map
+        for ((key, value) in entries.vals()) {
+          switch (key, value) {
+            case ("user", #Blob(userBlob)) {
+              // Principal.fromBlob can trap, so we need to handle it carefully
+              // For now, we'll assume the blob is valid since it comes from our own archive
+              blockUser := ?Principal.fromBlob(userBlob);
+            };
+            case ("newVotingPower", #Nat(vp)) {
+              newVotingPower := ?vp;
+              isVotingPowerBlock := true; // This indicates it's a voting power block
+            };
+            case ("timestamp", #Int(ts)) {
+              blockTimestamp := ?ts;
+            };
+            case _ { /* Ignore other fields */ };
+          };
+        };
+        
+        // Check if this block is for the target user and is a voting power block
+        if (isVotingPowerBlock) {
+          switch (blockUser, newVotingPower, blockTimestamp) {
+            case (?user, ?vp, ?ts) {
+              if (Principal.equal(user, targetUser)) {
+                (?vp, ?ts);
+              } else {
+                (null, null);
+              };
+            };
+            case _ { (null, null) };
+          };
+        } else {
+          (null, null);
+        };
+      };
+      case _ { (null, null) };
+    };
+  };
+
+  // Query method to find user's voting power at a specific timestamp
+  // Returns the most recent voting power change before the given timestamp
+  public query func getUserVotingPowerAtTime(user : Principal, timestamp : Int) : async Result.Result<Nat, ArchiveError> {
+    switch (Map.get(userIndex, Map.phash, user)) {
+      case (?blockIndices) {
+        var mostRecentVotingPower : Nat = 0;
+        var mostRecentTimestamp : Int = -1;
+        
+        // Iterate through the user's block indices
+        for (blockIndex in blockIndices.vals()) {
+          // Get the specific block using ICRC3
+          let getBlocksArgs = [{
+            start = blockIndex;
+            length = 1;
+          }];
+          
+          let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+          
+          // Process the single block if available
+          if (Array.size(icrc3Result.blocks) > 0) {
+            let block = icrc3Result.blocks[0];
+            
+            // Parse the block to check if it's a voting power change for our user
+            switch (parseBlockForVotingPower(block, user, timestamp)) {
+              case (?votingPower, ?blockTimestamp) {
+                // Only consider blocks before or at the target timestamp
+                if (blockTimestamp <= timestamp and blockTimestamp > mostRecentTimestamp) {
+                  mostRecentVotingPower := votingPower;
+                  mostRecentTimestamp := blockTimestamp;
+                };
+              };
+              case _ { /* Not a relevant voting power block */ };
+            };
+          };
+        };
+        
+        #ok(mostRecentVotingPower);
+      };
+      case null { 
+        // No blocks found for this user
+        #ok(0);
+      };
+    };
+  };
+
   public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
     let totalBlocks = base.getTotalBlocks();
     let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
