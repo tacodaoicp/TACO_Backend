@@ -424,6 +424,8 @@ shared (deployer) actor class treasury() = this {
       case (#UpdateMaxPortfolioSnapshots(details)) "Update Max Portfolio Snapshots: " # Nat.toText(details.oldLimit) # " → " # Nat.toText(details.newLimit);
       case (#SetTestMode(details)) "Set Test Mode: " # Bool.toText(details.isTestMode);
       case (#ClearSystemLogs) "Clear System Logs";
+      case (#TakeManualSnapshot) "Take Manual Portfolio Snapshot";
+      case (#ExecuteTradingCycle) "Execute Manual Trading Cycle";
     }
   };
 
@@ -565,7 +567,7 @@ shared (deployer) actor class treasury() = this {
    *
    * Only callable by DAO or controller.
    */
-  public shared ({ caller }) func startRebalancing() : async Result.Result<Text, RebalanceError> {
+  public shared ({ caller }) func startRebalancing(reason : ?Text) : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #startRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       return #err(#ConfigError("Not authorized"));
     };
@@ -597,10 +599,14 @@ shared (deployer) actor class treasury() = this {
       Debug.print("Rebalancing started");
       
       // Log the successful admin action
+      let reasonText = switch (reason) {
+        case (?r) r;
+        case null "Rebalancing started programmatically";
+      };
       logTreasuryAdminAction(
         caller,
         #StartRebalancing,
-        "Rebalancing started programmatically", // Default reason for programmatic calls
+        reasonText,
         true,
         null
       );
@@ -636,7 +642,7 @@ shared (deployer) actor class treasury() = this {
    * Cancels all timers and sets the system to idle state
    * Only callable by DAO or controller.
    */
-  public shared ({ caller }) func stopRebalancing() : async Result.Result<Text, RebalanceError> {
+  public shared ({ caller }) func stopRebalancing(reason : ?Text) : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #stopRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       Debug.print("Not authorized to stop rebalancing: " # debug_show(caller));
       logTreasuryAdminAction(caller, #StopRebalancing, "Unauthorized attempt", false, ?"Not authorized");
@@ -672,7 +678,11 @@ shared (deployer) actor class treasury() = this {
     };
 
     Debug.print("Rebalancing stopped" # debug_show(rebalanceState));
-    logTreasuryAdminAction(caller, #StopRebalancing, "Rebalancing stopped programmatically", true, null);
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Rebalancing stopped programmatically";
+    };
+    logTreasuryAdminAction(caller, #StopRebalancing, reasonText, true, null);
     #ok("Rebalancing stopped");
   };
 
@@ -682,7 +692,7 @@ shared (deployer) actor class treasury() = this {
    * Completely resets all metrics, trade history, and timers
    * Only callable by DAO or controller.
    */
-  public shared ({ caller }) func resetRebalanceState() : async Result.Result<Text, RebalanceError> {
+  public shared ({ caller }) func resetRebalanceState(reason : ?Text) : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #stopRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       Debug.print("Not authorized to reset rebalance state: " # debug_show(caller));
       logTreasuryAdminAction(caller, #ResetRebalanceState, "Unauthorized attempt", false, ?"Not authorized");
@@ -728,7 +738,11 @@ shared (deployer) actor class treasury() = this {
     };
 
     Debug.print("Rebalance state reset complete");
-    logTreasuryAdminAction(caller, #ResetRebalanceState, "Rebalance state reset programmatically", true, null);
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Rebalance state reset programmatically";
+    };
+    logTreasuryAdminAction(caller, #ResetRebalanceState, reasonText, true, null);
     #ok("Rebalance state reset to initial values");
   };
 
@@ -1045,9 +1059,9 @@ shared (deployer) actor class treasury() = this {
       switch (rebalanceStateNew) {
         case (?value) {
           if (value and rebalanceState.status == #Idle) {
-            ignore await startRebalancing();
+            ignore await startRebalancing(?"Auto-start via config update");
           } else if (not value and rebalanceState.status != #Idle) {
-            ignore await stopRebalancing();
+            ignore await stopRebalancing(?"Auto-stop via config update");
           };
         };
         case null {};
@@ -2047,9 +2061,9 @@ shared (deployer) actor class treasury() = this {
    * Removes a token from the trading pause registry, allowing it to trade again.
    * Only callable by admins with appropriate permissions.
    */
-  public shared ({ caller }) func unpauseTokenFromTrading(token : Principal) : async Result.Result<Text, TradingPauseError> {
+  public shared ({ caller }) func unpauseTokenFromTrading(token : Principal, reason : ?Text) : async Result.Result<Text, TradingPauseError> {
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
-      logTreasuryAdminAction(caller, #UnpauseToken({token}), "Unauthorized attempt", false, ?"Not authorized");
+      logTreasuryAdminAction(caller, #UnpauseToken({token}), "Unauthorized unpause attempt", false, ?"Not authorized");
       return #err(#NotAuthorized);
     };
 
@@ -2072,7 +2086,11 @@ shared (deployer) actor class treasury() = this {
       "unpauseTokenFromTrading"
     );
 
-    logTreasuryAdminAction(caller, #UnpauseToken({token}), "Token unpaused from trading", true, null);
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Token unpaused from trading";
+    };
+    logTreasuryAdminAction(caller, #UnpauseToken({token}), reasonText, true, null);
     #ok("Token " # pauseRecord.tokenSymbol # " unpaused from trading successfully");
   };
 
@@ -2133,7 +2151,7 @@ shared (deployer) actor class treasury() = this {
    * Removes all tokens from the trading pause registry.
    * Only callable by master admins.
    */
-  public shared ({ caller }) func clearAllTradingPauses() : async Result.Result<Text, TradingPauseError> {
+  public shared ({ caller }) func clearAllTradingPauses(reason : ?Text) : async Result.Result<Text, TradingPauseError> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller)) {
       logTreasuryAdminAction(caller, #ClearAllTradingPauses, "Unauthorized attempt", false, ?"Not authorized");
       return #err(#NotAuthorized);
@@ -2150,7 +2168,11 @@ shared (deployer) actor class treasury() = this {
       "clearAllTradingPauses"
     );
 
-    logTreasuryAdminAction(caller, #ClearAllTradingPauses, "Emergency clear of all trading pauses", true, null);
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Emergency clear of all trading pauses";
+    };
+    logTreasuryAdminAction(caller, #ClearAllTradingPauses, reasonText, true, null);
     #ok("Cleared " # Nat.toText(clearedCount) # " trading pauses");
   };
 
@@ -2300,12 +2322,18 @@ shared (deployer) actor class treasury() = this {
   /**
    * Manually trigger a portfolio snapshot (admin function)
    */
-  public shared ({ caller }) func takeManualPortfolioSnapshot() : async Result.Result<Text, PortfolioSnapshotError> {
+  public shared ({ caller }) func takeManualPortfolioSnapshot(reason : ?Text) : async Result.Result<Text, PortfolioSnapshotError> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller)) {
       return #err(#NotAuthorized);
     };
 
     await takePortfolioSnapshot(#Manual);
+    
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Manual portfolio snapshot taken";
+    };
+    logTreasuryAdminAction(caller, #TakeManualSnapshot, reasonText, true, null);
     #ok("Manual portfolio snapshot taken successfully");
   };
 
@@ -2326,7 +2354,7 @@ shared (deployer) actor class treasury() = this {
    * Older snapshots will be automatically removed when the limit is exceeded.
    * Only callable by admins with appropriate permissions.
    */
-  public shared ({ caller }) func updateMaxPortfolioSnapshots(newLimit : Nat) : async Result.Result<Text, PortfolioSnapshotError> {
+  public shared ({ caller }) func updateMaxPortfolioSnapshots(newLimit : Nat, reason : ?Text) : async Result.Result<Text, PortfolioSnapshotError> {
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       return #err(#NotAuthorized);
     };
@@ -2361,6 +2389,11 @@ shared (deployer) actor class treasury() = this {
       "updateMaxPortfolioSnapshots"
     );
 
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Portfolio snapshots limit updated";
+    };
+    logTreasuryAdminAction(caller, #UpdateMaxPortfolioSnapshots({oldLimit; newLimit}), reasonText, true, null);
     #ok("Maximum portfolio snapshots limit updated to " # Nat.toText(newLimit));
   };
 
@@ -3345,7 +3378,7 @@ shared (deployer) actor class treasury() = this {
   // 5. REBALANCING ENGINE CORE
   //=========================================================================
 
-  public shared ({ caller }) func admin_executeTradingCycle() : async Result.Result<Text, RebalanceError> {
+  public shared ({ caller }) func admin_executeTradingCycle(reason : ?Text) : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #startRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       Debug.print("Not authorized to execute trading cycle: " # debug_show(caller));
       return #err(#ConfigError("Not authorized"));
@@ -3359,6 +3392,12 @@ shared (deployer) actor class treasury() = this {
     };
 
     Debug.print("Completing trading cycle");
+    
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Manual trading cycle execution";
+    };
+    logTreasuryAdminAction(caller, #ExecuteTradingCycle, reasonText, true, null);
     return #ok("Trading cycle executed");
   };
 
@@ -5840,7 +5879,7 @@ shared (deployer) actor class treasury() = this {
           ignore setTimer<system>(
             #seconds(0),
             func() : async () {
-              ignore await stopRebalancing();
+              ignore await stopRebalancing(?"Auto-stop via timer");
             },
           );
         };

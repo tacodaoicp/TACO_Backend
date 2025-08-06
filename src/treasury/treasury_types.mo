@@ -503,6 +503,8 @@ module {
     
     // System Configuration
     #UpdateMaxPortfolioSnapshots: {oldLimit: Nat; newLimit: Nat};
+    #TakeManualSnapshot;
+    #ExecuteTradingCycle;
     #SetTestMode: {isTestMode: Bool};
     #ClearSystemLogs;
   };

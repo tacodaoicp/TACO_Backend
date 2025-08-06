@@ -1977,22 +1977,35 @@ shared (deployer) actor class ContinuousDAO() = this {
     isAdmin(principal, function);
   };
 
-  public shared ({ caller }) func addAdmin(principal : Principal) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func addAdmin(principal : Principal, reason : ?Text) : async Result.Result<Text, AuthorizationError> {
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Admin added";
+    };
+    
     if (isAdmin(caller, #addAdmin)) {
       let admins = Vector.fromArray<Principal>(spamGuard.getAdmins());
       if (Vector.indexOf(principal, admins, Principal.equal) == null) {
         Vector.add(admins, principal);
         spamGuard.setAdmins(Vector.toArray(admins));
+        logAdminAction(caller, #AdminAdd({newAdmin = principal}), reasonText, true, null);
         #ok("Admin added successfully");
       } else {
+        logAdminAction(caller, #AdminAdd({newAdmin = principal}), reasonText, false, ?"Admin already exists");
         #err(#UnexpectedError("Admin already exists"));
       };
     } else {
+      logAdminAction(caller, #AdminAdd({newAdmin = principal}), reasonText, false, ?"Not authorized");
       #err(#NotAdmin);
     };
   };
 
-  public shared ({ caller }) func removeAdmin(principal : Principal) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func removeAdmin(principal : Principal, reason : ?Text) : async Result.Result<Text, AuthorizationError> {
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Admin removed";
+    };
+    
     if (isAdmin(caller, #removeAdmin)) {
       let oldAdmins = spamGuard.getAdmins();
       let admins = Vector.new<Principal>();
@@ -2002,8 +2015,10 @@ shared (deployer) actor class ContinuousDAO() = this {
         };
       };
       spamGuard.setAdmins(Vector.toArray(admins));
+      logAdminAction(caller, #AdminRemove({removedAdmin = principal}), reasonText, true, null);
       #ok("Admin removed successfully");
     } else {
+      logAdminAction(caller, #AdminRemove({removedAdmin = principal}), reasonText, false, ?"Not authorized");
       #err(#NotAdmin);
     };
   };
@@ -2149,14 +2164,34 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   // Updates system configuration parameters with bounds checking.
   // Affects follow depth (1-3), max followers (50-5000), past allocations (20-500), snapshot interval (10m-48h).
-  public shared ({ caller }) func updateSystemParameter(param : SystemParameter) : async Result.Result<Text, AuthorizationError> {
+  public shared ({ caller }) func updateSystemParameter(param : SystemParameter, reason : ?Text) : async Result.Result<Text, AuthorizationError> {
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "System parameter updated";
+    };
+    
     if (not isAdmin(caller, #updateSystemParameter)) {
+      // Log the failed attempt first
+      let paramText = switch (param) {
+        case (#FollowDepth(v)) "FollowDepth: " # Nat.toText(v);
+        case (#LogAdmin(v)) "LogAdmin: " # Principal.toText(v);
+        case (#MaxFollowed(v)) "MaxFollowed: " # Nat.toText(v);
+        case (#MaxFollowUnfollowActionsPerDay(v)) "MaxFollowUnfollowActionsPerDay: " # Nat.toText(v);
+        case (#MaxAllocationsPerDay(v)) "MaxAllocationsPerDay: " # Int.toText(v);
+        case (#AllocationWindow(v)) "AllocationWindow: " # Int.toText(v);
+        case (#MaxFollowers(v)) "MaxFollowers: " # Nat.toText(v);
+        case (#MaxTotalUpdates(v)) "MaxTotalUpdates: " # Nat.toText(v);
+        case (#MaxPastAllocations(v)) "MaxPastAllocations: " # Nat.toText(v);
+        case (#SnapshotInterval(v)) "SnapshotInterval: " # Int.toText(v);
+      };
+      logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = "N/A"; newValue = paramText}), reasonText, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
     switch (param) {
       case (#FollowDepth(newDepth)) {
         if (newDepth < 1 or newDepth > 3) {
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(MAX_FOLLOW_DEPTH); newValue = Nat.toText(newDepth)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Follow depth must be between " #
@@ -2165,13 +2200,17 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = MAX_FOLLOW_DEPTH;
         MAX_FOLLOW_DEPTH := newDepth;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(oldValue); newValue = Nat.toText(newDepth)}), reasonText, true, null);
         logger.info("Admin", "Follow depth updated to " # Nat.toText(newDepth), "updateSystemParameter");
         #ok("Follow depth updated to " # Nat.toText(newDepth));
       };
 
       case (#LogAdmin(newLogAdmin)) {
+        let oldValue = logAdmin;
         logAdmin := newLogAdmin;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Principal.toText(oldValue); newValue = Principal.toText(newLogAdmin)}), reasonText, true, null);
         logger.info("Admin", "Log admin updated to " # Principal.toText(newLogAdmin), "updateSystemParameter");
         try {
           await neuronSnapshot.setLogAdmin(newLogAdmin);
@@ -2183,17 +2222,21 @@ shared (deployer) actor class ContinuousDAO() = this {
 
       case (#MaxFollowed(newMax)) {
         if (newMax < 1 or newMax > 10) {
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(MAX_FOLLOWED); newValue = Nat.toText(newMax)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError("Max followed must be between " # Nat.toText(1) # " and " # Nat.toText(10))
           );
         };
+        let oldValue = MAX_FOLLOWED;
         MAX_FOLLOWED := newMax;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(oldValue); newValue = Nat.toText(newMax)}), reasonText, true, null);
         logger.info("Admin", "Max followed updated to " # Nat.toText(newMax), "updateSystemParameter");
         #ok("Max followed updated to " # Nat.toText(newMax));
       };
 
       case (#MaxFollowUnfollowActionsPerDay(newMax)) {
         if (newMax < 9 or newMax > 100) {
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY); newValue = Nat.toText(newMax)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Max follow/unfollow actions per day must be between " #
@@ -2202,13 +2245,16 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY;
         MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY := newMax;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(oldValue); newValue = Nat.toText(newMax)}), reasonText, true, null);
         logger.info("Admin", "Max follow/unfollow actions per day updated to " # Nat.toText(newMax), "updateSystemParameter");
         #ok("Max follow/unfollow actions per day updated to " # Nat.toText(newMax));
       };
 
       case (#MaxAllocationsPerDay(newMax)) {
         if (newMax < 1 or newMax > 10) {
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Int.toText(MAX_ALLOCATIONS_PER_DAY); newValue = Int.toText(newMax)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Max allocations per day must be between " #
@@ -2217,7 +2263,9 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = MAX_ALLOCATIONS_PER_DAY;
         MAX_ALLOCATIONS_PER_DAY := newMax;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Int.toText(oldValue); newValue = Int.toText(newMax)}), reasonText, true, null);
         logger.info("Admin", "Max allocations per day updated to " # Int.toText(newMax), "updateSystemParameter");
         #ok("Max allocations per day updated to " # Int.toText(newMax));
       };
@@ -2225,6 +2273,7 @@ shared (deployer) actor class ContinuousDAO() = this {
       case (#AllocationWindow(newWindow)) {
         if (newWindow < 3600000000000 or newWindow > 7 * 86400000000000) {
           // 1 hour to 7 days
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Int.toText(ALLOCATION_WINDOW); newValue = Int.toText(newWindow)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Allocation window must be between " #
@@ -2233,13 +2282,16 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = ALLOCATION_WINDOW;
         ALLOCATION_WINDOW := newWindow;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Int.toText(oldValue); newValue = Int.toText(newWindow)}), reasonText, true, null);
         logger.info("Admin", "Allocation window updated to " # Int.toText(newWindow), "updateSystemParameter");
         #ok("Allocation window updated to " # Int.toText(newWindow));
       };
 
       case (#MaxFollowers(newMax)) {
         if (newMax < 50 or newMax > 5000) {
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(MAX_FOLLOWERS); newValue = Nat.toText(newMax)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Max followers must be between " #
@@ -2248,13 +2300,16 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = MAX_FOLLOWERS;
         MAX_FOLLOWERS := newMax;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(oldValue); newValue = Nat.toText(newMax)}), reasonText, true, null);
         logger.info("Admin", "Max followers updated to " # Nat.toText(newMax), "updateSystemParameter");
         #ok("Max followers updated to " # Nat.toText(newMax));
       };
 
       case (#MaxTotalUpdates(newMax)) {
         if (newMax < 200 or newMax > 10000) {
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(MAX_TOTAL_UPDATES); newValue = Nat.toText(newMax)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Max total updates must be between " #
@@ -2263,13 +2318,16 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = MAX_TOTAL_UPDATES;
         MAX_TOTAL_UPDATES := newMax;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(oldValue); newValue = Nat.toText(newMax)}), reasonText, true, null);
         logger.info("Admin", "Max total updates updated to " # Nat.toText(newMax), "updateSystemParameter");
         #ok("Max total updates updated to " # Nat.toText(newMax));
       };
 
       case (#MaxPastAllocations(newMax)) {
         if (newMax < 20 or newMax > 500) {
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(MAX_PAST_ALLOCATIONS); newValue = Nat.toText(newMax)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Max past allocations must be between " #
@@ -2278,7 +2336,9 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = MAX_PAST_ALLOCATIONS;
         MAX_PAST_ALLOCATIONS := newMax;
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Nat.toText(oldValue); newValue = Nat.toText(newMax)}), reasonText, true, null);
         logger.info("Admin", "Max past allocations updated to " # Nat.toText(newMax), "updateSystemParameter");
         #ok("Max past allocations updated to " # Nat.toText(newMax));
       };
@@ -2286,6 +2346,7 @@ shared (deployer) actor class ContinuousDAO() = this {
       case (#SnapshotInterval(newInterval)) {
         if (newInterval < 600_000_000_000 or newInterval > 172_800_000_000_000) {
           // 10 minutes to 48 hours
+          logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Int.toText(SNAPSHOT_INTERVAL); newValue = Int.toText(newInterval)}), reasonText, false, ?"Value out of range");
           return #err(
             #UnexpectedError(
               "Snapshot interval must be between " #
@@ -2294,8 +2355,10 @@ shared (deployer) actor class ContinuousDAO() = this {
             )
           );
         };
+        let oldValue = SNAPSHOT_INTERVAL;
         SNAPSHOT_INTERVAL := newInterval;
         ignore startSnapshotTimer();
+        logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Int.toText(oldValue); newValue = Int.toText(newInterval)}), reasonText, true, null);
         logger.info("Admin", "Snapshot interval updated to " # Int.toText(newInterval), "updateSystemParameter");
         #ok("Snapshot interval updated to " # Int.toText(newInterval));
       };
