@@ -762,7 +762,7 @@ shared (deployer) actor class treasury() = this {
     let oldConfigText = serializeRebalanceConfig(oldConfig);
 
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
-      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "Unauthorized attempt", false, ?"Not authorized");
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "Unauthorized configuration update attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -1018,7 +1018,7 @@ shared (deployer) actor class treasury() = this {
 
     // If no changes were requested, return early
     if (not hasChanges) {
-      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "No changes requested", true, null);
+      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "No configuration changes requested", true, null);
       return #ok("No changes requested to rebalance configuration");
     };
 
@@ -1058,7 +1058,11 @@ shared (deployer) actor class treasury() = this {
     // Serialize new configuration for audit trail (old config was captured at the beginning)
     let newConfigText = serializeRebalanceConfig(updatedConfig);
     
-    logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = newConfigText}), "Rebalance configuration updated", true, reason);
+    let reasonText = switch (reason) {
+      case (?r) r;
+      case null "Configuration updated";
+    };
+    logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = newConfigText}), reasonText, true, null);
     #ok("Rebalance configuration updated successfully");
   };
 
