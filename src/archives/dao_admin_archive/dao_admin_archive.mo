@@ -382,12 +382,25 @@ shared (deployer) actor class DAOAdminArchive() = this {
     #ok("Import timestamps reset successfully");
   };
 
+  // Wrapper function for postupgrade compatibility
+  private func runAdminBatchImport() : async () {
+    base.logger.info("BATCH_IMPORT", "Starting admin batch import cycle", "runAdminBatchImport");
+    let results = await importBatchAdminActions<system>();
+    base.logger.info("BATCH_IMPORT", 
+      "Admin batch import cycle completed - Imported: " # Nat.toText(results.imported) # 
+      " Failed: " # Nat.toText(results.failed), "runAdminBatchImport");
+  };
+
   system func preupgrade() {
+    // Save ICRC3 state before upgrade
+    icrc3State := icrc3StateRef.value;
     base.preupgrade();
   };
 
   system func postupgrade() {
-    icrc3State := null;
+    // Restore ICRC3 state after upgrade
+    icrc3StateRef.value := icrc3State;
+    base.postupgrade<system>(runAdminBatchImport);
   };
 
   //=========================================================================
