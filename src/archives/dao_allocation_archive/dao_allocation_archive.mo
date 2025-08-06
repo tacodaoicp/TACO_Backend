@@ -181,9 +181,9 @@ shared (deployer) actor class DAOAllocationArchive() = this {
               timestamp = change.from;
               user = change.user;
               changeType = #UserUpdate({userInitiated = true}); // Simplified for now
-              oldAllocations = []; // Would need previous allocation data
+              oldAllocations = []; // Not available in DAO PastAllocationRecord - needs migration
               newAllocations = change.allocation;
-              votingPower = 0; // Would need voting power at time of change
+              votingPower = 0; // Not available in DAO PastAllocationRecord - needs migration
               maker = change.allocationMaker;
               reason = null;
             };

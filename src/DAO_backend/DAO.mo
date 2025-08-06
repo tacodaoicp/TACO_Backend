@@ -3029,9 +3029,9 @@ shared (deployer) actor class ContinuousDAO() = this {
       };
     };
 
-    // Sort by timestamp (most recent first)
+    // Sort by timestamp (oldest first for proper archive ordering)
     allChanges := Array.sort(allChanges, func(a: PastAllocationRecord, b: PastAllocationRecord) : Order.Order {
-      Int.compare(b.from, a.from)
+      Int.compare(a.from, b.from)
     });
     
     let totalCount = allChanges.size();
