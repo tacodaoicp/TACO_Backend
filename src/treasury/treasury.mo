@@ -1103,7 +1103,7 @@ shared (deployer) actor class treasury() = this {
    * - Current vs target allocations
    * - Performance metrics
    */
-  public shared query func getTradingStatus() : async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text> {
+  public shared query func getTradingStatus() : async Result.Result<{ rebalanceStatus : RebalanceStatus; executedTrades : [TradeRecord]; portfolioState : { totalValueICP : Nat; totalValueUSD : Float; currentAllocations : [(Principal, Nat)]; targetAllocations : [(Principal, Nat)] }; metrics : { lastUpdate : Int; lastRebalanceAttempt : Int; totalTradesExecuted : Nat; totalTradesFailed : Nat; totalTradesSkipped : Nat; skipBreakdown : { noPairsFound : Nat; noExecutionPath : Nat; tokensFiltered : Nat; pausedTokens : Nat; insufficientCandidates : Nat }; avgSlippage : Float; successRate : Float; skipRate : Float } }, Text> {
 
     // Calculate total portfolio value
     var totalValueICP = 0;
@@ -1162,6 +1162,7 @@ shared (deployer) actor class treasury() = this {
       };
       metrics = {
         lastUpdate = rebalanceState.metrics.lastPriceUpdate;
+        lastRebalanceAttempt = rebalanceState.metrics.lastRebalanceAttempt;
         totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted;
         totalTradesFailed = rebalanceState.metrics.totalTradesFailed;
         totalTradesSkipped = rebalanceState.metrics.totalTradesSkipped;
