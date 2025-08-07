@@ -420,15 +420,6 @@ shared (deployer) actor class DAOAllocationArchive() = this {
     #ok("Import timestamps reset successfully");
   };
 
-  // Wrapper function for postupgrade compatibility
-  private func runAllocationBatchImport() : async () {
-    base.logger.info("BATCH_IMPORT", "Starting allocation batch import cycle", "runAllocationBatchImport");
-    let results = await importBatchData<system>();
-    base.logger.info("BATCH_IMPORT", 
-      "Allocation batch import cycle completed - Imported: " # Nat.toText(results.imported) # 
-      " Failed: " # Nat.toText(results.failed), "runAllocationBatchImport");
-  };
-
   system func preupgrade() {
     // Save ICRC3 state before upgrade
     icrc3State := icrc3StateRef.value;
@@ -438,7 +429,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   system func postupgrade() {
     // Restore ICRC3 state after upgrade
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(runAllocationBatchImport);
+    base.postupgrade<system>(func() : async () { /* no-op */ });
   };
 
   //=========================================================================

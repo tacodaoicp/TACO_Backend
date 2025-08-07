@@ -379,16 +379,8 @@ shared (deployer) actor class DAOAdminArchive() = this {
     // Reset all import timestamps to re-import from beginning
     lastImportedDAOActionId := 0;
     lastImportedTreasuryActionId := 0;
+    Debug.print("Import timestamps reset successfully");
     #ok("Import timestamps reset successfully");
-  };
-
-  // Wrapper function for postupgrade compatibility
-  private func runAdminBatchImport() : async () {
-    base.logger.info("BATCH_IMPORT", "Starting admin batch import cycle", "runAdminBatchImport");
-    let results = await importBatchAdminActions<system>();
-    base.logger.info("BATCH_IMPORT", 
-      "Admin batch import cycle completed - Imported: " # Nat.toText(results.imported) # 
-      " Failed: " # Nat.toText(results.failed), "runAdminBatchImport");
   };
 
   system func preupgrade() {
@@ -398,9 +390,9 @@ shared (deployer) actor class DAOAdminArchive() = this {
   };
 
   system func postupgrade() {
-    // Restore ICRC3 state after upgrade
+        // Restore ICRC3 state after upgrade
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(runAdminBatchImport);
+    base.postupgrade<system>(func() : async () { /* no-op */ });
   };
 
   //=========================================================================
