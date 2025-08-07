@@ -509,6 +509,6 @@ shared (deployer) actor class TradingArchiveV2() = this {
   system func postupgrade() {
     // Restore ICRC3 state after upgrade  
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(runTradingBatchImport);
+    base.postupgrade<system>(func() : async () { /* no-op */ });
   };
 } 

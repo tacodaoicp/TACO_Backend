@@ -360,6 +360,6 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
 
   system func postupgrade() {
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(runPortfolioBatchImport);
+    base.postupgrade<system>(func() : async () { /* no-op */ });
   };
 } 

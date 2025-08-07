@@ -395,6 +395,6 @@ shared (deployer) actor class PriceArchiveV2() = this {
 
   system func postupgrade() {
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(runPriceBatchImport);
+    base.postupgrade<system>(func() : async () { /* no-op */ });
   };
 } 
