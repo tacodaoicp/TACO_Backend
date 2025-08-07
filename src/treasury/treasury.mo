@@ -3452,6 +3452,15 @@ shared (deployer) actor class treasury() = this {
 
   private func do_executeTradingCycle() : async* () {
 
+    // Update lastRebalanceAttempt at the start of every trading cycle
+    rebalanceState := {
+      rebalanceState with
+      metrics = {
+        rebalanceState.metrics with
+        lastRebalanceAttempt = now();
+      };
+    };
+
     // VERBOSE LOGGING: Trading cycle start
     logger.info("REBALANCE_CYCLE", 
       "Trading cycle started - Status=" # debug_show(rebalanceState.status) # 
