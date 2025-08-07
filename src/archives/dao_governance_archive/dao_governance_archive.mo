@@ -350,19 +350,61 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
         // Extract the relevant fields from the map
         for ((key, value) in entries.vals()) {
           switch (key, value) {
+            case ("tx", #Map(txEntries)) {
+              // The actual data is inside the tx field
+              for ((txKey, txValue) in txEntries.vals()) {
+                switch (txKey, txValue) {
+                  case ("user", #Blob(userBlob)) {
+                    blockUser := ?Principal.fromBlob(userBlob);
+                  };
+                  case ("newVotingPower", #Nat(vp)) {
+                    newVotingPower := ?vp;
+                    isVotingPowerBlock := true;
+                  };
+                  case ("timestamp", #Int(ts)) {
+                    blockTimestamp := ?ts;
+                  };
+                  case ("operation", #Text(op)) {
+                    if (op == "3voting_power") {
+                      isVotingPowerBlock := true;
+                    };
+                  };
+                  case ("data", #Map(dataEntries)) {
+                    // The actual voting power data is inside the data field
+                    for ((dataKey, dataValue) in dataEntries.vals()) {
+                      switch (dataKey, dataValue) {
+                        case ("user", #Blob(userBlob)) {
+                          blockUser := ?Principal.fromBlob(userBlob);
+                        };
+                        case ("newVotingPower", #Nat(vp)) {
+                          newVotingPower := ?vp;
+                        };
+                        case ("timestamp", #Int(ts)) {
+                          blockTimestamp := ?ts;
+                        };
+                        case _ { 
+                        };
+                      };
+                    };
+                  };
+                  case _ { 
+                  };
+                };
+              };
+            };
             case ("user", #Blob(userBlob)) {
-              // Principal.fromBlob can trap, so we need to handle it carefully
-              // For now, we'll assume the blob is valid since it comes from our own archive
+              // Also check top level (in case structure varies)
               blockUser := ?Principal.fromBlob(userBlob);
             };
             case ("newVotingPower", #Nat(vp)) {
               newVotingPower := ?vp;
-              isVotingPowerBlock := true; // This indicates it's a voting power block
+              isVotingPowerBlock := true;
             };
             case ("timestamp", #Int(ts)) {
               blockTimestamp := ?ts;
             };
-            case _ { /* Ignore other fields */ };
+            case _ { 
+            };
           };
         };
         
@@ -389,6 +431,7 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
   // Query method to find user's voting power at a specific timestamp
   // Returns the most recent voting power change before the given timestamp
   public query func getUserVotingPowerAtTime(user : Principal, timestamp : Int) : async Result.Result<Nat, ArchiveError> {
+        
     switch (Map.get(userIndex, Map.phash, user)) {
       case (?blockIndices) {
         var mostRecentVotingPower : Nat = 0;
@@ -415,10 +458,13 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
                 if (blockTimestamp <= timestamp and blockTimestamp > mostRecentTimestamp) {
                   mostRecentVotingPower := votingPower;
                   mostRecentTimestamp := blockTimestamp;
+                } else {
                 };
               };
-              case _ { /* Not a relevant voting power block */ };
+              case _ { 
+              };
             };
+          } else {
           };
         };
         
@@ -601,3 +647,4 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
     debug_show(neuronId);
   };
 };
+
