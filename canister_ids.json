@@ -4,12 +4,15 @@
     "staging": "tisou-7aaaa-aaaai-atiea-cai"
   },
   "dao_admin_archive": {
+    "ic": "cspwf-4aaaa-aaaan-qz5ia-cai",
     "staging": "b6ygs-xaaaa-aaaan-qz5ca-cai"
   },
   "dao_allocation_archive": {
+    "ic": "cvoqr-ryaaa-aaaan-qz5iq-cai",
     "staging": "bq2l2-mqaaa-aaaan-qz5da-cai"
   },
   "dao_governance_archive": {
+    "ic": "c4n3n-hqaaa-aaaan-qz5ja-cai",
     "staging": "bzzag-2yaaa-aaaan-qz5cq-cai"
   },
   "neuronSnapshot": {
