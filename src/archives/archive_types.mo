@@ -168,6 +168,7 @@ module {
     // DAO_backend actions
     #TokenAdd: {token: Principal; tokenType: DAOTypes.TokenType; viaGovernance: Bool};
     #TokenRemove: {token: Principal};
+    #TokenDelete: {token: Principal};
     #TokenPause: {token: Principal};
     #TokenUnpause: {token: Principal};
     #SystemStateChange: {oldState: DAOTypes.SystemState; newState: DAOTypes.SystemState};
@@ -707,6 +708,12 @@ module {
       case (#TokenRemove(details)) { 
         #Map([
           ("type", #Text("TokenRemove")),
+          ("token", principalToValue(details.token))
+        ]);
+      };
+      case (#TokenDelete(details)) { 
+        #Map([
+          ("type", #Text("TokenDelete")),
           ("token", principalToValue(details.token))
         ]);
       };

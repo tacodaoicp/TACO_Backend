@@ -432,6 +432,7 @@ shared (deployer) actor class DAOAdminArchive() = this {
     switch (actionType) {
       case (#TokenAdd(details)) { #TokenAdd(details) };
       case (#TokenRemove(details)) { #TokenRemove(details) };
+      case (#TokenDelete(details)) { #TokenDelete(details) };
       case (#TokenPause(details)) { #TokenPause(details) };
       case (#TokenUnpause(details)) { #TokenUnpause(details) };
       case (#SystemStateChange(details)) { #SystemStateChange(details) };
@@ -480,6 +481,7 @@ shared (deployer) actor class DAOAdminArchive() = this {
     switch (actionType) {
       case (#TokenAdd(_)) { "TokenAdd" };
       case (#TokenRemove(_)) { "TokenRemove" };
+      case (#TokenDelete(_)) { "TokenDelete" };
       case (#TokenPause(_)) { "TokenPause" };
       case (#TokenUnpause(_)) { "TokenUnpause" };
       case (#SystemStateChange(_)) { "SystemStateChange" };

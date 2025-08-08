@@ -10,6 +10,7 @@ module {
   public type AdminFunction = {
     #addToken;
     #removeToken;
+    #deleteToken;
     #pauseToken;
     #unpauseToken;
     #addAdmin;

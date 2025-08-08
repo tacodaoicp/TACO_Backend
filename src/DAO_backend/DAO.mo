@@ -269,6 +269,7 @@ shared (deployer) actor class ContinuousDAO() = this {
         "Add token " # Principal.toText(details.token) # viaText;
       };
       case (#TokenRemove(details)) "Remove token " # Principal.toText(details.token);
+      case (#TokenDelete(details)) "Delete token " # Principal.toText(details.token);
       case (#TokenPause(details)) "Pause token " # Principal.toText(details.token);
       case (#TokenUnpause(details)) "Unpause token " # Principal.toText(details.token);
       case (#SystemStateChange(details)) "Change system state from " # debug_show(details.oldState) # " to " # debug_show(details.newState);
@@ -424,7 +425,7 @@ shared (deployer) actor class ContinuousDAO() = this {
         ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
       } catch (e) {
         // Don't fail the whole operation for sync issues, just log
-        logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "addTokenWithReason");
+        //logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "addTokenWithReason");
       };
 
       // Log successful action
@@ -495,6 +496,60 @@ shared (deployer) actor class ContinuousDAO() = this {
     } catch (e) {
       let errorMsg = Error.message(e);
       logAdminAction(caller, #TokenRemove({token}), reason, false, ?errorMsg);
+      #err(#UnexpectedError(errorMsg));
+    };
+  };
+
+  // Permanently delete a token from the trusted token list
+  public shared ({ caller }) func deleteToken(token : Principal, reason : Text) : async Result.Result<Text, AuthorizationError> {
+    if (not isAdmin(caller, #deleteToken)) {
+      return #err(#NotAdmin);
+    };
+
+    // Validate reason is not empty
+    if (Text.size(reason) == 0) {
+      return #err(#UnexpectedError("Reason is required for admin actions"));
+    };
+
+    try {
+      // Check if token exists
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (null) {
+          // Token doesn't exist - this is actually OK, not an error
+          logAdminAction(caller, #TokenDelete({token}), reason, true, null);
+          return #ok("Token doesn't exist");
+        };
+        case (?details) {
+          // Actually delete from tokenDetailsMap
+          Map.delete(tokenDetailsMap, phash, token);
+
+          // Remove from aggregateAllocation if present
+          if (Map.has(aggregateAllocation, phash, token)) {
+            Map.delete(aggregateAllocation, phash, token);
+          };
+        };
+      };
+      
+      activeTokenCount := 0;
+      for ((_, details) in Map.entries(tokenDetailsMap)) {
+        if (details.Active) {
+          activeTokenCount += 1;
+        };
+      };
+      
+      try {
+        ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+      } catch (e) {
+        // Don't fail the whole operation for sync issues, just log
+        logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "deleteToken");
+      };
+
+      logAdminAction(caller, #TokenDelete({token}), reason, true, null);
+      #ok("Token deleted successfully");
+      
+    } catch (e) {
+      let errorMsg = Error.message(e);
+      logAdminAction(caller, #TokenDelete({token}), reason, false, ?errorMsg);
       #err(#UnexpectedError(errorMsg));
     };
   };
@@ -2648,6 +2703,7 @@ shared (deployer) actor class ContinuousDAO() = this {
       #removeAdmin : () -> Principal;
       #removeFollower : () -> (follower : Principal);
       #removeToken : () -> Principal;
+      #deleteToken : () -> Principal;
       #setTacoAddress : () -> Principal;
       #set_sns_governance_canister_id : () -> Principal;
       #syncTokenDetailsFromTreasury : () -> [(Principal, TokenDetails)];
@@ -2930,6 +2986,9 @@ shared (deployer) actor class ContinuousDAO() = this {
       };
       case (#removeToken _) {
         isAdmin(caller, #removeToken);
+      };
+      case (#deleteToken _) {
+        isAdmin(caller, #deleteToken);
       };
       case (#pauseToken _) {
         isAdmin(caller, #pauseToken);

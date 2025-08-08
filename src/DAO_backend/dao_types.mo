@@ -186,6 +186,7 @@ module {
   public type AdminActionType = {
     #TokenAdd: {token: Principal; tokenType: TokenType; viaGovernance: Bool};
     #TokenRemove: {token: Principal};
+    #TokenDelete: {token: Principal};
     #TokenPause: {token: Principal};
     #TokenUnpause: {token: Principal};
     #SystemStateChange: {oldState: SystemState; newState: SystemState};
@@ -293,6 +294,7 @@ module {
     addToken : shared (Principal, TokenType) -> async Result.Result<Text, AuthorizationError>;
     addTokenWithReason : shared (Principal, TokenType, Text) -> async Result.Result<Text, AuthorizationError>;
     removeToken : shared (Principal, Text) -> async Result.Result<Text, AuthorizationError>;
+    deleteToken : shared (Principal, Text) -> async Result.Result<Text, AuthorizationError>;
     pauseToken : shared (Principal, Text) -> async Result.Result<Text, AuthorizationError>;
     unpauseToken : shared (Principal, Text) -> async Result.Result<Text, AuthorizationError>;
     grantAdminPermission : shared (Principal, SpamProtection.AdminFunction, Nat) -> async Result.Result<Text, AuthorizationError>;
