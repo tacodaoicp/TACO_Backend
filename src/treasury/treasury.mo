@@ -1044,31 +1044,6 @@ shared (deployer) actor class treasury() = this {
       config = updatedConfig
     };
 
-    // Reset timers if they exist
-    switch (rebalanceState.priceUpdateTimerId) {
-      case (?id) { cancelTimer(id) };
-      case null {};
-    };
-    switch (rebalanceState.rebalanceTimerId) {
-      case (?id) { cancelTimer(id) };
-      case null {};
-    };
-
-    // Handle rebalance state changes, if it fails it can be retried
-    try {
-      switch (rebalanceStateNew) {
-        case (?value) {
-          if (value and rebalanceState.status == #Idle) {
-            ignore await startRebalancing(?"Auto-start via config update");
-          } else if (not value and rebalanceState.status != #Idle) {
-            ignore await stopRebalancing(?"Auto-stop via config update");
-          };
-        };
-        case null {};
-      };
-    } catch (_) {
-
-    };
 
     // Serialize new configuration for audit trail (old config was captured at the beginning)
     let newConfigText = serializeRebalanceConfig(updatedConfig);
