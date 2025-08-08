@@ -469,6 +469,8 @@ shared (deployer) actor class DAOAdminArchive() = this {
       case (#UpdatePausedTokenThreshold(details)) { #UpdatePausedTokenThreshold(details) };
       case (#ClearPortfolioCircuitBreakerLogs) { #ClearPortfolioCircuitBreakerLogs };
       case (#UpdateMaxPortfolioSnapshots(details)) { #UpdateMaxPortfolioSnapshots(details) };
+      case (#TakeManualSnapshot) { #TakeManualSnapshot };
+      case (#ExecuteTradingCycle) { #ExecuteTradingCycle };
       case (#SetTestMode(details)) { #SetTestMode(details) };
       case (#ClearSystemLogs) { #ClearSystemLogs };
     };
@@ -507,6 +509,8 @@ shared (deployer) actor class DAOAdminArchive() = this {
       case (#StartPortfolioSnapshots) { "StartPortfolioSnapshots" };
       case (#StopPortfolioSnapshots) { "StopPortfolioSnapshots" };
       case (#UpdatePortfolioSnapshotInterval(_)) { "UpdatePortfolioSnapshotInterval" };
+      case (#TakeManualSnapshot) { "TakeManualSnapshot" };
+      case (#ExecuteTradingCycle) { "ExecuteTradingCycle" };
       case (#SetTestMode(_)) { "SetTestMode" };
       case (#ClearSystemLogs) { "ClearSystemLogs" };
       case (#CanisterStart) { "CanisterStart" };

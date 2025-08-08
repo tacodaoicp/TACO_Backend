@@ -198,6 +198,8 @@ module {
     #StartPortfolioSnapshots;
     #StopPortfolioSnapshots;
     #UpdatePortfolioSnapshotInterval: {oldIntervalNS: Nat; newIntervalNS: Nat};
+    #TakeManualSnapshot;
+    #ExecuteTradingCycle;
     #SetTestMode: {isTestMode: Bool};
     #ClearSystemLogs;
 
@@ -861,6 +863,19 @@ module {
         ]);
       };
       case (#ClearSystemLogs) { #Map([("type", #Text("ClearSystemLogs"))]); };
+      case (#StartPortfolioSnapshots) { #Map([("type", #Text("StartPortfolioSnapshots"))]); };
+      case (#StopPortfolioSnapshots) { #Map([("type", #Text("StopPortfolioSnapshots"))]); };
+      case (#UpdatePortfolioSnapshotInterval(details)) { 
+        #Map([
+          ("type", #Text("UpdatePortfolioSnapshotInterval")),
+          ("oldIntervalNS", #Nat(details.oldIntervalNS)),
+          ("newIntervalNS", #Nat(details.newIntervalNS))
+        ]);
+      };
+      case (#TakeManualSnapshot) { #Map([("type", #Text("TakeManualSnapshot"))]); };
+      case (#ExecuteTradingCycle) { #Map([("type", #Text("ExecuteTradingCycle"))]); };
+      case (#CanisterStart) { #Map([("type", #Text("CanisterStart"))]); };
+      case (#CanisterStop) { #Map([("type", #Text("CanisterStop"))]); };
     };
   };
 

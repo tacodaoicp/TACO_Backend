@@ -4981,11 +4981,11 @@ shared (deployer) actor class treasury() = this {
                 Debug.print("ICPSwap quote error: " # e);
                 
                 // VERBOSE LOGGING: ICPSwap quote error
-                logger.warn("EXCHANGE_COMPARISON", 
+                /*logger.warn("EXCHANGE_COMPARISON", 
                   "ICPSwap quote failed - Error=" # e #
                   " Status=QUOTE_ERROR",
                   "findBestExecution"
-                );
+                );*/
               };
             };
           };
