@@ -303,7 +303,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   system func preupgrade() {
     // Record a canister stop (pre-upgrade) event in admin logs
     logAdminAction(this_canister_id(), #ParameterUpdate({
-      parameter = #LogAdmin;
+      parameter = #LogAdmin(this_canister_id());
       oldValue = "Canister running";
       newValue = "Canister stopping (preupgrade)";
     }), "Canister preupgrade", true, null);
@@ -312,7 +312,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   system func postupgrade() {
     // Record a canister start (post-upgrade) event in admin logs
     logAdminAction(this_canister_id(), #ParameterUpdate({
-      parameter = #LogAdmin;
+      parameter = #LogAdmin(this_canister_id());
       oldValue = "Canister stopped";
       newValue = "Canister started (postupgrade)";
     }), "Canister postupgrade", true, null);
