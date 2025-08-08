@@ -193,6 +193,8 @@ module {
     #AdminPermissionGrant: {targetAdmin: Principal; function: Text; durationDays: Nat};
     #AdminAdd: {newAdmin: Principal};
     #AdminRemove: {removedAdmin: Principal};
+    #CanisterStart;
+    #CanisterStop;
   };
 
   public type AdminActionRecord = {

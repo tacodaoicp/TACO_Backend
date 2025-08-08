@@ -648,7 +648,7 @@ shared (deployer) actor class treasury() = this {
   public shared ({ caller }) func stopRebalancing(reason : ?Text) : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #stopRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       Debug.print("Not authorized to stop rebalancing: " # debug_show(caller));
-      logTreasuryAdminAction(caller, #StopRebalancing, "Unauthorized attempt", false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #StopRebalancing, "Unauthorized attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -693,7 +693,7 @@ shared (deployer) actor class treasury() = this {
   public shared ({ caller }) func resetRebalanceState(reason : ?Text) : async Result.Result<Text, RebalanceError> {
     if (((await hasAdminPermission(caller, #stopRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       Debug.print("Not authorized to reset rebalance state: " # debug_show(caller));
-      logTreasuryAdminAction(caller, #ResetRebalanceState, "Unauthorized attempt", false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #ResetRebalanceState, "Unauthorized attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -775,7 +775,7 @@ shared (deployer) actor class treasury() = this {
     let oldConfigText = serializeRebalanceConfig(oldConfig);
 
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
-      logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "Unauthorized configuration update attempt", false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #UpdateRebalanceConfig({oldConfig = oldConfigText; newConfig = oldConfigText}), "Unauthorized configuration update attempt", false, ?"Not authorized");
       return #err(#ConfigError("Not authorized"));
     };
 
@@ -2037,7 +2037,7 @@ shared (deployer) actor class treasury() = this {
    */
   public shared ({ caller }) func unpauseTokenFromTrading(token : Principal, reason : ?Text) : async Result.Result<Text, TradingPauseError> {
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
-      logTreasuryAdminAction(caller, #UnpauseToken({token}), "Unauthorized unpause attempt", false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #UnpauseToken({token}), "Unauthorized unpause attempt", false, ?"Not authorized");
       return #err(#NotAuthorized);
     };
 
@@ -2079,7 +2079,7 @@ shared (deployer) actor class treasury() = this {
     reason : Text
   ) : async Result.Result<Text, TradingPauseError> {
     if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
-      logTreasuryAdminAction(caller, #PauseTokenManual({token; pauseType = "manual"}), reason, false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #PauseTokenManual({token; pauseType = "manual"}), reason, false, ?"Not authorized");
       return #err(#NotAuthorized);
     };
 
@@ -2127,7 +2127,7 @@ shared (deployer) actor class treasury() = this {
    */
   public shared ({ caller }) func clearAllTradingPauses(reason : ?Text) : async Result.Result<Text, TradingPauseError> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller)) {
-      logTreasuryAdminAction(caller, #ClearAllTradingPauses, "Unauthorized attempt", false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #ClearAllTradingPauses, "Unauthorized attempt", false, ?"Not authorized");
       return #err(#NotAuthorized);
     };
 
@@ -2289,7 +2289,7 @@ shared (deployer) actor class treasury() = this {
   public shared ({ caller }) func startPortfolioSnapshots(reason: ?Text) : async Result.Result<Text, Text> {
     if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal)) {
       let reasonText = switch (reason) { case (?r) r; case null "Start portfolio snapshots" };
-      logTreasuryAdminAction(caller, #StartPortfolioSnapshots, reasonText, false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #StartPortfolioSnapshots, reasonText, false, ?"Not authorized");
       return #err("Not authorized");
     };
 
@@ -2317,7 +2317,7 @@ shared (deployer) actor class treasury() = this {
   public shared ({ caller }) func stopPortfolioSnapshots(reason: ?Text) : async Result.Result<Text, Text> {
     if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal)) {
       let reasonText = switch (reason) { case (?r) r; case null "Stop portfolio snapshots" };
-      logTreasuryAdminAction(caller, #StopPortfolioSnapshots, reasonText, false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #StopPortfolioSnapshots, reasonText, false, ?"Not authorized");
       return #err("Not authorized");
     };
 
@@ -2339,7 +2339,7 @@ shared (deployer) actor class treasury() = this {
   public shared ({ caller }) func updatePortfolioSnapshotInterval(intervalMinutes: Nat, reason: ?Text) : async Result.Result<Text, Text> {
     if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal)) {
       let reasonText = switch (reason) { case (?r) r; case null "Update portfolio snapshot interval" };
-      logTreasuryAdminAction(caller, #UpdatePortfolioSnapshotInterval({oldIntervalNS = portfolioSnapshotIntervalNS; newIntervalNS = portfolioSnapshotIntervalNS}), reasonText, false, ?"Not authorized");
+      //logTreasuryAdminAction(caller, #UpdatePortfolioSnapshotInterval({oldIntervalNS = portfolioSnapshotIntervalNS; newIntervalNS = portfolioSnapshotIntervalNS}), reasonText, false, ?"Not authorized");
       return #err("Not authorized");
     };
 

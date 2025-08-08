@@ -296,26 +296,20 @@ shared (deployer) actor class ContinuousDAO() = this {
       case (#AdminPermissionGrant(details)) "Grant " # details.function # " permission to " # Principal.toText(details.targetAdmin);
       case (#AdminAdd(details)) "Add admin " # Principal.toText(details.newAdmin);
       case (#AdminRemove(details)) "Remove admin " # Principal.toText(details.removedAdmin);
+      case (#CanisterStart) "Canister Start";
+      case (#CanisterStop) "Canister Stop";
     };
   };
 
   // Log lifecycle events in admin log on upgrade/stop/start
   system func preupgrade() {
     // Record a canister stop (pre-upgrade) event in admin logs
-    logAdminAction(this_canister_id(), #ParameterUpdate({
-      parameter = #LogAdmin(this_canister_id());
-      oldValue = "Canister running";
-      newValue = "Canister stopping (preupgrade)";
-    }), "Canister preupgrade", true, null);
+    logAdminAction(this_canister_id(), #CanisterStop, "Canister stopping (preupgrade)", true, null);
   };
 
   system func postupgrade() {
     // Record a canister start (post-upgrade) event in admin logs
-    logAdminAction(this_canister_id(), #ParameterUpdate({
-      parameter = #LogAdmin(this_canister_id());
-      oldValue = "Canister stopped";
-      newValue = "Canister started (postupgrade)";
-    }), "Canister postupgrade", true, null);
+    logAdminAction(this_canister_id(), #CanisterStart, "Canister started (postupgrade)", true, null);
   };
 
   private func getDefaultTokenDetails(): TokenDetails {
@@ -347,7 +341,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   // Adds new token to DAO with required reason. Fetches metadata from token's ledger canister.
   public shared ({ caller }) func addTokenWithReason(token : Principal, tokenType : TokenType, reason : Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #addToken)) {
-      logAdminAction(caller, #TokenAdd({token; tokenType; viaGovernance = false}), reason, false, ?"Not authorized");
+      //logAdminAction(caller, #TokenAdd({token; tokenType; viaGovernance = false}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
@@ -473,7 +467,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   // This allows the user to get notified about the need for a new allocation, as one of the tokens is not active anymore.
   public shared ({ caller }) func removeToken(token : Principal, reason : Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #removeToken)) {
-      logAdminAction(caller, #TokenRemove({token}), reason, false, ?"Not authorized");
+      //logAdminAction(caller, #TokenRemove({token}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
@@ -529,7 +523,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   public shared ({ caller }) func pauseToken(token : Principal, reason: Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #pauseToken)) {
       logger.warn("Admin", "Unauthorized pauseToken attempt by: " # Principal.toText(caller), "pauseToken");
-      logAdminAction(caller, #TokenPause({token}), reason, false, ?"Not authorized");
+      //logAdminAction(caller, #TokenPause({token}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
@@ -581,7 +575,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   public shared ({ caller }) func unpauseToken(token : Principal, reason: Text) : async Result.Result<Text, AuthorizationError> {
     if (not isAdmin(caller, #unpauseToken)) {
       logger.warn("Admin", "Unauthorized unpauseToken attempt by: " # Principal.toText(caller), "unpauseToken");
-      logAdminAction(caller, #TokenUnpause({token}), reason, false, ?"Not authorized");
+      //logAdminAction(caller, #TokenUnpause({token}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
@@ -2014,7 +2008,7 @@ shared (deployer) actor class ContinuousDAO() = this {
         #err(#UnexpectedError("Admin already exists"));
       };
     } else {
-      logAdminAction(caller, #AdminAdd({newAdmin = principal}), reasonText, false, ?"Not authorized");
+      //logAdminAction(caller, #AdminAdd({newAdmin = principal}), reasonText, false, ?"Not authorized");
       #err(#NotAdmin);
     };
   };
@@ -2037,14 +2031,14 @@ shared (deployer) actor class ContinuousDAO() = this {
       logAdminAction(caller, #AdminRemove({removedAdmin = principal}), reasonText, true, null);
       #ok("Admin removed successfully");
     } else {
-      logAdminAction(caller, #AdminRemove({removedAdmin = principal}), reasonText, false, ?"Not authorized");
+      //logAdminAction(caller, #AdminRemove({removedAdmin = principal}), reasonText, false, ?"Not authorized");
       #err(#NotAdmin);
     };
   };
 
   public shared ({ caller }) func updateSystemState(newState : SystemState, reason: Text) : async Result.Result<Text, AuthorizationError> {
     if (not Principal.isController(caller) and not isAdmin(caller, #updateSystemState) and sns_governance_canister_id != ?caller) {
-      logAdminAction(caller, #SystemStateChange({oldState = systemState; newState}), reason, false, ?"Not authorized");
+      //logAdminAction(caller, #SystemStateChange({oldState = systemState; newState}), reason, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
@@ -2203,7 +2197,7 @@ shared (deployer) actor class ContinuousDAO() = this {
         case (#MaxPastAllocations(v)) "MaxPastAllocations: " # Nat.toText(v);
         case (#SnapshotInterval(v)) "SnapshotInterval: " # Int.toText(v);
       };
-      logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = "N/A"; newValue = paramText}), reasonText, false, ?"Not authorized");
+      //logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = "N/A"; newValue = paramText}), reasonText, false, ?"Not authorized");
       return #err(#NotAdmin);
     };
 
