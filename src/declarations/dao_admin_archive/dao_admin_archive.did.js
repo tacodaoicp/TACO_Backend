@@ -48,6 +48,7 @@ export const idlFactory = ({ IDL }) => {
       'function' : IDL.Text,
       'targetAdmin' : IDL.Principal,
     }),
+    'CanisterStart' : IDL.Null,
     'TokenPause' : IDL.Record({ 'token' : IDL.Principal }),
     'SetPortfolioCircuitBreakerActive' : IDL.Record({
       'conditionId' : IDL.Nat,
@@ -86,6 +87,12 @@ export const idlFactory = ({ IDL }) => {
       'newConfig' : IDL.Text,
       'oldConfig' : IDL.Text,
     }),
+    'StartPortfolioSnapshots' : IDL.Null,
+    'UpdatePortfolioSnapshotInterval' : IDL.Record({
+      'newIntervalNS' : IDL.Nat,
+      'oldIntervalNS' : IDL.Nat,
+    }),
+    'StopPortfolioSnapshots' : IDL.Null,
     'AddTriggerCondition' : IDL.Record({
       'conditionId' : IDL.Nat,
       'conditionType' : IDL.Text,
@@ -103,6 +110,7 @@ export const idlFactory = ({ IDL }) => {
     'ResetRebalanceState' : IDL.Null,
     'ClearSystemLogs' : IDL.Null,
     'ClearPriceAlerts' : IDL.Null,
+    'CanisterStop' : IDL.Null,
   });
   const AdminCanisterSource = IDL.Variant({
     'DAO_backend' : IDL.Null,

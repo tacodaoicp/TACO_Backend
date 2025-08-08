@@ -201,6 +201,8 @@ type AdminActionVariant =
       targetAdmin: principal;
     };
    AdminRemove: record {removedAdmin: principal;};
+   CanisterStart;
+   CanisterStop;
    ClearAllTradingPauses;
    ClearPortfolioCircuitBreakerLogs;
    ClearPriceAlerts;
@@ -228,7 +230,9 @@ type AdminActionVariant =
                                 conditionId: nat;
                                 isActive: bool;
                               };
+   StartPortfolioSnapshots;
    StartRebalancing;
+   StopPortfolioSnapshots;
    StopRebalancing;
    SystemStateChange: record {
                         newState: SystemState;
@@ -257,6 +261,11 @@ type AdminActionVariant =
       conditionId: nat;
       newCondition: text;
       oldCondition: text;
+    };
+   UpdatePortfolioSnapshotInterval:
+    record {
+      newIntervalNS: nat;
+      oldIntervalNS: nat;
     };
    UpdateRebalanceConfig: record {
                             newConfig: text;

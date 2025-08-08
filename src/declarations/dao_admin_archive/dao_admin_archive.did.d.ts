@@ -39,6 +39,7 @@ export type AdminActionVariant = { 'StopRebalancing' : null } |
       'targetAdmin' : Principal,
     }
   } |
+  { 'CanisterStart' : null } |
   { 'TokenPause' : { 'token' : Principal } } |
   {
     'SetPortfolioCircuitBreakerActive' : {
@@ -83,6 +84,14 @@ export type AdminActionVariant = { 'StopRebalancing' : null } |
     }
   } |
   { 'UpdateRebalanceConfig' : { 'newConfig' : string, 'oldConfig' : string } } |
+  { 'StartPortfolioSnapshots' : null } |
+  {
+    'UpdatePortfolioSnapshotInterval' : {
+      'newIntervalNS' : bigint,
+      'oldIntervalNS' : bigint,
+    }
+  } |
+  { 'StopPortfolioSnapshots' : null } |
   {
     'AddTriggerCondition' : {
       'conditionId' : bigint,
@@ -102,7 +111,8 @@ export type AdminActionVariant = { 'StopRebalancing' : null } |
   } |
   { 'ResetRebalanceState' : null } |
   { 'ClearSystemLogs' : null } |
-  { 'ClearPriceAlerts' : null };
+  { 'ClearPriceAlerts' : null } |
+  { 'CanisterStop' : null };
 export type AdminCanisterSource = { 'DAO_backend' : null } |
   { 'Treasury' : null };
 export type ArchiveError = { 'StorageFull' : null } |
