@@ -145,27 +145,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   // Token info storage
   stable let tokenDetailsMap = Map.new<Principal, TokenDetails>();
 
-  Map.set(
-    tokenDetailsMap,
-    phash,
-    tacoAddress,
-    {
-      tokenName = "TACO";
-      tokenSymbol = "TACO";
-      tokenDecimals = 8;
-      tokenTransferFee = 10000;
-      tokenType = #ICRC3;
-      Active = false;
-      isPaused = false;
-      epochAdded = Time.now();
-      balance = 0;
-      priceInICP = 0;
-      priceInUSD = 0.0;
-      pastPrices = [];
-      lastTimeSynced = 0;
-      pausedDueToSyncFailure = false;
-    },
-  );
+
 
   stable var activeTokenCount : Nat = 0;
 
@@ -2622,29 +2602,7 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   public shared ({ caller }) func setTacoAddress(address : Principal) : async () {
     if (Principal.isController(caller) or isAdmin(caller, #setTacoAddress) or sns_governance_canister_id == ?caller) {
-      Map.delete(tokenDetailsMap, phash, tacoAddress);
       tacoAddress := address;
-      Map.set(
-        tokenDetailsMap,
-        phash,
-        tacoAddress,
-        {
-          tokenName = "TACO";
-          tokenSymbol = "TACO";
-          tokenDecimals = 8;
-          tokenTransferFee = 10000;
-          tokenType = #ICRC3;
-          Active = false;
-          isPaused = false;
-          epochAdded = Time.now();
-          balance = 0;
-          priceInICP = 0;
-          priceInUSD = 0.0;
-          pastPrices = [];
-          lastTimeSynced = 0;
-          pausedDueToSyncFailure = false;
-        },
-      );
     };
   };
 
