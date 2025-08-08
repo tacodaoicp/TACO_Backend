@@ -329,6 +329,8 @@ shared (deployer) actor class treasury() = this {
   stable var maxPortfolioSnapshots : Nat = 1000; // Keep ~42 days of hourly data
   stable var lastPortfolioSnapshotTime : Int = 0;
   stable var portfolioSnapshotTimerId : Nat = 0;
+  stable var portfolioSnapshotIntervalNS : Nat = 3_600_000_000_000; // 1 hour default
+  stable var portfolioSnapshotStatus : {#Running; #Stopped} = #Stopped;
 
   //=========================================================================
   // PORTFOLIO CIRCUIT BREAKER SYSTEM STORAGE
@@ -591,10 +593,6 @@ shared (deployer) actor class treasury() = this {
     try {
       startTradingTimer<system>();
       
-      // Start portfolio snapshot timer if not already running
-      if (portfolioSnapshotTimerId == 0) {
-        ignore await* startPortfolioSnapshotTimer<system>();
-      };
       
       Debug.print("Rebalancing started");
       
@@ -660,11 +658,6 @@ shared (deployer) actor class treasury() = this {
       case null {};
     };
     
-    // Cancel portfolio snapshot timer
-    if (portfolioSnapshotTimerId != 0) {
-      cancelTimer(portfolioSnapshotTimerId);
-      portfolioSnapshotTimerId := 0;
-    };
 
     rebalanceState := {
       rebalanceState with
@@ -2250,18 +2243,146 @@ shared (deployer) actor class treasury() = this {
     };
 
     portfolioSnapshotTimerId := setTimer<system>(
-      #nanoseconds(3_600_000_000_000), // 1 hour
+      #nanoseconds(portfolioSnapshotIntervalNS),
       func() : async () {
         await takePortfolioSnapshot(#Scheduled);
-        await* startPortfolioSnapshotTimer();
+        // Only restart if still in running status
+        if (portfolioSnapshotStatus == #Running) {
+          await* startPortfolioSnapshotTimer();
+        };
       }
     );
 
+    portfolioSnapshotStatus := #Running;
     logger.info(
       "PORTFOLIO_SNAPSHOT",
-      "Portfolio snapshot timer started - Interval=1h Timer_ID=" # Nat.toText(portfolioSnapshotTimerId),
+      "Portfolio snapshot timer started - Interval=" # Nat.toText(portfolioSnapshotIntervalNS / 1_000_000_000) # "s Timer_ID=" # Nat.toText(portfolioSnapshotTimerId),
       "startPortfolioSnapshotTimer"
     );
+  };
+
+  /**
+   * Stop the portfolio snapshot timer
+   */
+  private func stopPortfolioSnapshotTimer() {
+    if (portfolioSnapshotTimerId != 0) {
+      cancelTimer(portfolioSnapshotTimerId);
+      portfolioSnapshotTimerId := 0;
+    };
+    portfolioSnapshotStatus := #Stopped;
+    
+    logger.info(
+      "PORTFOLIO_SNAPSHOT",
+      "Portfolio snapshot timer stopped",
+      "stopPortfolioSnapshotTimer"
+    );
+  };
+
+  /**
+   * Start portfolio snapshots (Admin method)
+   */
+  public shared ({ caller }) func startPortfolioSnapshots(reason: ?Text) : async Result.Result<Text, Text> {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal)) {
+      let reasonText = switch (reason) { case (?r) r; case null "Start portfolio snapshots" };
+      logTreasuryAdminAction(caller, #StartPortfolioSnapshots, reasonText, false, ?"Not authorized");
+      return #err("Not authorized");
+    };
+
+    if (portfolioSnapshotStatus == #Running) {
+      let reasonText = switch (reason) { case (?r) r; case null "Start portfolio snapshots" };
+      logTreasuryAdminAction(caller, #StartPortfolioSnapshots, reasonText, false, ?"Already running");
+      return #err("Portfolio snapshots already running");
+    };
+
+    try {
+      ignore await* startPortfolioSnapshotTimer<system>();
+      let reasonText = switch (reason) { case (?r) r; case null "Portfolio snapshots started" };
+      logTreasuryAdminAction(caller, #StartPortfolioSnapshots, reasonText, true, null);
+      #ok("Portfolio snapshots started successfully")
+    } catch (e) {
+      let reasonText = switch (reason) { case (?r) r; case null "Start portfolio snapshots" };
+      logTreasuryAdminAction(caller, #StartPortfolioSnapshots, reasonText, false, ?Error.message(e));
+      #err("Failed to start portfolio snapshots: " # Error.message(e))
+    };
+  };
+
+  /**
+   * Stop portfolio snapshots (Admin method)
+   */
+  public shared ({ caller }) func stopPortfolioSnapshots(reason: ?Text) : async Result.Result<Text, Text> {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal)) {
+      let reasonText = switch (reason) { case (?r) r; case null "Stop portfolio snapshots" };
+      logTreasuryAdminAction(caller, #StopPortfolioSnapshots, reasonText, false, ?"Not authorized");
+      return #err("Not authorized");
+    };
+
+    if (portfolioSnapshotStatus == #Stopped) {
+      let reasonText = switch (reason) { case (?r) r; case null "Stop portfolio snapshots" };
+      logTreasuryAdminAction(caller, #StopPortfolioSnapshots, reasonText, false, ?"Already stopped");
+      return #err("Portfolio snapshots already stopped");
+    };
+
+    stopPortfolioSnapshotTimer();
+    let reasonText = switch (reason) { case (?r) r; case null "Portfolio snapshots stopped" };
+    logTreasuryAdminAction(caller, #StopPortfolioSnapshots, reasonText, true, null);
+    #ok("Portfolio snapshots stopped successfully");
+  };
+
+  /**
+   * Update portfolio snapshot interval (Admin method)
+   */
+  public shared ({ caller }) func updatePortfolioSnapshotInterval(intervalMinutes: Nat, reason: ?Text) : async Result.Result<Text, Text> {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal)) {
+      let reasonText = switch (reason) { case (?r) r; case null "Update portfolio snapshot interval" };
+      logTreasuryAdminAction(caller, #UpdatePortfolioSnapshotInterval({oldIntervalNS = portfolioSnapshotIntervalNS; newIntervalNS = portfolioSnapshotIntervalNS}), reasonText, false, ?"Not authorized");
+      return #err("Not authorized");
+    };
+
+    // Validate interval (between 1 minute and 24 hours)
+    if (intervalMinutes < 1 or intervalMinutes > 1440) {
+      let reasonText = switch (reason) { case (?r) r; case null "Update portfolio snapshot interval" };
+      logTreasuryAdminAction(caller, #UpdatePortfolioSnapshotInterval({oldIntervalNS = portfolioSnapshotIntervalNS; newIntervalNS = portfolioSnapshotIntervalNS}), reasonText, false, ?"Invalid interval: must be between 1 and 1440 minutes");
+      return #err("Invalid interval: must be between 1 and 1440 minutes");
+    };
+
+    let oldIntervalNS = portfolioSnapshotIntervalNS;
+    let newIntervalNS = intervalMinutes * 60 * 1_000_000_000; // Convert minutes to nanoseconds
+    
+    if (oldIntervalNS == newIntervalNS) {
+      let reasonText = switch (reason) { case (?r) r; case null "Update portfolio snapshot interval" };
+      logTreasuryAdminAction(caller, #UpdatePortfolioSnapshotInterval({oldIntervalNS; newIntervalNS}), reasonText, true, null);
+      return #ok("No change needed - interval already set to " # Nat.toText(intervalMinutes) # " minutes");
+    };
+
+    portfolioSnapshotIntervalNS := newIntervalNS;
+    
+    // If currently running, restart with new interval
+    let wasRunning = portfolioSnapshotStatus == #Running;
+    if (wasRunning) {
+      stopPortfolioSnapshotTimer();
+      ignore await* startPortfolioSnapshotTimer<system>();
+    };
+
+    let reasonText = switch (reason) { case (?r) r; case null "Portfolio snapshot interval updated to " # Nat.toText(intervalMinutes) # " minutes" };
+    logTreasuryAdminAction(caller, #UpdatePortfolioSnapshotInterval({oldIntervalNS; newIntervalNS}), reasonText, true, null);
+    
+    let statusMsg = if (wasRunning) " (timer restarted with new interval)" else "";
+    #ok("Portfolio snapshot interval updated to " # Nat.toText(intervalMinutes) # " minutes" # statusMsg);
+  };
+
+  /**
+   * Get portfolio snapshot status
+   */
+  public query func getPortfolioSnapshotStatus() : async {
+    status: {#Running; #Stopped};
+    intervalMinutes: Nat;
+    lastSnapshotTime: Int;
+  } {
+    {
+      status = portfolioSnapshotStatus;
+      intervalMinutes = portfolioSnapshotIntervalNS / (60 * 1_000_000_000);
+      lastSnapshotTime = lastPortfolioSnapshotTime;
+    }
   };
 
   /**
@@ -6103,6 +6224,33 @@ shared (deployer) actor class treasury() = this {
       actions = limitedActions;
       totalCount = totalFilteredCount;
     })
+  };
+
+  /**
+   * System upgrade functions
+   */
+  system func postupgrade() {
+    // After canister upgrade, all timers are invalidated
+    // Reset trading status to Idle to prevent inconsistent state
+    // where status shows Trading but no timer is actually running
+    if (rebalanceState.status != #Idle) {
+      logger.info("UPGRADE", "Resetting trading status from " # debug_show(rebalanceState.status) # " to Idle after upgrade", "postupgrade");
+      
+      rebalanceState := {
+        rebalanceState with
+        status = #Idle;
+        rebalanceTimerId = null;
+        priceUpdateTimerId = null;
+      };
+      
+      // Reset portfolio snapshot timer ID but preserve status
+      // If it was running before upgrade, admin will need to restart it manually
+      if (portfolioSnapshotStatus == #Running) {
+        logger.info("UPGRADE", "Portfolio snapshots were running before upgrade - set to Stopped (restart manually)", "postupgrade");
+        portfolioSnapshotStatus := #Stopped;
+      };
+      portfolioSnapshotTimerId := 0;
+    };
   };
 
 };

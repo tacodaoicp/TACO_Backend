@@ -504,6 +504,9 @@ module {
     // System Configuration
     #UpdateMaxPortfolioSnapshots: {oldLimit: Nat; newLimit: Nat};
     #TakeManualSnapshot;
+    #StartPortfolioSnapshots;
+    #StopPortfolioSnapshots;
+    #UpdatePortfolioSnapshotInterval: {oldIntervalNS: Nat; newIntervalNS: Nat};
     #ExecuteTradingCycle;
     #SetTestMode: {isTestMode: Bool};
     #ClearSystemLogs;
