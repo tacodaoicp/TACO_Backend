@@ -430,6 +430,9 @@ shared (deployer) actor class treasury() = this {
       case (#ClearSystemLogs) "Clear System Logs";
       case (#TakeManualSnapshot) "Take Manual Portfolio Snapshot";
       case (#ExecuteTradingCycle) "Execute Manual Trading Cycle";
+      case (#StartPortfolioSnapshots) "Start Portfolio Snapshots";
+      case (#StopPortfolioSnapshots) "Stop Portfolio Snapshots";
+      case (#UpdatePortfolioSnapshotInterval(details)) "Update Portfolio Snapshot Interval: " # Nat.toText(details.oldIntervalNS / 60_000_000_000) # "min → " # Nat.toText(details.newIntervalNS / 60_000_000_000) # "min";
     }
   };
 
