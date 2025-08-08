@@ -409,6 +409,8 @@ shared (deployer) actor class treasury() = this {
       case (#StopRebalancing) "Stop Trading Bot";
       case (#ResetRebalanceState) "Reset Trading State";
       case (#UpdateRebalanceConfig(_)) "Update Trading Config";
+      case (#CanisterStart) "Canister Start";
+      case (#CanisterStop) "Canister Stop";
       case (#PauseTokenManual(details)) "Manual Token Pause: " # Principal.toText(details.token);
       case (#UnpauseToken(details)) "Unpause Token: " # Principal.toText(details.token);
       case (#ClearAllTradingPauses) "Clear All Trading Pauses";
@@ -6094,6 +6096,11 @@ shared (deployer) actor class treasury() = this {
   // Initialize sync timer at system startup
   startAllSyncTimers<system>(true);
 
+  system func preupgrade() {
+    // Log lifecycle: canister stop
+    logTreasuryAdminAction(this_canister_id(), #CanisterStop, "Canister stopping (preupgrade)", true, null);
+  };
+
   //=========================================================================
   // LOG ACCESS METHODS
   //=========================================================================
@@ -6233,6 +6240,8 @@ shared (deployer) actor class treasury() = this {
     // After canister upgrade, all timers are invalidated
     // Reset trading status to Idle to prevent inconsistent state
     // where status shows Trading but no timer is actually running
+    // Log lifecycle: canister start
+    logTreasuryAdminAction(this_canister_id(), #CanisterStart, "Canister started (postupgrade)", true, null);
     if (rebalanceState.status != #Idle) {
       logger.info("UPGRADE", "Resetting trading status from " # debug_show(rebalanceState.status) # " to Idle after upgrade", "postupgrade");
       

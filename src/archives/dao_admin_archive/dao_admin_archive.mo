@@ -449,6 +449,11 @@ shared (deployer) actor class DAOAdminArchive() = this {
       case (#StopRebalancing) { #StopRebalancing };
       case (#ResetRebalanceState) { #ResetRebalanceState };
       case (#UpdateRebalanceConfig(details)) { #UpdateRebalanceConfig(details) };
+      case (#StartPortfolioSnapshots) { #StartPortfolioSnapshots };
+      case (#StopPortfolioSnapshots) { #StopPortfolioSnapshots };
+      case (#UpdatePortfolioSnapshotInterval(details)) { #UpdatePortfolioSnapshotInterval(details) };
+      case (#CanisterStart) { #CanisterStart };
+      case (#CanisterStop) { #CanisterStop };
       case (#PauseTokenManual(details)) { #PauseTokenManual(details) };
       case (#UnpauseToken(details)) { #UnpauseToken(details) };
       case (#ClearAllTradingPauses) { #ClearAllTradingPauses };
@@ -499,8 +504,13 @@ shared (deployer) actor class DAOAdminArchive() = this {
       case (#UpdatePausedTokenThreshold(_)) { "UpdatePausedTokenThreshold" };
       case (#ClearPortfolioCircuitBreakerLogs) { "ClearPortfolioCircuitBreakerLogs" };
       case (#UpdateMaxPortfolioSnapshots(_)) { "UpdateMaxPortfolioSnapshots" };
+      case (#StartPortfolioSnapshots) { "StartPortfolioSnapshots" };
+      case (#StopPortfolioSnapshots) { "StopPortfolioSnapshots" };
+      case (#UpdatePortfolioSnapshotInterval(_)) { "UpdatePortfolioSnapshotInterval" };
       case (#SetTestMode(_)) { "SetTestMode" };
       case (#ClearSystemLogs) { "ClearSystemLogs" };
+      case (#CanisterStart) { "CanisterStart" };
+      case (#CanisterStop) { "CanisterStop" };
     };
   };
 

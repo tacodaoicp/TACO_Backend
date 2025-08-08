@@ -195,8 +195,15 @@ module {
     #UpdatePausedTokenThreshold: {oldThreshold: Nat; newThreshold: Nat};
     #ClearPortfolioCircuitBreakerLogs;
     #UpdateMaxPortfolioSnapshots: {oldLimit: Nat; newLimit: Nat};
+    #StartPortfolioSnapshots;
+    #StopPortfolioSnapshots;
+    #UpdatePortfolioSnapshotInterval: {oldIntervalNS: Nat; newIntervalNS: Nat};
     #SetTestMode: {isTestMode: Bool};
     #ClearSystemLogs;
+
+    // Canister lifecycle (both DAO and Treasury)
+    #CanisterStart;
+    #CanisterStop;
   };
 
   // Allocation change tracking for dao_allocation_archive

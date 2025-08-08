@@ -480,6 +480,10 @@ module {
     #StopRebalancing;
     #ResetRebalanceState;
     #UpdateRebalanceConfig: {oldConfig: Text; newConfig: Text}; // JSON representation
+
+    // Canister lifecycle
+    #CanisterStart;
+    #CanisterStop;
     
     // Token Trading Pauses
     #PauseTokenManual: {token: Principal; pauseType: Text};

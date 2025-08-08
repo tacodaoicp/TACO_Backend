@@ -299,6 +299,25 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  // Log lifecycle events in admin log on upgrade/stop/start
+  system func preupgrade() {
+    // Record a canister stop (pre-upgrade) event in admin logs
+    logAdminAction(this_canister_id(), #ParameterUpdate({
+      parameter = #LogAdmin;
+      oldValue = "Canister running";
+      newValue = "Canister stopping (preupgrade)";
+    }), "Canister preupgrade", true, null);
+  };
+
+  system func postupgrade() {
+    // Record a canister start (post-upgrade) event in admin logs
+    logAdminAction(this_canister_id(), #ParameterUpdate({
+      parameter = #LogAdmin;
+      oldValue = "Canister stopped";
+      newValue = "Canister started (postupgrade)";
+    }), "Canister postupgrade", true, null);
+  };
+
   private func getDefaultTokenDetails(): TokenDetails {
     {
       Active = false;
