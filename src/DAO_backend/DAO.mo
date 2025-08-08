@@ -140,7 +140,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   // State variables
   let { phash; bhash } = Map;
 
-  var tacoAddress = Principal.fromText("aaaaa-aa");
+  var tacoAddress = Principal.fromText("kknbx-zyaaa-aaaaq-aae4a-cai");
 
   // Token info storage
   stable let tokenDetailsMap = Map.new<Principal, TokenDetails>();
