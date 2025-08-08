@@ -102,7 +102,8 @@ shared (deployer) actor class TradingArchiveV2() = this {
       return #err(#NotAuthorized);
     };
 
-    let timestamp = Time.now();
+    // Use original event timestamp from TradeBlockData, not import time!
+    let timestamp = trade.timestamp;
     let blockValue = ArchiveTypes.tradeToValue(trade, timestamp, null);
     
     // Use base class to store the block
@@ -135,7 +136,8 @@ shared (deployer) actor class TradingArchiveV2() = this {
       return #err(#NotAuthorized);
     };
 
-    let timestamp = Time.now();
+    // Use original event timestamp from CircuitBreakerBlockData, not import time!
+    let timestamp = circuitBreaker.timestamp;
     let blockValue = ArchiveTypes.circuitBreakerToValue(circuitBreaker, timestamp, null);
     
     // Use base class to store the block
@@ -158,7 +160,8 @@ shared (deployer) actor class TradingArchiveV2() = this {
       return #err(#NotAuthorized);
     };
 
-    let timestamp = Time.now();
+    // Use original event timestamp from TradingPauseBlockData, not import time!
+    let timestamp = pause.timestamp;
     let blockValue = ArchiveTypes.tradingPauseToValue(pause, timestamp, null);
     
     // Use base class to store the block
@@ -253,15 +256,20 @@ shared (deployer) actor class TradingArchiveV2() = this {
           // No need to filter client-side anymore - server already filtered
           let newTrades = trades;
           
-          // Process trades in batches (limit to 50 per batch)
-          let batchSize = 50;
+          // Process trades in batches (100 per batch × 100 batches = 10,000 per cycle)
+          let batchSize = 100;
           let batchedTrades = if (newTrades.size() > batchSize) {
             Array.subArray(newTrades, 0, batchSize)
           } else {
             newTrades
           };
           
-          for (trade in batchedTrades.vals()) {
+          // Sort trades chronologically (oldest first) for proper block ordering
+          let sortedTrades = Array.sort<TreasuryTypes.TradeRecord>(batchedTrades, func(a, b) {
+            Int.compare(a.timestamp, b.timestamp)
+          });
+          
+          for (trade in sortedTrades.vals()) {
             let tradeBlockData : TradeBlockData = {
               trader = TREASURY_ID; // Treasury is the trader
               tokenSold = trade.tokenSold;
@@ -273,6 +281,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
               slippage = trade.slippage;
               fee = 0; // Treasury trades don't have explicit fees
               error = trade.error;
+              timestamp = trade.timestamp; // Use original event timestamp!
             };
             
             let blockResult = await archiveTradeBlock(tradeBlockData);
@@ -340,6 +349,7 @@ shared (deployer) actor class TradingArchiveV2() = this {
             tokensAffected = [alert.token];
             systemResponse = "Price alert triggered: " # alert.triggeredCondition.name;
             severity = "Medium";
+            timestamp = alert.timestamp; // Use original alert timestamp
           };
           
           let blockResult = await archiveCircuitBreakerBlock(circuitBreakerData);

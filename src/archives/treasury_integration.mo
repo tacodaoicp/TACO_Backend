@@ -155,6 +155,7 @@ module {
         tokensAffected = tokensAffected;
         systemResponse = systemResponse;
         severity = severity;
+        timestamp = Time.now(); // Current time for circuit breaker events
       };
       
       await tradingArchive.archiveCircuitBreakerBlock(circuitBreakerData);

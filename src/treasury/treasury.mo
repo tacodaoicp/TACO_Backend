@@ -1308,10 +1308,9 @@ shared (deployer) actor class treasury() = this {
     
     let totalFilteredCount = filteredSnapshots.size();
     
-    // Apply limit to filtered results (get most recent ones)
+    // Apply limit to filtered results (get oldest ones first for proper archive processing)
     let limitedSnapshots = if (totalFilteredCount > limit) {
-      let startIndex = totalFilteredCount - limit;
-      Array.subArray(filteredSnapshots, startIndex, limit)
+      Array.subArray(filteredSnapshots, 0, limit)
     } else {
       filteredSnapshots
     };

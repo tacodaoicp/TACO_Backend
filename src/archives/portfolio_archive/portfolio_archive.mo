@@ -124,8 +124,8 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   // Import batch of portfolio snapshots from treasury
   private func importPortfolioSnapshotsBatch() : async { imported: Nat; failed: Nat } {
     try {
-      // Use new efficient method that filters on server-side
-      let result = await treasuryCanister.getPortfolioHistorySince(lastPortfolioImportTime, 50);
+      // Use new efficient method that filters on server-side (100 per batch × 100 batches = 10,000 per cycle)
+      let result = await treasuryCanister.getPortfolioHistorySince(lastPortfolioImportTime, 100);
       
       switch (result) {
         case (#ok(response)) {
@@ -135,7 +135,12 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
           // No need to filter client-side anymore - server already filtered
           let newSnapshots = response.snapshots;
           
-          for (snapshot in newSnapshots.vals()) {
+          // Sort snapshots chronologically (oldest first) for proper block ordering
+          let sortedSnapshots = Array.sort<TreasuryTypes.PortfolioSnapshot>(newSnapshots, func(a, b) {
+            Int.compare(a.timestamp, b.timestamp)
+          });
+          
+          for (snapshot in sortedSnapshots.vals()) {
             // Convert treasury TokenSnapshots to archive DetailedTokenSnapshots (excluding symbol)
             let detailedTokens = Array.map<TreasuryTypes.TokenSnapshot, ArchiveTypes.DetailedTokenSnapshot>(
               snapshot.tokens, 

@@ -102,7 +102,8 @@ shared (deployer) actor class PriceArchiveV2() = this {
       return #err(#NotAuthorized);
     };
 
-    let timestamp = Time.now();
+    // Use original event timestamp from PriceBlockData, not import time!
+    let timestamp = price.timestamp;
     let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
     
     // Use base class to store the block
@@ -233,8 +234,13 @@ shared (deployer) actor class PriceArchiveV2() = this {
         
         base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": lastKnownTime=" # Int.toText(lastKnownTime) # ", final filtered to " # Nat.toText(newPricePoints.size()) # " new price points", "importPriceHistoryBatch");
         
+        // Sort price points chronologically (oldest first) for proper block ordering
+        let sortedPricePoints = Array.sort<TreasuryTypes.PricePoint>(newPricePoints, func(a, b) {
+          Int.compare(a.time, b.time)
+        });
+        
         // Import each new price point from historical data
-        for (pricePoint in newPricePoints.vals()) {
+        for (pricePoint in sortedPricePoints.vals()) {
           let priceData : PriceBlockData = {
             token = token;
             priceICP = pricePoint.icpPrice;
@@ -242,6 +248,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
             source = #NTN;
             volume24h = null;
             change24h = null;
+            timestamp = pricePoint.time; // Use original event timestamp!
           };
           
           let result = await archivePriceBlock(priceData);
