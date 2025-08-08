@@ -425,7 +425,7 @@ shared (deployer) actor class ContinuousDAO() = this {
         ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
       } catch (e) {
         // Don't fail the whole operation for sync issues, just log
-        //logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "addTokenWithReason");
+        logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "addTokenWithReason");
       };
 
       // Log successful action

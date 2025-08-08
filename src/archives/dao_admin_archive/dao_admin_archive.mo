@@ -440,6 +440,8 @@ shared (deployer) actor class DAOAdminArchive() = this {
       case (#AdminPermissionGrant(details)) { #AdminPermissionGrant(details) };
       case (#AdminAdd(details)) { #AdminAdd(details) };
       case (#AdminRemove(details)) { #AdminRemove(details) };
+      case (#CanisterStart) { #CanisterStart };
+      case (#CanisterStop) { #CanisterStop };
     };
   };
 
