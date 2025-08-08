@@ -207,6 +207,7 @@ type AdminActionVariant =
    ClearPortfolioCircuitBreakerLogs;
    ClearPriceAlerts;
    ClearSystemLogs;
+   ExecuteTradingCycle;
    ParameterUpdate:
     record {
       newValue: text;
@@ -238,6 +239,7 @@ type AdminActionVariant =
                         newState: SystemState;
                         oldState: SystemState;
                       };
+   TakeManualSnapshot;
    TokenAdd:
     record {
       token: principal;

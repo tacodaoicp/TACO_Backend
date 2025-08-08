@@ -30,6 +30,7 @@ export type AdminActionVariant = { 'StopRebalancing' : null } |
   { 'AdminAdd' : { 'newAdmin' : Principal } } |
   { 'ClearAllTradingPauses' : null } |
   { 'UnpauseToken' : { 'token' : Principal } } |
+  { 'ExecuteTradingCycle' : null } |
   { 'PauseTokenManual' : { 'token' : Principal, 'pauseType' : string } } |
   { 'TokenUnpause' : { 'token' : Principal } } |
   {
@@ -77,6 +78,7 @@ export type AdminActionVariant = { 'StopRebalancing' : null } |
   } |
   { 'TokenRemove' : { 'token' : Principal } } |
   { 'RemoveTriggerCondition' : { 'conditionId' : bigint } } |
+  { 'TakeManualSnapshot' : null } |
   {
     'UpdatePausedTokenThreshold' : {
       'newThreshold' : bigint,

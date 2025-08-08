@@ -38,6 +38,7 @@ export const idlFactory = ({ IDL }) => {
     'AdminAdd' : IDL.Record({ 'newAdmin' : IDL.Principal }),
     'ClearAllTradingPauses' : IDL.Null,
     'UnpauseToken' : IDL.Record({ 'token' : IDL.Principal }),
+    'ExecuteTradingCycle' : IDL.Null,
     'PauseTokenManual' : IDL.Record({
       'token' : IDL.Principal,
       'pauseType' : IDL.Text,
@@ -79,6 +80,7 @@ export const idlFactory = ({ IDL }) => {
     }),
     'TokenRemove' : IDL.Record({ 'token' : IDL.Principal }),
     'RemoveTriggerCondition' : IDL.Record({ 'conditionId' : IDL.Nat }),
+    'TakeManualSnapshot' : IDL.Null,
     'UpdatePausedTokenThreshold' : IDL.Record({
       'newThreshold' : IDL.Nat,
       'oldThreshold' : IDL.Nat,
