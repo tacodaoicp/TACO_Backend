@@ -102,8 +102,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
       return #err(#NotAuthorized);
     };
 
-    // Use original event timestamp from PriceBlockData, not import time!
-    let timestamp = price.timestamp;
+    let timestamp = Time.now();
     let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
     
     // Use base class to store the block
@@ -157,6 +156,31 @@ shared (deployer) actor class PriceArchiveV2() = this {
     };
 
     #ok(Map.get(lastKnownPrices, Map.phash, token));
+  };
+
+  // New method for rewards calculation - get price at specific time
+  public query ({ caller }) func getPriceAtTime(token : Principal, timestamp : Int) : async Result.Result<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}, ArchiveError> {
+    if (not base.isQueryAuthorized(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // For now, return the latest known price as placeholder
+    // This method will need to:
+    // 1. Query ICRC3 blocks to find price at or before the timestamp
+    // 2. Return the most recent price before the given timestamp
+    // 3. Return null if no price exists before that timestamp
+    
+    // Temporary implementation: return latest price if it exists and is before timestamp
+    switch (Map.get(lastKnownPrices, Map.phash, token)) {
+      case (?priceInfo) {
+        if (priceInfo.timestamp <= timestamp) {
+          #ok(?priceInfo);
+        } else {
+          #ok(null); // No price data before this timestamp
+        };
+      };
+      case (null) { #ok(null) };
+    };
   };
 
   //=========================================================================
@@ -234,13 +258,8 @@ shared (deployer) actor class PriceArchiveV2() = this {
         
         base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": lastKnownTime=" # Int.toText(lastKnownTime) # ", final filtered to " # Nat.toText(newPricePoints.size()) # " new price points", "importPriceHistoryBatch");
         
-        // Sort price points chronologically (oldest first) for proper block ordering
-        let sortedPricePoints = Array.sort<TreasuryTypes.PricePoint>(newPricePoints, func(a, b) {
-          Int.compare(a.time, b.time)
-        });
-        
         // Import each new price point from historical data
-        for (pricePoint in sortedPricePoints.vals()) {
+        for (pricePoint in newPricePoints.vals()) {
           let priceData : PriceBlockData = {
             token = token;
             priceICP = pricePoint.icpPrice;
@@ -248,7 +267,6 @@ shared (deployer) actor class PriceArchiveV2() = this {
             source = #NTN;
             volume24h = null;
             change24h = null;
-            timestamp = pricePoint.time; // Use original event timestamp!
           };
           
           let result = await archivePriceBlock(priceData);
@@ -402,6 +420,6 @@ shared (deployer) actor class PriceArchiveV2() = this {
 
   system func postupgrade() {
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(func() : async () { /* no-op */ });
+    base.postupgrade<system>(runPriceBatchImport);
   };
 } 

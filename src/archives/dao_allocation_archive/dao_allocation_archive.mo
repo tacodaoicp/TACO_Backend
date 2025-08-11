@@ -321,6 +321,20 @@ shared (deployer) actor class DAOAllocationArchive() = this {
     };
   };
 
+  // New method for rewards calculation - get allocation changes in time range
+  public query func getAllocationChangesByUserInTimeRange(user : Principal, startTime : Int, endTime : Int) : async Result.Result<[AllocationChangeBlockData], ArchiveError> {
+    if (startTime >= endTime) {
+      return #err(#InvalidTimeRange);
+    };
+
+    // For now, return empty array as placeholder until ICRC3 block querying is fully implemented
+    // This method will need to:
+    // 1. Query ICRC3 blocks in time range
+    // 2. Filter by user
+    // 3. Return allocation change data
+    #ok([]);
+  };
+
   public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
     let totalBlocks = base.getTotalBlocks();
     let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
