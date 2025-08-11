@@ -39,6 +39,10 @@
     "dao_governance_archive": {
       "main": "src/archives/dao_governance_archive/dao_governance_archive.mo",
       "type": "motoko"
+    },
+    "rewards": {
+      "main": "src/rewards/rewards.mo",
+      "type": "motoko"
     }
   },
   "networks": {
