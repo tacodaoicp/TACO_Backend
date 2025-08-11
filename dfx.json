@@ -43,6 +43,10 @@
     "rewards": {
       "main": "src/rewards/rewards.mo",
       "type": "motoko"
+    },
+    "dao_neuron_allocation_archive": {
+      "main": "src/archives/dao_neuron_allocation_archive/dao_neuron_allocation_archive.mo",
+      "type": "motoko"
     }
   },
   "networks": {

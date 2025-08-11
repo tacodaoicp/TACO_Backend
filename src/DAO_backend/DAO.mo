@@ -76,6 +76,8 @@ shared (deployer) actor class ContinuousDAO() = this {
   type UserVotingPowerRecord = DAO_types.UserVotingPowerRecord;
   type NeuronUpdatesSinceResponse = DAO_types.NeuronUpdatesSinceResponse;
   type NeuronRecord = DAO_types.NeuronRecord;
+  type NeuronAllocationChangeRecord = DAO_types.NeuronAllocationChangeRecord;
+  type NeuronAllocationChangesSinceResponse = DAO_types.NeuronAllocationChangesSinceResponse;
   
   // Constants
   let BASIS_POINTS_TOTAL = 10000;
@@ -88,6 +90,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   stable var MAX_ALLOCATIONS_PER_DAY : Int = 5;
   stable var ALLOCATION_WINDOW = 86_400_000_000_000; // 24 hours in nanoseconds
   stable var MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY = 10;
+  stable var MAX_NEURON_ALLOCATION_CHANGES = 10000; // Configurable circular buffer size
 
   stable var sns_governance_canister_id : ?Principal = null;
 
@@ -165,6 +168,11 @@ shared (deployer) actor class ContinuousDAO() = this {
   // Neuron allocation storage
 
   stable var neuronAllocationMap : NeuronAllocationMap = Map.new<Blob, NeuronAllocation>();
+
+  // Circular buffer for neuron allocation changes (FIFO)
+  stable var neuronAllocationChanges : [var ?NeuronAllocationChangeRecord] = Array.init<?NeuronAllocationChangeRecord>(MAX_NEURON_ALLOCATION_CHANGES, null);
+  stable var neuronAllocationChangesHead : Nat = 0;
+  stable var neuronAllocationChangesSize : Nat = 0;
 
   let emptyUserState : UserState = {
     allocations = [];
@@ -685,6 +693,23 @@ shared (deployer) actor class ContinuousDAO() = this {
     Iter.toArray(Map.entries(deltaMap));
   };
 
+  // Helper function to add neuron allocation change to circular buffer (FIFO)
+  private func addNeuronAllocationChange(change: NeuronAllocationChangeRecord) {
+    // Calculate the position to insert (circular buffer)
+    let insertPos = (neuronAllocationChangesHead + neuronAllocationChangesSize) % MAX_NEURON_ALLOCATION_CHANGES;
+    
+    // Insert the new record
+    neuronAllocationChanges[insertPos] := ?change;
+    
+    // Update size and head pointer
+    if (neuronAllocationChangesSize < MAX_NEURON_ALLOCATION_CHANGES) {
+      neuronAllocationChangesSize += 1;
+    } else {
+      // Buffer is full, move head pointer (FIFO - remove oldest)
+      neuronAllocationChangesHead := (neuronAllocationChangesHead + 1) % MAX_NEURON_ALLOCATION_CHANGES;
+    };
+  };
+
   // Updates user's token allocation strategy. Validates total basis points = 10000.
   // Updates aggregate allocation and triggers updates for all followers.
   // Worst-case cost when 1000 max updates: 110 million cycles
@@ -856,6 +881,19 @@ shared (deployer) actor class ContinuousDAO() = this {
               lastAllocationMaker = caller;
             },
           );
+
+          // Log neuron allocation change to circular buffer
+          let neuronAllocationChange: NeuronAllocationChangeRecord = {
+            timestamp = timenow;
+            neuronId = neuron.neuronId;
+            changeType = #UserUpdate({userInitiated = true}); // User-initiated change
+            oldAllocations = existingAlloc;
+            newAllocations = newAllocations;
+            votingPower = neuron.votingPower;
+            maker = caller;
+            reason = null; // No reason for regular user updates
+          };
+          addNeuronAllocationChange(neuronAllocationChange);
         };
 
         // Update user state
@@ -3307,6 +3345,58 @@ shared (deployer) actor class ContinuousDAO() = this {
 
     let response: NeuronUpdatesSinceResponse = {
       neurons = limitedRecords;
+      totalCount = totalCount;
+    };
+
+    #ok(response);
+  };
+
+  // Query method for neuron allocation changes since timestamp (for dao_neuron_allocation_archive)
+  public shared query ({ caller }) func getNeuronAllocationChangesSince(
+    sinceTimestamp: Int, 
+    limit: Nat
+  ) : async Result.Result<NeuronAllocationChangesSinceResponse, AuthorizationError> {
+    // Allow master admins and our own canisters (secure approach)
+    if (not isMasterAdmin(caller)) {
+      return #err(#NotAdmin);
+    };
+
+    if (limit == 0 or limit > 500) {
+      return #err(#UnexpectedError("Invalid limit: must be between 1 and 500"));
+    };
+
+    // Collect neuron allocation changes from circular buffer
+    var allChanges : [NeuronAllocationChangeRecord] = [];
+    
+    // Iterate through the circular buffer
+    for (i in Iter.range(0, neuronAllocationChangesSize - 1)) {
+      let pos = (neuronAllocationChangesHead + i) % MAX_NEURON_ALLOCATION_CHANGES;
+      switch (neuronAllocationChanges[pos]) {
+        case (?change) {
+          if (change.timestamp > sinceTimestamp) {
+            allChanges := Array.append(allChanges, [change]);
+          };
+        };
+        case null {
+          // Should not happen in a properly maintained circular buffer
+        };
+      };
+    };
+
+    // Sort by timestamp (oldest first for proper archive ordering)
+    allChanges := Array.sort(allChanges, func(a: NeuronAllocationChangeRecord, b: NeuronAllocationChangeRecord) : Order.Order {
+      Int.compare(a.timestamp, b.timestamp)
+    });
+    
+    let totalCount = allChanges.size();
+    let limitedChanges = if (totalCount > limit) {
+      Array.subArray(allChanges, 0, limit)
+    } else {
+      allChanges
+    };
+
+    let response: NeuronAllocationChangesSinceResponse = {
+      changes = limitedChanges;
       totalCount = totalCount;
     };
 

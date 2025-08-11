@@ -41,5 +41,8 @@
   "validation": {
     "ic": "th44n-iyaaa-aaaan-qzz5a-cai",
     "staging": "tbrfi-jiaaa-aaaai-atifq-cai"
+  },
+  "dao_neuron_allocation_archive": {
+    "staging": "cajb4-qqaaa-aaaan-qz5la-cai"
   }
 }
