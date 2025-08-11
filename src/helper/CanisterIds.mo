@@ -16,6 +16,7 @@ module CanisterId {
         #dao_admin_archive;
         #dao_governance_archive;
         #dao_allocation_archive;
+        #rewards;
     };
     
     // Define the environments
@@ -38,6 +39,7 @@ module CanisterId {
             (#Staging, #dao_admin_archive, Principal.fromText("b6ygs-xaaaa-aaaan-qz5ca-cai")),
             (#Staging, #dao_governance_archive, Principal.fromText("bzzag-2yaaa-aaaan-qz5cq-cai")),
             (#Staging, #dao_allocation_archive, Principal.fromText("bq2l2-mqaaa-aaaan-qz5da-cai")),
+            (#Staging, #rewards, Principal.fromText("cjkka-gyaaa-aaaan-qz5kq-cai")), // Placeholder ID
 
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),
@@ -49,7 +51,8 @@ module CanisterId {
             (#Production, #price_archive, Principal.fromText("bm6rl-3qaaa-aaaan-qz5ba-cai")),
             (#Production, #dao_admin_archive, Principal.fromText("cspwf-4aaaa-aaaan-qz5ia-cai")),
             (#Production, #dao_governance_archive, Principal.fromText("c4n3n-hqaaa-aaaan-qz5ja-cai")),
-            (#Production, #dao_allocation_archive, Principal.fromText("cvoqr-ryaaa-aaaan-qz5iq-cai"))
+            (#Production, #dao_allocation_archive, Principal.fromText("cvoqr-ryaaa-aaaan-qz5iq-cai")),
+            (#Production, #rewards, Principal.fromText("aaaaa-aa")) // Placeholder ID
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {
