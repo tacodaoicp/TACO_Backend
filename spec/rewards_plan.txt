@@ -1,0 +1,7 @@
+Assign a value of 1 to the user's starting allocation. Then assign proportional value to each asset, so if the user allocation was 25 X, 25 Y and 50 Z, we would assign a value of 0.25 to the user's X holding, 0.25 to the Y holding, and 0.5 to the Z. Then we check the prices at this time and record them. 
+
+Then we go to the first allocation change. We see the new prices of X Y and Z. If X has gone up 10%, then the value of the user's X holding went up 10% to 0.275 (0.25 * 1.1). We adjust the values of the user's Y and Z holdings as well. This is the new value at this checkpoint time (NB: using the user's yet unchanged allocations!) So if each asset (for simplicity of math here) went up 10%, the new portfolio value would be 1.1 (no longer 1). 
+
+Then we look at the new allocations. Let's say the user now has a 10 X, 10Y, 80 Z allocation. Well, we know the new portfolio value before the realloc, it was in our example 1.1. So, the value of the user's X allocation is now 10% of 1.1, so 0.11, so is the Y allocation, and Z is worth 0.8 * 1.1 = 0.88
+
+Then we go to the next allocation point. Here we redo the same thing. We look at how the price of each asset has developed. Say X has gone down 50% (!) then X was worth 0.11 at the last checkpoint, and is thus worth 0.055. Etc etc, until we reach the end-of-week which acts as a "last checkpoint" and we check the prices at end-of-week to determine the final value of each asset for the user, add them up and get the final score. 

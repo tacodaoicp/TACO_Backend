@@ -102,7 +102,8 @@ shared (deployer) actor class PriceArchiveV2() = this {
       return #err(#NotAuthorized);
     };
 
-    let timestamp = Time.now();
+    // Use original event timestamp from PriceBlockData, not import time!
+    let timestamp = price.timestamp;
     let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
     
     // Use base class to store the block
@@ -160,26 +161,113 @@ shared (deployer) actor class PriceArchiveV2() = this {
 
   // New method for rewards calculation - get price at specific time
   public query ({ caller }) func getPriceAtTime(token : Principal, timestamp : Int) : async Result.Result<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}, ArchiveError> {
-    if (not base.isQueryAuthorized(caller)) {
-      return #err(#NotAuthorized);
+    // Query method is open for everyone. (Data not sensitive and query methods are free)
+    //if (not base.isQueryAuthorized(caller)) {
+    //  return #err(#NotAuthorized);
+    //};
+
+    // Query ICRC3 blocks to find the most recent price for this token at or before the timestamp
+    let filter : ArchiveTypes.BlockFilter = {
+      blockTypes = ?[#Price]; // Only price blocks
+      startTime = null; // No start time limit
+      endTime = ?timestamp; // Up to the requested timestamp
+      tokens = ?[token]; // Only for this specific token
+      traders = null;
+      minAmount = null;
+      maxAmount = null;
     };
 
-    // For now, return the latest known price as placeholder
-    // This method will need to:
-    // 1. Query ICRC3 blocks to find price at or before the timestamp
-    // 2. Return the most recent price before the given timestamp
-    // 3. Return null if no price exists before that timestamp
-    
-    // Temporary implementation: return latest price if it exists and is before timestamp
-    switch (Map.get(lastKnownPrices, Map.phash, token)) {
-      case (?priceInfo) {
-        if (priceInfo.timestamp <= timestamp) {
-          #ok(?priceInfo);
-        } else {
-          #ok(null); // No price data before this timestamp
+    switch (base.queryBlocks(filter, caller)) {
+      case (#ok(queryResult)) {
+        // Find the most recent price block for this token
+        var mostRecentPrice : ?{icpPrice: Nat; usdPrice: Float; timestamp: Int} = null;
+        var mostRecentTimestamp : Int = -1;
+
+        for (block in queryResult.blocks.vals()) {
+          switch (block.block) {
+            case (#Map(entries)) {
+              // Check if this is a price block by looking for operation type
+              var isPriceBlock = false;
+              for ((key, value) in entries.vals()) {
+                switch (key, value) {
+                  case ("operation", #Text("3price")) {
+                    isPriceBlock := true;
+                  };
+                  case _ {};
+                };
+              };
+              
+              if (isPriceBlock) {
+                switch (convertValueToPriceData(#Map(entries))) {
+                  case (?priceData) {
+                    if (Principal.equal(priceData.token, token) and 
+                        priceData.timestamp <= timestamp and 
+                        priceData.timestamp > mostRecentTimestamp) {
+                      mostRecentTimestamp := priceData.timestamp;
+                      mostRecentPrice := ?{
+                        icpPrice = priceData.priceICP;
+                        usdPrice = priceData.priceUSD;
+                        timestamp = priceData.timestamp;
+                      };
+                    };
+                  };
+                  case null {};
+                };
+              };
+            };
+            case _ {};
+          };
+        };
+
+        #ok(mostRecentPrice);
+      };
+      case (#err(error)) { #err(error) };
+    };
+  };
+
+  // Helper function to convert Value back to PriceBlockData
+  private func convertValueToPriceData(value : ArchiveTypes.Value) : ?ArchiveTypes.PriceBlockData {
+    switch (value) {
+      case (#Map(fields)) {
+        // Extract fields from the Value map
+        var token : ?Principal = null;
+        var priceICP : ?Nat = null;
+        var priceUSD : ?Float = null;
+        var timestamp : ?Int = null;
+        var source : ?ArchiveTypes.PriceSource = null;
+        var volume24h : ?Nat = null;
+        var change24h : ?Float = null;
+
+        for ((key, val) in fields.vals()) {
+          switch (key, val) {
+            case ("token", #Blob(b)) { 
+              try { token := ?Principal.fromBlob(b) } catch (_) {};
+            };
+            case ("priceICP", #Nat(p)) { priceICP := ?p };
+            case ("priceUSD", #Float(p)) { priceUSD := ?p };
+            case ("timestamp", #Int(t)) { timestamp := ?t };
+            // TODO: Parse source, volume24h, change24h if needed
+            case _ {};
+          };
+        };
+
+        // Return the parsed data if we have the required fields
+        switch (token, priceICP, priceUSD, timestamp) {
+          case (?t, ?icp, ?usd, ?ts) {
+            ?{
+              token = t;
+              priceICP = icp;
+              priceUSD = usd;
+              timestamp = ts;
+              source = switch (source) { case (?s) s; case null #Aggregated };
+              volume24h = switch (volume24h) { case (?v) v; case null null };
+              change24h = switch (change24h) { case (?c) c; case null null };
+            };
+          };
+          case _ { null };
         };
       };
-      case (null) { #ok(null) };
+      case _ { null };
     };
   };
 
@@ -258,8 +346,13 @@ shared (deployer) actor class PriceArchiveV2() = this {
         
         base.logger.info("Batch Import", "Token " # details.tokenSymbol # ": lastKnownTime=" # Int.toText(lastKnownTime) # ", final filtered to " # Nat.toText(newPricePoints.size()) # " new price points", "importPriceHistoryBatch");
         
+        // Sort price points chronologically (oldest first) for proper block ordering
+        let sortedPricePoints = Array.sort<TreasuryTypes.PricePoint>(newPricePoints, func(a, b) {
+          Int.compare(a.time, b.time)
+        });
+        
         // Import each new price point from historical data
-        for (pricePoint in newPricePoints.vals()) {
+        for (pricePoint in sortedPricePoints.vals()) {
           let priceData : PriceBlockData = {
             token = token;
             priceICP = pricePoint.icpPrice;
@@ -267,6 +360,7 @@ shared (deployer) actor class PriceArchiveV2() = this {
             source = #NTN;
             volume24h = null;
             change24h = null;
+            timestamp = pricePoint.time; // Use original event timestamp!
           };
           
           let result = await archivePriceBlock(priceData);
@@ -420,6 +514,6 @@ shared (deployer) actor class PriceArchiveV2() = this {
 
   system func postupgrade() {
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(runPriceBatchImport);
+    base.postupgrade<system>(func() : async () { /* no-op */ });
   };
 } 

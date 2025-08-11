@@ -30,6 +30,7 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   type ArchiveError = ArchiveTypes.ArchiveError;
   type AllocationChangeType = ArchiveTypes.AllocationChangeType;
   type FollowActionType = ArchiveTypes.FollowActionType;
+  type Allocation = ArchiveTypes.Allocation;
 
   // Initialize the generic base class with allocation-specific configuration
   private let initialConfig : ArchiveTypes.ArchiveConfig = {
@@ -322,17 +323,110 @@ shared (deployer) actor class DAOAllocationArchive() = this {
   };
 
   // New method for rewards calculation - get allocation changes in time range
-  public query func getAllocationChangesByUserInTimeRange(user : Principal, startTime : Int, endTime : Int) : async Result.Result<[AllocationChangeBlockData], ArchiveError> {
+  public query ({ caller }) func getAllocationChangesByUserInTimeRange(user : Principal, startTime : Int, endTime : Int) : async Result.Result<[AllocationChangeBlockData], ArchiveError> {
     if (startTime >= endTime) {
       return #err(#InvalidTimeRange);
     };
 
-    // For now, return empty array as placeholder until ICRC3 block querying is fully implemented
-    // This method will need to:
-    // 1. Query ICRC3 blocks in time range
-    // 2. Filter by user
-    // 3. Return allocation change data
-    #ok([]);
+    // Use base class query functionality with filters
+    let filter : ArchiveTypes.BlockFilter = {
+      blockTypes = ?[#AllocationChange]; // Only allocation change blocks
+      startTime = ?startTime;
+      endTime = ?endTime;
+      tokens = null;
+      traders = ?[user]; // Filter by user (using traders field as user filter)
+      minAmount = null;
+      maxAmount = null;
+    };
+
+    switch (base.queryBlocks(filter, caller)) {
+      case (#ok(queryResult)) {
+        // Convert the generic blocks to AllocationChangeBlockData
+        let allocationChanges = Array.mapFilter<ArchiveTypes.Block, AllocationChangeBlockData>(
+          queryResult.blocks,
+          func(block) {
+            // Extract AllocationChangeBlockData from the block
+            switch (block.block) {
+              case (#Map(entries)) {
+                // Check if this is an allocation change block by looking for operation type
+                var isAllocationChange = false;
+                for ((key, value) in entries.vals()) {
+                  switch (key, value) {
+                    case ("operation", #Text("3allocation_change")) {
+                      isAllocationChange := true;
+                    };
+                    case _ {};
+                  };
+                };
+                
+                if (isAllocationChange) {
+                  convertValueToAllocationChange(#Map(entries));
+                } else {
+                  null;
+                };
+              };
+              case _ { null };
+            };
+          }
+        );
+        #ok(allocationChanges);
+      };
+      case (#err(error)) { #err(error) };
+    };
+  };
+
+  // Helper function to convert Value back to AllocationChangeBlockData
+  private func convertValueToAllocationChange(value : ArchiveTypes.Value) : ?AllocationChangeBlockData {
+    switch (value) {
+      case (#Map(fields)) {
+        // Extract fields from the Value map
+        var id : ?Nat = null;
+        var timestamp : ?Int = null;
+        var user : ?Principal = null;
+        var changeType : ?AllocationChangeType = null;
+        var oldAllocations : ?[Allocation] = null;
+        var newAllocations : ?[Allocation] = null;
+        var votingPower : ?Nat = null;
+        var maker : ?Principal = null;
+        var reason : ?Text = null;
+
+        for ((key, val) in fields.vals()) {
+          switch (key, val) {
+            case ("id", #Nat(n)) { id := ?n };
+            case ("timestamp", #Int(t)) { timestamp := ?t };
+            case ("user", #Blob(b)) { 
+              try { user := ?Principal.fromBlob(b) } catch (_) {};
+            };
+            case ("maker", #Blob(b)) { 
+              try { maker := ?Principal.fromBlob(b) } catch (_) {};
+            };
+            case ("votingPower", #Nat(vp)) { votingPower := ?vp };
+            case ("reason", #Text(r)) { reason := ?r };
+            // TODO: Parse changeType, oldAllocations, newAllocations from their Value representations
+            case _ {};
+          };
+        };
+
+        // Return the parsed data if we have the required fields
+        switch (id, timestamp, user, maker, votingPower) {
+          case (?i, ?t, ?u, ?m, ?vp) {
+            ?{
+              id = i;
+              timestamp = t;
+              user = u;
+              changeType = switch (changeType) { case (?ct) ct; case null #SystemRebalance };
+              oldAllocations = switch (oldAllocations) { case (?oa) oa; case null [] };
+              newAllocations = switch (newAllocations) { case (?na) na; case null [] };
+              votingPower = vp;
+              maker = m;
+              reason = reason;
+            };
+          };
+          case _ { null };
+        };
+      };
+      case _ { null };
+    };
   };
 
   public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
