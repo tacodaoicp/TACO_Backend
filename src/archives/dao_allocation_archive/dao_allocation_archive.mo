@@ -395,10 +395,16 @@ shared (deployer) actor class DAOAllocationArchive() = this {
             case ("id", #Nat(n)) { id := ?n };
             case ("timestamp", #Int(t)) { timestamp := ?t };
             case ("user", #Blob(b)) { 
-              try { user := ?Principal.fromBlob(b) } catch (_) {};
+              // Principal.fromBlob can trap, so we need to handle it carefully
+              if (b.size() == 29) { // Valid principal blob size
+                user := ?Principal.fromBlob(b);
+              };
             };
             case ("maker", #Blob(b)) { 
-              try { maker := ?Principal.fromBlob(b) } catch (_) {};
+              // Principal.fromBlob can trap, so we need to handle it carefully  
+              if (b.size() == 29) { // Valid principal blob size
+                maker := ?Principal.fromBlob(b);
+              };
             };
             case ("votingPower", #Nat(vp)) { votingPower := ?vp };
             case ("reason", #Text(r)) { reason := ?r };
