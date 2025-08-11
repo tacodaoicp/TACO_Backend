@@ -241,7 +241,10 @@ shared (deployer) actor class PriceArchiveV2() = this {
         for ((key, val) in fields.vals()) {
           switch (key, val) {
             case ("token", #Blob(b)) { 
-              try { token := ?Principal.fromBlob(b) } catch (_) {};
+              // Principal.fromBlob can trap, so we need to handle it carefully
+              if (b.size() == 29) { // Valid principal blob size
+                token := ?Principal.fromBlob(b);
+              };
             };
             case ("priceICP", #Nat(p)) { priceICP := ?p };
             case ("priceUSD", #Float(p)) { priceUSD := ?p };
@@ -260,8 +263,8 @@ shared (deployer) actor class PriceArchiveV2() = this {
               priceUSD = usd;
               timestamp = ts;
               source = switch (source) { case (?s) s; case null #Aggregated };
-              volume24h = switch (volume24h) { case (?v) v; case null null };
-              change24h = switch (change24h) { case (?c) c; case null null };
+              volume24h = volume24h; // Already optional
+              change24h = change24h; // Already optional
             };
           };
           case _ { null };
