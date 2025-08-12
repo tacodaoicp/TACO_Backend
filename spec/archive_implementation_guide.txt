@@ -1,0 +1,325 @@
+# TACO DAO Archive Implementation Guide
+
+This guide provides a comprehensive checklist for implementing a new archive canister in the TACO DAO system. Follow ALL steps to ensure complete, correct, consistent, and compatible implementation.
+
+## Overview
+Archives in TACO DAO follow a standardized pattern using:
+- ICRC3 standard for data storage and querying
+- ArchiveBase class for common functionality
+- Circular buffers in source canisters for recent data
+- Batch import systems for periodic data synchronization
+- Standardized admin interface integration
+
+## Step-by-Step Implementation Checklist
+
+### 1. Planning Phase
+- [ ] **Define Data Structure**: Determine what data the archive will store
+- [ ] **Identify Source**: Determine which canister will provide the data
+- [ ] **Define Block Type**: Create the block data type that will be stored in ICRC3
+- [ ] **Plan Indexing**: Determine what indexes are needed (by user, timestamp, etc.)
+
+### 2. Type Definitions
+
+#### 2.1 Add Types to archive_types.mo
+- [ ] **Block Data Type**: Add your `XxxBlockData` type to `archive_types.mo`
+- [ ] **Conversion Function**: Add `xxxToValue` function to convert your type to ICRC3 Value
+- [ ] **Error Types**: Add any specific error types if needed
+- [ ] **Query Response Types**: Add response types for query methods
+
+#### 2.2 Add Types to Source Canister Types (if needed)
+- [ ] **Record Type**: Add record type for circular buffer storage
+- [ ] **Response Type**: Add response type for `getXxxSince` method
+- [ ] **Interface Method**: Add method signature to the canister's `Self` interface
+
+### 3. Source Canister Modifications (if using circular buffer pattern)
+
+#### 3.1 Add Circular Buffer to Source Canister
+- [ ] **Buffer Size**: Add configurable `MAX_XXX_CHANGES` stable variable (default 10,000)
+- [ ] **Buffer Storage**: Add `[var ?XxxRecord]` stable variable for FIFO circular buffer
+- [ ] **Buffer Pointers**: Add `head` and `size` tracking variables
+- [ ] **Add Function**: Implement `addXxxChange` helper function with FIFO logic
+- [ ] **Integration**: Call `addXxxChange` in relevant business logic methods
+
+#### 3.2 Add Query Method to Source Canister
+- [ ] **Method Signature**: `public shared query ({ caller }) func getXxxSince(sinceTimestamp: Int, limit: Nat)`
+- [ ] **Authorization**: Use appropriate authorization check
+- [ ] **Filter Logic**: Filter by timestamp and limit results
+- [ ] **Response**: Return filtered records in standardized response format
+
+### 4. Archive Canister Implementation
+
+#### 4.1 File Structure
+- [ ] **Create Directory**: `src/archives/xxx_archive/`
+- [ ] **Main File**: `xxx_archive.mo` following exact naming pattern
+
+#### 4.2 Imports (Copy exactly from existing archives)
+```motoko
+import Time "mo:base/Time";
+import Principal "mo:base/Principal";
+import Result "mo:base/Result";
+import Array "mo:base/Array";
+import Map "mo:map/Map";
+import Int "mo:base/Int";
+import Nat "mo:base/Nat";
+import Text "mo:base/Text";
+import Error "mo:base/Error";
+import Debug "mo:base/Debug";
+
+import ICRC3 "mo:icrc3-mo";
+import ICRC3Service "mo:icrc3-mo/service";
+import ArchiveTypes "../archive_types";
+import DAOTypes "../../DAO_backend/dao_types";
+import CanisterIds "../../helper/CanisterIds";
+import ArchiveBase "../../helper/archive_base";
+import Logger "../../helper/logger";
+import BatchImportTimer "../../helper/batch_import_timer";
+```
+
+#### 4.3 Actor Class Structure
+- [ ] **Actor Declaration**: `shared (deployer) actor class XxxArchive() = this`
+- [ ] **Canister ID Helper**: `private func this_canister_id() : Principal`
+- [ ] **Type Aliases**: Define local types to avoid circular dependencies
+- [ ] **Configuration**: Set up archive configuration
+- [ ] **Base Initialization**: Initialize `ArchiveBase` with proper parameters
+
+#### 4.4 Core Data Structures
+- [ ] **Stable Variables**: For indexes (xxxIndex, makerIndex, etc.)
+- [ ] **Counters**: totalXxx, xxxCounter variables
+- [ ] **ICRC3 Setup**: Initialize ICRC3 with proper configuration
+
+#### 4.5 Index Management
+- [ ] **Update Functions**: `updateXxxIndex`, `updateMakerIndex`, etc.
+- [ ] **Index Types**: Use appropriate Map types (phash for Principal, thash for Text, etc.)
+- [ ] **Array Append**: Use `Array.append` for adding to index arrays
+
+#### 4.6 Core Archive Method
+- [ ] **Archive Function**: `archiveXxx(data: XxxBlockData) : async Result<Nat, Text>`
+- [ ] **Block Creation**: Create ICRC3 block with proper timestamp and data
+- [ ] **Index Updates**: Update all relevant indexes
+- [ ] **Counter Updates**: Increment counters
+- [ ] **Return Block Index**: Return the block index on success
+
+#### 4.7 Query Methods
+- [ ] **By Primary Key**: `getXxxByYyy(yyy: Yyy, startIndex: ?Nat, length: Nat)`
+- [ ] **By Maker**: `getXxxByMaker(maker: Principal, startIndex: ?Nat, length: Nat)`
+- [ ] **By Time Range**: `getXxxByYyyInTimeRange(yyy: Yyy, startTime: Int, endTime: Int)`
+- [ ] **Authorization**: All query methods need `#ArchiveData` authorization check
+- [ ] **ICRC3 Queries**: Use `base.icrc3().get_blocks` for data retrieval
+- [ ] **Data Conversion**: Convert ICRC3 Value back to your block data type
+
+#### 4.8 Standard Archive Management Methods (REQUIRED for admin interface)
+```motoko
+public query func getBatchImportStatus() : async {isRunning: Bool; intervalSeconds: Nat} {
+  base.getBatchImportStatus();
+};
+
+public query func getTimerStatus() : async BatchImportTimer.TimerStatus {
+  base.getTimerStatus();
+};
+
+public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveTypes.ArchiveStatus, ArchiveError> {
+  if (not base.isAuthorized(caller, #GetMetrics)) {
+    return #err(#NotAuthorized);
+  };
+  #ok({
+    totalBlocks = base.getTotalBlocks();
+    lastArchiveTime = 0;
+    newestBlock = null;
+    oldestBlock = null;
+    storageUsed = 0;
+    supportedBlockTypes = ["YourBlockType"];
+  });
+};
+
+public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
+  base.getLogs(count, caller);
+};
+
+public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
+  await base.startAdvancedBatchImportSystem<system>(caller, null, null, null);
+};
+
+public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
+  base.stopBatchImportSystem(caller);
+};
+
+public shared ({ caller }) func stopAllTimers() : async Result.Result<Text, Text> {
+  base.stopAllTimers(caller);
+};
+
+public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
+  await base.runAdvancedManualBatchImport<system>(caller, null, null, null);
+};
+
+public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
+  base.setMaxInnerLoopIterations(caller, iterations);
+};
+
+public shared ({ caller }) func resetImportTimestamps() : async Result.Result<Text, Text> {
+  if (not base.isAuthorized(caller, #UpdateConfig)) {
+    return #err("Not authorized");
+  };
+  #ok("Import timestamps reset");
+};
+
+public shared ({ caller }) func importXxx<system>() : async Result.Result<Text, Text> {
+  if (not base.isAuthorized(caller, #UpdateConfig)) {
+    return #err("Not authorized");
+  };
+  // TODO: Implement actual import logic
+  #ok("Import completed");
+};
+```
+
+#### 4.9 ICRC3 Interface Methods (REQUIRED)
+```motoko
+public query func icrc3_get_archives(args: ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
+  base.icrc3().get_archives(args);
+};
+
+public query func icrc3_get_tip_certificate() : async ?ICRC3.DataCertificate {
+  base.icrc3().get_tip_certificate();
+};
+
+public query func icrc3_get_blocks(args: ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
+  base.icrc3().get_blocks(args);
+};
+
+public query func icrc3_supported_block_types() : async [ICRC3.BlockType] {
+  base.icrc3().supported_block_types();
+};
+```
+
+#### 4.10 System Functions
+```motoko
+public func getArchiveStats() : async {
+  totalBlocks: Nat;
+  totalXxx: Nat;
+  // Add other relevant stats
+} {
+  {
+    totalBlocks = base.getTotalBlocks();
+    totalXxx = totalXxx;
+  };
+};
+
+system func preupgrade() {
+  base.preupgrade();
+};
+
+system func postupgrade() {
+  base.postupgrade();
+};
+```
+
+### 5. Configuration Updates
+
+#### 5.1 dfx.json
+- [ ] **Add Canister Entry**: Add new archive to canisters section
+- [ ] **Correct Type**: Use `"type": "motoko"`
+- [ ] **Main File**: Point to correct `.mo` file
+
+#### 5.2 canister_ids.json
+- [ ] **Add Canister ID**: Add placeholder ID for new archive
+- [ ] **Staging and IC**: Add entries for both environments
+
+#### 5.3 CanisterIds.mo
+- [ ] **Add Canister Type**: Add `#xxx_archive` to `CanisterType` enum
+- [ ] **Add IDs**: Add placeholder IDs for staging and production
+
+### 6. Frontend Integration
+
+#### 6.1 AdminArchiveView.vue Updates
+- [ ] **Import Declaration**: Add import for new archive actor
+- [ ] **Dropdown Option**: Add option to archive selection dropdown with appropriate emoji
+- [ ] **Data Property**: Add `xxxActor: null` to data section
+- [ ] **Actor Mapping**: Add case in `currentArchiveActor` computed property
+- [ ] **Canister ID Method**: Add `xxxArchiveCanisterId()` method
+- [ ] **Actor Initialization**: Add actor creation in `mounted()` lifecycle
+- [ ] **Styling**: Add case in archive styling method (choose appropriate color)
+- [ ] **Status Description**: Add case in archive status method
+- [ ] **Template Section**: Add conditional template section for archive-specific actions
+
+#### 6.2 Template Section Example
+```vue
+<div v-if="selectedArchive === 'xxx_archive'" class="mt-3">
+  <h6>Xxx Archive</h6>
+  <div class="d-flex flex-wrap gap-2">
+    <button 
+      class="btn btn-sm btn-outline-primary" 
+      @click="runArchiveSpecificImport('importXxx')"
+      :disabled="loading"
+    >
+      🔄 Import Xxx Data
+    </button>
+  </div>
+</div>
+```
+
+### 7. Testing and Validation
+
+#### 7.1 Compilation
+- [ ] **Archive Compiles**: `dfx build xxx_archive --check`
+- [ ] **Source Canister Compiles**: Verify source canister still builds
+- [ ] **No Linter Errors**: Use `read_lints` to verify clean compilation
+
+#### 7.2 Deployment
+- [ ] **Deploy Archive**: `dfx deploy xxx_archive`
+- [ ] **Deploy Source**: Redeploy source canister if modified
+- [ ] **Generate Declarations**: `dfx generate` for frontend types
+
+#### 7.3 Admin Interface
+- [ ] **Archive Appears**: Verify new archive appears in dropdown
+- [ ] **Status Methods**: Verify getTimerStatus, getBatchImportStatus work
+- [ ] **Import Button**: Verify import method can be called
+- [ ] **No JavaScript Errors**: Check browser console
+
+### 8. Authorization Types Reference
+Use these exact authorization types:
+- `#ArchiveData` - For query methods accessing archive data
+- `#GetMetrics` - For status and metrics methods
+- `#GetLogs` - For log access methods
+- `#UpdateConfig` - For configuration and import methods
+- `#DeleteData` - For data deletion methods
+
+### 9. Common Pitfalls and Solutions
+
+#### 9.1 Circular Dependencies
+- **Problem**: Importing types causes circular dependencies
+- **Solution**: Define types locally in archive files, avoid cross-imports
+
+#### 9.2 ICRC3 Value Conversion
+- **Problem**: Complex type conversion to/from ICRC3 Value
+- **Solution**: Follow existing patterns in archive_types.mo exactly
+
+#### 9.3 Authorization Errors
+- **Problem**: Using wrong authorization permission types
+- **Solution**: Use only the 5 valid types listed in section 8
+
+#### 9.4 Method Signatures
+- **Problem**: Admin interface expects specific method signatures
+- **Solution**: Copy method signatures exactly from working archives
+
+#### 9.5 Index Management
+- **Problem**: Inefficient querying due to missing indexes
+- **Solution**: Create indexes for all query patterns you need to support
+
+### 10. Final Checklist
+
+Before considering the archive complete:
+- [ ] **All compilation passes**: No errors or warnings
+- [ ] **Admin interface integration**: Archive appears and functions work
+- [ ] **Query methods work**: Can retrieve data through all query paths
+- [ ] **Indexes are efficient**: Query performance is acceptable
+- [ ] **Authorization is correct**: All methods have proper auth checks
+- [ ] **Error handling**: Proper error types and messages
+- [ ] **Documentation**: Code is well-commented
+- [ ] **Follows patterns**: Exactly matches existing archive structure
+
+## Notes
+- **NEVER** deviate from existing patterns without explicit approval
+- **ALWAYS** copy method signatures exactly from working archives
+- **ALWAYS** test admin interface integration before considering complete
+- **REMEMBER** that production systems depend on this infrastructure being consistent
+
+This guide ensures that every new archive follows the exact same patterns as existing archives, maintaining system consistency and compatibility.
