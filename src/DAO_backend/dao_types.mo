@@ -268,6 +268,29 @@ module {
     users: [Principal]; // Users who have this neuron
   };
 
+  public type AllocationChangeType = {
+    #UserUpdate: {userInitiated: Bool};
+    #FollowAction: {followedUser: Principal};
+    #SystemRebalance;
+    #VotingPowerChange;
+  };
+
+  public type NeuronAllocationChangeRecord = {
+    timestamp: Int;
+    neuronId: Blob;
+    changeType: AllocationChangeType;
+    oldAllocations: [Allocation];
+    newAllocations: [Allocation];
+    votingPower: Nat;
+    maker: Principal;
+    reason: ?Text;
+  };
+
+  public type NeuronAllocationChangesSinceResponse = {
+    changes: [NeuronAllocationChangeRecord];
+    totalCount: Nat;
+  };
+
   public type Self = actor {
     updateAllocation : shared ([Allocation]) -> async Result.Result<Text, UpdateError>;
     getAggregateAllocation : shared query () -> async [(Principal, Nat)];
@@ -310,5 +333,6 @@ module {
     getFollowActionsSince : shared query (Int, Nat) -> async Result.Result<FollowActionsSinceResponse, AuthorizationError>;
     getVotingPowerChangesSince : shared query (Int, Nat) -> async Result.Result<VotingPowerChangesSinceResponse, AuthorizationError>;
     getNeuronUpdatesSince : shared query (Int, Nat) -> async Result.Result<NeuronUpdatesSinceResponse, AuthorizationError>;
+    getNeuronAllocationChangesSince : shared query (Int, Nat) -> async Result.Result<NeuronAllocationChangesSinceResponse, AuthorizationError>;
   };
 };
