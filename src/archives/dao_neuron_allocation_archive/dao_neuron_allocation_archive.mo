@@ -342,18 +342,7 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
   };
 
   public query ({ caller }) func getArchiveStatus() : async Result.Result<ArchiveTypes.ArchiveStatus, ArchiveError> {
-    if (not base.isAuthorized(caller, #GetMetrics)) {
-      return #err(#NotAuthorized);
-    };
-    
-    #ok({
-      totalBlocks = base.getTotalBlocks();
-      lastArchiveTime = 0; // Not implemented for this archive
-      newestBlock = null;
-      oldestBlock = null;
-      storageUsed = 0;
-      supportedBlockTypes = ["NeuronAllocationChange"];
-    });
+    base.getArchiveStatus(caller);
   };
 
   public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
