@@ -267,6 +267,65 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
   };
 
   //=========================================================================
+  // Import Logic
+  //=========================================================================
+
+  // Import function that fetches data from DAO canister
+  private func importBatchData<system>() : async {imported: Nat; failed: Nat} {
+    var totalImported = 0;
+    var totalFailed = 0;
+    
+    try {
+      // Get DAO canister actor
+      let canisterIds = CanisterIds.CanisterIds(this_canister_id());
+      let daoCanisterId = canisterIds.getCanisterId(#DAO_backend);
+      let daoActor : DAOTypes.Self = actor(Principal.toText(daoCanisterId));
+      
+      // Get the last timestamp we imported (for now, start from 0)
+      let sinceTimestamp = 0; // TODO: Track last import timestamp
+      let limit = 100; // Import in batches
+      
+      // Fetch neuron allocation changes from DAO
+      let result = await daoActor.getNeuronAllocationChangesSince(sinceTimestamp, limit);
+      
+      switch (result) {
+        case (#ok(response)) {
+          // Process each neuron allocation change
+          for (change in response.changes.vals()) {
+            try {
+              // Convert to block data format
+              let blockData : NeuronAllocationChangeBlockData = {
+                id = totalNeuronAllocationChanges; // Use current count as unique ID
+                neuronId = change.neuronId;
+                timestamp = change.timestamp;
+                changeType = change.changeType;
+                oldAllocations = change.oldAllocations;
+                newAllocations = change.newAllocations;
+                votingPower = change.votingPower;
+                maker = change.maker;
+                reason = change.reason;
+              };
+              
+              // Archive the data
+              switch (await archiveNeuronAllocationChange(blockData)) {
+                case (#ok(_)) { totalImported += 1; };
+                case (#err(_)) { totalFailed += 1; };
+              };
+            } catch (e) {
+              totalFailed += 1;
+            };
+          };
+        };
+        case (#err(_)) { totalFailed += 1; };
+      };
+    } catch (e) {
+      totalFailed += 1;
+    };
+    
+    {imported = totalImported; failed = totalFailed};
+  };
+
+  //=========================================================================
   // Standard Archive Management Methods (required by admin interface)
   //=========================================================================
 
@@ -298,7 +357,7 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
   };
 
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
-    await base.startAdvancedBatchImportSystem<system>(caller, null, null, null);
+    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importBatchData);
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
@@ -310,7 +369,7 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
   };
 
   public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
-    await base.runAdvancedManualBatchImport<system>(caller, null, null, null);
+    await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importBatchData);
   };
 
   public shared ({ caller }) func setMaxInnerLoopIterations(iterations: Nat) : async Result.Result<Text, Text> {
