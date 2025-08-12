@@ -8,6 +8,8 @@ import Nat "mo:base/Nat";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
 import Debug "mo:base/Debug";
+import Iter "mo:base/Iter";
+import Blob "mo:base/Blob";
 
 import ICRC3 "mo:icrc3-mo";
 import ICRC3Service "mo:icrc3-mo/service";
@@ -194,8 +196,43 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
       case null { return #ok([]) };
     };
 
-    // For now, return empty results - we'll enhance this later
-    #ok([]);
+    var results : [NeuronAllocationChangeBlockData] = [];
+    
+    // Convert to array and take only up to limit
+    let indicesArray = Iter.toArray(blockIndices.vals());
+    let limitedIndices = if (Array.size(indicesArray) > limit) {
+      Array.subArray(indicesArray, 0, limit);
+    } else {
+      indicesArray;
+    };
+    
+    // Iterate through the limited block indices
+    for (blockIndex in limitedIndices.vals()) {
+      // Get the specific block using ICRC3
+      let getBlocksArgs = [{
+        start = blockIndex;
+        length = 1;
+      }];
+      
+      let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+      
+      // Process the single block if available
+      if (Array.size(icrc3Result.blocks) > 0) {
+        let block = icrc3Result.blocks[0];
+        
+        // Parse the block to extract neuron allocation change data (no time filtering)
+        switch (parseBlockForNeuronAllocationNoTimeFilter(block, neuronId)) {
+          case (?changeData) {
+            results := Array.append(results, [changeData]);
+          };
+          case (_) {
+            // Block doesn't match our criteria
+          };
+        };
+      };
+    };
+    
+    #ok(results);
   };
 
   public shared query ({ caller }) func getNeuronAllocationChangesByMaker(maker: Principal, limit: Nat) : async Result.Result<[NeuronAllocationChangeBlockData], ArchiveError> {
@@ -234,8 +271,355 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
       return #err(#InvalidTimeRange);
     };
 
-    // For now, return empty results - we'll enhance this later
-    #ok([]);
+    // Get block indices for this neuron from the index
+    switch (Map.get(neuronIndex, Map.bhash, neuronId)) {
+      case (?blockIndices) {
+        var results : [NeuronAllocationChangeBlockData] = [];
+        var count = 0;
+        
+        // Convert to array and take only up to limit
+        let indicesArray = Iter.toArray(blockIndices.vals());
+        let limitedIndices = if (Array.size(indicesArray) > limit) {
+          Array.subArray(indicesArray, 0, limit);
+        } else {
+          indicesArray;
+        };
+        
+        // Iterate through the limited block indices
+        for (blockIndex in limitedIndices.vals()) {
+          // Get the specific block using ICRC3
+          let getBlocksArgs = [{
+            start = blockIndex;
+            length = 1;
+          }];
+          
+          let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+          
+          // Process the single block if available
+          if (Array.size(icrc3Result.blocks) > 0) {
+            let block = icrc3Result.blocks[0];
+            
+            // Parse the block to extract neuron allocation change data
+            switch (parseBlockForNeuronAllocation(block, neuronId, startTime, endTime)) {
+              case (?changeData) {
+                results := Array.append(results, [changeData]);
+                count += 1;
+              };
+              case (_) {
+                // Block doesn't match our criteria (outside time range, etc.)
+              };
+            };
+          };
+        };
+        
+        #ok(results);
+      };
+      case (_) {
+        // No blocks found for this neuron
+        #ok([]);
+      };
+    };
+  };
+
+  //=========================================================================
+  // Helper Functions for Block Parsing
+  //=========================================================================
+
+  // Helper function to parse ICRC3 block and extract neuron allocation change data
+  private func parseBlockForNeuronAllocation(
+    block : ICRC3Service.Block, 
+    targetNeuronId : Blob, 
+    startTime : Int, 
+    endTime : Int
+  ) : ?NeuronAllocationChangeBlockData {
+    // The ICRC3 Block has structure {block : Value; id : Nat}
+    // The block.block field contains our Value data
+    switch (block.block) {
+      case (#Map(entries)) {
+        var blockTimestamp : ?Int = null;
+        var blockNeuronId : ?Blob = null;
+        var isNeuronAllocationChange : Bool = false;
+        var extractedData : ?NeuronAllocationChangeBlockData = null;
+        
+        // Extract the relevant fields from the map
+        for ((key, value) in entries.vals()) {
+          switch (key, value) {
+            case ("tx", #Map(txEntries)) {
+              // The actual data is inside the tx field
+              for ((txKey, txValue) in txEntries.vals()) {
+                switch (txKey, txValue) {
+                  case ("operation", #Text(op)) {
+                    if (op == "3neuron_allocation_change") {
+                      isNeuronAllocationChange := true;
+                    };
+                  };
+                  case ("timestamp", #Int(ts)) {
+                    blockTimestamp := ?ts;
+                  };
+                  case ("data", #Map(dataEntries)) {
+                    // Parse the neuron allocation change data
+                    if (isNeuronAllocationChange) {
+                      extractedData := parseNeuronAllocationData(dataEntries);
+                      // Extract neuron ID for verification
+                      for ((dataKey, dataValue) in dataEntries.vals()) {
+                        switch (dataKey, dataValue) {
+                          case ("neuronId", #Blob(nId)) {
+                            blockNeuronId := ?nId;
+                          };
+                          case (_) {};
+                        };
+                      };
+                    };
+                  };
+                  case (_) {};
+                };
+              };
+            };
+            case (_) {};
+          };
+        };
+        
+        // Verify this block matches our criteria
+        switch (blockTimestamp, blockNeuronId, extractedData) {
+          case (?timestamp, ?neuronId, ?data) {
+            // Check if neuron ID matches
+            if (not Blob.equal(neuronId, targetNeuronId)) {
+              return null;
+            };
+            
+            // Check if timestamp is within range
+            if (timestamp < startTime or timestamp > endTime) {
+              return null;
+            };
+            
+            // Return the parsed data
+            ?data;
+          };
+          case (_) {
+            null; // Missing required fields
+          };
+        };
+      };
+      case (_) {
+        null; // Not a map structure
+      };
+    };
+  };
+
+  // Helper function to parse neuron allocation change data from ICRC3 Map entries
+  private func parseNeuronAllocationData(dataEntries : [(Text, ArchiveTypes.Value)]) : ?NeuronAllocationChangeBlockData {
+    var id : ?Nat = null;
+    var timestamp : ?Int = null;
+    var neuronId : ?Blob = null;
+    var changeType : ?ArchiveTypes.AllocationChangeType = null;
+    var oldAllocations : ?[ArchiveTypes.Allocation] = null;
+    var newAllocations : ?[ArchiveTypes.Allocation] = null;
+    var votingPower : ?Nat = null;
+    var maker : ?Principal = null;
+    var reason : ?Text = null;
+    
+    // Extract all fields
+    for ((key, value) in dataEntries.vals()) {
+      switch (key, value) {
+        case ("id", #Nat(n)) { id := ?n; };
+        case ("timestamp", #Int(t)) { timestamp := ?t; };
+        case ("neuronId", #Blob(nId)) { neuronId := ?nId; };
+        case ("changeType", changeTypeValue) { 
+          changeType := parseAllocationChangeType(changeTypeValue); 
+        };
+        case ("oldAllocations", #Array(allocArray)) { 
+          oldAllocations := parseAllocationArray(allocArray); 
+        };
+        case ("newAllocations", #Array(allocArray)) { 
+          newAllocations := parseAllocationArray(allocArray); 
+        };
+        case ("votingPower", #Nat(vp)) { votingPower := ?vp; };
+        case ("maker", #Blob(makerBlob)) { 
+          maker := ?Principal.fromBlob(makerBlob); 
+        };
+        case ("reason", #Text(r)) { reason := ?r; };
+        case (_) {};
+      };
+    };
+    
+    // Construct the result if all required fields are present
+    switch (id, timestamp, neuronId, changeType, oldAllocations, newAllocations, votingPower, maker, reason) {
+      case (?i, ?t, ?nId, ?ct, ?old, ?new, ?vp, ?m, ?r) {
+        ?{
+          id = i;
+          timestamp = t;
+          neuronId = nId;
+          changeType = ct;
+          oldAllocations = old;
+          newAllocations = new;
+          votingPower = vp;
+          maker = m;
+          reason = ?r;
+        };
+      };
+      case (_) {
+        null; // Missing required fields
+      };
+    };
+  };
+
+  // Helper function to parse AllocationChangeType from ICRC3 Value
+  private func parseAllocationChangeType(value : ArchiveTypes.Value) : ?ArchiveTypes.AllocationChangeType {
+    switch (value) {
+      case (#Map(entries)) {
+        var changeTypeStr : ?Text = null;
+        var userInitiated : ?Bool = null;
+        var followedUser : ?Principal = null;
+        
+        for ((key, val) in entries.vals()) {
+          switch (key, val) {
+            case ("type", #Text(t)) { changeTypeStr := ?t; };
+            case ("userInitiated", #Nat(1)) { userInitiated := ?true; };
+            case ("userInitiated", #Nat(0)) { userInitiated := ?false; };
+            case ("followedUser", #Blob(userBlob)) { 
+              followedUser := ?Principal.fromBlob(userBlob); 
+            };
+            case (_) {};
+          };
+        };
+        
+        switch (changeTypeStr) {
+          case (?"UserUpdate") {
+            switch (userInitiated) {
+              case (?initiated) {
+                ?#UserUpdate({ userInitiated = initiated });
+              };
+              case (_) { null; };
+            };
+          };
+          case (?"FollowAction") {
+            switch (followedUser) {
+              case (?user) {
+                ?#FollowAction({ followedUser = user });
+              };
+              case (_) { null; };
+            };
+          };
+          case (?"SystemRebalance") { ?#SystemRebalance; };
+          case (?"VotingPowerChange") { ?#VotingPowerChange; };
+          case (_) { null; };
+        };
+      };
+      case (_) { null; };
+    };
+  };
+
+  // Helper function to parse allocation array from ICRC3 Values
+  private func parseAllocationArray(values : [ArchiveTypes.Value]) : ?[ArchiveTypes.Allocation] {
+    var results : [ArchiveTypes.Allocation] = [];
+    
+    for (value in values.vals()) {
+      switch (value) {
+        case (#Map(entries)) {
+          var token : ?Principal = null;
+          var basisPoints : ?Nat = null;
+          
+          for ((key, val) in entries.vals()) {
+            switch (key, val) {
+              case ("token", #Blob(tokenBlob)) {
+                token := ?Principal.fromBlob(tokenBlob);
+              };
+              case ("basisPoints", #Nat(bp)) {
+                basisPoints := ?bp;
+              };
+              case (_) {};
+            };
+          };
+          
+          switch (token, basisPoints) {
+            case (?t, ?bp) {
+              results := Array.append(results, [{
+                token = t;
+                basisPoints = bp;
+              }]);
+            };
+            case (_) {
+              return null; // Invalid allocation
+            };
+          };
+        };
+        case (_) {
+          return null; // Invalid allocation format
+        };
+      };
+    };
+    
+    ?results;
+  };
+
+  // Helper function to parse ICRC3 block without time filtering
+  private func parseBlockForNeuronAllocationNoTimeFilter(
+    block : ICRC3Service.Block, 
+    targetNeuronId : Blob
+  ) : ?NeuronAllocationChangeBlockData {
+    // The ICRC3 Block has structure {block : Value; id : Nat}
+    // The block.block field contains our Value data
+    switch (block.block) {
+      case (#Map(entries)) {
+        var blockNeuronId : ?Blob = null;
+        var isNeuronAllocationChange : Bool = false;
+        var extractedData : ?NeuronAllocationChangeBlockData = null;
+        
+        // Extract the relevant fields from the map
+        for ((key, value) in entries.vals()) {
+          switch (key, value) {
+            case ("tx", #Map(txEntries)) {
+              // The actual data is inside the tx field
+              for ((txKey, txValue) in txEntries.vals()) {
+                switch (txKey, txValue) {
+                  case ("operation", #Text(op)) {
+                    if (op == "3neuron_allocation_change") {
+                      isNeuronAllocationChange := true;
+                    };
+                  };
+                  case ("data", #Map(dataEntries)) {
+                    // Parse the neuron allocation change data
+                    if (isNeuronAllocationChange) {
+                      extractedData := parseNeuronAllocationData(dataEntries);
+                      // Extract neuron ID for verification
+                      for ((dataKey, dataValue) in dataEntries.vals()) {
+                        switch (dataKey, dataValue) {
+                          case ("neuronId", #Blob(nId)) {
+                            blockNeuronId := ?nId;
+                          };
+                          case (_) {};
+                        };
+                      };
+                    };
+                  };
+                  case (_) {};
+                };
+              };
+            };
+            case (_) {};
+          };
+        };
+        
+        // Verify this block matches our criteria (neuron ID only, no time filtering)
+        switch (blockNeuronId, extractedData) {
+          case (?neuronId, ?data) {
+            // Check if neuron ID matches
+            if (not Blob.equal(neuronId, targetNeuronId)) {
+              return null;
+            };
+            
+            // Return the parsed data
+            ?data;
+          };
+          case (_) {
+            null; // Missing required fields
+          };
+        };
+      };
+      case (_) {
+        null; // Not a map structure
+      };
+    };
   };
 
   //=========================================================================
