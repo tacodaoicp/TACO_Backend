@@ -281,8 +281,8 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
       let daoCanisterId = canisterIds.getCanisterId(#DAO_backend);
       let daoActor : DAOTypes.Self = actor(Principal.toText(daoCanisterId));
       
-      // Get the last timestamp we imported (for now, start from 0)
-      let sinceTimestamp = 0; // TODO: Track last import timestamp
+      // Get the last timestamp we imported
+      let sinceTimestamp = lastImportedNeuronAllocationTimestamp;
       let limit = 100; // Import in batches
       
       // Fetch neuron allocation changes from DAO
@@ -307,8 +307,12 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
               };
               
               // Archive the data
-              switch (await archiveNeuronAllocationChange(blockData)) {
-                case (#ok(_)) { totalImported += 1; };
+              switch (await archiveNeuronAllocationChange<system>(blockData)) {
+                case (#ok(_)) { 
+                  totalImported += 1;
+                  // Update the timestamp tracking
+                  lastImportedNeuronAllocationTimestamp := change.timestamp;
+                };
                 case (#err(_)) { totalFailed += 1; };
               };
             } catch (e) {
@@ -380,7 +384,8 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
     if (not base.isAuthorized(caller, #UpdateConfig)) {
       return #err("Not authorized");
     };
-    // Reset any import timestamps - for now just return success
+    // Reset import timestamp to re-import all historical data
+    lastImportedNeuronAllocationTimestamp := 0;
     #ok("Import timestamps reset for neuron allocation archive");
   };
 
