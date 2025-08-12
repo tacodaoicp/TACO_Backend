@@ -9,7 +9,7 @@ import Iter "mo:base/Iter";
 
 import CanisterIds "../helper/CanisterIds";
 
-shared (deployer) actor class Rewards() = this {
+shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
     Principal.fromActor(this);
@@ -22,7 +22,7 @@ shared (deployer) actor class Rewards() = this {
   };
 
   public type PerformanceResult = {
-    user: Principal;
+    neuronId: Blob;
     startTime: Int;
     endTime: Int;
     initialValue: Float; // Always 1.0
@@ -31,7 +31,7 @@ shared (deployer) actor class Rewards() = this {
   };
 
   public type RewardsError = {
-    #UserNotFound;
+    #NeuronNotFound;
     #InvalidTimeRange;
     #PriceDataMissing: {token: Principal; timestamp: Int};
     #AllocationDataMissing;
@@ -41,12 +41,12 @@ shared (deployer) actor class Rewards() = this {
   // External canister interfaces
   private transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   
-  private transient let DAO_ALLOCATION_ARCHIVE_ID = canister_ids.getCanisterId(#dao_allocation_archive);
+  private transient let DAO_NEURON_ALLOCATION_ARCHIVE_ID = canister_ids.getCanisterId(#dao_neuron_allocation_archive);
   private transient let PRICE_ARCHIVE_ID = canister_ids.getCanisterId(#price_archive);
 
   // Import the external canister types (we'll need to define these)
-  type AllocationChangeBlockData = {
-    user: Principal;
+  type NeuronAllocationChangeBlockData = {
+    neuronId: Blob;
     newAllocations: [Allocation];
     oldAllocations: [Allocation];
     timestamp: Int;
@@ -86,23 +86,23 @@ shared (deployer) actor class Rewards() = this {
   };
 
   // External canister interfaces
-  type AllocationArchive = actor {
-    getAllocationChangesByUserInTimeRange: (Principal, Int, Int) -> async Result.Result<[AllocationChangeBlockData], ArchiveError>;
+  type NeuronAllocationArchive = actor {
+    getNeuronAllocationChangesByNeuronInTimeRange: (Blob, Int, Int) -> async Result.Result<[NeuronAllocationChangeBlockData], ArchiveError>;
   };
 
   type PriceArchive = actor {
     getPriceAtTime: (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
   };
 
-  private transient let allocationArchive : AllocationArchive = actor (Principal.toText(DAO_ALLOCATION_ARCHIVE_ID));
+  private transient let neuronAllocationArchive : NeuronAllocationArchive = actor (Principal.toText(DAO_NEURON_ALLOCATION_ARCHIVE_ID));
   private transient let priceArchive : PriceArchive = actor (Principal.toText(PRICE_ARCHIVE_ID));
 
   //=========================================================================
   // Main Query Method
   //=========================================================================
 
-  public query func calculateUserPerformance(
-    user: Principal,
+  public query func calculateNeuronPerformance(
+    neuronId: Blob,
     startTime: Int,
     endTime: Int,
     priceType: PriceType
@@ -115,7 +115,7 @@ shared (deployer) actor class Rewards() = this {
     // This will be implemented as a composite query once we have the required methods
     // For now, return a placeholder
     #ok({
-      user = user;
+      neuronId = neuronId;
       startTime = startTime;
       endTime = endTime;
       initialValue = 1.0;
@@ -175,12 +175,12 @@ shared (deployer) actor class Rewards() = this {
   //=========================================================================
 
   public shared ({ caller }) func getCanisterStatus() : async {
-    allocationArchiveId: Principal;
+    neuronAllocationArchiveId: Principal;
     priceArchiveId: Principal;
     environment: Text;
   } {
     {
-      allocationArchiveId = DAO_ALLOCATION_ARCHIVE_ID;
+      neuronAllocationArchiveId = DAO_NEURON_ALLOCATION_ARCHIVE_ID;
       priceArchiveId = PRICE_ARCHIVE_ID;
       environment = switch (canister_ids.getEnvironment()) {
         case (#Staging) { "staging" };
