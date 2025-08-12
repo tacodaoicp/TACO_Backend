@@ -2,6 +2,7 @@ import Time "mo:base/Time";
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Array "mo:base/Array";
+import Buffer "mo:base/Buffer";
 import Float "mo:base/Float";
 import Int "mo:base/Int";
 import Debug "mo:base/Debug";
@@ -21,13 +22,26 @@ shared (deployer) persistent actor class Rewards() = this {
     #USD;
   };
 
+  // Detailed checkpoint data for each calculation point
+  public type CheckpointData = {
+    timestamp: Int;
+    allocations: [Allocation]; // Active allocations at this point
+    tokenValues: [(Principal, Float)]; // Per-token values (allocation % × token price)
+    totalPortfolioValue: Float; // Sum of all token values
+    pricesUsed: [(Principal, PriceInfo)]; // Prices used for this calculation
+  };
+
   public type PerformanceResult = {
     neuronId: Blob;
     startTime: Int;
     endTime: Int;
-    initialValue: Float; // Always 1.0
-    finalValue: Float;   // Calculated performance score
+    initialValue: Float; // Always 1.0 (first checkpoint)
+    finalValue: Float;   // Final portfolio value (last checkpoint)
+    performanceScore: Float; // finalValue / initialValue
     allocationChanges: Nat; // Number of rebalances in the period
+    checkpoints: [CheckpointData]; // Detailed data for each calculation point
+    preTimespanAllocation: ?NeuronAllocationChangeBlockData; // Most recent allocation before timespan
+    inTimespanChanges: [NeuronAllocationChangeBlockData]; // All changes within timespan
   };
 
   public type RewardsError = {
@@ -87,7 +101,11 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // External canister interfaces
   type NeuronAllocationArchive = actor {
-    getNeuronAllocationChangesByNeuronInTimeRange: (Blob, Int, Int) -> async Result.Result<[NeuronAllocationChangeBlockData], ArchiveError>;
+    getNeuronAllocationChangesByNeuronInTimeRange: (Blob, Int, Int, Nat) -> async Result.Result<[NeuronAllocationChangeBlockData], ArchiveError>;
+    getNeuronAllocationChangesWithContext: (Blob, Int, Int, Nat) -> async Result.Result<{
+      preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+      inTimespanChanges: [NeuronAllocationChangeBlockData];
+    }, ArchiveError>;
   };
 
   type PriceArchive = actor {
@@ -101,7 +119,7 @@ shared (deployer) persistent actor class Rewards() = this {
   // Main Query Method
   //=========================================================================
 
-  public query func calculateNeuronPerformance(
+  public shared func calculateNeuronPerformance(
     neuronId: Blob,
     startTime: Int,
     endTime: Int,
@@ -112,15 +130,132 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#InvalidTimeRange);
     };
 
-    // This will be implemented as a composite query once we have the required methods
-    // For now, return a placeholder
+    // Get allocation data from the neuron allocation archive
+    let allocationResult = await neuronAllocationArchive.getNeuronAllocationChangesWithContext(
+      neuronId, startTime, endTime, 100
+    );
+
+    let allocationData = switch (allocationResult) {
+      case (#ok(data)) { data };
+      case (#err(error)) {
+        return #err(#SystemError("Failed to get allocation data: " # debug_show(error)));
+      };
+    };
+
+    // Determine the active allocation at start time
+    let startAllocation = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { preAlloc.newAllocations };
+      case (null) {
+        // Check if there's a change exactly at start time
+        switch (Array.find(allocationData.inTimespanChanges, func(change: NeuronAllocationChangeBlockData) : Bool {
+          change.timestamp == startTime
+        })) {
+          case (?exactChange) { exactChange.oldAllocations };
+          case (null) {
+            // No allocation data found
+            return #err(#NeuronNotFound);
+          };
+        };
+      };
+    };
+
+    // Build timeline of allocation changes
+    let timelineBuffer = Buffer.Buffer<(Int, [Allocation])>(10);
+    timelineBuffer.add((startTime, startAllocation));
+    
+    // Add all in-timespan changes
+    for (change in allocationData.inTimespanChanges.vals()) {
+      timelineBuffer.add((change.timestamp, change.newAllocations));
+    };
+    
+    // Add end time if it's different from the last change
+    let lastChangeTime = if (timelineBuffer.size() == 0) { 
+      startTime 
+    } else { 
+      timelineBuffer.get(timelineBuffer.size() - 1).0 
+    };
+    if (lastChangeTime != endTime) {
+      let endAllocations = if (timelineBuffer.size() == 0) { 
+        startAllocation 
+      } else { 
+        timelineBuffer.get(timelineBuffer.size() - 1).1 
+      };
+      timelineBuffer.add((endTime, endAllocations));
+    };
+
+    let timeline = Buffer.toArray(timelineBuffer);
+
+    // Calculate checkpoints for each point in timeline
+    let checkpointsBuffer = Buffer.Buffer<CheckpointData>(timeline.size());
+    var currentValue : Float = 1.0;
+
+    for (i in timeline.keys()) {
+      let (timestamp, allocations) = timeline[i];
+      
+      // Get prices for all tokens at this timestamp
+      let tokenPricesBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
+      let tokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(allocations.size());
+      var totalValue : Float = 0.0;
+
+      for (allocation in allocations.vals()) {
+        let priceResult = await priceArchive.getPriceAtTime(allocation.token, timestamp);
+        switch (priceResult) {
+          case (#ok(?priceInfo)) {
+            let tokenPrice = getPriceValue(priceInfo, priceType);
+            let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
+            let tokenValue = currentValue * allocationPercent * tokenPrice;
+            
+            tokenPricesBuffer.add((allocation.token, priceInfo));
+            tokenValuesBuffer.add((allocation.token, tokenValue));
+            totalValue += tokenValue;
+          };
+          case (#ok(null)) {
+            return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+          };
+          case (#err(_)) {
+            return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+          };
+        };
+      };
+
+      // Create checkpoint
+      let checkpoint : CheckpointData = {
+        timestamp = timestamp;
+        allocations = allocations;
+        tokenValues = Buffer.toArray(tokenValuesBuffer);
+        totalPortfolioValue = totalValue;
+        pricesUsed = Buffer.toArray(tokenPricesBuffer);
+      };
+      
+      checkpointsBuffer.add(checkpoint);
+      
+      // Update current value for next iteration (except for the last checkpoint)
+      let isLastCheckpoint = (Int.abs(i) + 1 == Int.abs(timeline.size()));
+      if (not isLastCheckpoint) {
+        currentValue := totalValue;
+      };
+    };
+
+    let checkpoints = Buffer.toArray(checkpointsBuffer);
+
+    // Calculate final results
+    let finalValue = if (checkpoints.size() == 0) { 
+      1.0 
+    } else { 
+      checkpoints[checkpoints.size() - 1].totalPortfolioValue 
+    };
+
     #ok({
       neuronId = neuronId;
       startTime = startTime;
       endTime = endTime;
       initialValue = 1.0;
-      finalValue = 1.0; // Placeholder
-      allocationChanges = 0;
+      finalValue = finalValue;
+      performanceScore = finalValue / 1.0;
+      allocationChanges = Array.size(allocationData.inTimespanChanges);
+      checkpoints = checkpoints;
+      preTimespanAllocation = allocationData.preTimespanAllocation;
+      inTimespanChanges = allocationData.inTimespanChanges;
     });
   };
 

@@ -321,6 +321,89 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
     };
   };
 
+  // Comprehensive query method that returns both pre-timespan allocation and in-timespan changes
+  public shared query ({ caller }) func getNeuronAllocationChangesWithContext(
+    neuronId: Blob,
+    startTime: Int,
+    endTime: Int,
+    limit: Nat
+  ) : async Result.Result<{
+    preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+    inTimespanChanges: [NeuronAllocationChangeBlockData];
+  }, ArchiveError> {
+    if (not base.isAuthorized(caller, #QueryData)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (limit > 500) {
+      return #err(#InvalidData);
+    };
+
+    if (startTime > endTime) {
+      return #err(#InvalidTimeRange);
+    };
+
+    // Get block indices for this neuron from the index
+    switch (Map.get(neuronIndex, Map.bhash, neuronId)) {
+      case (?blockIndices) {
+        var inTimespanChanges : [NeuronAllocationChangeBlockData] = [];
+        var preTimespanAllocation : ?NeuronAllocationChangeBlockData = null;
+        var inTimespanCount = 0;
+        
+        // Convert to array and sort by timestamp (block indices should be in order)
+        let indicesArray = Iter.toArray(blockIndices.vals());
+        
+        // Iterate through all block indices to find pre-timespan and in-timespan data
+        for (blockIndex in indicesArray.vals()) {
+          // Get the specific block using ICRC3
+          let getBlocksArgs = [{
+            start = blockIndex;
+            length = 1;
+          }];
+          
+          let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+          
+          // Process the single block if available
+          if (Array.size(icrc3Result.blocks) > 0) {
+            let block = icrc3Result.blocks[0];
+            
+            // Parse the block to extract neuron allocation change data (no time filtering)
+            switch (parseBlockForNeuronAllocation(block, neuronId, 0, Int.abs(Time.now()) + 1000000000)) {
+              case (?changeData) {
+                if (changeData.timestamp < startTime) {
+                  // This is before the timespan - keep as most recent pre-timespan allocation
+                  preTimespanAllocation := ?changeData;
+                } else if (changeData.timestamp >= startTime and changeData.timestamp <= endTime) {
+                  // This is within the timespan
+                  if (inTimespanCount < limit) {
+                    inTimespanChanges := Array.append(inTimespanChanges, [changeData]);
+                    inTimespanCount += 1;
+                  };
+                };
+                // Ignore changes after endTime
+              };
+              case (_) {
+                // Block parsing failed
+              };
+            };
+          };
+        };
+        
+        #ok({
+          preTimespanAllocation = preTimespanAllocation;
+          inTimespanChanges = inTimespanChanges;
+        });
+      };
+      case (_) {
+        // No blocks found for this neuron
+        #ok({
+          preTimespanAllocation = null;
+          inTimespanChanges = [];
+        });
+      };
+    };
+  };
+
   //=========================================================================
   // Helper Functions for Block Parsing
   //=========================================================================
