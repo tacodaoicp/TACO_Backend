@@ -100,6 +100,54 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
   };
 
   //=========================================================================
+  // Helper Functions
+  //=========================================================================
+
+  // Helper function to convert AllocationChangeType to Value
+  private func allocationChangeTypeToValue(changeType: ArchiveTypes.AllocationChangeType) : ArchiveTypes.Value {
+    switch (changeType) {
+      case (#UserUpdate(details)) { 
+        #Map([
+          ("type", #Text("UserUpdate")),
+          ("userInitiated", ArchiveTypes.boolToValue(details.userInitiated))
+        ]);
+      };
+      case (#FollowAction(details)) { 
+        #Map([
+          ("type", #Text("FollowAction")),
+          ("followedUser", ArchiveTypes.principalToValue(details.followedUser))
+        ]);
+      };
+      case (#SystemRebalance) { #Map([("type", #Text("SystemRebalance"))]); };
+      case (#VotingPowerChange) { #Map([("type", #Text("VotingPowerChange"))]); };
+    };
+  };
+
+  // Helper function to convert Allocation to Value
+  private func allocationToValueHelper(allocation: ArchiveTypes.Allocation) : ArchiveTypes.Value {
+    #Map([
+      ("token", ArchiveTypes.principalToValue(allocation.token)),
+      ("basisPoints", #Nat(allocation.basisPoints))
+    ]);
+  };
+
+  // Convert NeuronAllocationChangeBlockData to ICRC3 Value format
+  private func neuronAllocationChangeToValue(change: NeuronAllocationChangeBlockData, _timestamp: Int, _parentHash: ?Blob) : ArchiveTypes.Value {
+    #Map([
+      ("id", #Nat(change.id)),
+      ("timestamp", #Int(change.timestamp)),
+      ("neuronId", #Blob(change.neuronId)), // Include the neuron ID!
+      ("user", ArchiveTypes.principalToValue(change.maker)), // Use maker as user for compatibility
+      ("changeType", allocationChangeTypeToValue(change.changeType)),
+      ("oldAllocations", #Array(Array.map(change.oldAllocations, allocationToValueHelper))),
+      ("newAllocations", #Array(Array.map(change.newAllocations, allocationToValueHelper))),
+      ("votingPower", #Nat(change.votingPower)),
+      ("maker", ArchiveTypes.principalToValue(change.maker)),
+      ("reason", switch (change.reason) { case (?r) { #Text(r) }; case null { #Text("") }; })
+    ]);
+  };
+
+  //=========================================================================
   // Custom Neuron Allocation Archive Functions
   //=========================================================================
 
@@ -108,20 +156,8 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
       return #err(#NotAuthorized);
     };
 
-    // Create compatible allocation change for existing system
-    let compatibleChange : ArchiveTypes.AllocationChangeBlockData = {
-      id = change.id;
-      timestamp = change.timestamp;
-      user = change.maker; // Use maker as user for compatibility
-      changeType = change.changeType;
-      oldAllocations = change.oldAllocations;
-      newAllocations = change.newAllocations;
-      votingPower = change.votingPower;
-      maker = change.maker;
-      reason = change.reason;
-    };
-
-    let blockValue = ArchiveTypes.allocationChangeToValue(compatibleChange, change.timestamp, null);
+    // Create neuron allocation change value with neuronId included
+    let blockValue = neuronAllocationChangeToValue(change, change.timestamp, null);
     let blockIndex = base.storeBlock<system>(
       blockValue,
       "3neuron_allocation_change",
