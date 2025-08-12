@@ -248,7 +248,24 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
   // Admin Functions
   //=========================================================================
 
-  public shared ({ caller }) func getArchiveStats() : async Result.Result<{
+  // Public stats method for frontend (no authorization required)
+  public query func getArchiveStats() : async ArchiveTypes.ArchiveStatus {
+    let totalBlocks = base.getTotalBlocks();
+    let oldestBlock = if (totalBlocks > 0) { ?0 } else { null };
+    let newestBlock = if (totalBlocks > 0) { ?(totalBlocks - 1) } else { null };
+    
+    {
+      totalBlocks = totalBlocks;
+      oldestBlock = oldestBlock;
+      newestBlock = newestBlock;
+      supportedBlockTypes = ["3neuron_allocation_change"];
+      storageUsed = 0;
+      lastArchiveTime = lastImportedNeuronAllocationTimestamp;
+    };
+  };
+
+  // Detailed stats method with authorization for admin interface
+  public shared ({ caller }) func getDetailedArchiveStats() : async Result.Result<{
     totalBlocks: Nat;
     totalNeuronAllocationChanges: Nat;
     neuronCount: Nat;
