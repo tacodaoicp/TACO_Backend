@@ -93,7 +93,8 @@ module {
     private var innerLoopTimerId : ?Nat = null;
     
     // Running states
-    private var outerLoopRunning : Bool = false;
+    private var outerLoopRunning : Bool = false;  // Controls if system should reschedule
+    private var outerLoopExecuting : Bool = false; // Semaphore for current execution
     private var middleLoopRunning : Bool = false;
     private var innerLoopRunning : Bool = false;
     
@@ -163,8 +164,8 @@ module {
     //=========================================================================
     
     private func startOuterLoopTimer<system>() : async* () {
-      if (outerLoopRunning) {
-        return; // Already running
+      if (outerLoopExecuting) {
+        return; // Already executing - semaphore check
       };
       
       switch (outerLoopTimerId) {
@@ -176,15 +177,24 @@ module {
         #nanoseconds(config.outerLoopIntervalNS),
         func() : async () {
           await* runOuterLoop<system>();
-          await* startOuterLoopTimer<system>(); // Reschedule
+          // Only reschedule if system is still supposed to be running
+          if (outerLoopRunning) {
+            await* startOuterLoopTimer<system>(); // Reschedule
+          };
         }
       );
       
-      outerLoopRunning := true;
+      outerLoopRunning := true;  // System is now scheduled
       logger.info("OUTER_LOOP", "Outer loop timer started - Interval: " # Nat.toText(config.outerLoopIntervalNS / 1_000_000_000) # "s", "startOuterLoopTimer");
     };
     
     private func runOuterLoop<system>() : async* () {
+      // Acquire execution semaphore
+      if (outerLoopExecuting) {
+        return; // Already executing
+      };
+      outerLoopExecuting := true;
+      
       outerLoopLastRun := Time.now();
       outerLoopTotalRuns += 1;
       
@@ -197,8 +207,8 @@ module {
         logger.info("OUTER_LOOP", "Middle loop already running, skipping", "runOuterLoop");
       };
       
-      // Reset running flag to allow rescheduling
-      outerLoopRunning := false;
+      // Release execution semaphore
+      outerLoopExecuting := false;
     };
     
     private func stopOuterLoopTimer() {
@@ -210,7 +220,8 @@ module {
         case null {};
       };
       
-      outerLoopRunning := false;
+      outerLoopRunning := false;  // Stop rescheduling
+      outerLoopExecuting := false; // Reset execution semaphore
       logger.info("OUTER_LOOP", "Outer loop timer stopped", "stopOuterLoopTimer");
     };
     
