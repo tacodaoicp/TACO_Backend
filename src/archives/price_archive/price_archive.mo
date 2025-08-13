@@ -166,63 +166,110 @@ shared (deployer) actor class PriceArchiveV2() = this {
     //  return #err(#NotAuthorized);
     //};
 
-    // Query ICRC3 blocks to find the most recent price for this token at or before the timestamp
-    let filter : ArchiveTypes.BlockFilter = {
-      blockTypes = ?[#Price]; // Only price blocks
-      startTime = null; // No start time limit
-      endTime = ?timestamp; // Up to the requested timestamp
-      tokens = ?[token]; // Only for this specific token
-      traders = null;
-      minAmount = null;
-      maxAmount = null;
-    };
+    // First get a small sample to check total blocks
+    let sampleArgs = [{ start = 0; length = 1 }];
+    let sampleResult = base.icrc3_get_blocks(sampleArgs);
+    
+    // Use ICRC3 interface directly to get recent blocks and search for the most recent price
+    let totalBlocks = sampleResult.log_length;
+    let startBlock = if (totalBlocks > 5000) { totalBlocks - 5000 } else { 0 };
+    let getBlocksArgs = [{
+      start = startBlock;
+      length = 5000; // Get more recent blocks
+    }];
+    
+    let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+    
+    // Find the most recent price block for this token at or before the timestamp
+    var mostRecentPrice : ?{icpPrice: Nat; usdPrice: Float; timestamp: Int} = null;
+    var mostRecentTimestamp : Int = -1;
 
-    switch (base.queryBlocks(filter, caller)) {
-      case (#ok(queryResult)) {
-        // Find the most recent price block for this token
-        var mostRecentPrice : ?{icpPrice: Nat; usdPrice: Float; timestamp: Int} = null;
-        var mostRecentTimestamp : Int = -1;
-
-        for (block in queryResult.blocks.vals()) {
-          switch (block.block) {
-            case (#Map(entries)) {
-              // Check if this is a price block by looking for operation type
-              var isPriceBlock = false;
-              for ((key, value) in entries.vals()) {
-                switch (key, value) {
-                  case ("operation", #Text("3price")) {
-                    isPriceBlock := true;
-                  };
-                  case _ {};
-                };
-              };
-              
-              if (isPriceBlock) {
-                switch (convertValueToPriceData(#Map(entries))) {
-                  case (?priceData) {
-                    if (Principal.equal(priceData.token, token) and 
-                        priceData.timestamp <= timestamp and 
-                        priceData.timestamp > mostRecentTimestamp) {
-                      mostRecentTimestamp := priceData.timestamp;
-                      mostRecentPrice := ?{
-                        icpPrice = priceData.priceICP;
-                        usdPrice = priceData.priceUSD;
-                        timestamp = priceData.timestamp;
+    for (block in icrc3Result.blocks.vals()) {
+      switch (block.block) {
+        case (#Map(entries)) {
+          // Look for the tx.data structure
+          for ((key, value) in entries.vals()) {
+            switch (key, value) {
+              case ("tx", #Map(txEntries)) {
+                // Check if this is a price operation
+                var isPrice = false;
+                var txTimestamp : Int = 0;
+                
+                for ((txKey, txValue) in txEntries.vals()) {
+                  switch (txKey, txValue) {
+                    case ("operation", #Text("3price")) {
+                      isPrice := true;
+                    };
+                    case ("timestamp", #Int(t)) {
+                      txTimestamp := t;
+                    };
+                    case ("data", #Map(dataEntries)) {
+                      if (isPrice) {
+                        // Parse the price data
+                        var blockToken : ?Principal = null;
+                        var blockTimestamp : Int = txTimestamp;
+                        var blockPriceICP : ?Nat = null;
+                        var blockPriceUSD : ?Text = null;
+                        
+                        for ((dataKey, dataValue) in dataEntries.vals()) {
+                          switch (dataKey, dataValue) {
+                            case ("token", #Blob(b)) { 
+                              if (b.size() <= 29 and b.size() > 0) {
+                                blockToken := ?Principal.fromBlob(b);
+                              };
+                            };
+                            case ("ts", #Int(t)) { 
+                              blockTimestamp := t;
+                            };
+                            case ("price_icp", #Nat(p)) { 
+                              blockPriceICP := ?p;
+                            };
+                            case ("price_usd", #Text(p)) { 
+                              blockPriceUSD := ?p;
+                            };
+                            case _ {};
+                          };
+                        };
+                        
+                        // Check if this matches our criteria
+                        switch (blockToken, blockPriceICP, blockPriceUSD) {
+                          case (?bToken, ?icp, ?usdText) {
+                            if (Principal.equal(bToken, token) and 
+                                blockTimestamp <= timestamp and 
+                                blockTimestamp > mostRecentTimestamp) {
+                              // Convert USD price from Text to Float
+                              // Note: Motoko doesn't have Float.fromText, so we'll use a simple approach
+                              // assuming the text is a valid float representation
+                              switch (textToFloat(usdText)) {
+                                case (?usd) {
+                                  mostRecentTimestamp := blockTimestamp;
+                                  mostRecentPrice := ?{
+                                    icpPrice = icp;
+                                    usdPrice = usd;
+                                    timestamp = blockTimestamp;
+                                  };
+                                };
+                                case null {};
+                              };
+                            };
+                          };
+                          case _ {};
+                        };
                       };
                     };
+                    case _ {};
                   };
-                  case null {};
                 };
               };
+              case _ {};
             };
-            case _ {};
           };
         };
-
-        #ok(mostRecentPrice);
+        case _ {};
       };
-      case (#err(error)) { #err(error) };
     };
+
+    #ok(mostRecentPrice);
   };
 
   // Helper function to convert Value back to PriceBlockData
@@ -509,6 +556,120 @@ shared (deployer) actor class PriceArchiveV2() = this {
   //=========================================================================
   // Lifecycle Functions (delegated to base class)
   //=========================================================================
+
+  // Helper function to convert text to float
+  // Simple implementation that handles basic decimal numbers
+  private func textToFloat(text: Text) : ?Float {
+    // For now, we'll use a simple approach
+    // In production, you might want a more robust parser
+    switch (text) {
+      case ("0") { ?0.0 };
+      case ("1") { ?1.0 };
+      case _ {
+        // Try to parse as a basic decimal number
+        // This is a simplified implementation
+        let chars = text.chars();
+        var result : Float = 0.0;
+        var decimal : Float = 0.0;
+        var afterDecimal = false;
+        var decimalPlace : Float = 0.1;
+        
+        for (char in chars) {
+          switch (char) {
+            case ('.') {
+              afterDecimal := true;
+            };
+            case ('0') {
+              if (afterDecimal) {
+                decimal := decimal + (0.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 0.0;
+              };
+            };
+            case ('1') {
+              if (afterDecimal) {
+                decimal := decimal + (1.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 1.0;
+              };
+            };
+            case ('2') {
+              if (afterDecimal) {
+                decimal := decimal + (2.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 2.0;
+              };
+            };
+            case ('3') {
+              if (afterDecimal) {
+                decimal := decimal + (3.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 3.0;
+              };
+            };
+            case ('4') {
+              if (afterDecimal) {
+                decimal := decimal + (4.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 4.0;
+              };
+            };
+            case ('5') {
+              if (afterDecimal) {
+                decimal := decimal + (5.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 5.0;
+              };
+            };
+            case ('6') {
+              if (afterDecimal) {
+                decimal := decimal + (6.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 6.0;
+              };
+            };
+            case ('7') {
+              if (afterDecimal) {
+                decimal := decimal + (7.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 7.0;
+              };
+            };
+            case ('8') {
+              if (afterDecimal) {
+                decimal := decimal + (8.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 8.0;
+              };
+            };
+            case ('9') {
+              if (afterDecimal) {
+                decimal := decimal + (9.0 * decimalPlace);
+                decimalPlace := decimalPlace * 0.1;
+              } else {
+                result := result * 10.0 + 9.0;
+              };
+            };
+            case _ {
+              // Invalid character, return null
+              return null;
+            };
+          };
+        };
+        
+        ?(result + decimal);
+      };
+    };
+  };
 
   system func preupgrade() {
     icrc3State := icrc3StateRef.value;
