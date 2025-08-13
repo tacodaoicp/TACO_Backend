@@ -16,7 +16,7 @@ import Text "mo:base/Text";
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 
-shared (deployer) actor class Rewards() = this {
+shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
     Principal.fromActor(this);
@@ -107,10 +107,10 @@ shared (deployer) actor class Rewards() = this {
   stable var distributionCounter : Nat = 0;
   stable var currentDistributionId : ?Nat = null;
   stable var lastDistributionTime : Int = 0;
-  private var distributionTimerId : ?Nat = null;
+  private transient var distributionTimerId : ?Nat = null;
   
   // Reward tracking
-  private let { phash; bhash } = Map;
+  private transient let { phash; bhash } = Map;
   stable var neuronRewardBalances = Map.new<Blob, Float>(); // neuronId -> accumulated rewards
   
   // Distribution history (circular buffer using Vector)
@@ -611,16 +611,14 @@ shared (deployer) actor class Rewards() = this {
       status = #InProgress({currentNeuron = 0; totalNeurons = 0});
     };
 
-    // Add to history (manage circular buffer)
+    // Add to history (using treasury pattern for consistency)
     Vector.add(distributionHistory, initialRecord);
     if (Vector.size(distributionHistory) > maxDistributionHistory) {
-      // Remove oldest (first) element by recreating vector with recent elements
-      let currentArray = Vector.toArray(distributionHistory);
-      Vector.clear(distributionHistory);
-      let keepCount = maxDistributionHistory - 1;
-      for (i in Iter.range(currentArray.size() - keepCount, currentArray.size() - 1)) {
-        Vector.add(distributionHistory, currentArray[i]);
+      Vector.reverse(distributionHistory);
+      while (Vector.size(distributionHistory) > maxDistributionHistory) {
+        ignore Vector.removeLast(distributionHistory);
       };
+      Vector.reverse(distributionHistory);
     };
 
     // Get all neurons from DAO
