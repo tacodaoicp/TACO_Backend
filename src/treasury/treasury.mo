@@ -111,6 +111,7 @@ import Fuzz "mo:fuzz";
 import SpamProtection "../helper/spam_protection";
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
+import AdminAuth "../helper/admin_authorization";
 
 shared (deployer) actor class treasury() = this {
 
@@ -144,18 +145,7 @@ shared (deployer) actor class treasury() = this {
   //stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
   stable var MintVaultPrincipal = DAO_BACKEND_ID;
 
-  var masterAdmins = [
-    Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae"), 
-    Principal.fromText("uuyso-zydjd-tsb4o-lgpgj-dfsvq-awald-j2zfp-e6h72-d2je3-whmjr-xae"), // lx7ws-diaaa-aaaag-aubda-cai.icp0.io identities
-    Principal.fromText("5uvsz-em754-ulbgb-vxihq-wqyzd-brdgs-snzlu-mhlqw-k74uu-4l5h3-2qe"),
-    Principal.fromText("6mxg4-njnu6-qzizq-2ekit-rnagc-4d42s-qyayx-jghoe-nd72w-elbsy-xqe"),
-    Principal.fromText("6q3ra-pds56-nqzzc-itigw-tsw4r-vs235-yqx5u-dg34n-nnsus-kkpqf-aqe"),
-    Principal.fromText("chxs6-z6h3t-hjrgk-i5x57-rm7fm-3tvlz-b352m-heq2g-hu23b-sxasf-kqe"), // tacodao.com identities
-    Principal.fromText("k2xol-5avzc-lf3wt-vwoft-pjx6k-77fjh-7pera-6b7qt-fwt5e-a3ekl-vqe"),
-    Principal.fromText("as6jn-gaoo7-k4kji-tdkxg-jlsrk-avxkc-zu76j-vz7hj-di3su-2f74z-qqe"),
-    Principal.fromText("r27hb-ckxon-xohqv-afcvx-yhemm-xoggl-37dg6-sfyt3-n6jer-ditge-6qe"), // staging identities
-    Principal.fromText("yjdlk-jqx52-ha6xa-w6iqe-b4jrr-s5ova-mirv4-crlfi-xgsaa-ib3cg-3ae"),
-    Principal.fromText("as6jn-gaoo7-k4kji-tdkxg-jlsrk-avxkc-zu76j-vz7hj-di3su-2f74z-qqe")];
+
 
 
   // Core type aliases
@@ -349,15 +339,7 @@ shared (deployer) actor class treasury() = this {
   stable var maxTreasuryAdminActionsStored: Nat = 10000; // Keep last 10k actions before archiving
 
   private func isMasterAdmin(caller : Principal) : Bool {
-    // Check if caller is a human master admin
-    for (admin in masterAdmins.vals()) {
-      if (admin == caller) {
-        return true;
-      };
-    };
-    
-    // Check if caller is one of our own canisters
-    canister_ids.isKnownCanister(caller);
+    AdminAuth.isMasterAdmin(caller, canister_ids.isKnownCanister)
   };
 
   // Treasury admin action logging function
