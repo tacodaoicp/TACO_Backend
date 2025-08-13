@@ -187,52 +187,134 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Calculate checkpoints for each point in timeline
     let checkpointsBuffer = Buffer.Buffer<CheckpointData>(timeline.size());
-    var currentValue : Float = 1.0;
-
+    
+    // Track asset values between checkpoints
+    var assetValues = Buffer.Buffer<(Principal, Float)>(10); // (token, current_value)
+    var previousPrices = Buffer.Buffer<(Principal, Float)>(10); // (token, price)
+    
     for (i in timeline.keys()) {
       let (timestamp, allocations) = timeline[i];
       
       // Get prices for all tokens at this timestamp
       let tokenPricesBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
       let tokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(allocations.size());
-      var totalValue : Float = 0.0;
-
-      for (allocation in allocations.vals()) {
-        let priceResult = await priceArchive.getPriceAtTime(allocation.token, timestamp);
-        switch (priceResult) {
-          case (#ok(?priceInfo)) {
-            let tokenPrice = getPriceValue(priceInfo, priceType);
-            let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
-            let tokenValue = currentValue * allocationPercent * tokenPrice;
-            
-            tokenPricesBuffer.add((allocation.token, priceInfo));
-            tokenValuesBuffer.add((allocation.token, tokenValue));
-            totalValue += tokenValue;
-          };
-          case (#ok(null)) {
-            return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
-          };
-          case (#err(_)) {
-            return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+      
+      if (i == 0) {
+        // First checkpoint: Initialize with 1.0 total value, distributed by allocation
+        var totalValue : Float = 1.0;
+        
+        for (allocation in allocations.vals()) {
+          let priceResult = await priceArchive.getPriceAtTime(allocation.token, timestamp);
+          switch (priceResult) {
+            case (#ok(?priceInfo)) {
+              let tokenPrice = getPriceValue(priceInfo, priceType);
+              let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
+              let tokenValue = totalValue * allocationPercent; // Just allocation percentage of 1.0
+              
+              tokenPricesBuffer.add((allocation.token, priceInfo));
+              tokenValuesBuffer.add((allocation.token, tokenValue));
+              
+              // Store initial asset values and prices
+              assetValues.add((allocation.token, tokenValue));
+              previousPrices.add((allocation.token, tokenPrice));
+            };
+            case (#ok(null)) {
+              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+            };
+            case (#err(_)) {
+              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+            };
           };
         };
-      };
-
-      // Create checkpoint
-      let checkpoint : CheckpointData = {
-        timestamp = timestamp;
-        allocations = allocations;
-        tokenValues = Buffer.toArray(tokenValuesBuffer);
-        totalPortfolioValue = totalValue;
-        pricesUsed = Buffer.toArray(tokenPricesBuffer);
-      };
-      
-      checkpointsBuffer.add(checkpoint);
-      
-      // Update current value for next iteration (except for the last checkpoint)
-      let isLastCheckpoint = (Int.abs(i) + 1 == Int.abs(timeline.size()));
-      if (not isLastCheckpoint) {
-        currentValue := totalValue;
+        
+        // Create first checkpoint
+        let checkpoint : CheckpointData = {
+          timestamp = timestamp;
+          allocations = allocations;
+          tokenValues = Buffer.toArray(tokenValuesBuffer);
+          totalPortfolioValue = 1.0;
+          pricesUsed = Buffer.toArray(tokenPricesBuffer);
+        };
+        checkpointsBuffer.add(checkpoint);
+        
+      } else {
+        // Subsequent checkpoints: Apply price changes to existing asset values
+        
+        // Step 1: Update asset values based on price changes
+        let updatedAssetValues = Buffer.Buffer<(Principal, Float)>(assetValues.size());
+        let updatedPrices = Buffer.Buffer<(Principal, Float)>(previousPrices.size());
+        
+        for (j in Iter.range(0, assetValues.size() - 1)) {
+          let (token, oldValue) = assetValues.get(j);
+          let (_, oldPrice) = previousPrices.get(j);
+          
+          // Get new price for this token
+          let priceResult = await priceArchive.getPriceAtTime(token, timestamp);
+          switch (priceResult) {
+            case (#ok(?priceInfo)) {
+              let newPrice = getPriceValue(priceInfo, priceType);
+              let priceRatio = newPrice / oldPrice; // This is the key fix!
+              let newValue = oldValue * priceRatio;
+              
+              updatedAssetValues.add((token, newValue));
+              updatedPrices.add((token, newPrice));
+            };
+            case (#ok(null)) {
+              return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+            };
+            case (#err(_)) {
+              return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+            };
+          };
+        };
+        
+        // Step 2: Calculate total portfolio value after price changes
+        var totalValueAfterPriceChanges : Float = 0.0;
+        for (j in Iter.range(0, updatedAssetValues.size() - 1)) {
+          let (_, value) = updatedAssetValues.get(j);
+          totalValueAfterPriceChanges += value;
+        };
+        
+        // Step 3: Rebalance to new allocations using the updated total value
+        for (allocation in allocations.vals()) {
+          let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
+          let tokenValue = totalValueAfterPriceChanges * allocationPercent;
+          
+          // Get price info for this token
+          let priceResult = await priceArchive.getPriceAtTime(allocation.token, timestamp);
+          switch (priceResult) {
+            case (#ok(?priceInfo)) {
+              tokenPricesBuffer.add((allocation.token, priceInfo));
+              tokenValuesBuffer.add((allocation.token, tokenValue));
+            };
+            case (#ok(null)) {
+              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+            };
+            case (#err(_)) {
+              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+            };
+          };
+        };
+        
+        // Create checkpoint
+        let checkpoint : CheckpointData = {
+          timestamp = timestamp;
+          allocations = allocations;
+          tokenValues = Buffer.toArray(tokenValuesBuffer);
+          totalPortfolioValue = totalValueAfterPriceChanges;
+          pricesUsed = Buffer.toArray(tokenPricesBuffer);
+        };
+        checkpointsBuffer.add(checkpoint);
+        
+        // Step 4: Update asset values for next iteration (rebalanced values)
+        assetValues := Buffer.Buffer<(Principal, Float)>(allocations.size());
+        previousPrices := updatedPrices;
+        
+        for (allocation in allocations.vals()) {
+          let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
+          let tokenValue = totalValueAfterPriceChanges * allocationPercent;
+          assetValues.add((allocation.token, tokenValue));
+        };
       };
     };
 
