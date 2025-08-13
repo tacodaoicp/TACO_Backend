@@ -593,12 +593,40 @@ shared (deployer) persistent actor class Rewards() = this {
     let endTime = now;
     let startTime = now - distributionPeriodNS;
     
+    await* runDistributionWithParams<system>(startTime, endTime, #USD);
+  };
+
+  // Custom distribution function with specified parameters
+  private func runCustomDistribution<system>(
+    startTime: Int,
+    endTime: Int,
+    priceType: PriceType
+  ) : async* () {
+    // Check if distribution is already in progress
+    switch (currentDistributionId) {
+      case (?_) {
+        logger.warn("Distribution", "Distribution already in progress, skipping", "runCustomDistribution");
+        return;
+      };
+      case null { };
+    };
+
+    await* runDistributionWithParams<system>(startTime, endTime, priceType);
+  };
+
+  // Core distribution logic with parameters
+  private func runDistributionWithParams<system>(
+    startTime: Int,
+    endTime: Int,
+    priceType: PriceType
+  ) : async* () {
     distributionCounter += 1;
     currentDistributionId := ?distributionCounter;
     
-    logger.info("Distribution", "Starting weekly distribution #" # Nat.toText(distributionCounter), "runWeeklyDistribution");
+    logger.info("Distribution", "Starting distribution #" # Nat.toText(distributionCounter) # " from " # Int.toText(startTime) # " to " # Int.toText(endTime), "runDistributionWithParams");
 
     // Create initial distribution record
+    let now = Time.now();
     let initialRecord : DistributionRecord = {
       id = distributionCounter;
       startTime = startTime;
@@ -641,7 +669,7 @@ shared (deployer) persistent actor class Rewards() = this {
       Vector.put(distributionHistory, Vector.size(distributionHistory) - 1, updatedRecord);
 
       // Start processing neurons one by one
-      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, [], 0.0, startTime, endTime);
+      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, [], 0.0, startTime, endTime, priceType);
       
     } catch (error) {
       logger.error("Distribution", "Failed to get neurons: " # "Error occurred", "runWeeklyDistribution");
@@ -657,7 +685,8 @@ shared (deployer) persistent actor class Rewards() = this {
     neuronRewards: [NeuronReward],
     totalRewardScore: Float,
     startTime: Int,
-    endTime: Int
+    endTime: Int,
+    priceType: PriceType
   ) : async* () {
     
     // Check if this distribution was cancelled
@@ -702,7 +731,7 @@ shared (deployer) persistent actor class Rewards() = this {
         neuronId,
         startTime,
         endTime,
-        #USD // Use USD prices for consistency
+        priceType
       );
 
       switch (performanceResult) {
@@ -733,7 +762,8 @@ shared (deployer) persistent actor class Rewards() = this {
                 updatedRewards,
                 updatedTotalScore,
                 startTime,
-                endTime
+                endTime,
+                priceType
               );
             }
           );
@@ -752,7 +782,8 @@ shared (deployer) persistent actor class Rewards() = this {
                 neuronRewards,
                 totalRewardScore,
                 startTime,
-                endTime
+                endTime,
+                priceType
               );
             }
           );
@@ -772,7 +803,8 @@ shared (deployer) persistent actor class Rewards() = this {
             neuronRewards,
             totalRewardScore,
             startTime,
-            endTime
+            endTime,
+            priceType
           );
         }
       );
@@ -875,6 +907,35 @@ shared (deployer) persistent actor class Rewards() = this {
           #ok("Distribution triggered successfully");
         } catch (error) {
           #err(#SystemError("Failed to trigger distribution: " # "Error occurred"));
+        };
+      };
+    };
+  };
+
+  // Manual distribution trigger with custom parameters (for testing/admin)
+  public shared ({ caller }) func triggerDistributionCustom(
+    startTime: Int,
+    endTime: Int,
+    priceType: PriceType
+  ) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (startTime >= endTime) {
+      return #err(#InvalidTimeRange);
+    };
+
+    switch (currentDistributionId) {
+      case (?_) {
+        return #err(#DistributionInProgress);
+      };
+      case null {
+        try {
+          await* runCustomDistribution<system>(startTime, endTime, priceType);
+          #ok("Custom distribution triggered successfully");
+        } catch (error) {
+          #err(#SystemError("Failed to trigger custom distribution: " # "Error occurred"));
         };
       };
     };
