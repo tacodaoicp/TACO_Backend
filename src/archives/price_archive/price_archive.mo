@@ -554,6 +554,109 @@ shared (deployer) actor class PriceArchiveV2() = this {
   };
 
   //=========================================================================
+  // Batch Price Query Method
+  //=========================================================================
+
+  public query ({ caller }) func getPricesAtTime(tokens : [Principal], timestamp : Int) : async Result.Result<[(Principal, ?{icpPrice: Nat; usdPrice: Float; timestamp: Int})], ArchiveError> {
+    let sampleArgs = [{ start = 0; length = 1 }];
+    let sampleResult = base.icrc3_get_blocks(sampleArgs);
+    
+    let totalBlocks = sampleResult.log_length;
+    let startBlock = if (totalBlocks > 5000) { totalBlocks - 5000 } else { 0 };
+    let getBlocksArgs = [{
+      start = startBlock;
+      length = 5000;
+    }];
+    
+    let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+    
+    // Map to store most recent price for each token
+    let tokenPrices = Map.new<Principal, {icpPrice: Nat; usdPrice: Float; timestamp: Int}>();
+    let tokenTimestamps = Map.new<Principal, Int>();
+
+    for (block in icrc3Result.blocks.vals()) {
+      switch (block.block) {
+        case (#Map(entries)) {
+          for ((key, value) in entries.vals()) {
+            switch (key, value) {
+              case ("tx", #Map(txEntries)) {
+                var isPrice = false;
+                var txTimestamp : Int = 0;
+                
+                for ((txKey, txValue) in txEntries.vals()) {
+                  switch (txKey, txValue) {
+                    case ("operation", #Text("3price")) { isPrice := true; };
+                    case ("timestamp", #Int(t)) { txTimestamp := t; };
+                    case ("data", #Map(dataEntries)) {
+                      if (isPrice) {
+                        var blockToken : ?Principal = null;
+                        var blockTimestamp : Int = txTimestamp;
+                        var blockPriceICP : ?Nat = null;
+                        var blockPriceUSD : ?Text = null;
+                        
+                        for ((dataKey, dataValue) in dataEntries.vals()) {
+                          switch (dataKey, dataValue) {
+                            case ("token", #Blob(b)) { if (b.size() <= 29 and b.size() > 0) { blockToken := ?Principal.fromBlob(b); }; };
+                            case ("ts", #Int(t)) { blockTimestamp := t; };
+                            case ("price_icp", #Nat(p)) { blockPriceICP := ?p; };
+                            case ("price_usd", #Text(p)) { blockPriceUSD := ?p; };
+                            case _ {};
+                          };
+                        };
+                        
+                        switch (blockToken, blockPriceICP, blockPriceUSD) {
+                          case (?bToken, ?icp, ?usdText) {
+                            // Check if this token is in our requested list
+                            let isRequestedToken = Array.find<Principal>(tokens, func(t) { Principal.equal(t, bToken) });
+                            
+                            switch (isRequestedToken) {
+                              case (?_) {
+                                if (blockTimestamp <= timestamp) {
+                                  let currentBestTimestamp = switch (Map.get(tokenTimestamps, Map.phash, bToken)) {
+                                    case (?ts) ts;
+                                    case null -1;
+                                  };
+                                  
+                                  if (blockTimestamp > currentBestTimestamp) {
+                                    switch (textToFloat(usdText)) {
+                                      case (?usd) {
+                                        Map.set(tokenTimestamps, Map.phash, bToken, blockTimestamp);
+                                        Map.set(tokenPrices, Map.phash, bToken, { icpPrice = icp; usdPrice = usd; timestamp = blockTimestamp; });
+                                      };
+                                      case null {};
+                                    };
+                                  };
+                                };
+                              };
+                              case null {};
+                            };
+                          };
+                          case _ {};
+                        };
+                      };
+                    };
+                    case _ {};
+                  };
+                };
+              };
+              case _ {};
+            };
+          };
+        };
+        case _ {};
+      };
+    };
+    
+    // Build result array in the same order as requested tokens
+    let results = Array.map<Principal, (Principal, ?{icpPrice: Nat; usdPrice: Float; timestamp: Int})>(tokens, func(token) {
+      let price = Map.get(tokenPrices, Map.phash, token);
+      (token, price)
+    });
+    
+    #ok(results);
+  };
+
+  //=========================================================================
   // Lifecycle Functions (delegated to base class)
   //=========================================================================
 

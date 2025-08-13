@@ -110,6 +110,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
   type PriceArchive = actor {
     getPriceAtTime: (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
+    getPricesAtTime: ([Principal], Int) -> async Result.Result<[(Principal, ?PriceInfo)], ArchiveError>;
   };
 
   private transient let neuronAllocationArchive : NeuronAllocationArchive = actor (Principal.toText(DAO_NEURON_ALLOCATION_ARCHIVE_ID));
@@ -203,10 +204,27 @@ shared (deployer) persistent actor class Rewards() = this {
         // First checkpoint: Initialize with 1.0 total value, distributed by allocation
         var totalValue : Float = 1.0;
         
+        // Collect all tokens for batch price request
+        let tokens = Array.map<Allocation, Principal>(allocations, func(allocation) { allocation.token });
+        
+        // Get prices for all tokens at once
+        let batchPriceResult = await priceArchive.getPricesAtTime(tokens, timestamp);
+        let tokenPrices = switch (batchPriceResult) {
+          case (#ok(prices)) { prices };
+          case (#err(_)) {
+            return #err(#SystemError("Failed to get price data"));
+          };
+        };
+        
+        // Process each allocation with its corresponding price
         for (allocation in allocations.vals()) {
-          let priceResult = await priceArchive.getPriceAtTime(allocation.token, timestamp);
-          switch (priceResult) {
-            case (#ok(?priceInfo)) {
+          // Find the price for this token
+          let priceEntry = Array.find<(Principal, ?PriceInfo)>(tokenPrices, func((token, _)) {
+            Principal.equal(token, allocation.token)
+          });
+          
+          switch (priceEntry) {
+            case (?(_, ?priceInfo)) {
               let tokenPrice = getPriceValue(priceInfo, priceType);
               let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
               let tokenValue = totalValue * allocationPercent; // Just allocation percentage of 1.0
@@ -218,10 +236,10 @@ shared (deployer) persistent actor class Rewards() = this {
               assetValues.add((allocation.token, tokenValue));
               previousPrices.add((allocation.token, tokenPrice));
             };
-            case (#ok(null)) {
+            case (?(_, null)) {
               return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
             };
-            case (#err(_)) {
+            case null {
               return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
             };
           };
@@ -240,6 +258,44 @@ shared (deployer) persistent actor class Rewards() = this {
       } else {
         // Subsequent checkpoints: Apply price changes to existing asset values
         
+        // Collect all unique tokens we need prices for (both existing assets and new allocations)
+        let existingTokens = Array.map<(Principal, Float), Principal>(Buffer.toArray(assetValues), func((token, _)) { token });
+        let newTokens = Array.map<Allocation, Principal>(allocations, func(allocation) { allocation.token });
+        
+        // Combine and deduplicate tokens
+        let allTokensBuffer = Buffer.Buffer<Principal>(existingTokens.size() + newTokens.size());
+        for (token in existingTokens.vals()) {
+          allTokensBuffer.add(token);
+        };
+        for (token in newTokens.vals()) {
+          let isDuplicate = Array.find<Principal>(existingTokens, func(t) { Principal.equal(t, token) });
+          switch (isDuplicate) {
+            case null { allTokensBuffer.add(token); };
+            case _ {}; // Already added
+          };
+        };
+        let allTokens = Buffer.toArray(allTokensBuffer);
+        
+        // Get prices for all tokens at once
+        let batchPriceResult = await priceArchive.getPricesAtTime(allTokens, timestamp);
+        let tokenPrices = switch (batchPriceResult) {
+          case (#ok(prices)) { prices };
+          case (#err(_)) {
+            return #err(#SystemError("Failed to get price data"));
+          };
+        };
+        
+        // Helper function to find price for a token
+        let findPrice = func(token: Principal) : ?PriceInfo {
+          let priceEntry = Array.find<(Principal, ?PriceInfo)>(tokenPrices, func((t, _)) {
+            Principal.equal(t, token)
+          });
+          switch (priceEntry) {
+            case (?(_, price)) { price };
+            case null { null };
+          };
+        };
+        
         // Step 1: Update asset values based on price changes
         let updatedAssetValues = Buffer.Buffer<(Principal, Float)>(assetValues.size());
         let updatedPrices = Buffer.Buffer<(Principal, Float)>(previousPrices.size());
@@ -248,10 +304,9 @@ shared (deployer) persistent actor class Rewards() = this {
           let (token, oldValue) = assetValues.get(j);
           let (_, oldPrice) = previousPrices.get(j);
           
-          // Get new price for this token
-          let priceResult = await priceArchive.getPriceAtTime(token, timestamp);
-          switch (priceResult) {
-            case (#ok(?priceInfo)) {
+          // Get new price for this token from batch result
+          switch (findPrice(token)) {
+            case (?priceInfo) {
               let newPrice = getPriceValue(priceInfo, priceType);
               let priceRatio = newPrice / oldPrice; // This is the key fix!
               let newValue = oldValue * priceRatio;
@@ -259,10 +314,7 @@ shared (deployer) persistent actor class Rewards() = this {
               updatedAssetValues.add((token, newValue));
               updatedPrices.add((token, newPrice));
             };
-            case (#ok(null)) {
-              return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
-            };
-            case (#err(_)) {
+            case null {
               return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
             };
           };
@@ -280,17 +332,13 @@ shared (deployer) persistent actor class Rewards() = this {
           let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
           let tokenValue = totalValueAfterPriceChanges * allocationPercent;
           
-          // Get price info for this token
-          let priceResult = await priceArchive.getPriceAtTime(allocation.token, timestamp);
-          switch (priceResult) {
-            case (#ok(?priceInfo)) {
+          // Get price info for this token from batch result
+          switch (findPrice(allocation.token)) {
+            case (?priceInfo) {
               tokenPricesBuffer.add((allocation.token, priceInfo));
               tokenValuesBuffer.add((allocation.token, tokenValue));
             };
-            case (#ok(null)) {
-              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
-            };
-            case (#err(_)) {
+            case null {
               return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
             };
           };
