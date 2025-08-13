@@ -180,12 +180,10 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   type NeuronAllocation = {
-    neuronId: Blob;
     allocations: [Allocation];
+    lastUpdate: Int;
     votingPower: Nat;
-    lastAllocationUpdate: Int;
-    pastAllocations: [Allocation];
-    maker: Principal;
+    lastAllocationMaker: Principal;
   };
 
   type DAOCanister = actor {
