@@ -196,6 +196,9 @@ module {
       } else {
         logger.info("OUTER_LOOP", "Middle loop already running, skipping", "runOuterLoop");
       };
+      
+      // Reset running flag to allow rescheduling
+      outerLoopRunning := false;
     };
     
     private func stopOuterLoopTimer() {
