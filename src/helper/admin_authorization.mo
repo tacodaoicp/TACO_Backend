@@ -34,23 +34,4 @@ module {
     isMasterAdmin(caller, isKnownCanister) or Principal.isController(caller)
   };
 
-  // Admin check with additional authorized principals (like DAO or Treasury)
-  public func isAdminOrAuthorized(
-    caller: Principal, 
-    isKnownCanister: (Principal) -> Bool,
-    additionalAuthorized: [Principal]
-  ) : Bool {
-    if (isAdmin(caller, isKnownCanister)) {
-      return true;
-    };
-    
-    // Check additional authorized principals
-    for (authorized in additionalAuthorized.vals()) {
-      if (authorized == caller) {
-        return true;
-      };
-    };
-    
-    false;
-  };
 }
