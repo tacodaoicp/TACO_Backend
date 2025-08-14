@@ -123,7 +123,7 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var neuronRewardBalances = Map.new<Blob, Float>(); // neuronId -> accumulated rewards
   
   // Distribution history (circular buffer using Vector)
-  private transient let distributionHistory = Vector.new<DistributionRecord>();
+  private stable let distributionHistory = Vector.new<DistributionRecord>();
 
   // External canister interfaces
   private transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
