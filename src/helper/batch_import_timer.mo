@@ -164,10 +164,13 @@ module {
     //=========================================================================
     
     private func startOuterLoopTimer<system>() : async* () {
+
       if (outerLoopExecuting) {
         return; // Already executing - semaphore check
       };
-      
+
+      outerLoopRunning := true;  // System is now scheduled
+
       switch (outerLoopTimerId) {
         case (?id) { Timer.cancelTimer(id) };
         case null {};
@@ -184,7 +187,6 @@ module {
         }
       );
       
-      outerLoopRunning := true;  // System is now scheduled
       logger.info("OUTER_LOOP", "Outer loop timer started - Interval: " # Nat.toText(config.outerLoopIntervalNS / 1_000_000_000) # "s", "startOuterLoopTimer");
     };
     
