@@ -17,6 +17,7 @@ import Error "mo:base/Error";
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
+import ICRC "../helper/icrc.types";
 
 shared (deployer) persistent actor class Rewards() = this {
 
@@ -30,6 +31,7 @@ shared (deployer) persistent actor class Rewards() = this {
   // TACO token constants
   private let TACO_DECIMALS : Nat = 8;
   private let TACO_SATOSHIS_PER_TOKEN : Nat = 100_000_000; // 10^8
+  private let TACO_LEDGER_CANISTER_ID : Text = "kknbx-zyaaa-aaaaq-aae4a-cai";
 
   // Helper functions for TACO amount conversions
   private func tacoTokensToSatoshis(tokens: Nat) : Nat {
@@ -1049,6 +1051,22 @@ shared (deployer) persistent actor class Rewards() = this {
   // Get total distributed amount (returns TACO satoshis)
   public query func getTotalDistributed() : async Nat {
     totalDistributed
+  };
+
+  // Get current TACO balance of this canister (returns TACO satoshis)
+  public func getTacoBalance() : async Nat {
+    let tacoLedger : ICRC.Self = actor(TACO_LEDGER_CANISTER_ID);
+    let account : ICRC.Account = {
+      owner = this_canister_id();
+      subaccount = null;
+    };
+    
+    try {
+      await tacoLedger.icrc1_balance_of(account)
+    } catch (error) {
+      logger.error("TacoBalance", "Failed to get TACO balance: " # Error.message(error), "getTacoBalance");
+      0 // Return 0 on error
+    }
   };
 
   // Get all neuron reward balances (admin only) - returns TACO satoshis
