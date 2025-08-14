@@ -27,6 +27,19 @@ shared (deployer) persistent actor class Rewards() = this {
   // Logger instance
   private transient var logger = Logger.Logger();
 
+  // TACO token constants
+  private let TACO_DECIMALS : Nat = 8;
+  private let TACO_SATOSHIS_PER_TOKEN : Nat = 100_000_000; // 10^8
+
+  // Helper functions for TACO amount conversions
+  private func tacoTokensToSatoshis(tokens: Nat) : Nat {
+    tokens * TACO_SATOSHIS_PER_TOKEN
+  };
+
+  private func tacoSatoshisToTokens(satoshis: Nat) : Float {
+    Float.fromInt(satoshis) / Float.fromInt(TACO_SATOSHIS_PER_TOKEN)
+  };
+
   // Types for our rewards calculations
   public type PriceType = {
     #ICP;
@@ -73,7 +86,7 @@ shared (deployer) persistent actor class Rewards() = this {
     performanceScore: Float;
     votingPower: Nat;
     rewardScore: Float;
-    rewardAmount: Float;
+    rewardAmount: Nat; // Reward amount in TACO satoshis (integer)
     checkpoints: [CheckpointData]; // Include checkpoints to access maker information
   };
 
@@ -82,12 +95,19 @@ shared (deployer) persistent actor class Rewards() = this {
     errorMessage: Text;
   };
 
+  public type DistributionStatus = {
+    #InProgress: {currentNeuron: Nat; totalNeurons: Nat};
+    #Completed;
+    #Failed: Text;
+    #PartiallyCompleted: {successfulNeurons: Nat; failedNeurons: Nat};
+  };
+
   public type DistributionRecord = {
     id: Nat;
     startTime: Int;
     endTime: Int;
     distributionTime: Int;
-    totalRewardPot: Float;
+    totalRewardPot: Nat; // Reward pot in whole TACO tokens
     totalRewardScore: Float;
     neuronsProcessed: Nat;
     neuronRewards: [NeuronReward];
@@ -95,12 +115,7 @@ shared (deployer) persistent actor class Rewards() = this {
     status: DistributionStatus;
   };
 
-  public type DistributionStatus = {
-    #InProgress: {currentNeuron: Nat; totalNeurons: Nat};
-    #Completed;
-    #PartiallyCompleted: {successfulNeurons: Nat; failedNeurons: Nat};
-    #Failed: Text;
-  };
+
 
   public type DistributionError = {
     #SystemError: Text;
@@ -110,7 +125,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // Configuration
   stable var distributionPeriodNS : Nat = 604_800_000_000_000; // 7 days in nanoseconds
-  stable var weeklyRewardPot : Float = 1000.0; // Default reward pot
+  stable var weeklyRewardPot : Nat = 1000; // Default reward pot in whole TACO tokens
   stable var maxDistributionHistory : Nat = 52; // Keep 1 year of weekly distributions
   stable var distributionEnabled : Bool = true;
 
@@ -122,7 +137,8 @@ shared (deployer) persistent actor class Rewards() = this {
   
   // Reward tracking
   private transient let { phash; bhash } = Map;
-  stable var neuronRewardBalances = Map.new<Blob, Float>(); // neuronId -> accumulated rewards
+  stable var neuronRewardBalances = Map.new<Blob, Nat>(); // neuronId -> accumulated rewards in TACO satoshis
+  stable var totalDistributed : Nat = 0; // Total amount distributed to users in TACO satoshis (for balance validation)
   
   // Distribution history (circular buffer using Vector)
   private stable let distributionHistory = Vector.new<DistributionRecord>();
@@ -778,7 +794,7 @@ shared (deployer) persistent actor class Rewards() = this {
             performanceScore = performance.performanceScore;
             votingPower = votingPower;
             rewardScore = rewardScore;
-            rewardAmount = 0.0; // Will be calculated later
+            rewardAmount = 0; // Will be calculated later
             checkpoints = performance.checkpoints;
           };
 
@@ -878,8 +894,11 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     // Calculate individual reward amounts
+    let weeklyRewardPotSatoshis = tacoTokensToSatoshis(weeklyRewardPot);
     let finalRewards = Array.map<NeuronReward, NeuronReward>(neuronRewards, func(reward) {
-      let rewardAmount = (reward.rewardScore / totalRewardScore) * weeklyRewardPot;
+      // Calculate as float first, then convert to integer satoshis using floor
+      let rewardAmountFloat = (reward.rewardScore / totalRewardScore) * Float.fromInt(weeklyRewardPotSatoshis);
+      let rewardAmount = Int.abs(Float.toInt(Float.floor(rewardAmountFloat))); // Use floor to never exceed pot
       { reward with rewardAmount = rewardAmount }
     });
 
@@ -887,14 +906,14 @@ shared (deployer) persistent actor class Rewards() = this {
     for (reward in finalRewards.vals()) {
       let currentBalance = switch (Map.get(neuronRewardBalances, bhash, reward.neuronId)) {
         case (?balance) { balance };
-        case null { 0.0 };
+        case null { 0 };
       };
       Map.set(neuronRewardBalances, bhash, reward.neuronId, currentBalance + reward.rewardAmount);
     };
 
     await* completeDistribution(distributionId, finalRewards, failedNeurons, totalRewardScore, "");
     
-    logger.info("Distribution", "Distribution " # Nat.toText(distributionId) # " completed. Processed " # Nat.toText(finalRewards.size()) # " neurons, distributed " # Float.toText(weeklyRewardPot) # " rewards", "calculateAndDistributeRewards");
+    logger.info("Distribution", "Distribution " # Nat.toText(distributionId) # " completed. Processed " # Nat.toText(finalRewards.size()) # " neurons, distributed " # Nat.toText(weeklyRewardPot) # " TACO tokens", "calculateAndDistributeRewards");
   };
 
   // Complete the distribution and update records
@@ -923,6 +942,16 @@ shared (deployer) persistent actor class Rewards() = this {
         } else {
           #Completed
         };
+
+        // Calculate total amount distributed in this distribution
+        let distributedAmount = Array.foldLeft<NeuronReward, Nat>(
+          neuronRewards, 
+          0, 
+          func(acc, reward) { acc + reward.rewardAmount }
+        );
+        
+        // Update the total distributed amount
+        totalDistributed += distributedAmount;
 
         let finalRecord = {
           record with
@@ -1006,16 +1035,21 @@ shared (deployer) persistent actor class Rewards() = this {
   // Reward Claim Functions
   //=========================================================================
 
-  // Get neuron reward balance
-  public query func getNeuronRewardBalance(neuronId: Blob) : async Float {
+  // Get neuron reward balance (returns TACO satoshis)
+  public query func getNeuronRewardBalance(neuronId: Blob) : async Nat {
     switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
       case (?balance) { balance };
-      case null { 0.0 };
+      case null { 0 };
     };
   };
 
-  // Get all neuron reward balances (admin only)
-  public shared query ({ caller }) func getAllNeuronRewardBalances() : async [(Blob, Float)] {
+  // Get total distributed amount (returns TACO satoshis)
+  public query func getTotalDistributed() : async Nat {
+    totalDistributed
+  };
+
+  // Get all neuron reward balances (admin only) - returns TACO satoshis
+  public shared query ({ caller }) func getAllNeuronRewardBalances() : async [(Blob, Nat)] {
     if (not isAdmin(caller)) {
       return [];
     };
@@ -1078,14 +1112,14 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Distribution period updated");
   };
 
-  // Set weekly reward pot
-  public shared ({ caller }) func setWeeklyRewardPot(amount: Float) : async Result.Result<Text, RewardsError> {
+  // Set weekly reward pot (amount in whole TACO tokens)
+  public shared ({ caller }) func setWeeklyRewardPot(amount: Nat) : async Result.Result<Text, RewardsError> {
     if (not isAdmin(caller)) {
       return #err(#NotAuthorized);
     };
     
     weeklyRewardPot := amount;
-    logger.info("Config", "Weekly reward pot set to " # Float.toText(amount), "setWeeklyRewardPot");
+    logger.info("Config", "Weekly reward pot set to " # Nat.toText(amount) # " TACO tokens", "setWeeklyRewardPot");
     #ok("Weekly reward pot updated");
   };
 
@@ -1103,7 +1137,7 @@ shared (deployer) persistent actor class Rewards() = this {
   // Get configuration
   public query func getConfiguration() : async {
     distributionPeriodNS: Nat;
-    weeklyRewardPot: Float;
+    weeklyRewardPot: Nat; // Reward pot in whole TACO tokens
     maxDistributionHistory: Nat;
     distributionEnabled: Bool;
   } {
@@ -1133,11 +1167,11 @@ shared (deployer) persistent actor class Rewards() = this {
       lastDistribution: Int;
       nextDistribution: Int;
       totalDistributions: Nat;
-      totalRewardsDistributed: Float;
+      totalRewardsDistributed: Nat; // Total TACO tokens distributed
     };
   } {
     // Calculate total rewards distributed
-    var totalRewards : Float = 0.0;
+    var totalRewards : Nat = 0;
     for (record in Vector.vals(distributionHistory)) {
       switch (record.status) {
         case (#Completed) {
@@ -1169,3 +1203,4 @@ shared (deployer) persistent actor class Rewards() = this {
     };
   };
 }
+
