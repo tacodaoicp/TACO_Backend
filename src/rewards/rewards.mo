@@ -40,6 +40,7 @@ shared (deployer) persistent actor class Rewards() = this {
     tokenValues: [(Principal, Float)]; // Per-token values (allocation % × token price)
     totalPortfolioValue: Float; // Sum of all token values
     pricesUsed: [(Principal, PriceInfo)]; // Prices used for this calculation
+    maker: ?Principal; // The principal responsible for the allocation at this checkpoint
   };
 
   public type PerformanceResult = {
@@ -73,6 +74,7 @@ shared (deployer) persistent actor class Rewards() = this {
     votingPower: Nat;
     rewardScore: Float;
     rewardAmount: Float;
+    checkpoints: [CheckpointData]; // Include checkpoints to access maker information
   };
 
   public type FailedNeuron = {
@@ -246,13 +248,27 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     };
 
-    // Build timeline of allocation changes
-    let timelineBuffer = Buffer.Buffer<(Int, [Allocation])>(10);
-    timelineBuffer.add((startTime, startAllocation));
+    // Build timeline of allocation changes with makers
+    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal)>(10);
     
-    // Add all in-timespan changes
+    // For start time, get maker from preTimespanAllocation if available
+    let startMaker = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { ?preAlloc.maker };
+      case (null) {
+        // Check if there's a change exactly at start time
+        switch (Array.find(allocationData.inTimespanChanges, func(change: NeuronAllocationChangeBlockData) : Bool {
+          change.timestamp == startTime
+        })) {
+          case (?exactChange) { ?exactChange.maker };
+          case (null) { null };
+        };
+      };
+    };
+    timelineBuffer.add((startTime, startAllocation, startMaker));
+    
+    // Add all in-timespan changes with their makers
     for (change in allocationData.inTimespanChanges.vals()) {
-      timelineBuffer.add((change.timestamp, change.newAllocations));
+      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker));
     };
     
     // Add end time if it's different from the last change
@@ -267,7 +283,13 @@ shared (deployer) persistent actor class Rewards() = this {
       } else { 
         timelineBuffer.get(timelineBuffer.size() - 1).1 
       };
-      timelineBuffer.add((endTime, endAllocations));
+      // For end time, use the maker from the last change
+      let endMaker = if (timelineBuffer.size() == 0) {
+        startMaker
+      } else {
+        timelineBuffer.get(timelineBuffer.size() - 1).2
+      };
+      timelineBuffer.add((endTime, endAllocations, endMaker));
     };
 
     let timeline = Buffer.toArray(timelineBuffer);
@@ -280,7 +302,7 @@ shared (deployer) persistent actor class Rewards() = this {
     var previousPrices = Buffer.Buffer<(Principal, Float)>(10); // (token, price)
     
     for (i in timeline.keys()) {
-      let (timestamp, allocations) = timeline[i];
+      let (timestamp, allocations, maker) = timeline[i];
       
       // Get prices for all tokens at this timestamp
       let tokenPricesBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
@@ -338,6 +360,7 @@ shared (deployer) persistent actor class Rewards() = this {
           tokenValues = Buffer.toArray(tokenValuesBuffer);
           totalPortfolioValue = 1.0;
           pricesUsed = Buffer.toArray(tokenPricesBuffer);
+          maker = maker;
         };
         checkpointsBuffer.add(checkpoint);
         
@@ -437,6 +460,7 @@ shared (deployer) persistent actor class Rewards() = this {
           tokenValues = Buffer.toArray(tokenValuesBuffer);
           totalPortfolioValue = totalValueAfterPriceChanges;
           pricesUsed = Buffer.toArray(tokenPricesBuffer);
+          maker = maker;
         };
         checkpointsBuffer.add(checkpoint);
         
@@ -755,6 +779,7 @@ shared (deployer) persistent actor class Rewards() = this {
             votingPower = votingPower;
             rewardScore = rewardScore;
             rewardAmount = 0.0; // Will be calculated later
+            checkpoints = performance.checkpoints;
           };
 
           let updatedRewards = Array.flatten([neuronRewards, [neuronReward]]);
