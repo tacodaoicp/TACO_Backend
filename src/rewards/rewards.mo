@@ -108,6 +108,7 @@ shared (deployer) persistent actor class Rewards() = this {
     endTime: Int;
     distributionTime: Int;
     totalRewardPot: Nat; // Reward pot in whole TACO tokens
+    actualDistributed: Nat; // Actual amount distributed in TACO satoshis
     totalRewardScore: Float;
     neuronsProcessed: Nat;
     neuronRewards: [NeuronReward];
@@ -680,6 +681,7 @@ shared (deployer) persistent actor class Rewards() = this {
       endTime = endTime;
       distributionTime = now;
       totalRewardPot = weeklyRewardPot;
+      actualDistributed = 0; // Will be updated when distribution completes
       totalRewardScore = 0.0;
       neuronsProcessed = 0;
       neuronRewards = [];
@@ -956,6 +958,7 @@ shared (deployer) persistent actor class Rewards() = this {
         let finalRecord = {
           record with
           totalRewardScore = totalRewardScore;
+          actualDistributed = distributedAmount;
           neuronsProcessed = neuronRewards.size() + failedNeurons.size();
           neuronRewards = neuronRewards;
           failedNeurons = failedNeurons;
