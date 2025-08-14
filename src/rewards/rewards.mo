@@ -12,6 +12,7 @@ import Map "mo:map/Map";
 import Vector "mo:vector";
 import Nat "mo:base/Nat";
 import Text "mo:base/Text";
+import Error "mo:base/Error";
 
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
@@ -74,6 +75,11 @@ shared (deployer) persistent actor class Rewards() = this {
     rewardAmount: Float;
   };
 
+  public type FailedNeuron = {
+    neuronId: Blob;
+    errorMessage: Text;
+  };
+
   public type DistributionRecord = {
     id: Nat;
     startTime: Int;
@@ -83,12 +89,14 @@ shared (deployer) persistent actor class Rewards() = this {
     totalRewardScore: Float;
     neuronsProcessed: Nat;
     neuronRewards: [NeuronReward];
+    failedNeurons: [FailedNeuron];
     status: DistributionStatus;
   };
 
   public type DistributionStatus = {
     #InProgress: {currentNeuron: Nat; totalNeurons: Nat};
     #Completed;
+    #PartiallyCompleted: {successfulNeurons: Nat; failedNeurons: Nat};
     #Failed: Text;
   };
 
@@ -635,6 +643,7 @@ shared (deployer) persistent actor class Rewards() = this {
       totalRewardScore = 0.0;
       neuronsProcessed = 0;
       neuronRewards = [];
+      failedNeurons = [];
       status = #InProgress({currentNeuron = 0; totalNeurons = 0});
     };
 
@@ -656,7 +665,7 @@ shared (deployer) persistent actor class Rewards() = this {
       logger.info("Distribution", "Found " # Nat.toText(neurons.size()) # " neurons to process", "runWeeklyDistribution");
       
       if (neurons.size() == 0) {
-        await* completeDistribution(distributionCounter, [], 0.0, "No neurons found");
+        await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, "No neurons found");
         return;
       };
 
@@ -668,11 +677,11 @@ shared (deployer) persistent actor class Rewards() = this {
       Vector.put(distributionHistory, Vector.size(distributionHistory) - 1, updatedRecord);
 
       // Start processing neurons one by one
-      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, [], 0.0, startTime, endTime, priceType);
+      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, startTime, endTime, priceType);
       
     } catch (error) {
       logger.error("Distribution", "Failed to get neurons: " # "Error occurred", "runWeeklyDistribution");
-      await* completeDistribution(distributionCounter, [], 0.0, "Failed to get neurons: " # "Error occurred");
+      await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, "Failed to get neurons: " # "Error occurred");
     };
   };
 
@@ -682,6 +691,7 @@ shared (deployer) persistent actor class Rewards() = this {
     neurons: [(Blob, NeuronAllocation)],
     currentIndex: Nat,
     neuronRewards: [NeuronReward],
+    failedNeurons: [FailedNeuron],
     totalRewardScore: Float,
     startTime: Int,
     endTime: Int,
@@ -704,7 +714,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Check if we've processed all neurons
     if (currentIndex >= neurons.size()) {
-      await* calculateAndDistributeRewards(distributionId, neuronRewards, totalRewardScore);
+      await* calculateAndDistributeRewards(distributionId, neuronRewards, failedNeurons, totalRewardScore);
       return;
     };
 
@@ -759,6 +769,7 @@ shared (deployer) persistent actor class Rewards() = this {
                 neurons,
                 currentIndex + 1,
                 updatedRewards,
+                failedNeurons, // Keep same failed neurons list
                 updatedTotalScore,
                 startTime,
                 endTime,
@@ -768,7 +779,15 @@ shared (deployer) persistent actor class Rewards() = this {
           );
         };
         case (#err(error)) {
-          logger.warn("Distribution", "Failed to calculate performance for neuron: " # "Error occurred", "processNeuronsSequentially");
+          let errorMsg = debug_show(error);
+          logger.warn("Distribution", "Failed to calculate performance for neuron: " # errorMsg, "processNeuronsSequentially");
+          
+          // Add this neuron to the failed list
+          let failedNeuron : FailedNeuron = {
+            neuronId = neuronId;
+            errorMessage = errorMsg;
+          };
+          let updatedFailedNeurons = Array.flatten([failedNeurons, [failedNeuron]]);
           
           // Continue with next neuron
           ignore Timer.setTimer<system>(
@@ -779,6 +798,7 @@ shared (deployer) persistent actor class Rewards() = this {
                 neurons,
                 currentIndex + 1,
                 neuronRewards,
+                updatedFailedNeurons,
                 totalRewardScore,
                 startTime,
                 endTime,
@@ -789,7 +809,15 @@ shared (deployer) persistent actor class Rewards() = this {
         };
       };
     } catch (error) {
-      logger.error("Distribution", "Error processing neuron: " # "Error occurred", "processNeuronsSequentially");
+      let errorMsg = Error.message(error);
+      logger.error("Distribution", "Error processing neuron: " # errorMsg, "processNeuronsSequentially");
+      
+      // Add this neuron to the failed list
+      let failedNeuron : FailedNeuron = {
+        neuronId = neuronId;
+        errorMessage = "System error: " # errorMsg;
+      };
+      let updatedFailedNeurons = Array.flatten([failedNeurons, [failedNeuron]]);
       
       // Continue with next neuron
       ignore Timer.setTimer<system>(
@@ -800,6 +828,7 @@ shared (deployer) persistent actor class Rewards() = this {
             neurons,
             currentIndex + 1,
             neuronRewards,
+            updatedFailedNeurons,
             totalRewardScore,
             startTime,
             endTime,
@@ -814,11 +843,12 @@ shared (deployer) persistent actor class Rewards() = this {
   private func calculateAndDistributeRewards(
     distributionId: Nat,
     neuronRewards: [NeuronReward],
+    failedNeurons: [FailedNeuron],
     totalRewardScore: Float
   ) : async* () {
     
     if (totalRewardScore == 0.0) {
-      await* completeDistribution(distributionId, neuronRewards, totalRewardScore, "No valid reward scores");
+      await* completeDistribution(distributionId, neuronRewards, failedNeurons, totalRewardScore, "No valid reward scores");
       return;
     };
 
@@ -837,7 +867,7 @@ shared (deployer) persistent actor class Rewards() = this {
       Map.set(neuronRewardBalances, bhash, reward.neuronId, currentBalance + reward.rewardAmount);
     };
 
-    await* completeDistribution(distributionId, finalRewards, totalRewardScore, "");
+    await* completeDistribution(distributionId, finalRewards, failedNeurons, totalRewardScore, "");
     
     logger.info("Distribution", "Distribution " # Nat.toText(distributionId) # " completed. Processed " # Nat.toText(finalRewards.size()) # " neurons, distributed " # Float.toText(weeklyRewardPot) # " rewards", "calculateAndDistributeRewards");
   };
@@ -846,6 +876,7 @@ shared (deployer) persistent actor class Rewards() = this {
   private func completeDistribution(
     distributionId: Nat,
     neuronRewards: [NeuronReward],
+    failedNeurons: [FailedNeuron],
     totalRewardScore: Float,
     errorMessage: Text
   ) : async* () {
@@ -857,17 +888,23 @@ shared (deployer) persistent actor class Rewards() = this {
     let historyIndex = Vector.size(distributionHistory) - 1;
     switch (Vector.get(distributionHistory, historyIndex)) {
       case (record) {
-        let status = if (errorMessage == "") {
-          #Completed
-        } else {
+        let status = if (errorMessage != "") {
           #Failed(errorMessage)
+        } else if (failedNeurons.size() > 0) {
+          #PartiallyCompleted({
+            successfulNeurons = neuronRewards.size();
+            failedNeurons = failedNeurons.size();
+          })
+        } else {
+          #Completed
         };
 
         let finalRecord = {
           record with
           totalRewardScore = totalRewardScore;
-          neuronsProcessed = neuronRewards.size();
+          neuronsProcessed = neuronRewards.size() + failedNeurons.size();
           neuronRewards = neuronRewards;
+          failedNeurons = failedNeurons;
           status = status;
         };
         Vector.put(distributionHistory, historyIndex, finalRecord);
@@ -905,7 +942,7 @@ shared (deployer) persistent actor class Rewards() = this {
           await* runWeeklyDistribution<system>();
           #ok("Distribution triggered successfully");
         } catch (error) {
-          #err(#SystemError("Failed to trigger distribution: " # "Error occurred"));
+          #err(#SystemError("Failed to trigger distribution: " # Error.message(error)));
         };
       };
     };
@@ -934,7 +971,7 @@ shared (deployer) persistent actor class Rewards() = this {
           await* runCustomDistribution<system>(startTime, endTime, priceType);
           #ok("Custom distribution triggered successfully");
         } catch (error) {
-          #err(#SystemError("Failed to trigger custom distribution: " # "Error occurred"));
+          #err(#SystemError("Failed to trigger custom distribution: " # Error.message(error)));
         };
       };
     };
@@ -1079,6 +1116,10 @@ shared (deployer) persistent actor class Rewards() = this {
     for (record in Vector.vals(distributionHistory)) {
       switch (record.status) {
         case (#Completed) {
+          totalRewards += record.totalRewardPot;
+        };
+        case (#PartiallyCompleted(_)) {
+          // Include partially completed distributions in total
           totalRewards += record.totalRewardPot;
         };
         case _ { };
