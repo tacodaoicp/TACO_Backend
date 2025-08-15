@@ -54,7 +54,7 @@ module CanisterId {
             (#Production, #dao_admin_archive, Principal.fromText("cspwf-4aaaa-aaaan-qz5ia-cai")),
             (#Production, #dao_governance_archive, Principal.fromText("c4n3n-hqaaa-aaaan-qz5ja-cai")),
             (#Production, #dao_allocation_archive, Principal.fromText("cvoqr-ryaaa-aaaan-qz5iq-cai")),
-            (#Production, #rewards, Principal.fromText("aaaaa-aa")), // Placeholder ID
+            (#Production, #rewards, Principal.fromText("dkgdg-saaaa-aaaan-qz5ma-cai")), // Placeholder ID
             (#Production, #dao_neuron_allocation_archive, Principal.fromText("aaaaa-aa")) // Placeholder ID
         ];
         

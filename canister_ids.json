@@ -15,6 +15,9 @@
     "ic": "c4n3n-hqaaa-aaaan-qz5ja-cai",
     "staging": "bzzag-2yaaa-aaaan-qz5cq-cai"
   },
+  "dao_neuron_allocation_archive": {
+    "staging": "cajb4-qqaaa-aaaan-qz5la-cai"
+  },
   "neuronSnapshot": {
     "ic": "vzs3x-taaaa-aaaan-qzzjq-cai",
     "staging": "tgqd4-eqaaa-aaaai-atifa-cai"
@@ -28,6 +31,7 @@
     "staging": "l7gh3-pqaaa-aaaan-qz4za-cai"
   },
   "rewards": {
+    "ic": "dkgdg-saaaa-aaaan-qz5ma-cai",
     "staging": "cjkka-gyaaa-aaaan-qz5kq-cai"
   },
   "trading_archive": {
@@ -41,8 +45,5 @@
   "validation": {
     "ic": "th44n-iyaaa-aaaan-qzz5a-cai",
     "staging": "tbrfi-jiaaa-aaaai-atifq-cai"
-  },
-  "dao_neuron_allocation_archive": {
-    "staging": "cajb4-qqaaa-aaaan-qz5la-cai"
   }
 }
