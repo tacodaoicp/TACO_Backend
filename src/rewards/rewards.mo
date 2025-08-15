@@ -1079,6 +1079,17 @@ shared (deployer) persistent actor class Rewards() = this {
     };
   };
 
+  // Get multiple neuron reward balances (returns array of neuronId-balance tuples)
+  public query func getNeuronRewardBalances(neuronIds: [Blob]) : async [(Blob, Nat)] {
+    Array.map<Blob, (Blob, Nat)>(neuronIds, func(neuronId) {
+      let balance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
+        case (?bal) { bal };
+        case null { 0 };
+      };
+      (neuronId, balance)
+    });
+  };
+
   // Get total distributed amount (returns TACO satoshis)
   public query func getTotalDistributed() : async Nat {
     totalDistributed
@@ -1311,14 +1322,23 @@ shared (deployer) persistent actor class Rewards() = this {
       // Calculate amount to send (total - fee)
       let amountToSend = totalBalance - TACO_WITHDRAWAL_FEE;
 
-      // Deduct balances from all neurons BEFORE transfer to prevent double spending
-      for (neuronId in neuronIds.vals()) {
+      // Deduct exact recorded balances from all neurons BEFORE transfer to prevent double spending
+      for ((neuronId, originalBalance) in originalBalances.vals()) {
         let currentBalance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
           case (?balance) { balance };
           case null { 0 };
         };
-        if (currentBalance > 0) {
+        let newBalance = if (currentBalance >= originalBalance) {
+          currentBalance - originalBalance
+        } else {
+          // This should never happen - indicates serious bug or data corruption
+          _Debug.trap("Withdrawal error: current balance (" # Nat.toText(currentBalance) # ") < original balance (" # Nat.toText(originalBalance) # ") for neuron");
+        };
+        
+        if (newBalance == 0) {
           ignore Map.remove(neuronRewardBalances, bhash, neuronId);
+        } else {
+          ignore Map.put(neuronRewardBalances, bhash, neuronId, newBalance);
         };
       };
 
