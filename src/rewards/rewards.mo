@@ -729,6 +729,23 @@ shared (deployer) persistent actor class Rewards() = this {
       Vector.reverse(distributionHistory);
     };
 
+    // Validate that we have enough available balance for the distribution
+    let availableBalance = await getAvailableBalance();
+    let rewardPotSatoshis = tacoTokensToSatoshis(periodicRewardPot);
+    
+    if (availableBalance < rewardPotSatoshis) {
+      let errorMsg = "Insufficient available balance for distribution. Available: " # 
+                     Nat.toText(availableBalance) # " satoshis, Required: " # 
+                     Nat.toText(rewardPotSatoshis) # " satoshis";
+      logger.error("Distribution", errorMsg, "runDistributionWithParams");
+      await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, errorMsg);
+      return;
+    };
+
+    logger.info("Distribution", "Balance validation passed. Available: " # 
+                Nat.toText(availableBalance) # " satoshis, Required: " # 
+                Nat.toText(rewardPotSatoshis) # " satoshis", "runDistributionWithParams");
+
     // Get all neurons from DAO
     try {
       let neuronsResult = await daoCanister.admin_getNeuronAllocations();
@@ -1442,6 +1459,8 @@ shared (deployer) persistent actor class Rewards() = this {
       0
     }
   };
+
+
 
   public shared ({ caller = _ }) func getCanisterStatus() : async {
     neuronAllocationArchiveId: Principal;
