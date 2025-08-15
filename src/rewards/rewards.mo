@@ -82,7 +82,7 @@ shared (deployer) persistent actor class Rewards() = this {
     #NotAuthorized;
   };
 
-  // Weekly distribution types
+  // Periodic distribution types
   public type NeuronReward = {
     neuronId: Blob;
     performanceScore: Float;
@@ -128,9 +128,11 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // Configuration
   stable var distributionPeriodNS : Nat = 604_800_000_000_000; // 7 days in nanoseconds
-  stable var weeklyRewardPot : Nat = 1000; // Default reward pot in whole TACO tokens
-  stable var maxDistributionHistory : Nat = 52; // Keep 1 year of weekly distributions
+  stable var periodicRewardPot : Nat = 1000; // Default reward pot in whole TACO tokens
+  stable var maxDistributionHistory : Nat = 52; // Keep 1 year of periodic distributions
   stable var distributionEnabled : Bool = true;
+  stable var performanceScorePower : Float = 1.0; // Power to raise performance scores to (0 = no effect, 1 = linear, 2 = quadratic, etc.)
+  stable var votingPowerPower : Float = 1.0; // Power to raise voting power to (0 = no effect, 1 = linear, 2 = quadratic, etc.)
 
   // Distribution state
   stable var distributionCounter : Nat = 0;
@@ -565,7 +567,7 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   //=========================================================================
-  // Weekly Distribution System
+  // Periodic Distribution System
   //=========================================================================
 
   // Start the recurring distribution timer
@@ -616,7 +618,7 @@ shared (deployer) persistent actor class Rewards() = this {
       #nanoseconds(distributionPeriodNS),
       func() : async () {
         try {
-          await* runWeeklyDistribution<system>();
+          await* runPeriodicDistribution<system>();
           // Schedule next distribution
           await* scheduleNextDistribution<system>();
         } catch (error) {
@@ -629,11 +631,11 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // Main distribution function
-  private func runWeeklyDistribution<system>() : async* () {
+  private func runPeriodicDistribution<system>() : async* () {
     // Check if distribution is already in progress
     switch (currentDistributionId) {
       case (?_) {
-        logger.warn("Distribution", "Distribution already in progress, skipping", "runWeeklyDistribution");
+        logger.warn("Distribution", "Distribution already in progress, skipping", "runPeriodicDistribution");
         return;
       };
       case null { };
@@ -682,7 +684,7 @@ shared (deployer) persistent actor class Rewards() = this {
       startTime = startTime;
       endTime = endTime;
       distributionTime = now;
-      totalRewardPot = weeklyRewardPot;
+      totalRewardPot = periodicRewardPot;
       actualDistributed = 0; // Will be updated when distribution completes
       totalRewardScore = 0.0;
       neuronsProcessed = 0;
@@ -706,7 +708,7 @@ shared (deployer) persistent actor class Rewards() = this {
       let neuronsResult = await daoCanister.admin_getNeuronAllocations();
       let neurons = neuronsResult;
       
-      logger.info("Distribution", "Found " # Nat.toText(neurons.size()) # " neurons to process", "runWeeklyDistribution");
+      logger.info("Distribution", "Found " # Nat.toText(neurons.size()) # " neurons to process", "runPeriodicDistribution");
       
       if (neurons.size() == 0) {
         await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, "No neurons found");
@@ -724,7 +726,7 @@ shared (deployer) persistent actor class Rewards() = this {
       await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, startTime, endTime, priceType);
       
     } catch (error) {
-      logger.error("Distribution", "Failed to get neurons: " # "Error occurred", "runWeeklyDistribution");
+      logger.error("Distribution", "Failed to get neurons: " # "Error occurred", "runPeriodicDistribution");
       await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, "Failed to get neurons: " # "Error occurred");
     };
   };
@@ -791,7 +793,10 @@ shared (deployer) persistent actor class Rewards() = this {
         case (#ok(performance)) {
           // Get voting power - use the most recent (oldest in time) available
           let votingPower = getVotingPowerFromPerformance(performance);
-          let rewardScore = performance.performanceScore * Float.fromInt(votingPower);
+          // Apply power factors to performance score and voting power
+          let adjustedPerformanceScore = Float.pow(performance.performanceScore, performanceScorePower);
+          let adjustedVotingPower = Float.pow(Float.fromInt(votingPower), votingPowerPower);
+          let rewardScore = adjustedPerformanceScore * adjustedVotingPower;
           
           let neuronReward : NeuronReward = {
             neuronId = neuronId;
@@ -898,10 +903,10 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     // Calculate individual reward amounts
-    let weeklyRewardPotSatoshis = tacoTokensToSatoshis(weeklyRewardPot);
+    let periodicRewardPotSatoshis = tacoTokensToSatoshis(periodicRewardPot);
     let finalRewards = Array.map<NeuronReward, NeuronReward>(neuronRewards, func(reward) {
       // Calculate as float first, then convert to integer satoshis using floor
-      let rewardAmountFloat = (reward.rewardScore / totalRewardScore) * Float.fromInt(weeklyRewardPotSatoshis);
+      let rewardAmountFloat = (reward.rewardScore / totalRewardScore) * Float.fromInt(periodicRewardPotSatoshis);
       let rewardAmount = Int.abs(Float.toInt(Float.floor(rewardAmountFloat))); // Use floor to never exceed pot
       { reward with rewardAmount = rewardAmount }
     });
@@ -917,7 +922,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
     await* completeDistribution(distributionId, finalRewards, failedNeurons, totalRewardScore, "");
     
-    logger.info("Distribution", "Distribution " # Nat.toText(distributionId) # " completed. Processed " # Nat.toText(finalRewards.size()) # " neurons, distributed " # Nat.toText(weeklyRewardPot) # " TACO tokens", "calculateAndDistributeRewards");
+    logger.info("Distribution", "Distribution " # Nat.toText(distributionId) # " completed. Processed " # Nat.toText(finalRewards.size()) # " neurons, distributed " # Nat.toText(periodicRewardPot) # " TACO tokens", "calculateAndDistributeRewards");
   };
 
   // Complete the distribution and update records
@@ -998,7 +1003,7 @@ shared (deployer) persistent actor class Rewards() = this {
       };
       case null {
         try {
-          await* runWeeklyDistribution<system>();
+          await* runPeriodicDistribution<system>();
           #ok("Distribution triggered successfully");
         } catch (error) {
           #err(#SystemError("Failed to trigger distribution: " # Error.message(error)));
@@ -1133,15 +1138,15 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Distribution period updated");
   };
 
-  // Set weekly reward pot (amount in whole TACO tokens)
-  public shared ({ caller }) func setWeeklyRewardPot(amount: Nat) : async Result.Result<Text, RewardsError> {
+  // Set periodic reward pot (amount in whole TACO tokens)
+  public shared ({ caller }) func setPeriodicRewardPot(amount: Nat) : async Result.Result<Text, RewardsError> {
     if (not isAdmin(caller)) {
       return #err(#NotAuthorized);
     };
     
-    weeklyRewardPot := amount;
-    logger.info("Config", "Weekly reward pot set to " # Nat.toText(amount) # " TACO tokens", "setWeeklyRewardPot");
-    #ok("Weekly reward pot updated");
+    periodicRewardPot := amount;
+    logger.info("Config", "Periodic reward pot set to " # Nat.toText(amount) # " TACO tokens", "setPeriodicRewardPot");
+    #ok("Periodic reward pot updated");
   };
 
   // Enable/disable distribution
@@ -1155,18 +1160,52 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Distribution status updated");
   };
 
+  // Set performance score power factor
+  public shared ({ caller }) func setPerformanceScorePower(power: Float) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    if (power < 0.0) {
+      return #err(#SystemError("Performance score power must be >= 0"));
+    };
+    
+    performanceScorePower := power;
+    logger.info("Config", "Performance score power set to " # Float.toText(power), "setPerformanceScorePower");
+    #ok("Performance score power updated");
+  };
+
+  // Set voting power power factor
+  public shared ({ caller }) func setVotingPowerPower(power: Float) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    if (power < 0.0) {
+      return #err(#SystemError("Voting power power must be >= 0"));
+    };
+    
+    votingPowerPower := power;
+    logger.info("Config", "Voting power power set to " # Float.toText(power), "setVotingPowerPower");
+    #ok("Voting power power updated");
+  };
+
   // Get configuration
   public query func getConfiguration() : async {
     distributionPeriodNS: Nat;
-    weeklyRewardPot: Nat; // Reward pot in whole TACO tokens
+    periodicRewardPot: Nat; // Reward pot in whole TACO tokens
     maxDistributionHistory: Nat;
     distributionEnabled: Bool;
+    performanceScorePower: Float;
+    votingPowerPower: Float;
   } {
     {
       distributionPeriodNS = distributionPeriodNS;
-      weeklyRewardPot = weeklyRewardPot;
+      periodicRewardPot = periodicRewardPot;
       maxDistributionHistory = maxDistributionHistory;
       distributionEnabled = distributionEnabled;
+      performanceScorePower = performanceScorePower;
+      votingPowerPower = votingPowerPower;
     };
   };
 
