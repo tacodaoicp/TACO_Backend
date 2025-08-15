@@ -1420,6 +1420,29 @@ shared (deployer) persistent actor class Rewards() = this {
     };
   };
 
+  // Get the sum of all current neuron reward balances
+  public query func getCurrentTotalNeuronBalances() : async Nat {
+    var total : Nat = 0;
+    for ((_, balance) in Map.entries(neuronRewardBalances)) {
+      total += balance;
+    };
+    total
+  };
+
+  // Get available balance for distribution (canister balance minus current neuron balances)
+  public func getAvailableBalance() : async Nat {
+    let canisterBalance = await getTacoBalance();
+    let currentNeuronBalances = await getCurrentTotalNeuronBalances();
+    
+    if (canisterBalance >= currentNeuronBalances) {
+      canisterBalance - currentNeuronBalances
+    } else {
+      // This should not happen in normal operation
+      logger.error("Balance Check", "Canister balance (" # Nat.toText(canisterBalance) # ") is less than neuron balances (" # Nat.toText(currentNeuronBalances) # ")", "getAvailableBalance");
+      0
+    }
+  };
+
   public shared ({ caller = _ }) func getCanisterStatus() : async {
     neuronAllocationArchiveId: Principal;
     priceArchiveId: Principal;
