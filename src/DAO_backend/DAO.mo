@@ -93,7 +93,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   stable var MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY = 10;
   stable var MAX_NEURON_ALLOCATION_CHANGES = 10000; // Configurable circular buffer size
 
-  stable var sns_governance_canister_id : ?Principal = null;
+  stable var sns_governance_canister_id : ?Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
   // Spam protection
   let spamGuard = SpamProtection.SpamGuard(this_canister_id());
