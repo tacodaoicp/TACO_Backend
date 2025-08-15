@@ -11,6 +11,7 @@ import Timer "mo:base/Timer";
 import Map "mo:map/Map";
 import Vector "mo:vector";
 import Nat "mo:base/Nat";
+import Nat64 "mo:base/Nat64";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
 
@@ -18,6 +19,7 @@ import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import ICRC "../helper/icrc.types";
+import NeuronSnapshot "../neuron_snapshot/ns_types";
 
 shared (deployer) persistent actor class Rewards() = this {
 
@@ -32,6 +34,9 @@ shared (deployer) persistent actor class Rewards() = this {
   private let TACO_DECIMALS : Nat = 8;
   private let TACO_SATOSHIS_PER_TOKEN : Nat = 100_000_000; // 10^8
   private let TACO_LEDGER_CANISTER_ID : Text = "kknbx-zyaaa-aaaaq-aae4a-cai";
+  private let TACO_WITHDRAWAL_FEE : Nat = 10_000; // 0.0001 TACO in satoshis
+
+  private let SNS_GOVERNANCE_CANISTER_ID : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
   // Helper functions for TACO amount conversions
   private func tacoTokensToSatoshis(tokens: Nat) : Nat {
@@ -126,6 +131,19 @@ shared (deployer) persistent actor class Rewards() = this {
     #NotAuthorized;
   };
 
+  // Withdrawal types
+  public type WithdrawalRecord = {
+    id: Nat;
+    caller: Principal;
+    neuronWithdrawals: [(Blob, Nat)]; // Array of (neuronId, amount withdrawn from it)
+    totalAmount: Nat; // Total from all neurons (including fee)
+    amountSent: Nat; // Amount actually sent (total - fee)
+    fee: Nat; // Fee deducted
+    targetAccount: ICRC.Account;
+    timestamp: Int;
+    transactionId: ?Nat; // ICRC1 transaction ID if successful
+  };
+
   // Configuration
   stable var distributionPeriodNS : Nat = 604_800_000_000_000; // 7 days in nanoseconds
   stable var periodicRewardPot : Nat = 1000; // Default reward pot in whole TACO tokens
@@ -145,8 +163,16 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var neuronRewardBalances = Map.new<Blob, Nat>(); // neuronId -> accumulated rewards in TACO satoshis
   stable var totalDistributed : Nat = 0; // Total amount distributed to users in TACO satoshis (for balance validation)
   
+  // Withdrawal tracking
+  stable var totalWithdrawn : Nat = 0; // Total amount withdrawn by users in TACO satoshis
+  stable var totalWithdrawals : Nat = 0; // Total number of withdrawal transactions
+  stable var withdrawalCounter : Nat = 0; // Counter for withdrawal IDs
+  
   // Distribution history (circular buffer using Vector)
   private stable let distributionHistory = Vector.new<DistributionRecord>();
+  
+  // Withdrawal history (circular buffer using Vector)
+  private stable let withdrawalHistory = Vector.new<WithdrawalRecord>();
 
   // External canister interfaces
   private transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
@@ -1216,6 +1242,163 @@ shared (deployer) persistent actor class Rewards() = this {
   //=========================================================================
   // Admin Functions
   //=========================================================================
+
+  //=========================================================================
+  // Withdrawal Functions
+  //=========================================================================
+
+  // Withdraw rewards from specified neurons to ICRC1 Account
+  public shared ({ caller }) func withdraw(account: ICRC.Account, neuronIds: [Blob]) : async ICRC.Result {
+    if (neuronIds.size() == 0) {
+      return #Err(#GenericError({ error_code = 1001; message = "No neurons specified" }));
+    };
+
+    // Track original balances for rollback if needed
+    let originalBalances = Buffer.Buffer<(Blob, Nat)>(neuronIds.size());
+
+    try {
+      // Create SNS governance actor to verify neuron ownership
+      let snsGov = actor (Principal.toText(SNS_GOVERNANCE_CANISTER_ID)) : actor {
+        list_neurons : shared query NeuronSnapshot.ListNeurons -> async NeuronSnapshot.ListNeuronsResponse;
+      };
+
+      // Fetch caller's neurons from SNS governance
+      let neuronsResult = await snsGov.list_neurons({
+        of_principal = ?caller;
+        limit = 1000; // Should be enough for most users
+        start_page_at = null;
+      });
+
+      // Create set of caller's owned neuron IDs for fast lookup
+      let ownedNeuronIds = Buffer.Buffer<Blob>(neuronsResult.neurons.size());
+      for (neuron in neuronsResult.neurons.vals()) {
+        switch (neuron.id) {
+          case (?neuronId) {
+            ownedNeuronIds.add(neuronId.id);
+          };
+          case null { /* Skip neurons without IDs */ };
+        };
+      };
+      let ownedNeuronSet = Buffer.toArray(ownedNeuronIds);
+
+      // Verify all requested neurons belong to caller
+      for (neuronId in neuronIds.vals()) {
+        let isOwned = Array.find<Blob>(ownedNeuronSet, func(ownedId) { 
+          neuronId == ownedId 
+        });
+        if (isOwned == null) {
+          return #Err(#GenericError({ error_code = 1002; message = "Neuron not owned by caller" }));
+        };
+      };
+
+      // Calculate total balance from all specified neurons and collect original balances
+      var totalBalance : Nat = 0;
+      
+      for (neuronId in neuronIds.vals()) {
+        let balance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
+          case (?bal) { bal };
+          case null { 0 };
+        };
+        originalBalances.add((neuronId, balance));
+        totalBalance += balance;
+      };
+
+      // Validate total amount
+      if (totalBalance <= TACO_WITHDRAWAL_FEE) {
+        return #Err(#InsufficientFunds({ balance = totalBalance }));
+      };
+
+      // Calculate amount to send (total - fee)
+      let amountToSend = totalBalance - TACO_WITHDRAWAL_FEE;
+
+      // Deduct balances from all neurons BEFORE transfer to prevent double spending
+      for (neuronId in neuronIds.vals()) {
+        let currentBalance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
+          case (?balance) { balance };
+          case null { 0 };
+        };
+        if (currentBalance > 0) {
+          ignore Map.remove(neuronRewardBalances, bhash, neuronId);
+        };
+      };
+
+      // Create withdrawal record
+      withdrawalCounter += 1;
+      let withdrawalRecord : WithdrawalRecord = {
+        id = withdrawalCounter;
+        caller = caller;
+        neuronWithdrawals = Buffer.toArray(originalBalances);
+        totalAmount = totalBalance;
+        amountSent = amountToSend;
+        fee = TACO_WITHDRAWAL_FEE;
+        targetAccount = account;
+        timestamp = Time.now();
+        transactionId = null; // Will be updated if transfer succeeds
+      };
+
+      // Perform ICRC1 transfer
+      let tacoLedger : ICRC.Self = actor(TACO_LEDGER_CANISTER_ID);
+      let transferArgs : ICRC.TransferArg = {
+        from_subaccount = null;
+        to = account;
+        amount = amountToSend;
+        fee = null; // Let the ledger handle the fee
+        memo = null;
+        created_at_time = ?Nat64.fromNat(Int.abs(Time.now()));
+      };
+
+      let transferResult = await tacoLedger.icrc1_transfer(transferArgs);
+      
+      switch (transferResult) {
+        case (#Ok(transactionId)) {
+          // Transfer successful - update tracking
+          totalWithdrawn += totalBalance;
+          totalWithdrawals += 1;
+          
+          // Update withdrawal record with transaction ID
+          let finalRecord = { withdrawalRecord with transactionId = ?transactionId };
+          Vector.add(withdrawalHistory, finalRecord);
+          
+          // Log successful withdrawal
+          logger.info("Withdrawal", "User " # Principal.toText(caller) # " withdrew " # Nat.toText(amountToSend) # " TACO satoshis (total: " # Nat.toText(totalBalance) # ") from " # Nat.toText(neuronIds.size()) # " neurons to account " # Principal.toText(account.owner), "withdraw");
+          
+          #Ok(transactionId);
+        };
+        case (#Err(error)) {
+          // Transfer failed - restore balances to all neurons
+          for ((neuronId, originalBalance) in originalBalances.vals()) {
+            if (originalBalance > 0) {
+              let currentBalance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
+                case (?balance) { balance };
+                case null { 0 };
+              };
+              ignore Map.put(neuronRewardBalances, bhash, neuronId, currentBalance + originalBalance);
+            };
+          };
+          
+          // Log failed withdrawal
+          logger.error("Withdrawal", "Failed withdrawal for user " # Principal.toText(caller) # ": " # debug_show(error), "withdraw");
+          
+          #Err(error);
+        };
+      };
+    } catch (error) {
+      // Exception occurred - restore balances if they were deducted
+      for ((neuronId, originalBalance) in originalBalances.vals()) {
+        if (originalBalance > 0) {
+          let currentBalance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
+            case (?balance) { balance };
+            case null { 0 };
+          };
+          ignore Map.put(neuronRewardBalances, bhash, neuronId, currentBalance + originalBalance);
+        };
+      };
+      
+      logger.error("Withdrawal", "Withdrawal exception for user " # Principal.toText(caller) # ": " # Error.message(error), "withdraw");
+      
+      #Err(#GenericError({ error_code = 1003; message = "Withdrawal failed: " # Error.message(error) }));
+    };
+  };
 
   public shared ({ caller = _ }) func getCanisterStatus() : async {
     neuronAllocationArchiveId: Principal;
