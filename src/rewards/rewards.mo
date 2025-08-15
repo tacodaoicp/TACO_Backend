@@ -156,6 +156,7 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var distributionCounter : Nat = 0;
   stable var currentDistributionId : ?Nat = null;
   stable var lastDistributionTime : Int = 0;
+  stable var nextScheduledDistributionTime : ?Int = null; // When the next distribution is scheduled to run
   private transient var distributionTimerId : ?Nat = null;
   
   // Reward tracking
@@ -602,16 +603,41 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#NotAuthorized);
     };
 
+    let now = Time.now();
+    let nextRunTime = now + distributionPeriodNS;
+    await startDistributionTimerAt(nextRunTime)
+  };
+
+  // Start distribution timer with a specific target datetime
+  public shared ({ caller }) func startDistributionTimerAt(targetTime: Int) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let now = Time.now();
+    
+    // Validate target time is in the future
+    if (targetTime <= now) {
+      return #err(#SystemError("Target time must be in the future"));
+    };
+
     // Cancel existing timer if any
     switch (distributionTimerId) {
       case (?id) { Timer.cancelTimer(id); };
       case null { };
     };
 
-    // Start new timer
-    await* scheduleNextDistribution<system>();
+    // Enable distributions and store the scheduled time
+    distributionEnabled := true;
+    nextScheduledDistributionTime := ?targetTime;
     
-    logger.info("Distribution", "Distribution timer started with period: " # Nat.toText(distributionPeriodNS / 1_000_000_000) # "s", "startDistributionTimer");
+    // Calculate delay until target time
+    let delayNS = Int.abs(targetTime - now);
+    
+    // Start timer with calculated delay
+    await* scheduleDistributionAt<system>(delayNS);
+    
+    logger.info("Distribution", "Distribution timer started, next run scheduled for: " # Int.toText(targetTime), "startDistributionTimerAt");
     #ok("Distribution timer started");
   };
 
@@ -621,39 +647,57 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#NotAuthorized);
     };
 
+    // Cancel existing timer
     switch (distributionTimerId) {
       case (?id) {
         Timer.cancelTimer(id);
         distributionTimerId := null;
-        logger.info("Distribution", "Distribution timer stopped", "stopDistributionTimer");
-        #ok("Distribution timer stopped");
       };
-      case null {
-        #ok("No timer was running");
-      };
+      case null { };
     };
+
+    // Disable distributions and clear scheduled time
+    distributionEnabled := false;
+    nextScheduledDistributionTime := null;
+    
+    logger.info("Distribution", "Distribution timer stopped and disabled", "stopDistributionTimer");
+    #ok("Distribution timer stopped");
   };
 
-  // Schedule the next distribution
+  // Schedule a distribution at a specific delay from now
+  private func scheduleDistributionAt<system>(delayNS: Nat) : async* () {
+    distributionTimerId := ?Timer.setTimer<system>(
+      #nanoseconds(delayNS),
+      func() : async () {
+        // Update the last distribution time when timer fires
+        lastDistributionTime := Time.now();
+        
+        // Start distribution asynchronously (0-second timer to avoid blocking)
+        ignore Timer.setTimer<system>(
+          #nanoseconds(0),
+          func() : async () {
+            await* runPeriodicDistribution<system>();
+          }
+        );
+        
+        // Schedule next distribution if still enabled
+        if (distributionEnabled) {
+          let nextRunTime = Time.now() + distributionPeriodNS;
+          nextScheduledDistributionTime := ?nextRunTime;
+          await* scheduleDistributionAt<system>(distributionPeriodNS);
+        } else {
+          nextScheduledDistributionTime := null;
+        };
+      }
+    );
+  };
+
+  // Legacy method for backward compatibility
   private func scheduleNextDistribution<system>() : async* () {
     if (not distributionEnabled) {
       return;
     };
-
-    distributionTimerId := ?Timer.setTimer<system>(
-      #nanoseconds(distributionPeriodNS),
-      func() : async () {
-        try {
-          await* runPeriodicDistribution<system>();
-          // Schedule next distribution
-          await* scheduleNextDistribution<system>();
-        } catch (error) {
-          logger.error("Distribution", "Error in scheduled distribution: " # "Error occurred", "scheduleNextDistribution");
-          // Still schedule next attempt
-          await* scheduleNextDistribution<system>();
-        };
-      }
-    );
+    await* scheduleDistributionAt<system>(distributionPeriodNS);
   };
 
   // Main distribution function
@@ -1252,6 +1296,8 @@ shared (deployer) persistent actor class Rewards() = this {
     distributionEnabled: Bool;
     performanceScorePower: Float;
     votingPowerPower: Float;
+    timerRunning: Bool;
+    nextScheduledDistribution: ?Int;
   } {
     {
       distributionPeriodNS = distributionPeriodNS;
@@ -1260,6 +1306,8 @@ shared (deployer) persistent actor class Rewards() = this {
       distributionEnabled = distributionEnabled;
       performanceScorePower = performanceScorePower;
       votingPowerPower = votingPowerPower;
+      timerRunning = switch (distributionTimerId) { case (?_) { true }; case null { false } };
+      nextScheduledDistribution = nextScheduledDistributionTime;
     };
   };
 
