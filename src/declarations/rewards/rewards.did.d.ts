@@ -100,6 +100,7 @@ export interface Rewards {
     [],
     Array<[Uint8Array | number[], bigint]>
   >,
+  'getAvailableBalance' : ActorMethod<[], bigint>,
   'getCanisterStatus' : ActorMethod<
     [],
     {
@@ -137,6 +138,7 @@ export interface Rewards {
       'inProgress' : boolean,
     }
   >,
+  'getCurrentTotalNeuronBalances' : ActorMethod<[], bigint>,
   'getDistributionHistory' : ActorMethod<
     [[] | [bigint]],
     Array<DistributionRecord>

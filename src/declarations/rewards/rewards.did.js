@@ -130,6 +130,7 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat))],
         ['query'],
       ),
+    'getAvailableBalance' : IDL.Func([], [IDL.Nat], []),
     'getCanisterStatus' : IDL.Func(
         [],
         [
@@ -176,6 +177,7 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getCurrentTotalNeuronBalances' : IDL.Func([], [IDL.Nat], ['query']),
     'getDistributionHistory' : IDL.Func(
         [IDL.Opt(IDL.Nat)],
         [IDL.Vec(DistributionRecord)],
