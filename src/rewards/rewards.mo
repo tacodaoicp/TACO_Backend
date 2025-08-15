@@ -1311,6 +1311,76 @@ shared (deployer) persistent actor class Rewards() = this {
     };
   };
 
+  // Restore timer after canister upgrade
+  system func postupgrade() {
+    // Restore timer if we have a scheduled time
+    switch (nextScheduledDistributionTime) {
+      case (?scheduledTime) {
+        let now = Time.now();
+        
+        if (scheduledTime > now) {
+          // Scheduled time is in the future, restore timer with remaining delay
+          let delayNS = Int.abs(scheduledTime - now);
+          ignore Timer.setTimer<system>(
+            #nanoseconds(delayNS),
+            func() : async () {
+              lastDistributionTime := Time.now();
+              ignore Timer.setTimer<system>(
+                #nanoseconds(0),
+                func() : async () {
+                  await* runPeriodicDistribution<system>();
+                }
+              );
+              
+              if (distributionEnabled) {
+                let nextRunTime = Time.now() + distributionPeriodNS;
+                nextScheduledDistributionTime := ?nextRunTime;
+                await* scheduleDistributionAt<system>(distributionPeriodNS);
+              } else {
+                nextScheduledDistributionTime := null;
+              };
+            }
+          );
+          logger.info("Postupgrade", "Timer restored for scheduled time: " # Int.toText(scheduledTime), "postupgrade");
+        } else {
+          // Scheduled time is in the past, find next valid time
+          var nextValidTime = scheduledTime;
+          while (nextValidTime <= now) {
+            nextValidTime += distributionPeriodNS;
+          };
+          
+          // Update stored time and start timer
+          nextScheduledDistributionTime := ?nextValidTime;
+          let delayNS = Int.abs(nextValidTime - now);
+          ignore Timer.setTimer<system>(
+            #nanoseconds(delayNS),
+            func() : async () {
+              lastDistributionTime := Time.now();
+              ignore Timer.setTimer<system>(
+                #nanoseconds(0),
+                func() : async () {
+                  await* runPeriodicDistribution<system>();
+                }
+              );
+              
+              if (distributionEnabled) {
+                let nextRunTime = Time.now() + distributionPeriodNS;
+                nextScheduledDistributionTime := ?nextRunTime;
+                await* scheduleDistributionAt<system>(distributionPeriodNS);
+              } else {
+                nextScheduledDistributionTime := null;
+              };
+            }
+          );
+          logger.info("Postupgrade", "Timer restored for adjusted time: " # Int.toText(nextValidTime), "postupgrade");
+        };
+      };
+      case null {
+        logger.info("Postupgrade", "No scheduled distribution found, timer not restored", "postupgrade");
+      };
+    };
+  };
+
   private func isAdmin(caller: Principal) : Bool {
     AdminAuth.isAdmin(caller, canister_ids.isKnownCanister)
   };
