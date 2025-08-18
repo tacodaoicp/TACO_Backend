@@ -1325,7 +1325,7 @@ shared (deployer) persistent actor class Rewards() = this {
         if (scheduledTime > now) {
           // Scheduled time is in the future, restore timer with remaining delay
           let delayNS = Int.abs(scheduledTime - now);
-          ignore Timer.setTimer<system>(
+          distributionTimerId := ?Timer.setTimer<system>(
             #nanoseconds(delayNS),
             func() : async () {
               lastDistributionTime := Time.now();
@@ -1356,7 +1356,7 @@ shared (deployer) persistent actor class Rewards() = this {
           // Update stored time and start timer
           nextScheduledDistributionTime := ?nextValidTime;
           let delayNS = Int.abs(nextValidTime - now);
-          ignore Timer.setTimer<system>(
+          distributionTimerId := ?Timer.setTimer<system>(
             #nanoseconds(delayNS),
             func() : async () {
               lastDistributionTime := Time.now();
