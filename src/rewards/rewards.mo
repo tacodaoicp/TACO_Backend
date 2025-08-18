@@ -1385,6 +1385,85 @@ shared (deployer) persistent actor class Rewards() = this {
     };
   };
 
+  // Get all withdrawal history (admin only)
+  public shared ({ caller }) func getAllWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    let maxLimit = switch (limit) {
+      case (?l) { if (l > 100) { 100 } else { l } }; // Cap at 100 records
+      case null { 50 }; // Default to 50 records
+    };
+    
+    let historySize = Vector.size(withdrawalHistory);
+    let recordsToTake = if (historySize < maxLimit) { historySize } else { maxLimit };
+    
+    let records = Buffer.Buffer<WithdrawalRecord>(recordsToTake);
+    
+    // Get the most recent records (iterate backwards)
+    var i = historySize;
+    var taken = 0;
+    while (i > 0 and taken < recordsToTake) {
+      i -= 1;
+      switch (Vector.getOpt(withdrawalHistory, i)) {
+        case (?record) {
+          records.add(record);
+          taken += 1;
+        };
+        case null { };
+      };
+    };
+    
+    #ok(Buffer.toArray(records));
+  };
+
+  // Get user's withdrawal history (authenticated user only)
+  public shared ({ caller }) func getUserWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
+    let maxLimit = switch (limit) {
+      case (?l) { if (l > 50) { 50 } else { l } }; // Cap at 50 records for users
+      case null { 20 }; // Default to 20 records
+    };
+    
+    let historySize = Vector.size(withdrawalHistory);
+    let userRecords = Buffer.Buffer<WithdrawalRecord>(maxLimit);
+    
+    // Search through withdrawal history for records from this caller
+    var i = historySize;
+    var found = 0;
+    while (i > 0 and found < maxLimit) {
+      i -= 1;
+      switch (Vector.getOpt(withdrawalHistory, i)) {
+        case (?record) {
+          if (record.caller == caller) {
+            userRecords.add(record);
+            found += 1;
+          };
+        };
+        case null { };
+      };
+    };
+    
+    #ok(Buffer.toArray(userRecords));
+  };
+
+  // Get withdrawal statistics (admin only)
+  public shared ({ caller }) func getWithdrawalStats() : async Result.Result<{
+    totalWithdrawn: Nat;
+    totalWithdrawals: Nat;
+    totalRecordsInHistory: Nat;
+  }, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    #ok({
+      totalWithdrawn = totalWithdrawn;
+      totalWithdrawals = totalWithdrawals;
+      totalRecordsInHistory = Vector.size(withdrawalHistory);
+    });
+  };
+
   private func isAdmin(caller: Principal) : Bool {
     AdminAuth.isAdmin(caller, canister_ids.isKnownCanister)
   };
