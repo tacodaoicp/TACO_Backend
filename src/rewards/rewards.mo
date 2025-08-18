@@ -1298,6 +1298,8 @@ shared (deployer) persistent actor class Rewards() = this {
     votingPowerPower: Float;
     timerRunning: Bool;
     nextScheduledDistribution: ?Int;
+    lastDistributionTime: Int;
+    totalDistributions: Nat;
   } {
     {
       distributionPeriodNS = distributionPeriodNS;
@@ -1308,6 +1310,8 @@ shared (deployer) persistent actor class Rewards() = this {
       votingPowerPower = votingPowerPower;
       timerRunning = switch (distributionTimerId) { case (?_) { true }; case null { false } };
       nextScheduledDistribution = nextScheduledDistributionTime;
+      lastDistributionTime = lastDistributionTime;
+      totalDistributions = distributionCounter;
     };
   };
 
