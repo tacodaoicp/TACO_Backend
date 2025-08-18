@@ -41,6 +41,8 @@ module {
     #FollowAction;  // "3follow_action" - Follow/unfollow relationships
     #VotingPower;   // "3voting_power" - Voting power changes
     #NeuronUpdate;  // "3neuron_update" - Neuron state updates
+    #RewardDistribution; // "3reward_distribution" - Reward distribution records
+    #RewardWithdrawal; // "3reward_withdrawal" - Reward withdrawal records
   };
 
   // Convert block type to string identifier
@@ -57,6 +59,8 @@ module {
       case (#FollowAction) { "3follow_action" };
       case (#VotingPower) { "3voting_power" };
       case (#NeuronUpdate) { "3neuron_update" };
+      case (#RewardDistribution) { "3reward_distribution" };
+      case (#RewardWithdrawal) { "3reward_withdrawal" };
     };
   };
 
@@ -282,6 +286,72 @@ module {
     #Removed;
     #VotingPowerChanged;
     #StateChanged;
+  };
+
+  // Reward distribution tracking for reward_distribution_archive
+  public type RewardDistributionBlockData = {
+    id: Nat;
+    timestamp: Int; // distributionTime from DistributionRecord
+    startTime: Int;
+    endTime: Int;
+    totalRewardPot: Nat; // Reward pot in whole TACO tokens
+    actualDistributed: Nat; // Actual amount distributed in TACO satoshis
+    totalRewardScore: Float;
+    neuronsProcessed: Nat;
+    neuronRewards: [NeuronReward]; // Individual neuron rewards
+    failedNeurons: [FailedNeuron]; // Failed neuron processing
+    status: DistributionStatus;
+  };
+
+  // Reward withdrawal tracking for reward_withdrawal_archive
+  public type RewardWithdrawalBlockData = {
+    id: Nat;
+    timestamp: Int;
+    caller: Principal;
+    neuronWithdrawals: [(Blob, Nat)]; // Array of (neuronId, amount withdrawn from it)
+    totalAmount: Nat; // Total from all neurons (including fee)
+    amountSent: Nat; // Amount actually sent (total - fee)
+    fee: Nat; // Fee deducted
+    targetAccountOwner: Principal; // ICRC.Account.owner
+    targetAccountSubaccount: ?Blob; // ICRC.Account.subaccount
+    transactionId: ?Nat; // ICRC1 transaction ID if successful
+  };
+
+  // Supporting types for reward archives
+  public type NeuronReward = {
+    neuronId: Blob;
+    performanceScore: Float;
+    votingPower: Nat;
+    rewardScore: Float;
+    rewardAmount: Nat; // Reward amount in TACO satoshis (integer)
+    checkpoints: [CheckpointData]; // Include checkpoints to access maker information
+  };
+
+  public type FailedNeuron = {
+    neuronId: Blob;
+    errorMessage: Text;
+  };
+
+  public type DistributionStatus = {
+    #InProgress: {currentNeuron: Nat; totalNeurons: Nat};
+    #Completed;
+    #Failed: Text;
+    #PartiallyCompleted: {successfulNeurons: Nat; failedNeurons: Nat};
+  };
+
+  public type CheckpointData = {
+    timestamp: Int;
+    allocations: [Allocation]; // Active allocations at this point
+    tokenValues: [(Principal, Float)]; // Per-token values (allocation % × token price)
+    totalPortfolioValue: Float; // Sum of all token values
+    pricesUsed: [(Principal, PriceInfo)]; // Prices used for this calculation
+    maker: ?Principal; // The principal responsible for the allocation at this checkpoint
+  };
+
+  public type PriceInfo = {
+    icpPrice: Nat;
+    usdPrice: Float;
+    timestamp: Int;
   };
 
   // Supporting types
@@ -975,6 +1045,126 @@ module {
       ("oldVotingPower", switch (update.oldVotingPower) { case (?n) { #Nat(n) }; case null { #Nat(0) }; }),
       ("newVotingPower", switch (update.newVotingPower) { case (?n) { #Nat(n) }; case null { #Nat(0) }; }),
       ("affectedUsers", #Array(Array.map(update.affectedUsers, principalToValue)))
+    ]);
+  };
+
+  // Convert RewardDistributionBlockData to Value
+  public func rewardDistributionToValue(distribution: RewardDistributionBlockData, _timestamp: Int, _parentHash: ?Blob) : Value {
+    #Map([
+      ("id", #Nat(distribution.id)),
+      ("timestamp", #Int(distribution.timestamp)),
+      ("startTime", #Int(distribution.startTime)),
+      ("endTime", #Int(distribution.endTime)),
+      ("totalRewardPot", #Nat(distribution.totalRewardPot)),
+      ("actualDistributed", #Nat(distribution.actualDistributed)),
+      ("totalRewardScore", floatToValue(distribution.totalRewardScore)),
+      ("neuronsProcessed", #Nat(distribution.neuronsProcessed)),
+      ("neuronRewards", #Array(Array.map(distribution.neuronRewards, neuronRewardToValue))),
+      ("failedNeurons", #Array(Array.map(distribution.failedNeurons, failedNeuronToValue))),
+      ("status", distributionStatusToValue(distribution.status))
+    ]);
+  };
+
+  // Convert RewardWithdrawalBlockData to Value
+  public func rewardWithdrawalToValue(withdrawal: RewardWithdrawalBlockData, _timestamp: Int, _parentHash: ?Blob) : Value {
+    #Map([
+      ("id", #Nat(withdrawal.id)),
+      ("timestamp", #Int(withdrawal.timestamp)),
+      ("caller", principalToValue(withdrawal.caller)),
+      ("neuronWithdrawals", #Array(Array.map(withdrawal.neuronWithdrawals, neuronWithdrawalToValue))),
+      ("totalAmount", #Nat(withdrawal.totalAmount)),
+      ("amountSent", #Nat(withdrawal.amountSent)),
+      ("fee", #Nat(withdrawal.fee)),
+      ("targetAccountOwner", principalToValue(withdrawal.targetAccountOwner)),
+      ("targetAccountSubaccount", switch (withdrawal.targetAccountSubaccount) { case (?sub) { #Blob(sub) }; case null { #Text("") }; }),
+      ("transactionId", switch (withdrawal.transactionId) { case (?id) { #Nat(id) }; case null { #Nat(0) }; })
+    ]);
+  };
+
+  // Helper conversion functions for reward archive types
+  private func neuronRewardToValue(reward: NeuronReward) : Value {
+    #Map([
+      ("neuronId", #Blob(reward.neuronId)),
+      ("performanceScore", floatToValue(reward.performanceScore)),
+      ("votingPower", #Nat(reward.votingPower)),
+      ("rewardScore", floatToValue(reward.rewardScore)),
+      ("rewardAmount", #Nat(reward.rewardAmount)),
+      ("checkpoints", #Array(Array.map(reward.checkpoints, checkpointDataToValue)))
+    ]);
+  };
+
+  private func failedNeuronToValue(failed: FailedNeuron) : Value {
+    #Map([
+      ("neuronId", #Blob(failed.neuronId)),
+      ("errorMessage", #Text(failed.errorMessage))
+    ]);
+  };
+
+  private func distributionStatusToValue(status: DistributionStatus) : Value {
+    switch (status) {
+      case (#InProgress(details)) {
+        #Map([
+          ("type", #Text("InProgress")),
+          ("currentNeuron", #Nat(details.currentNeuron)),
+          ("totalNeurons", #Nat(details.totalNeurons))
+        ]);
+      };
+      case (#Completed) {
+        #Map([("type", #Text("Completed"))]);
+      };
+      case (#Failed(msg)) {
+        #Map([
+          ("type", #Text("Failed")),
+          ("message", #Text(msg))
+        ]);
+      };
+      case (#PartiallyCompleted(details)) {
+        #Map([
+          ("type", #Text("PartiallyCompleted")),
+          ("successfulNeurons", #Nat(details.successfulNeurons)),
+          ("failedNeurons", #Nat(details.failedNeurons))
+        ]);
+      };
+    };
+  };
+
+  private func neuronWithdrawalToValue(withdrawal: (Blob, Nat)) : Value {
+    #Map([
+      ("neuronId", #Blob(withdrawal.0)),
+      ("amount", #Nat(withdrawal.1))
+    ]);
+  };
+
+  private func checkpointDataToValue(checkpoint: CheckpointData) : Value {
+    #Map([
+      ("timestamp", #Int(checkpoint.timestamp)),
+      ("allocations", #Array(Array.map(checkpoint.allocations, allocationToValueHelper))),
+      ("tokenValues", #Array(Array.map(checkpoint.tokenValues, tokenValueToValue))),
+      ("totalPortfolioValue", floatToValue(checkpoint.totalPortfolioValue)),
+      ("pricesUsed", #Array(Array.map(checkpoint.pricesUsed, priceInfoEntryToValue))),
+      ("maker", switch (checkpoint.maker) { case (?p) { principalToValue(p) }; case null { #Text("") }; })
+    ]);
+  };
+
+  private func tokenValueToValue(tokenValue: (Principal, Float)) : Value {
+    #Map([
+      ("token", principalToValue(tokenValue.0)),
+      ("value", floatToValue(tokenValue.1))
+    ]);
+  };
+
+  private func priceInfoEntryToValue(priceEntry: (Principal, PriceInfo)) : Value {
+    #Map([
+      ("token", principalToValue(priceEntry.0)),
+      ("priceInfo", priceInfoToValue(priceEntry.1))
+    ]);
+  };
+
+  private func priceInfoToValue(priceInfo: PriceInfo) : Value {
+    #Map([
+      ("icpPrice", #Nat(priceInfo.icpPrice)),
+      ("usdPrice", floatToValue(priceInfo.usdPrice)),
+      ("timestamp", #Int(priceInfo.timestamp))
     ]);
   };
 

@@ -47,6 +47,14 @@
     "dao_neuron_allocation_archive": {
       "main": "src/archives/dao_neuron_allocation_archive/dao_neuron_allocation_archive.mo",
       "type": "motoko"
+    },
+    "reward_distribution_archive": {
+      "main": "src/archives/reward_distribution_archive/reward_distribution_archive.mo",
+      "type": "motoko"
+    },
+    "reward_withdrawal_archive": {
+      "main": "src/archives/reward_withdrawal_archive/reward_withdrawal_archive.mo",
+      "type": "motoko"
     }
   },
   "networks": {

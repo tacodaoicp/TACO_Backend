@@ -1222,6 +1222,78 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   //=========================================================================
+  // Archive Integration - "Since" Methods
+  //=========================================================================
+
+  // Get distribution records since a timestamp for archive import
+  public shared query ({ caller }) func getDistributionsSince(sinceTimestamp: Int, limit: Nat) : async Result.Result<{
+    distributions: [DistributionRecord];
+  }, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (limit > 1000) {
+      return #err(#SystemError("Limit cannot exceed 1000"));
+    };
+
+    let historyArray = Vector.toArray(distributionHistory);
+    let filteredDistributions = Array.filter<DistributionRecord>(historyArray, func(dist) {
+      dist.distributionTime > sinceTimestamp
+    });
+
+    // Sort by timestamp (oldest first) for proper archival order
+    let sortedDistributions = Array.sort<DistributionRecord>(filteredDistributions, func(a, b) {
+      Int.compare(a.distributionTime, b.distributionTime)
+    });
+
+    // Apply limit
+    let limitedDistributions = if (sortedDistributions.size() > limit) {
+      Array.subArray(sortedDistributions, 0, limit)
+    } else {
+      sortedDistributions
+    };
+
+    #ok({
+      distributions = limitedDistributions;
+    });
+  };
+
+  // Get withdrawal records since a timestamp for archive import
+  public shared query ({ caller }) func getWithdrawalsSince(sinceTimestamp: Int, limit: Nat) : async Result.Result<{
+    withdrawals: [WithdrawalRecord];
+  }, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (limit > 1000) {
+      return #err(#SystemError("Limit cannot exceed 1000"));
+    };
+
+    let historyArray = Vector.toArray(withdrawalHistory);
+    let filteredWithdrawals = Array.filter<WithdrawalRecord>(historyArray, func(withdrawal) {
+      withdrawal.timestamp > sinceTimestamp
+    });
+
+    // Sort by timestamp (oldest first) for proper archival order
+    let sortedWithdrawals = Array.sort<WithdrawalRecord>(filteredWithdrawals, func(a, b) {
+      Int.compare(a.timestamp, b.timestamp)
+    });
+
+    // Apply limit
+    let limitedWithdrawals = if (sortedWithdrawals.size() > limit) {
+      Array.subArray(sortedWithdrawals, 0, limit)
+    } else {
+      sortedWithdrawals
+    };
+
+    #ok({
+      withdrawals = limitedWithdrawals;
+    });
+  };
+
+  //=========================================================================
   // Admin Configuration Functions
   //=========================================================================
 

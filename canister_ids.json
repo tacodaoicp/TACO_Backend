@@ -31,6 +31,12 @@
     "ic": "bm6rl-3qaaa-aaaan-qz5ba-cai",
     "staging": "l7gh3-pqaaa-aaaan-qz4za-cai"
   },
+  "reward_distribution_archive": {
+    "staging": "ddfi2-eiaaa-aaaan-qz5nq-cai"
+  },
+  "reward_withdrawal_archive": {
+    "staging": "dwczx-faaaa-aaaan-qz5oa-cai"
+  },
   "rewards": {
     "ic": "dkgdg-saaaa-aaaan-qz5ma-cai",
     "staging": "cjkka-gyaaa-aaaan-qz5kq-cai"
