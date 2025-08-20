@@ -161,6 +161,22 @@ module {
     #FollowUnfollowLimitReached;
   };
 
+  // Wallet-specific types (separate from UserState to avoid migration issues)
+  public type UserWalletData = {
+    registeredTokens : [Principal];
+    lastUpdated : Int;
+  };
+
+  public type TokenRegistrationError = {
+    #NotAllowed;
+    #TokenNotFound;
+    #TokenAlreadyRegistered;
+    #TokenNotRegistered;
+    #MaxTokensReached;
+    #SystemInactive;
+    #UnexpectedError : Text;
+  };
+
   public type AuthorizationError = {
     #NotAllowed;
     #NotAdmin;

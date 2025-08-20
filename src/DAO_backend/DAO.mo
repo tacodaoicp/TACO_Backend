@@ -48,6 +48,8 @@ shared (deployer) actor class ContinuousDAO() = this {
   // Voting power and allocation storage
   type UserState = DAO_types.UserState;
 
+  type UserWalletData = DAO_types.UserWalletData;
+
   type SystemState = DAO_types.SystemState;
 
   type NeuronVP = NeuronSnapshot.NeuronVP;
