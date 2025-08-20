@@ -61,6 +61,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   type AuthorizationError = DAO_types.AuthorizationError;
   type SyncError = DAO_types.SyncError;
   type RefreshError = DAO_types.RefreshError;
+  type TokenRegistrationError = DAO_types.TokenRegistrationError;
   type TokenType = DAO_types.TokenType;
   type NeuronAllocation = DAO_types.NeuronAllocation;
   type NeuronAllocationMap = DAO_types.NeuronAllocationMap;
@@ -155,6 +156,9 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   // User state storage
   stable var userStates = Map.new<Principal, UserState>();
+
+  // Wallet data storage (separate from UserState to avoid migration issues)
+  stable let userWalletData = Map.new<Principal, UserWalletData>();
 
   // Neuron allocation storage
 
@@ -3384,6 +3388,105 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
 
     #ok(response);
+  };
+
+  // User token registration methods
+  public shared(msg) func registerUserToken(tokenPrincipal: Principal): async Result.Result<Text, TokenRegistrationError> {
+    let caller = msg.caller;
+    
+    // Check if system is active
+    if (systemState != #Active) {
+      return #err(#SystemInactive);
+    };
+    
+    // Check if token exists in our system
+    switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
+      case null {
+        return #err(#TokenNotFound);
+      };
+      case (?tokenDetails) {
+        if (not tokenDetails.Active) {
+          return #err(#TokenNotFound);
+        };
+      };
+    };
+    
+    // Get or create user wallet data
+    let currentWalletData = switch (Map.get(userWalletData, phash, caller)) {
+      case null {
+        let newWalletData: UserWalletData = {
+          registeredTokens = [];
+          lastUpdated = Time.now();
+        };
+        Map.set(userWalletData, phash, caller, newWalletData);
+        newWalletData;
+      };
+      case (?existing) { existing };
+    };
+    
+    // Check if token is already registered
+    if (Array.find(currentWalletData.registeredTokens, func(p: Principal): Bool { Principal.equal(p, tokenPrincipal) }) != null) {
+      return #err(#TokenAlreadyRegistered);
+    };
+    
+    // Check max tokens limit (e.g., 50 tokens per user)
+    if (currentWalletData.registeredTokens.size() >= 50) {
+      return #err(#MaxTokensReached);
+    };
+    
+    // Add token to user's registered tokens
+    let updatedTokens = Array.append(currentWalletData.registeredTokens, [tokenPrincipal]);
+    let updatedWalletData: UserWalletData = {
+      registeredTokens = updatedTokens;
+      lastUpdated = Time.now();
+    };
+    
+    Map.set(userWalletData, phash, caller, updatedWalletData);
+    
+    #ok("Token registered successfully");
+  };
+
+  public shared(msg) func unregisterUserToken(tokenPrincipal: Principal): async Result.Result<Text, TokenRegistrationError> {
+    let caller = msg.caller;
+    
+    // Check if system is active
+    if (systemState != #Active) {
+      return #err(#SystemInactive);
+    };
+    
+    // Get user wallet data
+    switch (Map.get(userWalletData, phash, caller)) {
+      case null {
+        return #err(#TokenNotRegistered);
+      };
+      case (?currentWalletData) {
+        // Check if token is registered
+        let tokenExists = Array.find(currentWalletData.registeredTokens, func(p: Principal): Bool { Principal.equal(p, tokenPrincipal) }) != null;
+        if (not tokenExists) {
+          return #err(#TokenNotRegistered);
+        };
+        
+        // Remove token from registered tokens
+        let updatedTokens = Array.filter(currentWalletData.registeredTokens, func(p: Principal): Bool { not Principal.equal(p, tokenPrincipal) });
+        let updatedWalletData: UserWalletData = {
+          registeredTokens = updatedTokens;
+          lastUpdated = Time.now();
+        };
+        
+        Map.set(userWalletData, phash, caller, updatedWalletData);
+        
+        #ok("Token unregistered successfully");
+      };
+    };
+  };
+
+  public shared query(msg) func getUserRegisteredTokens(): async [Principal] {
+    let caller = msg.caller;
+    
+    switch (Map.get(userWalletData, phash, caller)) {
+      case null { [] };
+      case (?walletData) { walletData.registeredTokens };
+    };
   };
 
 };
