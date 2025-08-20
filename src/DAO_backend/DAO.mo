@@ -3399,17 +3399,7 @@ shared (deployer) actor class ContinuousDAO() = this {
       return #err(#SystemInactive);
     };
     
-    // Check if token exists in our system
-    switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
-      case null {
-        return #err(#TokenNotFound);
-      };
-      case (?tokenDetails) {
-        if (not tokenDetails.Active) {
-          return #err(#TokenNotFound);
-        };
-      };
-    };
+    // Allow registration of any ICRC1 token (no validation against trusted tokens)
     
     // Get or create user wallet data
     let currentWalletData = switch (Map.get(userWalletData, phash, caller)) {
