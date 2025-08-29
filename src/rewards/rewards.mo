@@ -800,15 +800,30 @@ shared (deployer) persistent actor class Rewards() = this {
       
       logger.info("Distribution", "Found " # Nat.toText(allNeurons.size()) # " total neurons", "runPeriodicDistribution");
       
-      // Filter out neurons in the skip list
-      let neurons = Array.filter<(Blob, NeuronAllocation)>(allNeurons, func((neuronId, _)) {
-        let isSkipped = Array.find<Blob>(rewardSkipList, func(skipId) { skipId == neuronId });
-        isSkipped == null // Include if not in skip list
-      });
+      // Separate neurons into processable and skipped
+      let neuronsBuffer = Buffer.Buffer<(Blob, NeuronAllocation)>(allNeurons.size());
+      let skippedNeuronsBuffer = Buffer.Buffer<FailedNeuron>(allNeurons.size());
       
-      let skippedCount = allNeurons.size() - neurons.size();
-      if (skippedCount > 0) {
-        logger.info("Distribution", "Skipped " # Nat.toText(skippedCount) # " neurons from skip list", "runPeriodicDistribution");
+      for ((neuronId, neuronAllocation) in allNeurons.vals()) {
+        let isSkipped = Array.find<Blob>(rewardSkipList, func(skipId) { skipId == neuronId });
+        if (isSkipped == null) {
+          // Not in skip list, include for processing
+          neuronsBuffer.add((neuronId, neuronAllocation));
+        } else {
+          // In skip list, add to failed neurons with skip message
+          let skippedNeuron : FailedNeuron = {
+            neuronId = neuronId;
+            errorMessage = "Neuron skipped by admin (in skip list)";
+          };
+          skippedNeuronsBuffer.add(skippedNeuron);
+        };
+      };
+      
+      let neurons = Buffer.toArray(neuronsBuffer);
+      let initialSkippedNeurons = Buffer.toArray(skippedNeuronsBuffer);
+      
+      if (initialSkippedNeurons.size() > 0) {
+        logger.info("Distribution", "Skipped " # Nat.toText(initialSkippedNeurons.size()) # " neurons from skip list", "runPeriodicDistribution");
       };
       
       logger.info("Distribution", "Processing " # Nat.toText(neurons.size()) # " neurons (after skip list filtering)", "runPeriodicDistribution");
@@ -819,7 +834,7 @@ shared (deployer) persistent actor class Rewards() = this {
         } else {
           "No neurons found"
         };
-        await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, message);
+        await* completeDistribution(distributionCounter, ([] : [NeuronReward]), initialSkippedNeurons, 0.0, message);
         return;
       };
 
@@ -830,8 +845,8 @@ shared (deployer) persistent actor class Rewards() = this {
       };
       Vector.put(distributionHistory, Vector.size(distributionHistory) - 1, updatedRecord);
 
-      // Start processing neurons one by one
-      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, startTime, endTime, priceType);
+      // Start processing neurons one by one (with initial skipped neurons in failed list)
+      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, ([] : [NeuronReward]), initialSkippedNeurons, 0.0, startTime, endTime, priceType);
       
     } catch (error) {
       logger.error("Distribution", "Failed to get neurons: " # "Error occurred", "runPeriodicDistribution");
