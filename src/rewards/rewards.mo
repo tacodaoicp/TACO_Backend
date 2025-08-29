@@ -158,6 +158,9 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var lastDistributionTime : Int = 0;
   stable var nextScheduledDistributionTime : ?Int = null; // When the next distribution is scheduled to run
   private transient var distributionTimerId : ?Nat = null;
+
+  // Skip list for reward distribution - neurons to skip during distribution
+  stable var rewardSkipList : [Blob] = [];
   
   // Reward tracking
   private transient let { phash; bhash } = Map;
@@ -793,16 +796,34 @@ shared (deployer) persistent actor class Rewards() = this {
     // Get all neurons from DAO
     try {
       let neuronsResult = await daoCanister.admin_getNeuronAllocations();
-      let neurons = neuronsResult;
+      let allNeurons = neuronsResult;
       
-      logger.info("Distribution", "Found " # Nat.toText(neurons.size()) # " neurons to process", "runPeriodicDistribution");
+      logger.info("Distribution", "Found " # Nat.toText(allNeurons.size()) # " total neurons", "runPeriodicDistribution");
+      
+      // Filter out neurons in the skip list
+      let neurons = Array.filter<(Blob, NeuronAllocation)>(allNeurons, func((neuronId, _)) {
+        let isSkipped = Array.find<Blob>(rewardSkipList, func(skipId) { skipId == neuronId });
+        isSkipped == null // Include if not in skip list
+      });
+      
+      let skippedCount = allNeurons.size() - neurons.size();
+      if (skippedCount > 0) {
+        logger.info("Distribution", "Skipped " # Nat.toText(skippedCount) # " neurons from skip list", "runPeriodicDistribution");
+      };
+      
+      logger.info("Distribution", "Processing " # Nat.toText(neurons.size()) # " neurons (after skip list filtering)", "runPeriodicDistribution");
       
       if (neurons.size() == 0) {
-        await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, "No neurons found");
+        let message = if (allNeurons.size() > 0) {
+          "All " # Nat.toText(allNeurons.size()) # " neurons are in skip list"
+        } else {
+          "No neurons found"
+        };
+        await* completeDistribution(distributionCounter, ([] : [NeuronReward]), ([] : [FailedNeuron]), 0.0, message);
         return;
       };
 
-      // Update status with total neuron count
+      // Update status with total neuron count (after filtering)
       let updatedRecord = {
         initialRecord with
         status = #InProgress({currentNeuron = 0; totalNeurons = neurons.size()});
@@ -1360,6 +1381,65 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Voting power power updated");
   };
 
+  //=========================================================================
+  // Skip List Management Functions
+  //=========================================================================
+
+  // Get the current reward skip list
+  public shared query ({ caller }) func getRewardSkipList() : async Result.Result<[Blob], RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    #ok(rewardSkipList);
+  };
+
+  // Set the reward skip list (replaces entire list)
+  public shared ({ caller }) func setRewardSkipList(neuronIds: [Blob]) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    rewardSkipList := neuronIds;
+    logger.info("Config", "Reward skip list updated with " # Nat.toText(neuronIds.size()) # " neurons", "setRewardSkipList");
+    #ok("Reward skip list updated");
+  };
+
+  // Add a neuron to the reward skip list
+  public shared ({ caller }) func addToRewardSkipList(neuronId: Blob) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    // Check if neuron is already in the skip list
+    let isAlreadySkipped = Array.find<Blob>(rewardSkipList, func(id) { id == neuronId });
+    if (isAlreadySkipped != null) {
+      return #err(#SystemError("Neuron is already in the skip list"));
+    };
+    
+    // Add to skip list
+    rewardSkipList := Array.flatten([rewardSkipList, [neuronId]]);
+    logger.info("Config", "Added neuron to reward skip list", "addToRewardSkipList");
+    #ok("Neuron added to skip list");
+  };
+
+  // Remove a neuron from the reward skip list
+  public shared ({ caller }) func removeFromRewardSkipList(neuronId: Blob) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    
+    // Check if neuron is in the skip list
+    let isInSkipList = Array.find<Blob>(rewardSkipList, func(id) { id == neuronId });
+    if (isInSkipList == null) {
+      return #err(#SystemError("Neuron is not in the skip list"));
+    };
+    
+    // Remove from skip list
+    rewardSkipList := Array.filter<Blob>(rewardSkipList, func(id) { id != neuronId });
+    logger.info("Config", "Removed neuron from reward skip list", "removeFromRewardSkipList");
+    #ok("Neuron removed from skip list");
+  };
+
   // Get configuration
   public query func getConfiguration() : async {
     distributionPeriodNS: Nat;
@@ -1372,6 +1452,7 @@ shared (deployer) persistent actor class Rewards() = this {
     nextScheduledDistribution: ?Int;
     lastDistributionTime: Int;
     totalDistributions: Nat;
+    rewardSkipListSize: Nat;
   } {
     {
       distributionPeriodNS = distributionPeriodNS;
@@ -1384,6 +1465,7 @@ shared (deployer) persistent actor class Rewards() = this {
       nextScheduledDistribution = nextScheduledDistributionTime;
       lastDistributionTime = lastDistributionTime;
       totalDistributions = distributionCounter;
+      rewardSkipListSize = rewardSkipList.size();
     };
   };
 
