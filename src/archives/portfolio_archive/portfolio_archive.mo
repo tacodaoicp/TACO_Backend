@@ -313,6 +313,123 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   };
 
   //=========================================================================
+  // Portfolio-specific Query Functions
+  //=========================================================================
+
+  // Binary search to find the smallest block index i where block[i].timestamp >= ts
+  public query func lower_bound_ts(ts : Int) : async Result.Result<Nat, ArchiveError> {
+    let totalBlocks = base.getTotalBlocks();
+    
+    // Handle empty archive
+    if (totalBlocks == 0) {
+      return #ok(0);
+    };
+    
+    // Binary search implementation
+    var left : Nat = 0;
+    var right : Nat = totalBlocks;
+    
+    while (left < right) {
+      let mid = left + (right - left) / 2;
+      
+      // Get the block at mid index
+      let blockResult = base.icrc3_get_blocks([{start = mid; length = 1}]);
+      
+      if (blockResult.blocks.size() == 0) {
+        // Block not found, search in left half
+        right := mid;
+      } else {
+        let block = blockResult.blocks[0];
+        
+        // Extract timestamp from the block data
+        switch (extractTimestampFromBlock(block.block)) {
+          case (?blockTimestamp) {
+            if (blockTimestamp >= ts) {
+              // Found a candidate, continue searching left for smaller index
+              right := mid;
+            } else {
+              // Block timestamp too small, search right half
+              left := mid + 1;
+            };
+          };
+          case null {
+            // Unable to extract timestamp, skip this block by searching right
+            left := mid + 1;
+          };
+        };
+      };
+    };
+    
+    // left is now the smallest index where block[index].timestamp >= ts
+    // or totalBlocks if no such block exists
+    #ok(left);
+  };
+  
+  public query func getTimestampFromBlock(blockIndex : Nat) : async Result.Result<Int, ArchiveError> {
+    let blockResult = base.icrc3_get_blocks([{start = blockIndex; length = 1}]);
+    if (blockResult.blocks.size() > 0) {
+      let block = blockResult.blocks[0];
+      switch (extractTimestampFromBlock(block.block)) {
+        case (?timestamp) { #ok(timestamp) };
+        case null { #err(#InvalidData) };
+      };
+    } else {
+      #err(#BlockNotFound);
+    };
+  };
+
+  // Debug function to see the actual block structure
+  public query func debugBlockStructure(blockIndex : Nat) : async Result.Result<Text, ArchiveError> {
+    let blockResult = base.icrc3_get_blocks([{start = blockIndex; length = 1}]);
+    if (blockResult.blocks.size() > 0) {
+      let block = blockResult.blocks[0];
+      #ok(debug_show(block.block));
+    } else {
+      #err(#BlockNotFound);
+    };
+  };
+  // Helper function to extract timestamp from block data
+  private func extractTimestampFromBlock(blockValue : ArchiveTypes.Value) : ?Int {
+    switch (blockValue) {
+      case (#Map(entries)) {
+        // Look for the tx field which contains the transaction data
+        for ((key, value) in entries.vals()) {
+          if (key == "tx") {
+            switch (value) {
+              case (#Map(txEntries)) {
+                // Look for data field in the tx
+                for ((txKey, txValue) in txEntries.vals()) {
+                  if (txKey == "data") {
+                    switch (txValue) {
+                      case (#Map(dataEntries)) {
+                        // Look for ts field in the data (portfolio timestamp)
+                        for ((dataKey, dataValue) in dataEntries.vals()) {
+                          if (dataKey == "ts") {
+                            switch (dataValue) {
+                              case (#Int(timestamp)) {
+                                return ?timestamp;
+                              };
+                              case _ {};
+                            };
+                          };
+                        };
+                      };
+                      case _ {};
+                    };
+                  };
+                };
+              };
+              case _ {};
+            };
+          };
+        };
+      };
+      case _ {};
+    };
+    null;
+  };
+
+  //=========================================================================
   // Admin Functions (delegated to base class)
   //=========================================================================
 

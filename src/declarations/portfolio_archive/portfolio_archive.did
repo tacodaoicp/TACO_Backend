@@ -85,6 +85,7 @@ type PortfolioArchiveV2 =
    icrc3_get_blocks: (args: GetBlocksArgs) -> (GetBlocksResult) query;
    icrc3_get_tip_certificate: () -> (opt DataCertificate) query;
    icrc3_supported_block_types: () -> (vec BlockType) query;
+   lower_bound_ts: (ts: int) -> (Result_3) query;
    resetImportTimestamps: () -> (Result_1);
    runLegacyManualBatchImport: () -> (Result_1);
    runManualBatchImport: () -> (Result_1);
