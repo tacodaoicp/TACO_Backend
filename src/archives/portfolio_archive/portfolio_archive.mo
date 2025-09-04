@@ -318,6 +318,10 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
 
   // Binary search to find the smallest block index i where block[i].timestamp >= ts
   public query func lower_bound_ts(ts : Int) : async Result.Result<Nat, ArchiveError> {
+    lower_bound_ts_impl(ts);
+  };
+
+  private func lower_bound_ts_impl(ts : Int) : Result.Result<Nat, ArchiveError> {
     let totalBlocks = base.getTotalBlocks();
     
     // Handle empty archive
@@ -373,7 +377,7 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   };
 
   // Generate OHLC candle data for portfolio values over time intervals
-  public func getOHLCCandles(startTime: Int, endTime: Int, intervalNS: Int) : async Result.Result<[OHLCCandle], ArchiveError> {
+  public query func getOHLCCandles(startTime: Int, endTime: Int, intervalNS: Int) : async Result.Result<[OHLCCandle], ArchiveError> {
     if (startTime >= endTime) {
       return #err(#InvalidTimeRange);
     };
@@ -388,7 +392,7 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
     };
 
     // Find starting block index using our binary search
-    let startBlockResult = await lower_bound_ts(startTime);
+    let startBlockResult = lower_bound_ts_impl(startTime);
     let startBlockIndex = switch (startBlockResult) {
       case (#ok(index)) { index };
       case (#err(error)) { return #err(error) };
@@ -408,7 +412,7 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
       let intervalEnd = currentIntervalStart + intervalNS;
       
       // Get all blocks in this interval
-      let intervalBlocks = await getBlocksInTimeRange(currentIntervalStart, intervalEnd);
+      let intervalBlocks = getBlocksInTimeRange(currentIntervalStart, intervalEnd);
       
       switch (intervalBlocks) {
         case (#ok(blocks)) {
@@ -492,14 +496,14 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
   };
 
   // Helper function to get blocks within a time range
-  private func getBlocksInTimeRange(startTime: Int, endTime: Int) : async Result.Result<[PortfolioBlockData], ArchiveError> {
+  private func getBlocksInTimeRange(startTime: Int, endTime: Int) : Result.Result<[PortfolioBlockData], ArchiveError> {
     let totalBlocks = base.getTotalBlocks();
     if (totalBlocks == 0) {
       return #ok([]);
     };
 
     // Find start index
-    let startIndexResult = await lower_bound_ts(startTime);
+    let startIndexResult = lower_bound_ts_impl(startTime);
     let startIndex = switch (startIndexResult) {
       case (#ok(index)) { index };
       case (#err(error)) { return #err(error) };
