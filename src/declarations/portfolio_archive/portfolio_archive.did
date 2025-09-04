@@ -68,6 +68,22 @@ type PortfolioBlockData =
    totalValueICP: nat;
    totalValueUSD: float64;
  };
+type OHLCCandle = 
+ record {
+   icpOHLC: record {
+              close: nat;
+              high: nat;
+              low: nat;
+              open: nat;
+            };
+   timestamp: int;
+   usdOHLC: record {
+              close: float64;
+              high: float64;
+              low: float64;
+              open: float64;
+            };
+ };
 type PortfolioArchiveV2 = 
  service {
    archivePortfolioBlock: (portfolio: PortfolioBlockData) -> (Result_3);
@@ -80,6 +96,8 @@ type PortfolioArchiveV2 =
        lastPortfolioImportTime: int;
      }) query;
    getLogs: (count: nat) -> (vec LogEntry) query;
+   getOHLCCandles: (startTime: int, endTime: int, intervalNS: int) -> 
+    (variant { err: ArchiveError; ok: vec OHLCCandle });
    getTimerStatus: () -> (TimerStatus) query;
    icrc3_get_archives: (args: GetArchivesArgs) -> (GetArchivesResult) query;
    icrc3_get_blocks: (args: GetBlocksArgs) -> (GetBlocksResult) query;
