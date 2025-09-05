@@ -8,12 +8,20 @@
       "main": "src/treasury/treasury.mo",
       "type": "motoko"
     },
+    "rewards": {
+      "main": "src/rewards/rewards.mo",
+      "type": "motoko"
+    },
     "validation": {
       "main": "src/validation/validation.mo",
       "type": "motoko"
     },
     "neuronSnapshot": {
       "main": "src/neuron_snapshot/neuronSnapshot.mo",
+      "type": "motoko"
+    },
+    "nachos": {
+      "main": "src/treasury/treasury.mo",
       "type": "motoko"
     },
     "trading_archive": {
@@ -38,10 +46,6 @@
     },
     "dao_governance_archive": {
       "main": "src/archives/dao_governance_archive/dao_governance_archive.mo",
-      "type": "motoko"
-    },
-    "rewards": {
-      "main": "src/rewards/rewards.mo",
       "type": "motoko"
     },
     "dao_neuron_allocation_archive": {
