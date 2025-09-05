@@ -128,6 +128,8 @@ shared (deployer) actor class treasury() = this {
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
   let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
+  let NACHOS_ID = canister_ids.getCanisterId(#nachos);
+  let TREASURY_ID = canister_ids.getCanisterId(#treasury);
 
   // Logger
   let logger = Logger.Logger();
@@ -145,7 +147,8 @@ shared (deployer) actor class treasury() = this {
   //stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
   stable var MintVaultPrincipal = DAO_BACKEND_ID;
 
-
+  let treasuryPrincipal = TREASURY_ID;
+  let nachosPrincipal = NACHOS_ID;
 
 
   // Core type aliases
@@ -341,6 +344,15 @@ shared (deployer) actor class treasury() = this {
   private func isMasterAdmin(caller : Principal) : Bool {
     AdminAuth.isMasterAdmin(caller, canister_ids.isKnownCanister)
   };
+  
+  private func is_nachos() : Bool {
+    return self == nachosPrincipal;
+  };
+
+  private func is_treasury() : Bool {
+    return self == treasuryPrincipal;
+  };
+
 
   // Treasury admin action logging function
   private func logTreasuryAdminAction(
@@ -6248,15 +6260,6 @@ shared (deployer) actor class treasury() = this {
       };
       portfolioSnapshotTimerId := 0;
     };
-  };
-
-  
-  private func is_nachos() : Bool {
-    return self == nachosPrincipal;
-  };
-
-  private func is_treasury() : Bool {
-    return self == treasuryPrincipal;
   };
 };
 
