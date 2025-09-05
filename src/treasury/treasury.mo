@@ -5439,9 +5439,11 @@ shared (deployer) actor class treasury() = this {
           try {
             await* syncPriceWithNTN();
           } catch (_) {};
-          try {
-            ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
-          } catch (_) {};
+          if (is_treasury()) {
+            try {
+              ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+            } catch (_) {};
+          };
           for ((token, details) in Map.entries(tokenDetailsMap)) {
             if ((details.lastTimeSynced + rebalanceConfig.tokenSyncTimeoutNS) < now()) {
               Map.set(tokenDetailsMap, phash, token, { details with pausedDueToSyncFailure = true });
@@ -5472,10 +5474,12 @@ shared (deployer) actor class treasury() = this {
         Debug.print("Sync price with NTN");
         await* syncPriceWithNTN();
       } catch (_) {};
-      try {
-        Debug.print("Sync token details to DAO");
-        ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
-      } catch (_) {};
+      if (is_treasury()) {
+        try {
+          Debug.print("Sync token details to DAO");
+          ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+        } catch (_) {};
+      };
       for ((token, details) in Map.entries(tokenDetailsMap)) {
         Debug.print("Check token details sync failure for " # Principal.toText(token));
         if ((details.lastTimeSynced + rebalanceConfig.tokenSyncTimeoutNS) < now()) {
@@ -6246,5 +6250,13 @@ shared (deployer) actor class treasury() = this {
     };
   };
 
+  
+  private func is_nachos() : Bool {
+    return self == nachosPrincipal;
+  };
+
+  private func is_treasury() : Bool {
+    return self == treasuryPrincipal;
+  };
 };
 
