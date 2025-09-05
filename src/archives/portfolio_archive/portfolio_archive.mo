@@ -11,6 +11,7 @@ import Array "mo:base/Array";
 import Float "mo:base/Float";
 import Text "mo:base/Text";
 import Vector "mo:vector";
+import Buffer "mo:base/Buffer";
 
 import ICRC3 "mo:icrc3-mo";                    // ← THE FIX: Use the actual library, not just types
 import ICRC3Service "mo:icrc3-mo/service";        // ← Keep service types for API
@@ -1154,108 +1155,149 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
       return #ok([]);
     };
 
-    // Find starting block index using our binary search
+    // Find first block at or after startTime
     let startBlockResult = lower_bound_ts_impl(startTime);
     let startBlockIndex = switch (startBlockResult) {
       case (#ok(index)) { index };
       case (#err(error)) { return #err(error) };
     };
 
-    // If no blocks found at or after start time, return empty
     if (startBlockIndex >= totalBlocks) {
       return #ok([]);
     };
 
-    var candles: [OHLCCandle] = [];
-    var currentIntervalStart = startTime;
-    var lastKnownUSD: ?Float = null;
-    var lastKnownICP: ?Nat = null;
+    // Efficient accumulation using Buffer and single-pass batched scan
+    let out = Buffer.Buffer<OHLCCandle>(64);
 
-    while (currentIntervalStart < endTime) {
-      let intervalEnd = currentIntervalStart + intervalNS;
-      
-      // Get all blocks in this interval
-      let intervalBlocks = getBlocksInTimeRange(currentIntervalStart, intervalEnd);
-      
-      switch (intervalBlocks) {
-        case (#ok(blocks)) {
-          if (blocks.size() > 0) {
-            // Calculate OHLC from blocks in this interval
-            var usdValues: [Float] = [];
-            var icpValues: [Nat] = [];
-            
-            for (blockData in blocks.vals()) {
-              usdValues := Array.append(usdValues, [blockData.totalValueUSD]);
-              icpValues := Array.append(icpValues, [blockData.totalValueICP]);
+    // Accumulator state for current interval
+    var haveAcc = false;
+    var accTs : Int = 0;
+    var usdOpen : Float = 0.0;
+    var usdHigh : Float = 0.0;
+    var usdLow : Float = 0.0;
+    var usdClose : Float = 0.0;
+    var icpOpen : Nat = 0;
+    var icpHigh : Nat = 0;
+    var icpLow : Nat = 0;
+    var icpClose : Nat = 0;
+
+    var lastKnownUSD : ?Float = null;
+    var lastKnownICP : ?Nat = null;
+
+    // Helper to push current accumulator as a candle and reset acc state
+    let flushAcc = func() : () {
+      if (haveAcc) {
+        let candle : OHLCCandle = {
+          timestamp = accTs;
+          usdOHLC = { open = usdOpen; high = usdHigh; low = usdLow; close = usdClose };
+          icpOHLC = { open = icpOpen; high = icpHigh; low = icpLow; close = icpClose };
+        };
+        out.add(candle);
+        lastKnownUSD := ?usdClose;
+        lastKnownICP := ?icpClose;
+        haveAcc := false;
+      };
+    };
+
+    // Helper to carry-forward candles for empty intervals
+    let fillGaps = func(fromTs: Int, toTs: Int) : () {
+      if (fromTs >= toTs) { return };
+      switch (lastKnownUSD, lastKnownICP) {
+        case (?usd, ?icp) {
+          var t = fromTs;
+          while (t < toTs) {
+            let c : OHLCCandle = {
+              timestamp = t;
+              usdOHLC = { open = usd; high = usd; low = usd; close = usd };
+              icpOHLC = { open = icp; high = icp; low = icp; close = icp };
             };
-            
-            if (usdValues.size() > 0) {
-              let usdOHLC = {
-                open = usdValues[0];
-                high = Array.foldLeft<Float, Float>(usdValues, usdValues[0], func(acc, val) = if (val > acc) val else acc);
-                low = Array.foldLeft<Float, Float>(usdValues, usdValues[0], func(acc, val) = if (val < acc) val else acc);
-                close = usdValues[usdValues.size() - 1];
-              };
-              
-              let icpOHLC = {
-                open = icpValues[0];
-                high = Array.foldLeft<Nat, Nat>(icpValues, icpValues[0], func(acc, val) = if (val > acc) val else acc);
-                low = Array.foldLeft<Nat, Nat>(icpValues, icpValues[0], func(acc, val) = if (val < acc) val else acc);
-                close = icpValues[icpValues.size() - 1];
-              };
-              
-              lastKnownUSD := ?usdOHLC.close;
-              lastKnownICP := ?icpOHLC.close;
-              
-              let candle: OHLCCandle = {
-                timestamp = currentIntervalStart;
-                usdOHLC = usdOHLC;
-                icpOHLC = icpOHLC;
-              };
-              
-              candles := Array.append(candles, [candle]);
+            out.add(c);
+            t += intervalNS;
+          };
+        };
+        case _ {};
+      };
+    };
+
+    // Convert a timestamp to its interval bucket start aligned to startTime
+    let alignBucketStart = func(ts: Int) : Int {
+      startTime + ((ts - startTime) / intervalNS) * intervalNS
+    };
+
+    // Single-pass over blocks in batches
+    let batchSize : Nat = 256;
+    var currentIndex = startBlockIndex;
+    var done = false;
+
+    while (currentIndex < totalBlocks and not done) {
+      let remaining = totalBlocks - currentIndex;
+      let len = if (remaining > batchSize) { batchSize } else { remaining };
+      let blockResult = base.icrc3_get_blocks([{ start = currentIndex; length = len }]);
+
+      // If no blocks are returned, break to avoid infinite loop
+      if (blockResult.blocks.size() == 0) { done := true; };
+
+      for (archivedBlock in blockResult.blocks.vals()) {
+        let blkVal = archivedBlock.block;
+
+        // Extract portfolio timestamp
+        switch (extractTimestampFromBlock(blkVal)) {
+          case (?ts) {
+            if (ts >= endTime) {
+              done := true;
+            };
+            if (ts < startTime) {
+              // Before range, skip
             } else {
-              // No data in interval, carry forward if we have previous values
-              switch (lastKnownUSD, lastKnownICP) {
-                case (?usd, ?icp) {
-                  let candle: OHLCCandle = {
-                    timestamp = currentIntervalStart;
-                    usdOHLC = {open = usd; high = usd; low = usd; close = usd};
-                    icpOHLC = {open = icp; high = icp; low = icp; close = icp};
+              // Extract portfolio values
+              switch (extractPortfolioDataFromBlock(blkVal)) {
+                case (?data) {
+                  let bStart = alignBucketStart(ts);
+                  if (not haveAcc) {
+                    accTs := bStart;
+                    usdOpen := data.totalValueUSD; usdHigh := data.totalValueUSD; usdLow := data.totalValueUSD; usdClose := data.totalValueUSD;
+                    icpOpen := data.totalValueICP; icpHigh := data.totalValueICP; icpLow := data.totalValueICP; icpClose := data.totalValueICP;
+                    haveAcc := true;
+                  } else if (bStart != accTs) {
+                    // New interval: flush previous and fill gaps if any
+                    flushAcc();
+                    fillGaps(accTs + intervalNS, bStart);
+                    accTs := bStart;
+                    usdOpen := data.totalValueUSD; usdHigh := data.totalValueUSD; usdLow := data.totalValueUSD; usdClose := data.totalValueUSD;
+                    icpOpen := data.totalValueICP; icpHigh := data.totalValueICP; icpLow := data.totalValueICP; icpClose := data.totalValueICP;
+                    haveAcc := true;
+                  } else {
+                    // Same interval: update OHLC
+                    if (data.totalValueUSD > usdHigh) { usdHigh := data.totalValueUSD };
+                    if (data.totalValueUSD < usdLow) { usdLow := data.totalValueUSD };
+                    usdClose := data.totalValueUSD;
+
+                    if (data.totalValueICP > icpHigh) { icpHigh := data.totalValueICP };
+                    if (data.totalValueICP < icpLow) { icpLow := data.totalValueICP };
+                    icpClose := data.totalValueICP;
                   };
-                  candles := Array.append(candles, [candle]);
                 };
-                case _ {
-                  // No previous data to carry forward, skip this interval
-                };
-              };
-            };
-          } else {
-            // No blocks in interval, carry forward if we have previous values
-            switch (lastKnownUSD, lastKnownICP) {
-              case (?usd, ?icp) {
-                let candle: OHLCCandle = {
-                  timestamp = currentIntervalStart;
-                  usdOHLC = {open = usd; high = usd; low = usd; close = usd};
-                  icpOHLC = {open = icp; high = icp; low = icp; close = icp};
-                };
-                candles := Array.append(candles, [candle]);
-              };
-              case _ {
-                // No previous data to carry forward, skip this interval
+                case null { /* Skip unparsable blocks */ };
               };
             };
           };
-        };
-        case (#err(error)) {
-          return #err(error);
+          case null { /* Skip blocks without timestamps */ };
         };
       };
-      
-      currentIntervalStart := intervalEnd;
+
+      currentIndex += len;
     };
-    
-    #ok(candles);
+
+    // Flush the last accumulator and fill any trailing gap up to endTime
+    if (haveAcc) {
+      flushAcc();
+      fillGaps(accTs + intervalNS, endTime);
+    } else {
+      // No data points in range; nothing to fill unless we have prior lastKnown
+      // which we don't at this point, so return empty
+    };
+
+    #ok(Buffer.toArray(out));
   };
 
   // Helper function to get blocks within a time range
