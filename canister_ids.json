@@ -19,6 +19,9 @@
     "ic": "dnhfs-7yaaa-aaaan-qz5mq-cai",
     "staging": "cajb4-qqaaa-aaaan-qz5la-cai"
   },
+  "nachos": {
+    "staging": "rctxc-zqaaa-aaaan-qz6na-cai"
+  },
   "neuronSnapshot": {
     "ic": "vzs3x-taaaa-aaaan-qzzjq-cai",
     "staging": "tgqd4-eqaaa-aaaai-atifa-cai"
