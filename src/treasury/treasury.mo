@@ -5940,7 +5940,7 @@ shared (deployer) actor class treasury() = this {
       var kongTokenPrice : ?Float = null;
       try {
         // Quote 1 token (in smallest units) to ICP
-        let oneTokenAmount = 10 ** details.decimals; // 1 token in smallest unit
+        let oneTokenAmount = 10 ** details.tokenDecimals; // 1 token in smallest unit
         let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount);
         switch (kongResult) {
           case (#ok(quote)) {
