@@ -5837,14 +5837,9 @@ shared (deployer) actor class treasury() = this {
       let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000);
       switch (kongResult) {
         case (#ok(quote)) {
-          // Check slippage - reject if over 10%
-          if (quote.slippage > 10.0) {
-            Debug.print("Kong ICP/ckUSDC quote rejected due to high slippage: " # Float.toText(quote.slippage) # "%");
-          } else {
-            // Use mid_price (spot price) directly - this matches ICPSwap's approach
-            kongICPPrice := ?quote.mid_price;
-            Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP (slippage: " # Float.toText(quote.slippage) # "%, execution would get " # Nat.toText(quote.receive_amount) # " ckUSDC e6s)");
-          };
+          // Use mid_price (spot price) directly - this matches ICPSwap's approach
+          kongICPPrice := ?quote.mid_price;
+          Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP");
         };
         case (#err(e)) {
           Debug.print("Kong ICP/ckUSDC quote failed: " # e);
@@ -5865,16 +5860,25 @@ shared (deployer) actor class treasury() = this {
           let icpAddress = Principal.toText(ICPprincipal);
           let usdcAddress = Principal.toText(ckUSDCPrincipal);
           
+          // The raw price from ICPSwap needs decimal adjustment
+          // ICP has 8 decimals, ckUSDC has 6 decimals
+          let icpDecimals = 8;
+          let usdcDecimals = 6;
+          let decimalAdjustment = Float.fromInt(10 ** (icpDecimals - usdcDecimals)); // 10^(8-6) = 100
+          
           let icpPrice = if (icpAddress == priceInfo.token0.address and usdcAddress == priceInfo.token1.address) {
             // ICP is token0, ckUSDC is token1
-            // Raw price = token1/token0 = ckUSDC/ICP = how much USDC per ICP
-            // We want ICP/USD, so we need the inverse
-            if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 }
+            // Raw price = token1/token0 = ckUSDC/ICP 
+            // Need to adjust for decimals: raw_price * (10^8 / 10^6) = raw_price * 100
+            let adjustedPrice = priceInfo.price * decimalAdjustment;
+            Debug.print("ICPSwap raw price: " # Float.toText(priceInfo.price) # ", decimal adjusted: " # Float.toText(adjustedPrice));
+            adjustedPrice
           } else if (icpAddress == priceInfo.token1.address and usdcAddress == priceInfo.token0.address) {
-            // ICP is token1, ckUSDC is token0
-            // Raw price = token1/token0 = ICP/ckUSDC = how much ICP per USDC
-            // This is what we want (ICP per USD)
-            priceInfo.price
+            // ICP is token1, ckUSDC is token0  
+            // Raw price = token1/token0 = ICP/ckUSDC
+            // Need to adjust and invert
+            let adjustedPrice = priceInfo.price * decimalAdjustment;
+            if (adjustedPrice > 0.0) { 1.0 / adjustedPrice } else { 0.0 }
           } else {
             // Unexpected token configuration
             Debug.print("Unexpected token configuration in ICP/ckUSDC pool - token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
@@ -5947,14 +5951,9 @@ shared (deployer) actor class treasury() = this {
         let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount);
         switch (kongResult) {
           case (#ok(quote)) {
-            // Check slippage - reject if over 10%
-            if (quote.slippage > 10.0) {
-              Debug.print("Kong " # tokenSymbol # "/ICP quote rejected due to high slippage: " # Float.toText(quote.slippage) # "%");
-            } else {
-              // Use mid_price (spot price) directly - this matches ICPSwap's approach
-              kongTokenPrice := ?quote.mid_price;
-              Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol # " (slippage: " # Float.toText(quote.slippage) # "%, execution would get " # Nat.toText(quote.receive_amount) # " ICP e8s)");
-            };
+            // Use mid_price (spot price) directly - this matches ICPSwap's approach
+            kongTokenPrice := ?quote.mid_price;
+            Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol);
           };
           case (#err(e)) {
             Debug.print("Kong " # tokenSymbol # "/ICP quote failed: " # e);
