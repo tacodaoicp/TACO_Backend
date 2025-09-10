@@ -5853,10 +5853,31 @@ shared (deployer) actor class treasury() = this {
       let icpSwapResult = await ICPSwap.getPrice(icpUsdcPoolPrincipal);
       switch (icpSwapResult) {
         case (#ok(priceInfo)) {
-          // ICPSwap returns price of token1 in terms of token0
-          // Need to check which is ICP and which is ckUSDC to get the right direction
-          icpSwapICPPrice := ?priceInfo.price;
-          Debug.print("ICPSwap ICP/ckUSDC price: " # Float.toText(priceInfo.price));
+          // The price represents token1 in terms of token0
+          // We want ICP/USD price, so we need to determine which is which
+          let icpAddress = Principal.toText(ICPprincipal);
+          let usdcAddress = Principal.toText(ckUSDCPrincipal);
+          
+          let icpPrice = if (icpAddress == priceInfo.token0.address and usdcAddress == priceInfo.token1.address) {
+            // ICP is token0, ckUSDC is token1
+            // Price is token1/token0 = USDC/ICP, so we want ICP/USDC = 1/price
+            if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 }
+          } else if (icpAddress == priceInfo.token1.address and usdcAddress == priceInfo.token0.address) {
+            // ICP is token1, ckUSDC is token0
+            // Price is token1/token0 = ICP/USDC, which is what we want
+            priceInfo.price
+          } else {
+            // Unexpected token configuration
+            Debug.print("Unexpected token configuration in ICP/ckUSDC pool - token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
+            0.0
+          };
+          
+          if (icpPrice > 0.0) {
+            icpSwapICPPrice := ?icpPrice;
+            Debug.print("ICPSwap ICP/ckUSDC price: " # Float.toText(icpPrice) # " (token0=" # priceInfo.token0.address # ", token1=" # priceInfo.token1.address # ")");
+          } else {
+            Debug.print("ICPSwap ICP/ckUSDC price calculation resulted in 0 or invalid");
+          };
         };
         case (#err(e)) {
           Debug.print("ICPSwap ICP/ckUSDC price failed: " # e);
@@ -5937,14 +5958,31 @@ shared (deployer) actor class treasury() = this {
             let icpSwapResult = await ICPSwap.getPrice(poolData.canisterId);
             switch (icpSwapResult) {
               case (#ok(priceInfo)) {
-                // Need to handle price direction properly based on token order
-                let price = if (Principal.toText(principal) == priceInfo.token0.address) {
-                  1.0 / priceInfo.price // If our token is token0, invert the price
+                // The price represents token1 in terms of token0
+                // We want TOKEN/ICP price, so we need to determine which is which
+                let icpAddress = Principal.toText(ICPprincipal);
+                let tokenAddress = Principal.toText(principal);
+                
+                let price = if (tokenAddress == priceInfo.token0.address and icpAddress == priceInfo.token1.address) {
+                  // Our token is token0, ICP is token1
+                  // Price is token1/token0 = ICP/TOKEN, so we want TOKEN/ICP = 1/price
+                  if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 }
+                } else if (tokenAddress == priceInfo.token1.address and icpAddress == priceInfo.token0.address) {
+                  // Our token is token1, ICP is token0  
+                  // Price is token1/token0 = TOKEN/ICP, which is what we want
+                  priceInfo.price
                 } else {
-                  priceInfo.price // If our token is token1, use price directly
+                  // Unexpected token configuration - log and skip
+                  Debug.print("Unexpected token configuration in pool - token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
+                  0.0
                 };
-                icpSwapTokenPrice := ?price;
-                Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(price));
+                
+                if (price > 0.0) {
+                  icpSwapTokenPrice := ?price;
+                  Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(price) # " (token0=" # priceInfo.token0.address # ", token1=" # priceInfo.token1.address # ")");
+                } else {
+                  Debug.print("ICPSwap " # tokenSymbol # "/ICP price calculation resulted in 0 or invalid");
+                };
               };
               case (#err(e)) {
                 Debug.print("ICPSwap " # tokenSymbol # "/ICP price failed: " # e);
