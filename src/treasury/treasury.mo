@@ -5841,11 +5841,9 @@ shared (deployer) actor class treasury() = this {
           if (quote.slippage > 10.0) {
             Debug.print("Kong ICP/ckUSDC quote rejected due to high slippage: " # Float.toText(quote.slippage) # "%");
           } else {
-            // Calculate price: how much ckUSDC we get for 1 ICP
-            // quote.receive_amount is in ckUSDC smallest units (6 decimals)
-            let icpToUsdcRate = Float.fromInt(quote.receive_amount) / Float.fromInt(1000000); // Convert to full ckUSDC units
-            kongICPPrice := ?icpToUsdcRate;
-            Debug.print("Kong ICP/ckUSDC quote: " # Nat.toText(quote.receive_amount) # " ckUSDC e6s for 1 ICP -> " # Float.toText(icpToUsdcRate) # " USD per ICP (slippage: " # Float.toText(quote.slippage) # "%)");
+            // Use mid_price (spot price) directly - this matches ICPSwap's approach
+            kongICPPrice := ?quote.mid_price;
+            Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP (slippage: " # Float.toText(quote.slippage) # "%, execution would get " # Nat.toText(quote.receive_amount) # " ckUSDC e6s)");
           };
         };
         case (#err(e)) {
@@ -5953,11 +5951,9 @@ shared (deployer) actor class treasury() = this {
             if (quote.slippage > 10.0) {
               Debug.print("Kong " # tokenSymbol # "/ICP quote rejected due to high slippage: " # Float.toText(quote.slippage) # "%");
             } else {
-              // Calculate price: how much ICP we get for 1 token
-              // quote.receive_amount is in ICP e8s (8 decimals)
-              let tokenToIcpRate = Float.fromInt(quote.receive_amount) / Float.fromInt(100000000); // Convert to full ICP units
-              kongTokenPrice := ?tokenToIcpRate;
-              Debug.print("Kong " # tokenSymbol # "/ICP quote: " # Nat.toText(quote.receive_amount) # " ICP e8s for 1 " # tokenSymbol # " -> " # Float.toText(tokenToIcpRate) # " ICP per " # tokenSymbol # " (slippage: " # Float.toText(quote.slippage) # "%)");
+              // Use mid_price (spot price) directly - this matches ICPSwap's approach
+              kongTokenPrice := ?quote.mid_price;
+              Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol # " (slippage: " # Float.toText(quote.slippage) # "%, execution would get " # Nat.toText(quote.receive_amount) # " ICP e8s)");
             };
           };
           case (#err(e)) {
