@@ -5826,7 +5826,7 @@ shared (deployer) actor class treasury() = this {
     let icpUsdcPoolPrincipal = Principal.fromText("mohjv-bqaaa-aaaag-qjyia-cai");
     
     // Step 1: Get ICP/USD price via ICP/ckUSDC pair
-    var icpPriceUSD : Float = 20.0; // Default fallback
+    var icpPriceUSD : ?Float = null;
     
     Debug.print("Getting ICP/USD price via ckUSDC...");
     
@@ -5870,29 +5870,39 @@ shared (deployer) actor class treasury() = this {
     switch (kongICPPrice, icpSwapICPPrice) {
       case (?kong, ?icpSwap) {
         // Average both prices
-        icpPriceUSD := (kong + icpSwap) / 2.0;
-        Debug.print("Using averaged ICP/USD price: " # Float.toText(icpPriceUSD));
+        icpPriceUSD := ?(kong + icpSwap) / 2.0;
+        Debug.print("Using averaged ICP/USD price: " # Float.toText((kong + icpSwap) / 2.0));
       };
       case (?kong, null) {
-        icpPriceUSD := kong;
-        Debug.print("Using Kong ICP/USD price: " # Float.toText(icpPriceUSD));
+        icpPriceUSD := ?kong;
+        Debug.print("Using Kong ICP/USD price: " # Float.toText(kong));
       };
       case (null, ?icpSwap) {
-        icpPriceUSD := icpSwap;
-        Debug.print("Using ICPSwap ICP/USD price: " # Float.toText(icpPriceUSD));
+        icpPriceUSD := ?icpSwap;
+        Debug.print("Using ICPSwap ICP/USD price: " # Float.toText(icpSwap));
       };
       case (null, null) {
-        Debug.print("Failed to get ICP/USD price from both DEXes, using fallback: " # Float.toText(icpPriceUSD));
+        Debug.print("Failed to get ICP/USD price from both DEXes - aborting price sync to trigger sync failure detection");
+        return; // Exit early without updating lastPriceUpdate
       };
     };
     
     // Step 2: Get prices for all tokens against ICP
     Debug.print("Getting token/ICP prices for all tokens...");
     
+    // Extract the ICP/USD price (we know it exists at this point)
+    let finalICPPriceUSD = switch (icpPriceUSD) {
+      case (?price) { price };
+      case null { 
+        Debug.print("Internal error: icpPriceUSD is null after successful price discovery");
+        return;
+      };
+    };
+    
     label tokenLoop for ((principal, details) in Map.entries(tokenDetailsMap)) {
       if (principal == ICPprincipal) {
         // Update ICP price directly
-        updateTokenPriceWithHistory(ICPprincipal, 100000000, icpPriceUSD); // 1 ICP = 100000000 e8s
+        updateTokenPriceWithHistory(ICPprincipal, 100000000, finalICPPriceUSD); // 1 ICP = 100000000 e8s
         continue tokenLoop;
       };
       
@@ -5955,19 +5965,19 @@ shared (deployer) actor class treasury() = this {
           // Average both prices
           let avgPrice = (kong + icpSwap) / 2.0;
           let icpPrice = Float.toInt(avgPrice * Float.fromInt(10 ** details.tokenDecimals));
-          let usdPrice = avgPrice * icpPriceUSD;
+          let usdPrice = avgPrice * finalICPPriceUSD;
           updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
           Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
         };
         case (?kong, null) {
           let icpPrice = Float.toInt(kong * Float.fromInt(10 ** details.tokenDecimals));
-          let usdPrice = kong * icpPriceUSD;
+          let usdPrice = kong * finalICPPriceUSD;
           updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
           Debug.print("Updated " # tokenSymbol # " with Kong DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
         };
         case (null, ?icpSwap) {
           let icpPrice = Float.toInt(icpSwap * Float.fromInt(10 ** details.tokenDecimals));
-          let usdPrice = icpSwap * icpPriceUSD;
+          let usdPrice = icpSwap * finalICPPriceUSD;
           updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
           Debug.print("Updated " # tokenSymbol # " with ICPSwap DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
         };
