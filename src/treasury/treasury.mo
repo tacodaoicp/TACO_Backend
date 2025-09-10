@@ -5830,9 +5830,26 @@ shared (deployer) actor class treasury() = this {
     
     Debug.print("Getting ICP/USD price via ckUSDC...");
     
-    // Try Kong for ICP/ckUSDC price - TEMPORARILY DISABLED due to IDL issues
+    // Try Kong for ICP/ckUSDC price using getQuote for 1 ICP
     var kongICPPrice : ?Float = null;
-    Debug.print("Kong temporarily disabled due to IDL parsing issues");
+    try {
+      // Quote 1 ICP (100,000,000 e8s) to ckUSDC
+      let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000);
+      switch (kongResult) {
+        case (#ok(quote)) {
+          // Calculate price: how much ckUSDC we get for 1 ICP
+          // quote.receive_amount is in ckUSDC smallest units (6 decimals)
+          let icpToUsdcRate = Float.fromInt(quote.receive_amount) / Float.fromInt(1000000); // Convert to full ckUSDC units
+          kongICPPrice := ?icpToUsdcRate;
+          Debug.print("Kong ICP/ckUSDC quote: " # Nat.toText(quote.receive_amount) # " ckUSDC e6s for 1 ICP -> " # Float.toText(icpToUsdcRate) # " USD per ICP");
+        };
+        case (#err(e)) {
+          Debug.print("Kong ICP/ckUSDC quote failed: " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("Kong ICP/ckUSDC exception: " # Error.message(e));
+    };
     
     // Try ICPSwap for ICP/ckUSDC price
     var icpSwapICPPrice : ?Float = null;
@@ -5919,9 +5936,27 @@ shared (deployer) actor class treasury() = this {
       let tokenSymbol = details.tokenSymbol;
       Debug.print("Getting price for token: " # tokenSymbol);
       
-      // Try Kong for token/ICP price - TEMPORARILY DISABLED due to IDL issues
+      // Try Kong for token/ICP price using getQuote for 1 token
       var kongTokenPrice : ?Float = null;
-      Debug.print("Kong temporarily disabled due to IDL parsing issues");
+      try {
+        // Quote 1 token (in smallest units) to ICP
+        let oneTokenAmount = 10 ** details.decimals; // 1 token in smallest unit
+        let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount);
+        switch (kongResult) {
+          case (#ok(quote)) {
+            // Calculate price: how much ICP we get for 1 token
+            // quote.receive_amount is in ICP e8s (8 decimals)
+            let tokenToIcpRate = Float.fromInt(quote.receive_amount) / Float.fromInt(100000000); // Convert to full ICP units
+            kongTokenPrice := ?tokenToIcpRate;
+            Debug.print("Kong " # tokenSymbol # "/ICP quote: " # Nat.toText(quote.receive_amount) # " ICP e8s for 1 " # tokenSymbol # " -> " # Float.toText(tokenToIcpRate) # " ICP per " # tokenSymbol);
+          };
+          case (#err(e)) {
+            Debug.print("Kong " # tokenSymbol # "/ICP quote failed: " # e);
+          };
+        };
+      } catch (e) {
+        Debug.print("Kong " # tokenSymbol # "/ICP exception: " # Error.message(e));
+      };
       
       // Try ICPSwap for token/ICP price
       var icpSwapTokenPrice : ?Float = null;
