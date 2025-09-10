@@ -533,6 +533,10 @@ shared (deployer) actor class treasury() = this {
           };
         };
         
+        // Check circuit breaker conditions after pausing a token
+        // This ensures immediate response if ICP or threshold conditions are met
+        checkPortfolioCircuitBreakerConditions();
+        
         true;
       };
       case null { 
@@ -2833,6 +2837,12 @@ shared (deployer) actor class treasury() = this {
       return;
     };
     
+    // Check if ICP is paused - if so, trigger circuit breaker immediately
+    if (isTokenPausedFromTrading(ICPprincipal)) {
+      triggerICPPausedCircuitBreaker();
+      return; // Exit early since circuit breaker was triggered
+    };
+    
     // Check if we've hit the paused token threshold circuit breaker
     if (pausedTokenCount >= pausedTokenThresholdForCircuitBreaker) {
       triggerPausedTokenThresholdCircuitBreaker(pausedTokenCount);
@@ -3080,6 +3090,42 @@ shared (deployer) actor class treasury() = this {
       " Threshold=" # Nat.toText(pausedTokenThresholdForCircuitBreaker) #
       " Additional_Tokens_Paused=" # Nat.toText(Vector.size(pausedTokens)),
       "triggerPausedTokenThresholdCircuitBreaker"
+    );
+  };
+
+  /**
+   * Trigger circuit breaker due to ICP being paused
+   *
+   * Called when ICP token is paused from trading.
+   * Pauses all remaining active tokens since ICP is critical for fallback trading.
+   */
+  private func triggerICPPausedCircuitBreaker() {
+    // Get all active trading tokens to pause (excluding ICP since it's already paused)
+    let tokensToProcess = Iter.toArray(Map.entries(tokenDetailsMap));
+    let pausedTokens = Vector.new<Principal>();
+
+    for ((token, details) in tokensToProcess.vals()) {
+      if (details.Active and token != ICPprincipal and not isTokenPausedFromTrading(token)) {
+        let pauseReason : TradingPauseReason = #CircuitBreaker({
+          reason = "ICP circuit breaker triggered: ICP token has been paused from trading, disabling all trading to prevent system instability";
+          triggeredAt = now();
+          severity = "Critical";
+        });
+
+        let success = pauseTokenFromTrading(token, pauseReason);
+        if (success) {
+          Vector.add(pausedTokens, token);
+        };
+      };
+    };
+
+    logger.warn(
+      "ICP_PAUSED_CIRCUIT_BREAKER",
+      "ICP PAUSED CIRCUIT BREAKER TRIGGERED - " #
+      " ICP_Status=Paused" #
+      " Additional_Tokens_Paused=" # Nat.toText(Vector.size(pausedTokens)) #
+      " Reason=ICP_critical_for_fallback_trading",
+      "triggerICPPausedCircuitBreaker"
     );
   };
 
