@@ -5837,11 +5837,16 @@ shared (deployer) actor class treasury() = this {
       let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000);
       switch (kongResult) {
         case (#ok(quote)) {
-          // Calculate price: how much ckUSDC we get for 1 ICP
-          // quote.receive_amount is in ckUSDC smallest units (6 decimals)
-          let icpToUsdcRate = Float.fromInt(quote.receive_amount) / Float.fromInt(1000000); // Convert to full ckUSDC units
-          kongICPPrice := ?icpToUsdcRate;
-          Debug.print("Kong ICP/ckUSDC quote: " # Nat.toText(quote.receive_amount) # " ckUSDC e6s for 1 ICP -> " # Float.toText(icpToUsdcRate) # " USD per ICP");
+          // Check slippage - reject if over 10%
+          if (quote.slippage > 10.0) {
+            Debug.print("Kong ICP/ckUSDC quote rejected due to high slippage: " # Float.toText(quote.slippage) # "%");
+          } else {
+            // Calculate price: how much ckUSDC we get for 1 ICP
+            // quote.receive_amount is in ckUSDC smallest units (6 decimals)
+            let icpToUsdcRate = Float.fromInt(quote.receive_amount) / Float.fromInt(1000000); // Convert to full ckUSDC units
+            kongICPPrice := ?icpToUsdcRate;
+            Debug.print("Kong ICP/ckUSDC quote: " # Nat.toText(quote.receive_amount) # " ckUSDC e6s for 1 ICP -> " # Float.toText(icpToUsdcRate) # " USD per ICP (slippage: " # Float.toText(quote.slippage) # "%)");
+          };
         };
         case (#err(e)) {
           Debug.print("Kong ICP/ckUSDC quote failed: " # e);
@@ -5944,11 +5949,16 @@ shared (deployer) actor class treasury() = this {
         let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount);
         switch (kongResult) {
           case (#ok(quote)) {
-            // Calculate price: how much ICP we get for 1 token
-            // quote.receive_amount is in ICP e8s (8 decimals)
-            let tokenToIcpRate = Float.fromInt(quote.receive_amount) / Float.fromInt(100000000); // Convert to full ICP units
-            kongTokenPrice := ?tokenToIcpRate;
-            Debug.print("Kong " # tokenSymbol # "/ICP quote: " # Nat.toText(quote.receive_amount) # " ICP e8s for 1 " # tokenSymbol # " -> " # Float.toText(tokenToIcpRate) # " ICP per " # tokenSymbol);
+            // Check slippage - reject if over 10%
+            if (quote.slippage > 10.0) {
+              Debug.print("Kong " # tokenSymbol # "/ICP quote rejected due to high slippage: " # Float.toText(quote.slippage) # "%");
+            } else {
+              // Calculate price: how much ICP we get for 1 token
+              // quote.receive_amount is in ICP e8s (8 decimals)
+              let tokenToIcpRate = Float.fromInt(quote.receive_amount) / Float.fromInt(100000000); // Convert to full ICP units
+              kongTokenPrice := ?tokenToIcpRate;
+              Debug.print("Kong " # tokenSymbol # "/ICP quote: " # Nat.toText(quote.receive_amount) # " ICP e8s for 1 " # tokenSymbol # " -> " # Float.toText(tokenToIcpRate) # " ICP per " # tokenSymbol # " (slippage: " # Float.toText(quote.slippage) # "%)");
+            };
           };
           case (#err(e)) {
             Debug.print("Kong " # tokenSymbol # "/ICP quote failed: " # e);
