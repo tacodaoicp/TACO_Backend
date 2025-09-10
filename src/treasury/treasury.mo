@@ -5830,22 +5830,9 @@ shared (deployer) actor class treasury() = this {
     
     Debug.print("Getting ICP/USD price via ckUSDC...");
     
-    // Try Kong for ICP/ckUSDC price
+    // Try Kong for ICP/ckUSDC price - TEMPORARILY DISABLED due to IDL issues
     var kongICPPrice : ?Float = null;
-    try {
-      let kongResult = await KongSwap.getPrice("ICP", "ckUSDC");
-      switch (kongResult) {
-        case (#ok(priceInfo)) {
-          kongICPPrice := ?priceInfo.price;
-          Debug.print("Kong ICP/ckUSDC price: " # Float.toText(priceInfo.price));
-        };
-        case (#err(e)) {
-          Debug.print("Kong ICP/ckUSDC price failed: " # e);
-        };
-      };
-    } catch (e) {
-      Debug.print("Kong ICP/ckUSDC exception: " # Error.message(e));
-    };
+    Debug.print("Kong temporarily disabled due to IDL parsing issues");
     
     // Try ICPSwap for ICP/ckUSDC price
     var icpSwapICPPrice : ?Float = null;
@@ -5860,11 +5847,13 @@ shared (deployer) actor class treasury() = this {
           
           let icpPrice = if (icpAddress == priceInfo.token0.address and usdcAddress == priceInfo.token1.address) {
             // ICP is token0, ckUSDC is token1
-            // Price is token1/token0 = USDC/ICP, so we want ICP/USDC = 1/price
+            // Raw price = token1/token0 = ckUSDC/ICP = how much USDC per ICP
+            // We want ICP/USD, so we need the inverse
             if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 }
           } else if (icpAddress == priceInfo.token1.address and usdcAddress == priceInfo.token0.address) {
             // ICP is token1, ckUSDC is token0
-            // Price is token1/token0 = ICP/USDC, which is what we want
+            // Raw price = token1/token0 = ICP/ckUSDC = how much ICP per USDC
+            // This is what we want (ICP per USD)
             priceInfo.price
           } else {
             // Unexpected token configuration
@@ -5930,22 +5919,9 @@ shared (deployer) actor class treasury() = this {
       let tokenSymbol = details.tokenSymbol;
       Debug.print("Getting price for token: " # tokenSymbol);
       
-      // Try Kong for token/ICP price
+      // Try Kong for token/ICP price - TEMPORARILY DISABLED due to IDL issues
       var kongTokenPrice : ?Float = null;
-      try {
-        let kongResult = await KongSwap.getPrice(tokenSymbol, "ICP");
-        switch (kongResult) {
-          case (#ok(priceInfo)) {
-            kongTokenPrice := ?priceInfo.price;
-            Debug.print("Kong " # tokenSymbol # "/ICP price: " # Float.toText(priceInfo.price));
-          };
-          case (#err(e)) {
-            Debug.print("Kong " # tokenSymbol # "/ICP price failed: " # e);
-          };
-        };
-      } catch (e) {
-        Debug.print("Kong " # tokenSymbol # "/ICP exception: " # Error.message(e));
-      };
+      Debug.print("Kong temporarily disabled due to IDL parsing issues");
       
       // Try ICPSwap for token/ICP price
       var icpSwapTokenPrice : ?Float = null;
@@ -5958,28 +5934,43 @@ shared (deployer) actor class treasury() = this {
             let icpSwapResult = await ICPSwap.getPrice(poolData.canisterId);
             switch (icpSwapResult) {
               case (#ok(priceInfo)) {
-                // The price represents token1 in terms of token0
-                // We want TOKEN/ICP price, so we need to determine which is which
+                // The price from ICPSwap represents token1 in terms of token0
+                // We want: "How many ICP does 1 token cost?" (TOKEN/ICP ratio)
                 let icpAddress = Principal.toText(ICPprincipal);
                 let tokenAddress = Principal.toText(principal);
                 
-                let price = if (tokenAddress == priceInfo.token0.address and icpAddress == priceInfo.token1.address) {
+                Debug.print("ICPSwap price analysis - Raw price: " # Float.toText(priceInfo.price) # ", token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
+                
+                // IMPORTANT: ICPSwap prices seem to have scaling issues. Let's be very careful about the math.
+                // The raw price represents token1/token0, but we need to verify this makes sense.
+                
+                let tokenICPPrice = if (tokenAddress == priceInfo.token0.address and icpAddress == priceInfo.token1.address) {
                   // Our token is token0, ICP is token1
-                  // Price is token1/token0 = ICP/TOKEN, so we want TOKEN/ICP = 1/price
-                  if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 }
+                  // Raw price = token1/token0 = ICP/TOKEN = how much ICP per token
+                  // This is exactly what we want! No inversion needed.
+                  Debug.print("Token is token0, ICP is token1. Raw price = ICP/TOKEN = " # Float.toText(priceInfo.price) # " ICP per " # tokenSymbol # " (CORRECT)");
+                  priceInfo.price
                 } else if (tokenAddress == priceInfo.token1.address and icpAddress == priceInfo.token0.address) {
                   // Our token is token1, ICP is token0  
-                  // Price is token1/token0 = TOKEN/ICP, which is what we want
-                  priceInfo.price
+                  // Raw price = token1/token0 = TOKEN/ICP = how much token per ICP
+                  // We want ICP/TOKEN, so we need the inverse
+                  let icpPerToken = if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 };
+                  Debug.print("Token is token1, ICP is token0. Raw price = TOKEN/ICP = " # Float.toText(priceInfo.price) # ". ICP/TOKEN = " # Float.toText(icpPerToken));
+                  icpPerToken
                 } else {
                   // Unexpected token configuration - log and skip
                   Debug.print("Unexpected token configuration in pool - token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
                   0.0
                 };
                 
-                if (price > 0.0) {
-                  icpSwapTokenPrice := ?price;
-                  Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(price) # " (token0=" # priceInfo.token0.address # ", token1=" # priceInfo.token1.address # ")");
+                if (tokenICPPrice > 0.0) {
+                  // Sanity check: reasonable prices should be between 0.000001 and 100000 ICP per token
+                  if (tokenICPPrice >= 0.000001 and tokenICPPrice <= 100000.0) {
+                    icpSwapTokenPrice := ?tokenICPPrice;
+                    Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(tokenICPPrice) # " (calculated from raw: " # Float.toText(priceInfo.price) # ") - ACCEPTED");
+                  } else {
+                    Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(tokenICPPrice) # " seems unreasonable - REJECTED");
+                  };
                 } else {
                   Debug.print("ICPSwap " # tokenSymbol # "/ICP price calculation resulted in 0 or invalid");
                 };
