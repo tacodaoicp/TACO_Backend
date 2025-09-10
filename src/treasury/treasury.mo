@@ -5506,7 +5506,7 @@ shared (deployer) actor class treasury() = this {
           await syncFromDAO();
           await updateBalances();
           try {
-            await* syncPriceWithNTN();
+            await* syncPriceWithDEX();
           } catch (_) {};
           try {
             ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
@@ -5538,8 +5538,8 @@ shared (deployer) actor class treasury() = this {
       Debug.print("Update balances");
       await updateBalances();
       try {
-        Debug.print("Sync price with NTN");
-        await* syncPriceWithNTN();
+        Debug.print("Sync price with DEX");
+        await* syncPriceWithDEX();
       } catch (_) {};
       try {
         Debug.print("Sync token details to DAO");
@@ -5809,6 +5809,191 @@ shared (deployer) actor class treasury() = this {
   };
 
   /**
+   * Sync token prices with DEX data (Kong and ICPSwap)
+   *
+   * Fetches latest price data from DEXes instead of NTN oracle.
+   * Strategy:
+   * 1. Get ICP/USD price via ICP/ckUSDC pair
+   * 2. Get token/ICP prices for all tokens
+   * 3. Calculate USD prices using ICP/USD rate
+   * 4. Average quotes when available from both DEXes
+   */
+  private func syncPriceWithDEX() : async* () {
+    Debug.print("Starting DEX price sync...");
+    
+    // ckUSDC principal and ICP/ckUSDC pool
+    let ckUSDCPrincipal = Principal.fromText("xevnm-gaaaa-aaaar-qafnq-cai");
+    let icpUsdcPoolPrincipal = Principal.fromText("mohjv-bqaaa-aaaag-qjyia-cai");
+    
+    // Step 1: Get ICP/USD price via ICP/ckUSDC pair
+    var icpPriceUSD : Float = 20.0; // Default fallback
+    
+    Debug.print("Getting ICP/USD price via ckUSDC...");
+    
+    // Try Kong for ICP/ckUSDC price
+    var kongICPPrice : ?Float = null;
+    try {
+      let kongResult = await KongSwap.getPrice("ICP", "ckUSDC");
+      switch (kongResult) {
+        case (#ok(priceInfo)) {
+          kongICPPrice := ?priceInfo.price;
+          Debug.print("Kong ICP/ckUSDC price: " # Float.toText(priceInfo.price));
+        };
+        case (#err(e)) {
+          Debug.print("Kong ICP/ckUSDC price failed: " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("Kong ICP/ckUSDC exception: " # Error.message(e));
+    };
+    
+    // Try ICPSwap for ICP/ckUSDC price
+    var icpSwapICPPrice : ?Float = null;
+    try {
+      let icpSwapResult = await ICPSwap.getPrice(icpUsdcPoolPrincipal);
+      switch (icpSwapResult) {
+        case (#ok(priceInfo)) {
+          // ICPSwap returns price of token1 in terms of token0
+          // Need to check which is ICP and which is ckUSDC to get the right direction
+          icpSwapICPPrice := ?priceInfo.price;
+          Debug.print("ICPSwap ICP/ckUSDC price: " # Float.toText(priceInfo.price));
+        };
+        case (#err(e)) {
+          Debug.print("ICPSwap ICP/ckUSDC price failed: " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("ICPSwap ICP/ckUSDC exception: " # Error.message(e));
+    };
+    
+    // Calculate final ICP/USD price
+    switch (kongICPPrice, icpSwapICPPrice) {
+      case (?kong, ?icpSwap) {
+        // Average both prices
+        icpPriceUSD := (kong + icpSwap) / 2.0;
+        Debug.print("Using averaged ICP/USD price: " # Float.toText(icpPriceUSD));
+      };
+      case (?kong, null) {
+        icpPriceUSD := kong;
+        Debug.print("Using Kong ICP/USD price: " # Float.toText(icpPriceUSD));
+      };
+      case (null, ?icpSwap) {
+        icpPriceUSD := icpSwap;
+        Debug.print("Using ICPSwap ICP/USD price: " # Float.toText(icpPriceUSD));
+      };
+      case (null, null) {
+        Debug.print("Failed to get ICP/USD price from both DEXes, using fallback: " # Float.toText(icpPriceUSD));
+      };
+    };
+    
+    // Step 2: Get prices for all tokens against ICP
+    Debug.print("Getting token/ICP prices for all tokens...");
+    
+    label tokenLoop for ((principal, details) in Map.entries(tokenDetailsMap)) {
+      if (principal == ICPprincipal) {
+        // Update ICP price directly
+        updateTokenPriceWithHistory(ICPprincipal, 100000000, icpPriceUSD); // 1 ICP = 100000000 e8s
+        continue tokenLoop;
+      };
+      
+      let tokenSymbol = details.tokenSymbol;
+      Debug.print("Getting price for token: " # tokenSymbol);
+      
+      // Try Kong for token/ICP price
+      var kongTokenPrice : ?Float = null;
+      try {
+        let kongResult = await KongSwap.getPrice(tokenSymbol, "ICP");
+        switch (kongResult) {
+          case (#ok(priceInfo)) {
+            kongTokenPrice := ?priceInfo.price;
+            Debug.print("Kong " # tokenSymbol # "/ICP price: " # Float.toText(priceInfo.price));
+          };
+          case (#err(e)) {
+            Debug.print("Kong " # tokenSymbol # "/ICP price failed: " # e);
+          };
+        };
+      } catch (e) {
+        Debug.print("Kong " # tokenSymbol # "/ICP exception: " # Error.message(e));
+      };
+      
+      // Try ICPSwap for token/ICP price
+      var icpSwapTokenPrice : ?Float = null;
+      
+      // First find the pool for this token pair with ICP
+      let poolKey = (principal, ICPprincipal);
+      switch (Map.get(ICPswapPools, hashpp, poolKey)) {
+        case (?poolData) {
+          try {
+            let icpSwapResult = await ICPSwap.getPrice(poolData.canisterId);
+            switch (icpSwapResult) {
+              case (#ok(priceInfo)) {
+                // Need to handle price direction properly based on token order
+                let price = if (Principal.toText(principal) == priceInfo.token0.address) {
+                  1.0 / priceInfo.price // If our token is token0, invert the price
+                } else {
+                  priceInfo.price // If our token is token1, use price directly
+                };
+                icpSwapTokenPrice := ?price;
+                Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(price));
+              };
+              case (#err(e)) {
+                Debug.print("ICPSwap " # tokenSymbol # "/ICP price failed: " # e);
+              };
+            };
+          } catch (e) {
+            Debug.print("ICPSwap " # tokenSymbol # "/ICP exception: " # Error.message(e));
+          };
+        };
+        case null {
+          Debug.print("No ICPSwap pool found for " # tokenSymbol # "/ICP");
+        };
+      };
+      
+      // Calculate final token price
+      switch (kongTokenPrice, icpSwapTokenPrice) {
+        case (?kong, ?icpSwap) {
+          // Average both prices
+          let avgPrice = (kong + icpSwap) / 2.0;
+          let icpPrice = Float.toInt(avgPrice * Float.fromInt(10 ** details.tokenDecimals));
+          let usdPrice = avgPrice * icpPriceUSD;
+          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+          Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+        };
+        case (?kong, null) {
+          let icpPrice = Float.toInt(kong * Float.fromInt(10 ** details.tokenDecimals));
+          let usdPrice = kong * icpPriceUSD;
+          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+          Debug.print("Updated " # tokenSymbol # " with Kong DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+        };
+        case (null, ?icpSwap) {
+          let icpPrice = Float.toInt(icpSwap * Float.fromInt(10 ** details.tokenDecimals));
+          let usdPrice = icpSwap * icpPriceUSD;
+          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+          Debug.print("Updated " # tokenSymbol # " with ICPSwap DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+        };
+        case (null, null) {
+          Debug.print("Failed to get price for " # tokenSymbol # " from both DEXes, keeping existing price");
+        };
+      };
+    };
+    
+    // Update rebalance state metrics
+    rebalanceState := {
+      rebalanceState with
+      metrics = {
+        rebalanceState.metrics with
+        lastPriceUpdate = now();
+      };
+    };
+
+    // Take portfolio snapshot after price updates
+    await takePortfolioSnapshot(#PriceUpdate);
+
+    // Check portfolio circuit breaker conditions after price updates and snapshot
+    checkPortfolioCircuitBreakerConditions();
+  };
+
+  /**
    * Update token metadata (name, symbol, decimals, fees)
    *
    * Gets the latest token metadata from their ledger canisters
@@ -6006,7 +6191,7 @@ shared (deployer) actor class treasury() = this {
   private func recoverFromFailure() : async* () {
     Debug.print("Attempting system recovery");
     try {
-      await* syncPriceWithNTN();
+      await* syncPriceWithDEX();
     } catch (e) {
       Debug.print("Recovery failed: " # Error.message(e));
     };
@@ -6089,7 +6274,7 @@ shared (deployer) actor class treasury() = this {
             await syncFromDAO();
             await updateBalances();
             try {
-              await* syncPriceWithNTN();
+              await* syncPriceWithDEX();
             } catch (_) {};
             for ((token, details) in Map.entries(tokenDetailsMap)) {
               if ((details.lastTimeSynced + rebalanceConfig.tokenSyncTimeoutNS) < now()) {
