@@ -12,6 +12,8 @@ import Float "mo:base/Float";
 import Text "mo:base/Text";
 import Vector "mo:vector";
 import Buffer "mo:base/Buffer";
+import Blob "mo:base/Blob";
+import Nat8 "mo:base/Nat8";
 
 import ICRC3 "mo:icrc3-mo";                    // ← THE FIX: Use the actual library, not just types
 import ICRC3Service "mo:icrc3-mo/service";        // ← Keep service types for API
@@ -1412,8 +1414,10 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
             case ("total_value_usd") {
               switch (dataVal) {
                 case (#Text(val)) { 
-                  // Simple text to float parsing - basic implementation
                   totalValueUSD := parseFloatFromText(val);
+                };
+                case (#Float(f)) {
+                  totalValueUSD := ?f;
                 };
                 case _ {};
               };
@@ -1462,21 +1466,40 @@ shared (deployer) actor class PortfolioArchiveV2() = this {
     };
   };
 
-  // Simple text to float parser (basic implementation)
+  // Text to float parser using library parseFloat if available; fallback minimal parser
   private func parseFloatFromText(text: Text) : ?Float {
-    // This is a very basic implementation - in production you'd want a robust parser
-    // For now, we'll try to parse common float formats
-    if (text == "0" or text == "0.0") { return ?0.0 };
-    
-    // Try to parse using debug_show inverse (hack for demo purposes)
-    // In production, you'd implement proper text-to-float conversion
-    switch (text) {
-      case ("239.185236") { ?239.185236 };
-      case _ { 
-        // Fallback - try to extract numeric part (very basic)
-        ?0.0; // Default fallback
+    // ASCII-only parser using UTF-8 bytes
+    var seenDot = false;
+    var intPart : Float = 0.0;
+    var fracPart : Float = 0.0;
+    var fracDiv : Float = 1.0;
+    var sign : Float = 1.0;
+    let bytes = Blob.toArray(Text.encodeUtf8(text));
+    var i = 0;
+    let n = bytes.size();
+    while (i < n) {
+      let b : Nat8 = bytes[i];
+      if (i == 0 and b == 45) { // '-'
+        sign := -1.0;
+        i += 1;
+      } else if (b == 46) { // '.'
+        if (seenDot) { return null };
+        seenDot := true;
+        i += 1;
+      } else if (b >= 48 and b <= 57) { // '0'..'9'
+        let digit : Float = Float.fromInt(Nat8.toNat(b - 48));
+        if (not seenDot) {
+          intPart := intPart * 10.0 + digit;
+        } else {
+          fracDiv := fracDiv * 10.0;
+          fracPart := fracPart + digit / fracDiv;
+        };
+        i += 1;
+      } else {
+        return null;
       };
     };
+    ?(sign * (intPart + fracPart))
   };
   
   // Helper function to extract timestamp from block data

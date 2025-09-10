@@ -545,6 +545,10 @@ shared (deployer) actor class treasury() = this {
           };
         };
         
+        // Check circuit breaker conditions after pausing a token
+        // This ensures immediate response if ICP or threshold conditions are met
+        checkPortfolioCircuitBreakerConditions();
+        
         true;
       };
       case null { 
@@ -2845,6 +2849,12 @@ shared (deployer) actor class treasury() = this {
       return;
     };
     
+    // Check if ICP is paused - if so, trigger circuit breaker immediately
+    if (isTokenPausedFromTrading(ICPprincipal)) {
+      triggerICPPausedCircuitBreaker();
+      return; // Exit early since circuit breaker was triggered
+    };
+    
     // Check if we've hit the paused token threshold circuit breaker
     if (pausedTokenCount >= pausedTokenThresholdForCircuitBreaker) {
       triggerPausedTokenThresholdCircuitBreaker(pausedTokenCount);
@@ -3092,6 +3102,42 @@ shared (deployer) actor class treasury() = this {
       " Threshold=" # Nat.toText(pausedTokenThresholdForCircuitBreaker) #
       " Additional_Tokens_Paused=" # Nat.toText(Vector.size(pausedTokens)),
       "triggerPausedTokenThresholdCircuitBreaker"
+    );
+  };
+
+  /**
+   * Trigger circuit breaker due to ICP being paused
+   *
+   * Called when ICP token is paused from trading.
+   * Pauses all remaining active tokens since ICP is critical for fallback trading.
+   */
+  private func triggerICPPausedCircuitBreaker() {
+    // Get all active trading tokens to pause (excluding ICP since it's already paused)
+    let tokensToProcess = Iter.toArray(Map.entries(tokenDetailsMap));
+    let pausedTokens = Vector.new<Principal>();
+
+    for ((token, details) in tokensToProcess.vals()) {
+      if (details.Active and token != ICPprincipal and not isTokenPausedFromTrading(token)) {
+        let pauseReason : TradingPauseReason = #CircuitBreaker({
+          reason = "ICP circuit breaker triggered: ICP token has been paused from trading, disabling all trading to prevent system instability";
+          triggeredAt = now();
+          severity = "Critical";
+        });
+
+        let success = pauseTokenFromTrading(token, pauseReason);
+        if (success) {
+          Vector.add(pausedTokens, token);
+        };
+      };
+    };
+
+    logger.warn(
+      "ICP_PAUSED_CIRCUIT_BREAKER",
+      "ICP PAUSED CIRCUIT BREAKER TRIGGERED - " #
+      " ICP_Status=Paused" #
+      " Additional_Tokens_Paused=" # Nat.toText(Vector.size(pausedTokens)) #
+      " Reason=ICP_critical_for_fallback_trading",
+      "triggerICPPausedCircuitBreaker"
     );
   };
 
@@ -3951,7 +3997,8 @@ shared (deployer) actor class treasury() = this {
                 
                 // ICP FALLBACK STRATEGY: If we can't find a direct route, try selling for ICP instead
                 // This creates an ICP overweight that will be corrected in the next cycle
-                if (buyToken != ICPprincipal and sellToken != ICPprincipal) {
+                // Only attempt fallback if ICP itself is not paused
+                if (buyToken != ICPprincipal and sellToken != ICPprincipal and not isTokenPausedFromTrading(ICPprincipal)) {
                   Debug.print("Attempting ICP fallback route: " # Principal.toText(sellToken) # " -> ICP");
                   
                   // VERBOSE LOGGING: ICP fallback attempt
@@ -4125,7 +4172,7 @@ shared (deployer) actor class treasury() = this {
                       await* recoverFromFailure();
                     };
                   };
-                } else {
+                } else if (buyToken == ICPprincipal or sellToken == ICPprincipal) {
                   // We were already trying to buy ICP and that failed - no fallback possible
                   Debug.print("No ICP fallback possible - was already trying to buy ICP");
                   
@@ -4142,6 +4189,28 @@ shared (deployer) actor class treasury() = this {
                     metrics = {
                       rebalanceState.metrics with
                       currentStatus = #Failed(e);
+                    };
+                  };
+                  
+                  // Attempt system recovery
+                  await* recoverFromFailure();
+                } else {
+                  // ICP fallback would be possible but ICP is paused
+                  Debug.print("ICP fallback not attempted - ICP is paused from trading");
+                  
+                  logger.warn("ICP_FALLBACK", 
+                    "ICP fallback skipped - ICP is paused from trading" #
+                    " Original_error=" # e #
+                    " Status=ICP_paused_fallback_skipped",
+                    "do_executeTradingStep"
+                  );
+                  
+                  incrementSkipCounter(#pausedTokens);
+                  rebalanceState := {
+                    rebalanceState with
+                    metrics = {
+                      rebalanceState.metrics with
+                      currentStatus = #Failed("No execution path and ICP fallback unavailable (ICP paused): " # e);
                     };
                   };
                   
@@ -5449,7 +5518,7 @@ shared (deployer) actor class treasury() = this {
           await syncFromDAO();
           await updateBalances();
           try {
-            await* syncPriceWithNTN();
+            await* syncPriceWithDEX();
           } catch (_) {};
           if (is_treasury()) {
             try {
@@ -5483,8 +5552,8 @@ shared (deployer) actor class treasury() = this {
       Debug.print("Update balances");
       await updateBalances();
       try {
-        Debug.print("Sync price with NTN");
-        await* syncPriceWithNTN();
+        Debug.print("Sync price with DEX");
+        await* syncPriceWithDEX();
       } catch (_) {};
       if (is_treasury()) {
         try {
@@ -5756,6 +5825,270 @@ shared (deployer) actor class treasury() = this {
   };
 
   /**
+   * Sync token prices with DEX data (Kong and ICPSwap)
+   *
+   * Fetches latest price data from DEXes instead of NTN oracle.
+   * Strategy:
+   * 1. Get ICP/USD price via ICP/ckUSDC pair
+   * 2. Get token/ICP prices for all tokens
+   * 3. Calculate USD prices using ICP/USD rate
+   * 4. Average quotes when available from both DEXes
+   */
+  private func syncPriceWithDEX() : async* () {
+    Debug.print("Starting DEX price sync...");
+    
+    // ckUSDC principal and ICP/ckUSDC pool
+    let ckUSDCPrincipal = Principal.fromText("xevnm-gaaaa-aaaar-qafnq-cai");
+    let icpUsdcPoolPrincipal = Principal.fromText("mohjv-bqaaa-aaaag-qjyia-cai");
+    
+    // Step 1: Get ICP/USD price via ICP/ckUSDC pair
+    var icpPriceUSD : ?Float = null;
+    
+    Debug.print("Getting ICP/USD price via ckUSDC...");
+    
+    // Try Kong for ICP/ckUSDC price using getQuote for 1 ICP
+    var kongICPPrice : ?Float = null;
+    try {
+      // Quote 1 ICP (100,000,000 e8s) to ckUSDC
+      let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000);
+      switch (kongResult) {
+        case (#ok(quote)) {
+          // Use mid_price (spot price) directly - this matches ICPSwap's approach
+          kongICPPrice := ?quote.mid_price;
+          Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP");
+        };
+        case (#err(e)) {
+          Debug.print("Kong ICP/ckUSDC quote failed: " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("Kong ICP/ckUSDC exception: " # Error.message(e));
+    };
+    
+    // Try ICPSwap for ICP/ckUSDC price
+    var icpSwapICPPrice : ?Float = null;
+    try {
+      let icpSwapResult = await ICPSwap.getPrice(icpUsdcPoolPrincipal);
+      switch (icpSwapResult) {
+        case (#ok(priceInfo)) {
+          // The price represents token1 in terms of token0
+          // We want ICP/USD price, so we need to determine which is which
+          let icpAddress = Principal.toText(ICPprincipal);
+          let usdcAddress = Principal.toText(ckUSDCPrincipal);
+          
+          // The raw price from ICPSwap needs decimal adjustment
+          // ICP has 8 decimals, ckUSDC has 6 decimals
+          let icpDecimals = 8;
+          let usdcDecimals = 6;
+          let decimalAdjustment = Float.fromInt(10 ** (icpDecimals - usdcDecimals)); // 10^(8-6) = 100
+          
+          let icpPrice = if (icpAddress == priceInfo.token0.address and usdcAddress == priceInfo.token1.address) {
+            // ICP is token0, ckUSDC is token1
+            // Raw price = token1/token0 = ckUSDC/ICP 
+            // Need to adjust for decimals: raw_price * (10^8 / 10^6) = raw_price * 100
+            let adjustedPrice = priceInfo.price * decimalAdjustment;
+            Debug.print("ICPSwap raw price: " # Float.toText(priceInfo.price) # ", decimal adjusted: " # Float.toText(adjustedPrice));
+            adjustedPrice
+          } else if (icpAddress == priceInfo.token1.address and usdcAddress == priceInfo.token0.address) {
+            // ICP is token1, ckUSDC is token0  
+            // Raw price = token1/token0 = ICP/ckUSDC
+            // Need to adjust and invert
+            let adjustedPrice = priceInfo.price * decimalAdjustment;
+            if (adjustedPrice > 0.0) { 1.0 / adjustedPrice } else { 0.0 }
+          } else {
+            // Unexpected token configuration
+            Debug.print("Unexpected token configuration in ICP/ckUSDC pool - token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
+            0.0
+          };
+          
+          if (icpPrice > 0.0) {
+            icpSwapICPPrice := ?icpPrice;
+            Debug.print("ICPSwap ICP/ckUSDC price: " # Float.toText(icpPrice) # " (token0=" # priceInfo.token0.address # ", token1=" # priceInfo.token1.address # ")");
+          } else {
+            Debug.print("ICPSwap ICP/ckUSDC price calculation resulted in 0 or invalid");
+          };
+        };
+        case (#err(e)) {
+          Debug.print("ICPSwap ICP/ckUSDC price failed: " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("ICPSwap ICP/ckUSDC exception: " # Error.message(e));
+    };
+    
+    // Calculate final ICP/USD price
+    switch (kongICPPrice, icpSwapICPPrice) {
+      case (?kong, ?icpSwap) {
+        // Average both prices
+        icpPriceUSD := ?((kong + icpSwap) / 2.0);
+        Debug.print("Using averaged ICP/USD price: " # Float.toText((kong + icpSwap) / 2.0));
+      };
+      case (?kong, null) {
+        icpPriceUSD := ?kong;
+        Debug.print("Using Kong ICP/USD price: " # Float.toText(kong));
+      };
+      case (null, ?icpSwap) {
+        icpPriceUSD := ?icpSwap;
+        Debug.print("Using ICPSwap ICP/USD price: " # Float.toText(icpSwap));
+      };
+      case (null, null) {
+        Debug.print("Failed to get ICP/USD price from both DEXes - aborting price sync to trigger sync failure detection");
+        return; // Exit early without updating lastPriceUpdate
+      };
+    };
+    
+    // Step 2: Get prices for all tokens against ICP
+    Debug.print("Getting token/ICP prices for all tokens...");
+    
+    // Extract the ICP/USD price (we know it exists at this point)
+    let finalICPPriceUSD = switch (icpPriceUSD) {
+      case (?price) { price };
+      case null { 
+        Debug.print("Internal error: icpPriceUSD is null after successful price discovery");
+        return;
+      };
+    };
+    
+    label tokenLoop for ((principal, details) in Map.entries(tokenDetailsMap)) {
+      if (principal == ICPprincipal) {
+        // Update ICP price directly
+        updateTokenPriceWithHistory(ICPprincipal, 100000000, finalICPPriceUSD); // 1 ICP = 100000000 e8s
+        continue tokenLoop;
+      };
+      
+      let tokenSymbol = details.tokenSymbol;
+      Debug.print("Getting price for token: " # tokenSymbol);
+      
+      // Try Kong for token/ICP price using getQuote for 1 token
+      var kongTokenPrice : ?Float = null;
+      try {
+        // Quote 1 token (in smallest units) to ICP
+        let oneTokenAmount = 10 ** details.tokenDecimals; // 1 token in smallest unit
+        let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount);
+        switch (kongResult) {
+          case (#ok(quote)) {
+            // Use mid_price (spot price) directly - this matches ICPSwap's approach
+            kongTokenPrice := ?quote.mid_price;
+            Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol);
+          };
+          case (#err(e)) {
+            Debug.print("Kong " # tokenSymbol # "/ICP quote failed: " # e);
+          };
+        };
+      } catch (e) {
+        Debug.print("Kong " # tokenSymbol # "/ICP exception: " # Error.message(e));
+      };
+      
+      // Try ICPSwap for token/ICP price
+      var icpSwapTokenPrice : ?Float = null;
+      
+      // First find the pool for this token pair with ICP
+      let poolKey = (principal, ICPprincipal);
+      switch (Map.get(ICPswapPools, hashpp, poolKey)) {
+        case (?poolData) {
+          try {
+            let icpSwapResult = await ICPSwap.getPrice(poolData.canisterId);
+            switch (icpSwapResult) {
+              case (#ok(priceInfo)) {
+                // The price from ICPSwap represents token1 in terms of token0
+                // We want: "How many ICP does 1 token cost?" (TOKEN/ICP ratio)
+                let icpAddress = Principal.toText(ICPprincipal);
+                let tokenAddress = Principal.toText(principal);
+                
+                Debug.print("ICPSwap price analysis - Raw price: " # Float.toText(priceInfo.price) # ", token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
+                
+                // IMPORTANT: ICPSwap prices seem to have scaling issues. Let's be very careful about the math.
+                // The raw price represents token1/token0, but we need to verify this makes sense.
+                
+                let tokenICPPrice = if (tokenAddress == priceInfo.token0.address and icpAddress == priceInfo.token1.address) {
+                  // Our token is token0, ICP is token1
+                  // Raw price = token1/token0 = ICP/TOKEN = how much ICP per token
+                  // This is exactly what we want! No inversion needed.
+                  Debug.print("Token is token0, ICP is token1. Raw price = ICP/TOKEN = " # Float.toText(priceInfo.price) # " ICP per " # tokenSymbol # " (CORRECT)");
+                  priceInfo.price
+                } else if (tokenAddress == priceInfo.token1.address and icpAddress == priceInfo.token0.address) {
+                  // Our token is token1, ICP is token0  
+                  // Raw price = token1/token0 = TOKEN/ICP = how much token per ICP
+                  // We want ICP/TOKEN, so we need the inverse
+                  let icpPerToken = if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 };
+                  Debug.print("Token is token1, ICP is token0. Raw price = TOKEN/ICP = " # Float.toText(priceInfo.price) # ". ICP/TOKEN = " # Float.toText(icpPerToken));
+                  icpPerToken
+                } else {
+                  // Unexpected token configuration - log and skip
+                  Debug.print("Unexpected token configuration in pool - token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
+                  0.0
+                };
+                
+                if (tokenICPPrice > 0.0) {
+                  // Sanity check: reasonable prices should be between 0.000001 and 100000 ICP per token
+                  if (tokenICPPrice >= 0.000001 and tokenICPPrice <= 100000.0) {
+                    icpSwapTokenPrice := ?tokenICPPrice;
+                    Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(tokenICPPrice) # " (calculated from raw: " # Float.toText(priceInfo.price) # ") - ACCEPTED");
+                  } else {
+                    Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(tokenICPPrice) # " seems unreasonable - REJECTED");
+                  };
+                } else {
+                  Debug.print("ICPSwap " # tokenSymbol # "/ICP price calculation resulted in 0 or invalid");
+                };
+              };
+              case (#err(e)) {
+                Debug.print("ICPSwap " # tokenSymbol # "/ICP price failed: " # e);
+              };
+            };
+          } catch (e) {
+            Debug.print("ICPSwap " # tokenSymbol # "/ICP exception: " # Error.message(e));
+          };
+        };
+        case null {
+          Debug.print("No ICPSwap pool found for " # tokenSymbol # "/ICP");
+        };
+      };
+      
+      // Calculate final token price
+      switch (kongTokenPrice, icpSwapTokenPrice) {
+        case (?kong, ?icpSwap) {
+          // Average both prices
+          let avgPrice = (kong + icpSwap) / 2.0;
+          let icpPrice = Float.toInt(avgPrice * Float.fromInt(10 ** details.tokenDecimals));
+          let usdPrice = avgPrice * finalICPPriceUSD;
+          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+          Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+        };
+        case (?kong, null) {
+          let icpPrice = Float.toInt(kong * Float.fromInt(10 ** details.tokenDecimals));
+          let usdPrice = kong * finalICPPriceUSD;
+          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+          Debug.print("Updated " # tokenSymbol # " with Kong DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+        };
+        case (null, ?icpSwap) {
+          let icpPrice = Float.toInt(icpSwap * Float.fromInt(10 ** details.tokenDecimals));
+          let usdPrice = icpSwap * finalICPPriceUSD;
+          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+          Debug.print("Updated " # tokenSymbol # " with ICPSwap DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+        };
+        case (null, null) {
+          Debug.print("Failed to get price for " # tokenSymbol # " from both DEXes, keeping existing price");
+        };
+      };
+    };
+    
+    // Update rebalance state metrics
+    rebalanceState := {
+      rebalanceState with
+      metrics = {
+        rebalanceState.metrics with
+        lastPriceUpdate = now();
+      };
+    };
+
+    // Take portfolio snapshot after price updates
+    await takePortfolioSnapshot(#PriceUpdate);
+
+    // Check portfolio circuit breaker conditions after price updates and snapshot
+    checkPortfolioCircuitBreakerConditions();
+  };
+
+  /**
    * Update token metadata (name, symbol, decimals, fees)
    *
    * Gets the latest token metadata from their ledger canisters
@@ -5953,7 +6286,7 @@ shared (deployer) actor class treasury() = this {
   private func recoverFromFailure() : async* () {
     Debug.print("Attempting system recovery");
     try {
-      await* syncPriceWithNTN();
+      await* syncPriceWithDEX();
     } catch (e) {
       Debug.print("Recovery failed: " # Error.message(e));
     };
@@ -6036,7 +6369,7 @@ shared (deployer) actor class treasury() = this {
             await syncFromDAO();
             await updateBalances();
             try {
-              await* syncPriceWithNTN();
+              await* syncPriceWithDEX();
             } catch (_) {};
             for ((token, details) in Map.entries(tokenDetailsMap)) {
               if ((details.lastTimeSynced + rebalanceConfig.tokenSyncTimeoutNS) < now()) {
