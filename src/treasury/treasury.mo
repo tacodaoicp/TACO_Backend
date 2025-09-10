@@ -3939,7 +3939,8 @@ shared (deployer) actor class treasury() = this {
                 
                 // ICP FALLBACK STRATEGY: If we can't find a direct route, try selling for ICP instead
                 // This creates an ICP overweight that will be corrected in the next cycle
-                if (buyToken != ICPprincipal and sellToken != ICPprincipal) {
+                // Only attempt fallback if ICP itself is not paused
+                if (buyToken != ICPprincipal and sellToken != ICPprincipal and not isTokenPausedFromTrading(ICPprincipal)) {
                   Debug.print("Attempting ICP fallback route: " # Principal.toText(sellToken) # " -> ICP");
                   
                   // VERBOSE LOGGING: ICP fallback attempt
@@ -4113,7 +4114,7 @@ shared (deployer) actor class treasury() = this {
                       await* recoverFromFailure();
                     };
                   };
-                } else {
+                } else if (buyToken == ICPprincipal or sellToken == ICPprincipal) {
                   // We were already trying to buy ICP and that failed - no fallback possible
                   Debug.print("No ICP fallback possible - was already trying to buy ICP");
                   
@@ -4130,6 +4131,28 @@ shared (deployer) actor class treasury() = this {
                     metrics = {
                       rebalanceState.metrics with
                       currentStatus = #Failed(e);
+                    };
+                  };
+                  
+                  // Attempt system recovery
+                  await* recoverFromFailure();
+                } else {
+                  // ICP fallback would be possible but ICP is paused
+                  Debug.print("ICP fallback not attempted - ICP is paused from trading");
+                  
+                  logger.warn("ICP_FALLBACK", 
+                    "ICP fallback skipped - ICP is paused from trading" #
+                    " Original_error=" # e #
+                    " Status=ICP_paused_fallback_skipped",
+                    "do_executeTradingStep"
+                  );
+                  
+                  incrementSkipCounter(#pausedTokens);
+                  rebalanceState := {
+                    rebalanceState with
+                    metrics = {
+                      rebalanceState.metrics with
+                      currentStatus = #Failed("No execution path and ICP fallback unavailable (ICP paused): " # e);
                     };
                   };
                   
