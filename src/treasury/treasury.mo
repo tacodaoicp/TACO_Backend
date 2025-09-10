@@ -5870,7 +5870,7 @@ shared (deployer) actor class treasury() = this {
     switch (kongICPPrice, icpSwapICPPrice) {
       case (?kong, ?icpSwap) {
         // Average both prices
-        icpPriceUSD := ?(kong + icpSwap) / 2.0;
+        icpPriceUSD := ?((kong + icpSwap) / 2.0);
         Debug.print("Using averaged ICP/USD price: " # Float.toText((kong + icpSwap) / 2.0));
       };
       case (?kong, null) {
