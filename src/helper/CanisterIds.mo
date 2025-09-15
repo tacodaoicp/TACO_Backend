@@ -60,8 +60,8 @@ module CanisterId {
             (#Production, #dao_allocation_archive, Principal.fromText("cvoqr-ryaaa-aaaan-qz5iq-cai")),
             (#Production, #rewards, Principal.fromText("dkgdg-saaaa-aaaan-qz5ma-cai")), // Placeholder ID
             (#Production, #dao_neuron_allocation_archive, Principal.fromText("dnhfs-7yaaa-aaaan-qz5mq-cai")), // Placeholder ID
-            (#Production, #reward_distribution_archive, Principal.fromText("aaaaa-aa")),
-            (#Production, #reward_withdrawal_archive, Principal.fromText("aaaaa-aa"))
+            (#Production, #reward_distribution_archive, Principal.fromText("uqkap-jiaaa-aaaan-qz6tq-cai")),
+            (#Production, #reward_withdrawal_archive, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai"))
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {

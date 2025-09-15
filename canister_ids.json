@@ -32,9 +32,11 @@
     "staging": "l7gh3-pqaaa-aaaan-qz4za-cai"
   },
   "reward_distribution_archive": {
+    "ic": "uqkap-jiaaa-aaaan-qz6tq-cai",
     "staging": "ddfi2-eiaaa-aaaan-qz5nq-cai"
   },
   "reward_withdrawal_archive": {
+    "ic": "v5eeb-gaaaa-aaaan-qz6ua-cai",
     "staging": "dwczx-faaaa-aaaan-qz5oa-cai"
   },
   "rewards": {
