@@ -458,26 +458,57 @@ shared (deployer) persistent actor class Rewards() = this {
         
         // Step 1: Update asset values based on price changes
         let updatedAssetValues = Buffer.Buffer<(Principal, Float)>(assetValues.size());
-        let updatedPrices = Buffer.Buffer<(Principal, Float)>(previousPrices.size());
-        
+        let updatedPrices = Buffer.Buffer<(Principal, Float)>(assetValues.size());
+
+        // Build a lookup for old prices by token to avoid index mismatch
+        let oldPriceByToken = Buffer.toArray(previousPrices);
+
+        // Helper to find old price by token
+        let findOldPrice = func(token: Principal) : ?Float {
+          let entry = Array.find<(Principal, Float)>(oldPriceByToken, func((t, _)) { Principal.equal(t, token) });
+          switch (entry) {
+            case (?(t, p)) { ?p };
+            case null { null };
+          }
+        };
+
         // Only iterate if we have assets to update
         if (assetValues.size() > 0) {
           for (j in Iter.range(0, assetValues.size() - 1)) {
             let (token, oldValue) = assetValues.get(j);
-            let (_, oldPrice) = previousPrices.get(j);
-            
-            // Get new price for this token from batch result
-            switch (findPrice(token)) {
-              case (?priceInfo) {
-                let newPrice = getPriceValue(priceInfo, priceType);
-                let priceRatio = newPrice / oldPrice; // This is the key fix!
-                let newValue = oldValue * priceRatio;
-                
-                updatedAssetValues.add((token, newValue));
-                updatedPrices.add((token, newPrice));
+
+            // Look up the old price for this token; if missing, treat as missing price data
+            switch (findOldPrice(token)) {
+              case (?oldPrice) {
+                // Get new price for this token from batch result
+                switch (findPrice(token)) {
+                  case (?priceInfo) {
+                    let newPrice = getPriceValue(priceInfo, priceType);
+                    let priceRatio = newPrice / oldPrice;
+                    let newValue = oldValue * priceRatio;
+
+                    updatedAssetValues.add((token, newValue));
+                    updatedPrices.add((token, newPrice));
+                  };
+                  case null {
+                    return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+                  };
+                };
               };
               case null {
-                return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+                // If we had no previous price for this token (newly added asset), carry over its current value unchanged
+                // using the price at this checkpoint to populate updatedPrices.
+                switch (findPrice(token)) {
+                  case (?priceInfo) {
+                    let newPrice = getPriceValue(priceInfo, priceType);
+                    let newValue = oldValue; // no prior price to ratio against; keep value until rebalance step
+                    updatedAssetValues.add((token, newValue));
+                    updatedPrices.add((token, newPrice));
+                  };
+                  case null {
+                    return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+                  };
+                };
               };
             };
           };
