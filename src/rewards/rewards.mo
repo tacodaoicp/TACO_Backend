@@ -238,6 +238,7 @@ shared (deployer) persistent actor class Rewards() = this {
   type PriceArchive = actor {
     getPriceAtTime: (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
     getPricesAtTime: ([Principal], Int) -> async Result.Result<[(Principal, ?PriceInfo)], ArchiveError>;
+    getPriceAtOrAfterTime: (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
   };
 
   type NeuronAllocation = {
@@ -375,31 +376,42 @@ shared (deployer) persistent actor class Rewards() = this {
           };
         };
         
-        // Process each allocation with its corresponding price
+        // Process each allocation with its corresponding price, with fallback behavior
         for (allocation in allocations.vals()) {
-          // Find the price for this token
+          // Find the price for this token in batch result
           let priceEntry = Array.find<(Principal, ?PriceInfo)>(tokenPrices, func((token, _)) {
             Principal.equal(token, allocation.token)
           });
-          
+
+          var priceOpt : ?PriceInfo = null;
           switch (priceEntry) {
-            case (?(_, ?priceInfo)) {
+            case (?( _, ?pi)) { priceOpt := ?pi; };
+            case _ {
+              // Fallback 1: try to find closest price after timestamp
+              let futureRes = await priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+              switch (futureRes) {
+                case (#ok(?futurePrice)) { priceOpt := ?futurePrice; };
+                case _ { priceOpt := null; };
+              };
+            };
+          };
+
+          switch (priceOpt) {
+            case (?priceInfo) {
               let tokenPrice = getPriceValue(priceInfo, priceType);
               let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
               let tokenValue = totalValue * allocationPercent; // Just allocation percentage of 1.0
-              
+
               tokenPricesBuffer.add((allocation.token, priceInfo));
               tokenValuesBuffer.add((allocation.token, tokenValue));
-              
+
               // Store initial asset values and prices
               assetValues.add((allocation.token, tokenValue));
               previousPrices.add((allocation.token, tokenPrice));
             };
-            case (?(_, null)) {
-              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
-            };
             case null {
-              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+              // Fallback 2: Skip this token entirely if no price in past or future
+              // Do nothing for buffers; token is excluded from initial checkpoint
             };
           };
         };
@@ -480,8 +492,17 @@ shared (deployer) persistent actor class Rewards() = this {
             // Look up the old price for this token; if missing, treat as missing price data
             switch (findOldPrice(token)) {
               case (?oldPrice) {
-                // Get new price for this token from batch result
-                switch (findPrice(token)) {
+                // Get new price for this token from batch result, with fallback to future
+                var priceInfoOpt : ?PriceInfo = findPrice(token);
+                if (priceInfoOpt == null) {
+                  let futureResStep1 = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                  switch (futureResStep1) {
+                    case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
+                    case _ {};
+                  };
+                };
+
+                switch (priceInfoOpt) {
                   case (?priceInfo) {
                     let newPrice = getPriceValue(priceInfo, priceType);
                     let priceRatio = newPrice / oldPrice;
@@ -491,14 +512,22 @@ shared (deployer) persistent actor class Rewards() = this {
                     updatedPrices.add((token, newPrice));
                   };
                   case null {
-                    return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+                    // Fallback 2: Skip this token entirely if no price in past or future
                   };
                 };
               };
               case null {
                 // If we had no previous price for this token (newly added asset), carry over its current value unchanged
                 // using the price at this checkpoint to populate updatedPrices.
-                switch (findPrice(token)) {
+                var priceInfoOpt2 : ?PriceInfo = findPrice(token);
+                if (priceInfoOpt2 == null) {
+                  let futureResNew = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                  switch (futureResNew) {
+                    case (#ok(?futurePrice)) { priceInfoOpt2 := ?futurePrice; };
+                    case _ {};
+                  };
+                };
+                switch (priceInfoOpt2) {
                   case (?priceInfo) {
                     let newPrice = getPriceValue(priceInfo, priceType);
                     let newValue = oldValue; // no prior price to ratio against; keep value until rebalance step
@@ -506,7 +535,7 @@ shared (deployer) persistent actor class Rewards() = this {
                     updatedPrices.add((token, newPrice));
                   };
                   case null {
-                    return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+                    // Fallback 2: Skip this token entirely if no price in past or future
                   };
                 };
               };
@@ -530,15 +559,24 @@ shared (deployer) persistent actor class Rewards() = this {
         for (allocation in allocations.vals()) {
           let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
           let tokenValue = totalValueAfterPriceChanges * allocationPercent;
-          
-          // Get price info for this token from batch result
-          switch (findPrice(allocation.token)) {
+
+          // Get price info for this token from batch result, with same fallback rules
+          var priceInfoOpt : ?PriceInfo = findPrice(allocation.token);
+          if (priceInfoOpt == null) {
+            let futureRes2 = await priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+            switch (futureRes2) {
+              case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
+              case _ {};
+            };
+          };
+
+          switch (priceInfoOpt) {
             case (?priceInfo) {
               tokenPricesBuffer.add((allocation.token, priceInfo));
               tokenValuesBuffer.add((allocation.token, tokenValue));
             };
             case null {
-              return #err(#PriceDataMissing({token = allocation.token; timestamp = timestamp}));
+              // Fallback 2: Skip this token if no price in past or future
             };
           };
         };
