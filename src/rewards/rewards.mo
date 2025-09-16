@@ -460,31 +460,39 @@ shared (deployer) persistent actor class Rewards() = this {
         let updatedAssetValues = Buffer.Buffer<(Principal, Float)>(assetValues.size());
         let updatedPrices = Buffer.Buffer<(Principal, Float)>(previousPrices.size());
         
-        for (j in Iter.range(0, assetValues.size() - 1)) {
-          let (token, oldValue) = assetValues.get(j);
-          let (_, oldPrice) = previousPrices.get(j);
-          
-          // Get new price for this token from batch result
-          switch (findPrice(token)) {
-            case (?priceInfo) {
-              let newPrice = getPriceValue(priceInfo, priceType);
-              let priceRatio = newPrice / oldPrice; // This is the key fix!
-              let newValue = oldValue * priceRatio;
-              
-              updatedAssetValues.add((token, newValue));
-              updatedPrices.add((token, newPrice));
-            };
-            case null {
-              return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+        // Only iterate if we have assets to update
+        if (assetValues.size() > 0) {
+          for (j in Iter.range(0, assetValues.size() - 1)) {
+            let (token, oldValue) = assetValues.get(j);
+            let (_, oldPrice) = previousPrices.get(j);
+            
+            // Get new price for this token from batch result
+            switch (findPrice(token)) {
+              case (?priceInfo) {
+                let newPrice = getPriceValue(priceInfo, priceType);
+                let priceRatio = newPrice / oldPrice; // This is the key fix!
+                let newValue = oldValue * priceRatio;
+                
+                updatedAssetValues.add((token, newValue));
+                updatedPrices.add((token, newPrice));
+              };
+              case null {
+                return #err(#PriceDataMissing({token = token; timestamp = timestamp}));
+              };
             };
           };
         };
         
         // Step 2: Calculate total portfolio value after price changes
         var totalValueAfterPriceChanges : Float = 0.0;
-        for (j in Iter.range(0, updatedAssetValues.size() - 1)) {
-          let (_, value) = updatedAssetValues.get(j);
-          totalValueAfterPriceChanges += value;
+        if (updatedAssetValues.size() > 0) {
+          for (j in Iter.range(0, updatedAssetValues.size() - 1)) {
+            let (_, value) = updatedAssetValues.get(j);
+            totalValueAfterPriceChanges += value;
+          };
+        } else {
+          // If no previous assets, maintain portfolio value of 1.0 for proper rebalancing
+          totalValueAfterPriceChanges := 1.0;
         };
         
         // Step 3: Rebalance to new allocations using the updated total value
