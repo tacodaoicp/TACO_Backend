@@ -272,6 +272,84 @@ shared (deployer) actor class PriceArchiveV2() = this {
     #ok(mostRecentPrice);
   };
 
+  // Get the closest (oldest) price in the future of the given timestamp
+  public query ({ caller }) func getPriceAtOrAfterTime(token : Principal, timestamp : Int) : async Result.Result<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}, ArchiveError> {
+    // Query method is open for everyone.
+
+    // First get a small sample to check total blocks
+    let sampleArgs = [{ start = 0; length = 1 }];
+    let sampleResult = base.icrc3_get_blocks(sampleArgs);
+
+    let totalBlocks = sampleResult.log_length;
+    let startBlock = if (totalBlocks > 5000) { totalBlocks - 5000 } else { 0 };
+    let getBlocksArgs = [{ start = startBlock; length = 5000 }];
+    let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+
+    // Find the nearest price block for this token at or after the timestamp
+    var bestFuturePrice : ?{icpPrice: Nat; usdPrice: Float; timestamp: Int} = null;
+    var bestFutureTimestamp : Int = 9_223_372_036_854_775_807; // effectively +infinity for Int64 range
+
+    for (block in icrc3Result.blocks.vals()) {
+      switch (block.block) {
+        case (#Map(entries)) {
+          for ((key, value) in entries.vals()) {
+            switch (key, value) {
+              case ("tx", #Map(txEntries)) {
+                var isPrice = false;
+                var txTimestamp : Int = 0;
+
+                for ((txKey, txValue) in txEntries.vals()) {
+                  switch (txKey, txValue) {
+                    case ("operation", #Text("3price")) { isPrice := true; };
+                    case ("timestamp", #Int(t)) { txTimestamp := t; };
+                    case ("data", #Map(dataEntries)) {
+                      if (isPrice) {
+                        var blockToken : ?Principal = null;
+                        var blockTimestamp : Int = txTimestamp;
+                        var blockPriceICP : ?Nat = null;
+                        var blockPriceUSD : ?Text = null;
+
+                        for ((dataKey, dataValue) in dataEntries.vals()) {
+                          switch (dataKey, dataValue) {
+                            case ("token", #Blob(b)) { if (b.size() <= 29 and b.size() > 0) { blockToken := ?Principal.fromBlob(b); }; };
+                            case ("ts", #Int(t)) { blockTimestamp := t; };
+                            case ("price_icp", #Nat(p)) { blockPriceICP := ?p; };
+                            case ("price_usd", #Text(p)) { blockPriceUSD := ?p; };
+                            case _ {};
+                          };
+                        };
+
+                        switch (blockToken, blockPriceICP, blockPriceUSD) {
+                          case (?bToken, ?icp, ?usdText) {
+                            if (Principal.equal(bToken, token) and blockTimestamp >= timestamp and blockTimestamp < bestFutureTimestamp) {
+                              switch (textToFloat(usdText)) {
+                                case (?usd) {
+                                  bestFutureTimestamp := blockTimestamp;
+                                  bestFuturePrice := ?{ icpPrice = icp; usdPrice = usd; timestamp = blockTimestamp };
+                                };
+                                case null {};
+                              };
+                            };
+                          };
+                          case _ {};
+                        };
+                      };
+                    };
+                    case _ {};
+                  };
+                };
+              };
+              case _ {};
+            };
+          };
+        };
+        case _ {};
+      };
+    };
+
+    #ok(bestFuturePrice);
+  };
+
   // Helper function to convert Value back to PriceBlockData
   private func convertValueToPriceData(value : ArchiveTypes.Value) : ?ArchiveTypes.PriceBlockData {
     switch (value) {
