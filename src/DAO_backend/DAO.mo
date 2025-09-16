@@ -115,7 +115,7 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   let TREASURY_ID = canister_ids.getCanisterId(#treasury);
-  let NACHOS_ID = canister_ids.getCanisterId(#nachos);
+  //let NACHOS_ID = canister_ids.getCanisterId(#nachos);
 
   let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
 
@@ -123,7 +123,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   //spamGuard.setSelf(Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai"));
 
   spamGuard.setAllowedCanisters([this_canister_id(), // Really? TODO: See if we can remove!
-                                 TREASURY_ID, NACHOS_ID]);
+                                 TREASURY_ID/*, NACHOS_ID*/]);
 
   spamGuard.setSelf(this_canister_id());
 
@@ -208,7 +208,7 @@ shared (deployer) actor class ContinuousDAO() = this {
 
   //let treasury = actor ("z4is7-giaaa-aaaad-qg6uq-cai") : Treasury.Self;
   let treasury = actor (Principal.toText(TREASURY_ID)) : Treasury.Self;
-  let nachos = actor (Principal.toText(NACHOS_ID)) : Treasury.Self;
+  //let nachos = actor (Principal.toText(NACHOS_ID)) : Treasury.Self;
   //let mintingVault = actor ("ywhqf-eyaaa-aaaad-qg6tq-cai") : MintingVault.Self;
   let mintingVault = actor (Principal.toText(this_canister_id())) : MintingVault.Self;
   //let treasuryPrincipal = Principal.fromText("z4is7-giaaa-aaaad-qg6uq-cai");
