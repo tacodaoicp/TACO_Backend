@@ -1869,7 +1869,7 @@ shared (deployer) actor class ContinuousDAO() = this {
             for (permission in neuron.permissions.vals()) {
               switch (permission.principal) {
                 case (?p) {
-                  if (p == caller and (permission.permission_type == [4, 3] or permission.permission_type == [3, 4])) {
+                  if (p == caller) {
                     isHotkey := true;
                   };
                 };
