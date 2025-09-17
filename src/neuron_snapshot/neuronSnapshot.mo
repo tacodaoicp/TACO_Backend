@@ -490,9 +490,7 @@ shared deployer actor class neuronSnapshot() = this {
             switch (permission.principal) {
               case (null) { continue b };
               case (?p) {
-                if (permission.permission_type == [4, 3] or permission.permission_type == [3, 4]) {
                   Vector.add(tacoPrincipal, p);
-                };
               };
             };
           };
@@ -508,6 +506,7 @@ shared deployer actor class neuronSnapshot() = this {
           };
 
           let votingPower = vp_calc.getVotingPower(neuronDetails);
+          // NB: Snassy: this may not be a good idea - do we ever clear the neuron from the snapshot if it has 0 VP?
           if (votingPower == 0) {
             continue a;
           };
