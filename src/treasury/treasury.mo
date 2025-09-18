@@ -5837,9 +5837,13 @@ shared (deployer) actor class treasury() = this {
       let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000);
       switch (kongResult) {
         case (#ok(quote)) {
-          // Use mid_price (spot price) directly - this matches ICPSwap's approach
-          kongICPPrice := ?quote.mid_price;
-          Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP");
+          // Treat 0 (or invalid) as failure; only accept positive prices
+          if (quote.mid_price > 0.0) {
+            kongICPPrice := ?quote.mid_price;
+            Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP");
+          } else {
+            Debug.print("Kong ICP/ckUSDC returned zero/invalid price; ignoring");
+          };
         };
         case (#err(e)) {
           Debug.print("Kong ICP/ckUSDC quote failed: " # e);
@@ -5901,19 +5905,27 @@ shared (deployer) actor class treasury() = this {
     };
     
     // Calculate final ICP/USD price
-    switch (kongICPPrice, icpSwapICPPrice) {
+      switch (kongICPPrice, icpSwapICPPrice) {
       case (?kong, ?icpSwap) {
         // Average both prices
         icpPriceUSD := ?((kong + icpSwap) / 2.0);
         Debug.print("Using averaged ICP/USD price: " # Float.toText((kong + icpSwap) / 2.0));
       };
       case (?kong, null) {
-        icpPriceUSD := ?kong;
-        Debug.print("Using Kong ICP/USD price: " # Float.toText(kong));
+        if (kong > 0.0) {
+          icpPriceUSD := ?kong;
+          Debug.print("Using Kong ICP/USD price: " # Float.toText(kong));
+        } else {
+          Debug.print("Kong ICP/USD price was zero; treating as unavailable");
+        };
       };
       case (null, ?icpSwap) {
-        icpPriceUSD := ?icpSwap;
-        Debug.print("Using ICPSwap ICP/USD price: " # Float.toText(icpSwap));
+        if (icpSwap > 0.0) {
+          icpPriceUSD := ?icpSwap;
+          Debug.print("Using ICPSwap ICP/USD price: " # Float.toText(icpSwap));
+        } else {
+          Debug.print("ICPSwap ICP/USD price was zero; treating as unavailable");
+        };
       };
       case (null, null) {
         Debug.print("Failed to get ICP/USD price from both DEXes - aborting price sync to trigger sync failure detection");
@@ -5951,9 +5963,13 @@ shared (deployer) actor class treasury() = this {
         let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount);
         switch (kongResult) {
           case (#ok(quote)) {
-            // Use mid_price (spot price) directly - this matches ICPSwap's approach
-            kongTokenPrice := ?quote.mid_price;
-            Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol);
+            // Treat 0 (or unreasonable) as failure; only accept positive, sane prices
+            if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0) {
+              kongTokenPrice := ?quote.mid_price;
+              Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol # " (ACCEPTED)");
+            } else {
+              Debug.print("Kong " # tokenSymbol # "/ICP returned zero/unreasonable price (" # Float.toText(quote.mid_price) # "); ignoring");
+            };
           };
           case (#err(e)) {
             Debug.print("Kong " # tokenSymbol # "/ICP quote failed: " # e);
@@ -6031,24 +6047,36 @@ shared (deployer) actor class treasury() = this {
       // Calculate final token price
       switch (kongTokenPrice, icpSwapTokenPrice) {
         case (?kong, ?icpSwap) {
-          // Average both prices
+          // Average both prices (both are > 0.0 due to filtering above)
           let avgPrice = (kong + icpSwap) / 2.0;
-          let icpPrice = Float.toInt(avgPrice * Float.fromInt(10 ** details.tokenDecimals));
-          let usdPrice = avgPrice * finalICPPriceUSD;
-          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
-          Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+          if (avgPrice > 0.0) {
+            let icpPrice = Float.toInt(avgPrice * Float.fromInt(10 ** details.tokenDecimals));
+            let usdPrice = avgPrice * finalICPPriceUSD;
+            updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+            Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+          } else {
+            Debug.print("Averaged price was zero/unreasonable; skipping update for " # tokenSymbol);
+          };
         };
         case (?kong, null) {
-          let icpPrice = Float.toInt(kong * Float.fromInt(10 ** details.tokenDecimals));
-          let usdPrice = kong * finalICPPriceUSD;
-          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
-          Debug.print("Updated " # tokenSymbol # " with Kong DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+          if (kong > 0.0) {
+            let icpPrice = Float.toInt(kong * Float.fromInt(10 ** details.tokenDecimals));
+            let usdPrice = kong * finalICPPriceUSD;
+            updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+            Debug.print("Updated " # tokenSymbol # " with Kong DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+          } else {
+            Debug.print("Kong price for " # tokenSymbol # " was zero/unreasonable; ignoring");
+          };
         };
         case (null, ?icpSwap) {
-          let icpPrice = Float.toInt(icpSwap * Float.fromInt(10 ** details.tokenDecimals));
-          let usdPrice = icpSwap * finalICPPriceUSD;
-          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
-          Debug.print("Updated " # tokenSymbol # " with ICPSwap DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+          if (icpSwap > 0.0) {
+            let icpPrice = Float.toInt(icpSwap * Float.fromInt(10 ** details.tokenDecimals));
+            let usdPrice = icpSwap * finalICPPriceUSD;
+            updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+            Debug.print("Updated " # tokenSymbol # " with ICPSwap DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+          } else {
+            Debug.print("ICPSwap price for " # tokenSymbol # " was zero/unreasonable; ignoring");
+          };
         };
         case (null, null) {
           Debug.print("Failed to get price for " # tokenSymbol # " from both DEXes, keeping existing price");
