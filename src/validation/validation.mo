@@ -1,10 +1,12 @@
 import DAO_types "../DAO_backend/dao_types";
+import Blob "mo:base/Blob";
 import Result "mo:base/Result";
 import Principal "mo:base/Principal";
 import Debug "mo:base/Debug";
 
 actor validation {
 
+    type Subaccount = Blob;
     type TokenType = DAO_types.TokenType;
     type AuthorizationError = DAO_types.AuthorizationError;
 
@@ -22,5 +24,18 @@ actor validation {
       #Ok(msg);
 
     };
+
+
+    public query func validate_sendToken(token : Principal, amount_e8s : Nat, to_principal : Principal, to_subaccount : ?Subaccount) : async ValidationResult {
+
+      let to_account = { owner = to_principal; subaccount = to_subaccount };
+
+      let msg:Text = "amount_e8s: " # debug_show(amount_e8s) #  
+      ", token: " # Principal.toText(token) # 
+      ", to_account: " # debug_show(to_account);
+
+      #Ok(msg);
+    };
+
 
 }

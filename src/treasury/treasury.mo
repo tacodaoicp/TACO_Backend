@@ -145,6 +145,7 @@ shared (deployer) actor class treasury() = this {
   //stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
   stable var MintVaultPrincipal = DAO_BACKEND_ID;
 
+  let taco_dao_sns_governance_canister_id : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
 
 
@@ -3199,6 +3200,46 @@ shared (deployer) actor class treasury() = this {
   //=========================================================================
   // 4. TOKEN TRANSFER SYSTEM
   //=========================================================================
+
+  // simple token send for dao tasks. 
+  public shared ({ caller }) func sendToken(token : Principal, amount_e8s : Nat, to_principal : Principal, to_subaccount : ?Subaccount) : async () {
+
+    // ONLY TACO DAO governance canister may call this method (via adopted proposal)!
+    assert (caller == taco_dao_sns_governance_canister_id);
+
+    let ledger = actor (Principal.toText(token)) : ICRC1.FullInterface;
+    let to_account = { owner = to_principal; subaccount = to_subaccount };
+    
+    logger.info(
+      "SEND_TOKEN",
+      "SEND TOKEN - " #
+      " Token=" # Principal.toText(token) #
+      " Amount=" # Nat.toText(amount_e8s) #
+      " To=" # Principal.toText(to_principal) #
+      " To Subaccount=" # debug_show(to_subaccount),
+      "sendToken"
+    );
+
+    let result = await ledger.icrc1_transfer({
+      from_subaccount = null;
+      to = to_account;
+      amount = amount_e8s;
+      fee = null;
+      memo = null;
+      created_at_time = null;
+    });
+
+    logger.info(
+      "SEND_TOKEN",
+      "SEND TOKEN - " #
+      " Token=" # Principal.toText(token) #
+      " Amount=" # Nat.toText(amount_e8s) #
+      " To=" # Principal.toText(to_principal) #
+      " To Subaccount=" # debug_show(to_subaccount) #
+      " Result=" # debug_show(result),
+      "sendToken"
+    );
+  };
 
   /**
    * Process batch transfers from the DAO
