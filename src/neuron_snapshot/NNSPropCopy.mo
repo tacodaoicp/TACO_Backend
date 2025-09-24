@@ -3,6 +3,8 @@ import Nat64 "mo:base/Nat64";
 import Int32 "mo:base/Int32";
 import Result "mo:base/Result";
 import Error "mo:base/Error";
+import Time "mo:base/Time";
+import Int "mo:base/Int";
 import Logger "../helper/logger";
 import NNSTypes "./nns_types";
 import Debug "mo:base/Debug";
@@ -75,15 +77,104 @@ module {
     #UnauthorizedCaller;
   };
 
+  public type GetSNSProposalFullResult = Result.Result<SNSProposalData, SNSProposalError>;
+  public type GetSNSProposalSummaryResult = Result.Result<SNSProposalSummary, SNSProposalError>;
+
+  public type SNSProposalError = {
+    #ProposalNotFound;
+    #SNSGovernanceError : GovernanceError;
+    #NetworkError : Text;
+    #InvalidProposalData : Text;
+  };
+
   // NNS Governance canister actor type
   public type NNSGovernanceActor = actor {
     get_proposal_info : shared query (Nat64) -> async ?NNSTypes.ProposalInfo;
     list_proposals : shared query (NNSTypes.ListProposalInfo) -> async NNSTypes.ListProposalInfoResponse;
   };
 
+  // SNS Proposal types for fetching proposals
+  public type SNSProposalId = {
+    id : Nat64;
+  };
+
+  public type GetSNSProposal = {
+    proposal_id : ?SNSProposalId;
+  };
+
+  public type Tally = {
+    no : Nat64;
+    yes : Nat64;
+    total : Nat64;
+    timestamp_seconds : Nat64;
+  };
+
+  public type WaitForQuietState = {
+    current_deadline_timestamp_seconds : Nat64;
+  };
+
+  public type Percentage = {
+    basis_points : ?Nat64;
+  };
+
+  public type SNSProposalData = {
+    id : ?SNSProposalId;
+    payload_text_rendering : ?Text;
+    action : Nat64;
+    failure_reason : ?GovernanceError;
+    ballots : [(Text, { vote : Int32; cast_timestamp_seconds : Nat64; voting_power : Nat64 })];
+    minimum_yes_proportion_of_total : ?Percentage;
+    reward_event_round : Nat64;
+    failed_timestamp_seconds : Nat64;
+    reward_event_end_timestamp_seconds : ?Nat64;
+    proposal_creation_timestamp_seconds : Nat64;
+    initial_voting_period_seconds : Nat64;
+    reject_cost_e8s : Nat64;
+    latest_tally : ?Tally;
+    wait_for_quiet_deadline_increase_seconds : Nat64;
+    decided_timestamp_seconds : Nat64;
+    proposal : ?Proposal;
+    proposer : ?{ id : Blob };
+    wait_for_quiet_state : ?WaitForQuietState;
+    minimum_yes_proportion_of_exercised : ?Percentage;
+    is_eligible_for_rewards : Bool;
+    executed_timestamp_seconds : Nat64;
+  };
+
+  public type GetSNSProposalResult = {
+    #Error : GovernanceError;
+    #Proposal : SNSProposalData;
+  };
+
+  public type GetSNSProposalResponse = {
+    result : ?GetSNSProposalResult;
+  };
+
+  // SNS Proposal Summary types
+  public type VotingStatus = {
+    #YesLeading;
+    #NoLeading;
+    #Tied;
+    #NotStarted;
+    #Decided;
+  };
+
+  public type SNSProposalSummary = {
+    proposal_id : Nat64;
+    title : Text;
+    voting_status : VotingStatus;
+    yes_votes : Nat64;
+    no_votes : Nat64;
+    total_votes : Nat64;
+    time_remaining_seconds : ?Nat64; // null if voting has ended
+    voting_deadline : Nat64;
+    is_decided : Bool;
+  };
+
   // SNS Governance canister actor type
   public type SNSGovernanceActor = actor {
     manage_neuron : shared (ManageNeuron) -> async ManageNeuronResponse;
+    get_proposal : shared query (GetSNSProposal) -> async GetSNSProposalResponse;
   };
 
   // Helper function to format proposal text
@@ -146,6 +237,57 @@ module {
       "This is a test summary of the original proposal.",
       "https://nns.ic0.app/proposal/?u=qoctq-giaaa-aaaaa-aaaea-cai&proposal=138601"
     );
+  };
+
+  // Helper function to calculate current timestamp in seconds
+  private func getCurrentTimestampSeconds() : Nat64 {
+    Nat64.fromNat(Int.abs(Time.now()) / 1_000_000_000);
+  };
+
+  // Helper function to determine voting status from tally
+  public func determineVotingStatus(tally : ?Tally, isDecided : Bool) : VotingStatus {
+    if (isDecided) {
+      return #Decided;
+    };
+
+    switch (tally) {
+      case (null) { #NotStarted };
+      case (?t) {
+        if (t.yes > t.no) {
+          #YesLeading;
+        } else if (t.no > t.yes) {
+          #NoLeading;
+        } else {
+          #Tied;
+        };
+      };
+    };
+  };
+
+  // Helper function to calculate time remaining until voting deadline
+  public func calculateTimeRemaining(
+    proposalCreationTime : Nat64,
+    initialVotingPeriod : Nat64,
+    waitForQuietState : ?WaitForQuietState,
+    isDecided : Bool
+  ) : ?Nat64 {
+    if (isDecided) {
+      return null; // Voting has ended
+    };
+
+    let currentTime = getCurrentTimestampSeconds();
+    
+    // Calculate the deadline based on wait-for-quiet state or initial voting period
+    let deadline = switch (waitForQuietState) {
+      case (?wfq) { wfq.current_deadline_timestamp_seconds };
+      case (null) { proposalCreationTime + initialVotingPeriod };
+    };
+
+    if (currentTime >= deadline) {
+      ?0; // Voting should have ended
+    } else {
+      ?(deadline - currentTime);
+    };
   };
 
   let (test_doSnedSNSProp) = false;
@@ -247,6 +389,112 @@ module {
       let errorMsg = "Network error while copying proposal: " # Error.message(error);
       logger.error("NNSPropCopy", errorMsg, "copyNNSProposal");
       return #err(#NetworkError(errorMsg));
+    };
+  };
+
+  // Function to get full SNS proposal details
+  public func getSNSProposalFull(
+    proposalId : Nat64,
+    snsGovernance : SNSGovernanceActor,
+    logger : Logger.Logger
+  ) : async GetSNSProposalFullResult {
+    logger.info("SNSProposal", "Fetching full proposal details for ID: " # Nat64.toText(proposalId), "getSNSProposalFull");
+
+    try {
+      let request : GetSNSProposal = {
+        proposal_id = ?{ id = proposalId };
+      };
+
+      let response = await snsGovernance.get_proposal(request);
+      
+      switch (response.result) {
+        case (null) {
+          logger.warn("SNSProposal", "No result in response for proposal " # Nat64.toText(proposalId), "getSNSProposalFull");
+          return #err(#ProposalNotFound);
+        };
+        case (?result) {
+          switch (result) {
+            case (#Error(error)) {
+              logger.error("SNSProposal", "SNS governance error: " # error.error_message, "getSNSProposalFull");
+              return #err(#SNSGovernanceError(error));
+            };
+            case (#Proposal(proposalData)) {
+              logger.info("SNSProposal", "Successfully fetched proposal " # Nat64.toText(proposalId), "getSNSProposalFull");
+              return #ok(proposalData);
+            };
+          };
+        };
+      };
+    } catch (error) {
+      let errorMsg = "Network error while fetching proposal: " # Error.message(error);
+      logger.error("SNSProposal", errorMsg, "getSNSProposalFull");
+      return #err(#NetworkError(errorMsg));
+    };
+  };
+
+  // Function to get SNS proposal summary with voting status
+  public func getSNSProposalSummary(
+    proposalId : Nat64,
+    snsGovernance : SNSGovernanceActor,
+    logger : Logger.Logger
+  ) : async GetSNSProposalSummaryResult {
+    logger.info("SNSProposal", "Fetching proposal summary for ID: " # Nat64.toText(proposalId), "getSNSProposalSummary");
+
+    // First get the full proposal data
+    let fullResult = await getSNSProposalFull(proposalId, snsGovernance, logger);
+    
+    switch (fullResult) {
+      case (#err(error)) {
+        return #err(error);
+      };
+      case (#ok(proposalData)) {
+        // Extract title from proposal
+        let title = switch (proposalData.proposal) {
+          case (null) { "Untitled Proposal" };
+          case (?prop) { prop.title };
+        };
+
+        // Determine if proposal is decided
+        let isDecided = proposalData.decided_timestamp_seconds > 0;
+
+        // Get voting status
+        let votingStatus = determineVotingStatus(proposalData.latest_tally, isDecided);
+
+        // Get vote counts
+        let (yesVotes, noVotes, totalVotes) = switch (proposalData.latest_tally) {
+          case (null) { (0 : Nat64, 0 : Nat64, 0 : Nat64) };
+          case (?tally) { (tally.yes, tally.no, tally.total) };
+        };
+
+        // Calculate time remaining
+        let timeRemaining = calculateTimeRemaining(
+          proposalData.proposal_creation_timestamp_seconds,
+          proposalData.initial_voting_period_seconds,
+          proposalData.wait_for_quiet_state,
+          isDecided
+        );
+
+        // Calculate voting deadline
+        let votingDeadline = switch (proposalData.wait_for_quiet_state) {
+          case (?wfq) { wfq.current_deadline_timestamp_seconds };
+          case (null) { proposalData.proposal_creation_timestamp_seconds + proposalData.initial_voting_period_seconds };
+        };
+
+        let summary : SNSProposalSummary = {
+          proposal_id = proposalId;
+          title = title;
+          voting_status = votingStatus;
+          yes_votes = yesVotes;
+          no_votes = noVotes;
+          total_votes = totalVotes;
+          time_remaining_seconds = timeRemaining;
+          voting_deadline = votingDeadline;
+          is_decided = isDecided;
+        };
+
+        logger.info("SNSProposal", "Successfully created summary for proposal " # Nat64.toText(proposalId), "getSNSProposalSummary");
+        return #ok(summary);
+      };
     };
   };
 }

@@ -95,6 +95,7 @@ shared deployer actor class neuronSnapshot() = this {
     list_neurons : shared query T.ListNeurons -> async T.ListNeuronsResponse;
     get_nervous_system_parameters : shared () -> async T.NervousSystemParameters;
     manage_neuron : shared NNSPropCopy.ManageNeuron -> async NNSPropCopy.ManageNeuronResponse;
+    get_proposal : shared query NNSPropCopy.GetSNSProposal -> async NNSPropCopy.GetSNSProposalResponse;
   };
 
   let nns_gov_canister = actor (Principal.toText(nns_governance_canister_id)) : NNSPropCopy.NNSGovernanceActor;
@@ -855,6 +856,57 @@ shared deployer actor class neuronSnapshot() = this {
   // Test function for proposal text formatting (for development/testing purposes)
   public query func testProposalTextFormatting() : async Text {
     NNSPropCopy.testFormatProposalText();
+  };
+
+  // Test function to demonstrate voting status calculation
+  public query func testVotingStatus() : async [(Text, NNSPropCopy.VotingStatus)] {
+    [
+      ("No votes yet", NNSPropCopy.determineVotingStatus(null, false)),
+      ("Yes leading", NNSPropCopy.determineVotingStatus(?{ yes = 100; no = 50; total = 150; timestamp_seconds = 1000 }, false)),
+      ("No leading", NNSPropCopy.determineVotingStatus(?{ yes = 30; no = 80; total = 110; timestamp_seconds = 1000 }, false)),
+      ("Tied votes", NNSPropCopy.determineVotingStatus(?{ yes = 50; no = 50; total = 100; timestamp_seconds = 1000 }, false)),
+      ("Decided", NNSPropCopy.determineVotingStatus(?{ yes = 100; no = 50; total = 150; timestamp_seconds = 1000 }, true))
+    ];
+  };
+
+  // Get full SNS proposal details
+  public shared ({ caller }) func getSNSProposal(
+    proposalId : Nat64
+  ) : async NNSPropCopy.GetSNSProposalFullResult {
+    logger.info("SNSProposal", "Full proposal request by " # Principal.toText(caller) # " for ID: " # Nat64.toText(proposalId), "getSNSProposal");
+    
+    // Authorization check - only master admin, controllers, DAO backend, or SNS governance can call this
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("SNSProposal", "Unauthorized caller: " # Principal.toText(caller), "getSNSProposal");
+      return #err(#SNSGovernanceError({ error_message = "Unauthorized caller"; error_type = 403 }));
+    };
+
+    // Call the NNSPropCopy module function
+    await NNSPropCopy.getSNSProposalFull(
+      proposalId,
+      sns_gov_canister,
+      logger
+    );
+  };
+
+  // Get SNS proposal summary with voting status and time remaining
+  public shared ({ caller }) func getSNSProposalSummary(
+    proposalId : Nat64
+  ) : async NNSPropCopy.GetSNSProposalSummaryResult {
+    logger.info("SNSProposal", "Proposal summary request by " # Principal.toText(caller) # " for ID: " # Nat64.toText(proposalId), "getSNSProposalSummary");
+    
+    // Authorization check - only master admin, controllers, DAO backend, or SNS governance can call this
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("SNSProposal", "Unauthorized caller: " # Principal.toText(caller), "getSNSProposalSummary");
+      return #err(#SNSGovernanceError({ error_message = "Unauthorized caller"; error_type = 403 }));
+    };
+
+    // Call the NNSPropCopy module function
+    await NNSPropCopy.getSNSProposalSummary(
+      proposalId,
+      sns_gov_canister,
+      logger
+    );
   };
 
 /* NB: Turn on again after initial setup
