@@ -5,6 +5,7 @@ import Result "mo:base/Result";
 import Error "mo:base/Error";
 import Logger "../helper/logger";
 import NNSTypes "./nns_types";
+import Debug "mo:base/Debug";
 
 module {
 
@@ -147,6 +148,8 @@ module {
     );
   };
 
+  let (test_doSnedSNSProp) = false;
+
   // Main function to copy an NNS proposal to SNS
   public func copyNNSProposal(
     nnsProposalId : Nat64,
@@ -208,7 +211,11 @@ module {
 
           // Submit the proposal to SNS governance
           logger.info("NNSPropCopy", "Submitting motion proposal to SNS governance", "copyNNSProposal");
-                  
+          
+          if (not test_doSnedSNSProp) {
+          Debug.print("manageNeuronRequest: " # debug_show(manageNeuronRequest));
+          return #err(#NetworkError("TESTING"))
+          } else {
           let response = await snsGovernance.manage_neuron(manageNeuronRequest);
 
           switch (response.command) {
@@ -232,6 +239,7 @@ module {
                 };
               };
             };
+          };
           };
         };
       };
