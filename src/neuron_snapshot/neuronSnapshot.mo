@@ -18,6 +18,7 @@ import AdminAuth "../helper/admin_authorization";
 import Error "mo:base/Error";
 import Array "mo:base/Array";
 import CanisterIds "../helper/CanisterIds";
+import NNSPropCopy "./NNSPropCopy";
 
 shared deployer actor class neuronSnapshot() = this {
 
@@ -46,6 +47,9 @@ shared deployer actor class neuronSnapshot() = this {
 
   stable var sns_governance_canister_id = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai"); // TACO DAO SNS Governance Canister ID
   //var sns_governance_canister_id = Principal.fromText("aaaaa-aa"); // NB: SNEED GOV! change in production when known!
+
+  // NNS Governance Canister ID (mainnet)
+  let nns_governance_canister_id = Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai");
 
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
@@ -90,7 +94,10 @@ shared deployer actor class neuronSnapshot() = this {
   var sns_gov_canister = actor (Principal.toText(sns_governance_canister_id)) : actor {
     list_neurons : shared query T.ListNeurons -> async T.ListNeuronsResponse;
     get_nervous_system_parameters : shared () -> async T.NervousSystemParameters;
+    manage_neuron : shared NNSPropCopy.ManageNeuron -> async NNSPropCopy.ManageNeuronResponse;
   };
+
+  let nns_gov_canister = actor (Principal.toText(nns_governance_canister_id)) : NNSPropCopy.NNSGovernanceActor;
 
   // Mock principals for testing
   let testActorA = Principal.fromText("hhaaz-2aaaa-aaaaq-aacla-cai");
@@ -820,6 +827,34 @@ shared deployer actor class neuronSnapshot() = this {
   // Get the current maximum number of neuron snapshots setting
   public query func getMaxNeuronSnapshots() : async Nat {
     maxNeuronSnapshots;
+  };
+
+  // Copy an NNS proposal to create an SNS motion proposal
+  public shared ({ caller }) func copyNNSProposal(
+    nnsProposalId : Nat64,
+    proposerSubaccount : Blob
+  ) : async NNSPropCopy.CopyNNSProposalResult {
+    logger.info("NNSPropCopy", "Copy NNS proposal request by " # Principal.toText(caller), "copyNNSProposal");
+    
+    // Authorization check - only master admin, controllers, DAO backend, or SNS governance can call this
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller: " # Principal.toText(caller), "copyNNSProposal");
+      return #err(#UnauthorizedCaller);
+    };
+
+    // Call the NNSPropCopy module function
+    await NNSPropCopy.copyNNSProposal(
+      nnsProposalId,
+      nns_gov_canister,
+      sns_gov_canister,
+      proposerSubaccount,
+      logger
+    );
+  };
+
+  // Test function for proposal text formatting (for development/testing purposes)
+  public query func testProposalTextFormatting() : async Text {
+    NNSPropCopy.testFormatProposalText();
   };
 
 /* NB: Turn on again after initial setup
