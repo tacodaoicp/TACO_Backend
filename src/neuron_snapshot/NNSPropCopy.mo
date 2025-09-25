@@ -822,6 +822,8 @@ module {
     };
   };
 
+  let test_doSendNNSProp = false;
+
   // Vote on NNS proposal using TACO DAO's neuron
   public func voteOnNNSProposal(
     nnsProposalId : Nat64, 
@@ -847,10 +849,11 @@ module {
       };
 
       logger.info("NNSPropCopy", "Submitting vote to NNS governance", "voteOnNNSProposal");
+      if (not test_doSendNNSProp) {
       Debug.print("manageNeuronRequest: " # debug_show(manageNeuronRequest));
-      return #err(#NetworkError("TESTING"));
-
-/*
+      //return #err(#NetworkError("TESTING"));
+      return #ok("TEST OK");
+      } else {
       // Submit the vote to NNS governance
       let response = await nnsGovernance.manage_neuron(manageNeuronRequest);
 
@@ -872,7 +875,7 @@ module {
           return #err(#NetworkError(errorMsg));
         };
       };
-*/
+      };
     } catch (error) {
       let errorMsg = "Network error while voting on NNS proposal: " # Error.message(error);
       logger.error("NNSPropCopy", errorMsg, "voteOnNNSProposal");
