@@ -37,7 +37,7 @@ shared deployer actor class neuronSnapshot() = this {
   // Cumulative values per snapshot (total staked maturity and cached stake)
   stable let snapshotCumulativeValues : Map.Map<T.SnapshotId, T.CumulativeVP> = Map.new<T.SnapshotId, T.CumulativeVP>();
 
-  let { nhash; phash } = Map;
+  let { nhash; n64hash; phash } = Map;
 
   let second_ns : Nat64 = 1_000_000_000; // 1 second in nanoseconds
   let minute_ns : Nat64 = 60 * second_ns; // 1 minute in nanoseconds
@@ -87,6 +87,9 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Maximum number of snapshots to keep (configurable by admin/DAO)
   stable var maxNeuronSnapshots : Nat = 100; // Keep last 100 snapshots by default
+
+  // Track which NNS proposals we have already copied (to avoid duplicates)
+  stable var copiedNNSProposals : Map.Map<Nat64, Nat64> = Map.new<Nat64, Nat64>(); // NNS Proposal ID -> SNS Proposal ID
 
   // Test mode variables
   stable var test = false;
@@ -955,6 +958,75 @@ shared deployer actor class neuronSnapshot() = this {
       nns_gov_canister,
       logger
     );
+  };
+
+  // Process newest NNS proposals and automatically copy relevant ones we haven't copied yet
+  public shared ({ caller }) func processNewestNNSProposals(
+    limit : ?Nat32,
+    proposerSubaccount : Blob
+  ) : async NNSPropCopy.ProcessNewestProposalsResult {
+    let effectiveLimit = switch (limit) { case (?l) { l }; case (null) { 20 : Nat32 }; };
+    logger.info("NNSPropCopy", "Process newest proposals request by " # Principal.toText(caller) # " (limit: " # Nat32.toText(effectiveLimit) # ")", "processNewestNNSProposals");
+    
+    // Authorization check - only master admin, controllers, DAO backend, or SNS governance can call this
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller: " # Principal.toText(caller), "processNewestNNSProposals");
+      return #err(#UnauthorizedCaller);
+    };
+
+    // Call the NNSPropCopy module function
+    await NNSPropCopy.processNewestNNSProposals(
+      effectiveLimit,
+      copiedNNSProposals,
+      nns_gov_canister,
+      sns_gov_canister,
+      proposerSubaccount,
+      logger
+    );
+  };
+
+  // Get the count of copied NNS proposals
+  public query func getCopiedNNSProposalsCount() : async Nat {
+    Map.size(copiedNNSProposals);
+  };
+
+  // Get all copied NNS proposals (returns array of (NNS ID, SNS ID) pairs)
+  public query func getCopiedNNSProposals() : async [(Nat64, Nat64)] {
+    Iter.toArray(Map.entries(copiedNNSProposals));
+  };
+
+  // Check if a specific NNS proposal has been copied
+  public query func isNNSProposalCopied(nnsProposalId : Nat64) : async ?Nat64 {
+    Map.get(copiedNNSProposals, n64hash, nnsProposalId);
+  };
+
+  // Add a copied proposal to the tracking (admin only)
+  public shared ({ caller }) func addCopiedNNSProposal(nnsProposalId : Nat64, snsProposalId : Nat64) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller trying to add copied proposal: " # Principal.toText(caller), "addCopiedNNSProposal");
+      return;
+    };
+
+    Map.set(copiedNNSProposals, n64hash, nnsProposalId, snsProposalId);
+    logger.info("NNSPropCopy", "Added copied proposal mapping: NNS " # Nat64.toText(nnsProposalId) # " -> SNS " # Nat64.toText(snsProposalId) # " by " # Principal.toText(caller), "addCopiedNNSProposal");
+  };
+
+  // Remove a copied proposal from tracking (admin only)
+  public shared ({ caller }) func removeCopiedNNSProposal(nnsProposalId : Nat64) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller trying to remove copied proposal: " # Principal.toText(caller), "removeCopiedNNSProposal");
+      return;
+    };
+
+    switch (Map.get(copiedNNSProposals, n64hash, nnsProposalId)) {
+      case (?snsProposalId) {
+        Map.delete(copiedNNSProposals, n64hash, nnsProposalId);
+        logger.info("NNSPropCopy", "Removed copied proposal mapping: NNS " # Nat64.toText(nnsProposalId) # " -> SNS " # Nat64.toText(snsProposalId) # " by " # Principal.toText(caller), "removeCopiedNNSProposal");
+      };
+      case (null) {
+        logger.warn("NNSPropCopy", "No copied proposal found for NNS ID: " # Nat64.toText(nnsProposalId), "removeCopiedNNSProposal");
+      };
+    };
   };
 
 /* NB: Turn on again after initial setup

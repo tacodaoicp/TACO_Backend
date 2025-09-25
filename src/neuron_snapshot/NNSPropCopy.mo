@@ -1,10 +1,15 @@
 import Text "mo:base/Text";
+import Nat "mo:base/Nat";
+import Nat32 "mo:base/Nat32";
 import Nat64 "mo:base/Nat64";
 import Int32 "mo:base/Int32";
 import Result "mo:base/Result";
 import Error "mo:base/Error";
 import Time "mo:base/Time";
 import Int "mo:base/Int";
+import _Array "mo:base/Array";
+import Buffer "mo:base/Buffer";
+import Map "mo:map/Map";
 import Logger "../helper/logger";
 import NNSTypes "./nns_types";
 import Debug "mo:base/Debug";
@@ -89,6 +94,15 @@ module {
 
   // Result type for checking if proposal should be copied
   public type ShouldCopyProposalResult = Result.Result<Bool, CopyNNSProposalError>;
+
+  // Result types for processing newest proposals
+  public type ProcessNewestProposalsResult = Result.Result<{
+    fetched_count : Nat;
+    new_copied_count : Nat;
+    already_copied_count : Nat;
+    skipped_count : Nat;
+    newly_copied_proposals : [(Nat64, Nat64)]; // (NNS Proposal ID, SNS Proposal ID)
+  }, CopyNNSProposalError>;
 
   // NNS Governance Topic IDs that should be copied to SNS
   // Based on the official Topic enum from governance.proto
@@ -338,7 +352,7 @@ module {
     };
   };
 
-  let (test_doSnedSNSProp) = false;
+  let (test_doSendSNSProp) = false;
 
   // Main function to copy an NNS proposal to SNS
   public func copyNNSProposal(
@@ -423,7 +437,7 @@ module {
           // Submit the proposal to SNS governance
           logger.info("NNSPropCopy", "Submitting motion proposal to SNS governance", "copyNNSProposal");
           
-          if (not test_doSnedSNSProp) {
+          if (not test_doSendSNSProp) {
           Debug.print("manageNeuronRequest: " # debug_show(manageNeuronRequest));
           return #err(#NetworkError("TESTING"))
           } else {
@@ -655,6 +669,160 @@ module {
     } catch (error) {
       let errorMsg = "Network error while getting copy info: " # Error.message(error);
       logger.error("NNSPropCopy", errorMsg, "getNNSProposalCopyInfo");
+      return #err(#NetworkError(errorMsg));
+    };
+  };
+
+  // Function to process newest NNS proposals and copy relevant ones we haven't copied yet
+  public func processNewestNNSProposals(
+    limit : Nat32,
+    copiedProposals : Map.Map<Nat64, Nat64>,
+    nnsGovernance : NNSGovernanceActor,
+    snsGovernance : SNSGovernanceActor,
+    proposerSubaccount : Blob,
+    logger : Logger.Logger
+  ) : async ProcessNewestProposalsResult {
+    let { n64hash; phash = _ } = Map;
+    logger.info("NNSPropCopy", "Starting to process " # Nat32.toText(limit) # " newest NNS proposals", "processNewestNNSProposals");
+
+    try {
+      // Create list of topics we're NOT interested in (for efficiency)
+      let excludeTopics : [Int32] = [
+        0,  // Unspecified
+        1,  // Neuron Management
+        2,  // Exchange Rate
+        3,  // Network Economics
+        4,  // Governance
+        7,  // Subnet Management
+        8,  // Network Canister Management
+        9,  // KYC
+        11, // SNS Decentralization Sale (Deprecated)
+        12, // Subnet Replica Version Management
+        13, // Replica Version Management
+        15, // API Boundary Node Management
+      ];
+
+      // Fetch newest proposals from NNS governance
+      let listRequest : NNSTypes.ListProposalInfo = {
+        include_reward_status = [];
+        omit_large_fields = ?true; // Exclude large fields for efficiency
+        before_proposal = null; // Get newest proposals
+        limit = limit;
+        exclude_topic = excludeTopics; // Exclude topics we're not interested in
+        include_all_manage_neuron_proposals = ?false;
+        include_status = [];
+      };
+
+      let response = await nnsGovernance.list_proposals(listRequest);
+      let proposals = response.proposal_info;
+
+      logger.info("NNSPropCopy", "Fetched " # Nat.toText(proposals.size()) # " newest proposals from NNS governance", "processNewestNNSProposals");
+
+      var newCopiedCount : Nat = 0;
+      var alreadyCopiedCount : Nat = 0;
+      var skippedCount : Nat = 0;
+      let newlyCopiedProposals = Buffer.Buffer<(Nat64, Nat64)>(10);
+
+      // Process each proposal (they come in newest-first order)
+      for (proposal in proposals.vals()) {
+        switch (proposal.id) {
+          case (null) {
+            logger.warn("NNSPropCopy", "Skipping proposal with no ID", "processNewestNNSProposals");
+            skippedCount += 1;
+          };
+          case (?proposalId) {
+            let nnsProposalId = proposalId.id;
+            
+            // Check if we've already copied this proposal
+            switch (Map.get(copiedProposals, n64hash, nnsProposalId)) {
+              case (?snsProposalId) {
+                alreadyCopiedCount += 1;
+                logger.info("NNSPropCopy", "NNS proposal " # Nat64.toText(nnsProposalId) # " already copied to SNS proposal " # Nat64.toText(snsProposalId) # " - skipping", "processNewestNNSProposals");
+              };
+              case (null) {
+                // Not copied yet, check if we should copy it
+                let topicId = proposal.topic;
+                let topicName = getTopicName(topicId);
+                let shouldCopy = shouldCopyTopic(topicId);
+
+                if (shouldCopy) {
+                  logger.info(
+                    "NNSPropCopy",
+                    "NNS proposal " # Nat64.toText(nnsProposalId) # " has copyable topic: " # topicName # 
+                    " (ID: " # Int32.toText(topicId) # ") and hasn't been copied yet - attempting to copy",
+                    "processNewestNNSProposals"
+                  );
+
+                  // Attempt to copy the proposal
+                  let copyResult = await copyNNSProposal(
+                    nnsProposalId,
+                    nnsGovernance,
+                    snsGovernance,
+                    proposerSubaccount,
+                    logger
+                  );
+
+                  switch (copyResult) {
+                    case (#ok(snsProposalId)) {
+                      newCopiedCount += 1;
+                      newlyCopiedProposals.add((nnsProposalId, snsProposalId));
+                      
+                      // Add to the copied proposals map
+                      Map.set(copiedProposals, n64hash, nnsProposalId, snsProposalId);
+                      
+                      logger.info(
+                        "NNSPropCopy",
+                        "Successfully copied NNS proposal " # Nat64.toText(nnsProposalId) # 
+                        " to SNS proposal " # Nat64.toText(snsProposalId),
+                        "processNewestNNSProposals"
+                      );
+                    };
+                    case (#err(error)) {
+                      logger.error(
+                        "NNSPropCopy",
+                        "Failed to copy NNS proposal " # Nat64.toText(nnsProposalId) # ": " # debug_show(error),
+                        "processNewestNNSProposals"
+                      );
+                      skippedCount += 1;
+                      // Continue processing other proposals even if one fails
+                    };
+                  };
+                } else {
+                  skippedCount += 1;
+                  logger.info(
+                    "NNSPropCopy",
+                    "NNS proposal " # Nat64.toText(nnsProposalId) # " has non-copyable topic: " # topicName # 
+                    " (ID: " # Int32.toText(topicId) # ") - skipping",
+                    "processNewestNNSProposals"
+                  );
+                };
+              };
+            };
+          };
+        };
+      };
+
+      let result = {
+        fetched_count = proposals.size();
+        new_copied_count = newCopiedCount;
+        already_copied_count = alreadyCopiedCount;
+        skipped_count = skippedCount;
+        newly_copied_proposals = Buffer.toArray(newlyCopiedProposals);
+      };
+
+      logger.info(
+        "NNSPropCopy",
+        "Completed processing: " # Nat.toText(proposals.size()) # " proposals fetched, " #
+        Nat.toText(newCopiedCount) # " newly copied, " # Nat.toText(alreadyCopiedCount) # 
+        " already copied, " # Nat.toText(skippedCount) # " skipped",
+        "processNewestNNSProposals"
+      );
+
+      return #ok(result);
+
+    } catch (error) {
+      let errorMsg = "Network error while processing proposals: " # Error.message(error);
+      logger.error("NNSPropCopy", errorMsg, "processNewestNNSProposals");
       return #err(#NetworkError(errorMsg));
     };
   };
