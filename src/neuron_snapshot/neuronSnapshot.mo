@@ -37,7 +37,7 @@ shared deployer actor class neuronSnapshot() = this {
   // Cumulative values per snapshot (total staked maturity and cached stake)
   stable let snapshotCumulativeValues : Map.Map<T.SnapshotId, T.CumulativeVP> = Map.new<T.SnapshotId, T.CumulativeVP>();
 
-  let { nhash; n64hash; phash } = Map;
+  let { nhash; n64hash; phash; bhash } = Map;
 
   let second_ns : Nat64 = 1_000_000_000; // 1 second in nanoseconds
   let minute_ns : Nat64 = 60 * second_ns; // 1 minute in nanoseconds
@@ -96,6 +96,13 @@ shared deployer actor class neuronSnapshot() = this {
   
   // Track auto-processing state to prevent infinite loops and allow emergency stopping
   stable var isAutoProcessingNNSProposals : Bool = false;
+
+  // DAO Voting System - Track which NNS proposals the DAO has already voted on
+  stable var daoVotedNNSProposals : Map.Map<Nat64, Bool> = Map.new<Nat64, Bool>(); // NNS Proposal ID -> true (voted)
+  
+  // DAO Voting System - Track votes per SNS proposal per neuron  
+  // Structure: SNS Proposal ID -> Neuron ID -> Vote Details
+  stable var daoVotes : Map.Map<Nat64, Map.Map<Blob, T.DAOVote>> = Map.new<Nat64, Map.Map<Blob, T.DAOVote>>();
 
   // Test mode variables
   stable var test = false;
@@ -1185,6 +1192,288 @@ shared deployer actor class neuronSnapshot() = this {
   // Check if auto-processing is currently running
   public query func isAutoProcessingRunning() : async Bool {
     isAutoProcessingNNSProposals;
+  };
+
+  // DAO Voting System Functions
+
+  // Submit votes for a copied SNS proposal using TACO neurons
+  public shared ({ caller }) func submitDAOVotes(
+    snsProposalId : Nat64,
+    neuronIds : [Blob],
+    decision : T.DAOVoteDecision
+  ) : async Result.Result<{
+    successful_votes : Nat;
+    skipped_already_voted : Nat;
+    skipped_no_access : Nat;
+    total_voting_power : Nat;
+  }, Text> {
+    logger.info("DAOVoting", "Vote submission by " # Principal.toText(caller) # " for SNS proposal " # Nat64.toText(snsProposalId) # " with " # Nat.toText(neuronIds.size()) # " neurons", "submitDAOVotes");
+
+    // Check if this SNS proposal is in our copied proposals list
+    let correspondingNNSProposal = switch (findNNSProposalForSNS(snsProposalId)) {
+      case (null) {
+        logger.warn("DAOVoting", "SNS proposal " # Nat64.toText(snsProposalId) # " not found in copied proposals", "submitDAOVotes");
+        return #err("SNS proposal not found in copied proposals list");
+      };
+      case (?nnsId) { nnsId };
+    };
+
+    // Check if DAO has already voted on the corresponding NNS proposal
+    switch (Map.get(daoVotedNNSProposals, n64hash, correspondingNNSProposal)) {
+      case (?true) {
+        logger.warn("DAOVoting", "DAO has already voted on NNS proposal " # Nat64.toText(correspondingNNSProposal), "submitDAOVotes");
+        return #err("DAO has already voted on this NNS proposal");
+      };
+      case (_) { /* Continue */ };
+    };
+
+    // Get the caller's neurons from SNS governance to verify access
+    let callerNeurons = try {
+      let response = await sns_gov_canister.list_neurons({
+        of_principal = ?caller;
+        limit = 1000; // High limit to get all caller's neurons
+        start_page_at = null;
+      });
+      response.neurons;
+    } catch (error) {
+      logger.error("DAOVoting", "Failed to fetch caller's neurons: " # Error.message(error), "submitDAOVotes");
+      return #err("Failed to verify neuron access");
+    };
+
+    // Create a set of caller's neuron IDs for quick lookup
+    var callerNeuronIds = Map.new<Blob, Bool>();
+    for (neuron in callerNeurons.vals()) {
+      switch (neuron.id) {
+        case (?neuronId) {
+          Map.set(callerNeuronIds, bhash, neuronId.id, true);
+        };
+        case (null) { /* Skip neurons without ID */ };
+      };
+    };
+
+    // Get or create the votes map for this SNS proposal
+    let proposalVotes = switch (Map.get(daoVotes, n64hash, snsProposalId)) {
+      case (?existing) { existing };
+      case (null) { 
+        let newVotesMap = Map.new<Blob, T.DAOVote>();
+        Map.set(daoVotes, n64hash, snsProposalId, newVotesMap);
+        newVotesMap;
+      };
+    };
+
+    var successfulVotes : Nat = 0;
+    var skippedAlreadyVoted : Nat = 0;
+    var skippedNoAccess : Nat = 0;
+    var totalVotingPower : Nat = 0;
+    let currentTime = get_current_timestamp();
+
+    // Process each neuron ID
+    for (neuronId in neuronIds.vals()) {
+      // Check if this neuron has already voted
+      switch (Map.get(proposalVotes, bhash, neuronId)) {
+        case (?existingVote) {
+          skippedAlreadyVoted += 1;
+          logger.info("DAOVoting", "Neuron " # debug_show(neuronId) # " has already voted", "submitDAOVotes");
+        };
+        case (null) {
+          // Check if caller has access to this neuron
+          switch (Map.get(callerNeuronIds, bhash, neuronId)) {
+            case (?true) {
+              // Find the neuron to calculate voting power
+              let neuronOpt = Array.find<T.Neuron>(callerNeurons, func(n) {
+                switch (n.id) {
+                  case (?nId) { nId.id == neuronId };
+                  case (null) { false };
+                };
+              });
+
+              switch (neuronOpt) {
+                case (?neuron) {
+                  // Calculate voting power
+                  let neuronDetails : T.NeuronDetails = {
+                    id = neuron.id;
+                    staked_maturity_e8s_equivalent = neuron.staked_maturity_e8s_equivalent;
+                    cached_neuron_stake_e8s = neuron.cached_neuron_stake_e8s;
+                    aging_since_timestamp_seconds = neuron.aging_since_timestamp_seconds;
+                    dissolve_state = neuron.dissolve_state;
+                    voting_power_percentage_multiplier = neuron.voting_power_percentage_multiplier;
+                  };
+
+                  let votingPower = vp_calc.getVotingPower(neuronDetails);
+
+                  // Create and store the vote
+                  let vote : T.DAOVote = {
+                    decision = decision;
+                    voting_power = votingPower;
+                    timestamp = currentTime;
+                    voter_principal = caller;
+                  };
+
+                  Map.set(proposalVotes, bhash, neuronId, vote);
+                  successfulVotes += 1;
+                  totalVotingPower += votingPower;
+
+                  logger.info("DAOVoting", "Recorded vote for neuron with " # Nat.toText(votingPower) # " VP", "submitDAOVotes");
+                };
+                case (null) {
+                  skippedNoAccess += 1;
+                  logger.warn("DAOVoting", "Neuron details not found for ID: " # debug_show(neuronId), "submitDAOVotes");
+                };
+              };
+            };
+            case (_) {
+              skippedNoAccess += 1;
+              logger.warn("DAOVoting", "Caller does not have access to neuron: " # debug_show(neuronId), "submitDAOVotes");
+            };
+          };
+        };
+      };
+    };
+
+    let result = {
+      successful_votes = successfulVotes;
+      skipped_already_voted = skippedAlreadyVoted;
+      skipped_no_access = skippedNoAccess;
+      total_voting_power = totalVotingPower;
+    };
+
+    logger.info("DAOVoting", "Vote submission completed: " # Nat.toText(successfulVotes) # " successful, " # Nat.toText(skippedAlreadyVoted) # " already voted, " # Nat.toText(skippedNoAccess) # " no access, " # Nat.toText(totalVotingPower) # " total VP", "submitDAOVotes");
+
+    #ok(result);
+  };
+
+  // Helper function to find NNS proposal ID for a given SNS proposal ID
+  private func findNNSProposalForSNS(snsProposalId : Nat64) : ?Nat64 {
+    for ((nnsId, snsId) in Map.entries(copiedNNSProposals)) {
+      if (snsId == snsProposalId) {
+        return ?nnsId;
+      };
+    };
+    null;
+  };
+
+  // Get vote tally for a specific SNS proposal
+  public query func getDAOVoteTally(snsProposalId : Nat64) : async ?{
+    adopt_votes : Nat;
+    reject_votes : Nat;
+    adopt_voting_power : Nat;
+    reject_voting_power : Nat;
+    total_votes : Nat;
+    total_voting_power : Nat;
+  } {
+    switch (Map.get(daoVotes, n64hash, snsProposalId)) {
+      case (null) { null };
+      case (?proposalVotes) {
+        var adoptVotes : Nat = 0;
+        var rejectVotes : Nat = 0;
+        var adoptVotingPower : Nat = 0;
+        var rejectVotingPower : Nat = 0;
+
+        for ((_, vote) in Map.entries(proposalVotes)) {
+          switch (vote.decision) {
+            case (#Adopt) {
+              adoptVotes += 1;
+              adoptVotingPower += vote.voting_power;
+            };
+            case (#Reject) {
+              rejectVotes += 1;
+              rejectVotingPower += vote.voting_power;
+            };
+          };
+        };
+
+        ?{
+          adopt_votes = adoptVotes;
+          reject_votes = rejectVotes;
+          adopt_voting_power = adoptVotingPower;
+          reject_voting_power = rejectVotingPower;
+          total_votes = adoptVotes + rejectVotes;
+          total_voting_power = adoptVotingPower + rejectVotingPower;
+        };
+      };
+    };
+  };
+
+  // Get all votes for a specific SNS proposal (admin only)
+  public query ({ caller }) func getDAOVotesForProposal(snsProposalId : Nat64) : async [(Blob, T.DAOVote)] {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      return [];
+    };
+
+    switch (Map.get(daoVotes, n64hash, snsProposalId)) {
+      case (null) { [] };
+      case (?proposalVotes) { Iter.toArray(Map.entries(proposalVotes)) };
+    };
+  };
+
+  // Check if a specific neuron has voted on a proposal
+  public query func hasNeuronVoted(snsProposalId : Nat64, neuronId : Blob) : async ?T.DAOVote {
+    switch (Map.get(daoVotes, n64hash, snsProposalId)) {
+      case (null) { null };
+      case (?proposalVotes) { Map.get(proposalVotes, bhash, neuronId) };
+    };
+  };
+
+  // Get list of SNS proposals available for DAO voting
+  public query func getVotableProposals() : async [(Nat64, Nat64)] {
+    // Return SNS proposals that haven't been voted on by DAO yet
+    Array.filter<(Nat64, Nat64)>(
+      Iter.toArray(Map.entries(copiedNNSProposals)),
+      func((nnsId, snsId)) {
+        switch (Map.get(daoVotedNNSProposals, n64hash, nnsId)) {
+          case (?true) { false }; // Already voted
+          case (_) { true }; // Available for voting
+        };
+      }
+    );
+  };
+
+  // Check if DAO has already voted on an NNS proposal
+  public query func hasDAOVoted(nnsProposalId : Nat64) : async Bool {
+    switch (Map.get(daoVotedNNSProposals, n64hash, nnsProposalId)) {
+      case (?true) { true };
+      case (_) { false };
+    };
+  };
+
+  // Mark an NNS proposal as voted by DAO (admin only)
+  public shared ({ caller }) func markNNSProposalAsVoted(nnsProposalId : Nat64) : async Bool {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to mark NNS proposal as voted: " # Principal.toText(caller), "markNNSProposalAsVoted");
+      return false;
+    };
+
+    Map.set(daoVotedNNSProposals, n64hash, nnsProposalId, true);
+    logger.info("DAOVoting", "NNS proposal " # Nat64.toText(nnsProposalId) # " marked as voted by " # Principal.toText(caller), "markNNSProposalAsVoted");
+    true;
+  };
+
+  // Clear all DAO votes for a specific SNS proposal (admin only)
+  public shared ({ caller }) func clearDAOVotesForProposal(snsProposalId : Nat64) : async Nat {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to clear votes: " # Principal.toText(caller), "clearDAOVotesForProposal");
+      return 0;
+    };
+
+    switch (Map.get(daoVotes, n64hash, snsProposalId)) {
+      case (null) { 0 };
+      case (?proposalVotes) {
+        let count = Map.size(proposalVotes);
+        Map.delete(daoVotes, n64hash, snsProposalId);
+        logger.info("DAOVoting", "Cleared " # Nat.toText(count) # " votes for SNS proposal " # Nat64.toText(snsProposalId) # " by " # Principal.toText(caller), "clearDAOVotesForProposal");
+        count;
+      };
+    };
+  };
+
+  // Get count of proposals with DAO votes
+  public query func getDAOVotingProposalsCount() : async Nat {
+    Map.size(daoVotes);
+  };
+
+  // Get count of NNS proposals DAO has voted on
+  public query func getDAOVotedNNSProposalsCount() : async Nat {
+    Map.size(daoVotedNNSProposals);
   };
 
 /* NB: Turn on again after initial setup

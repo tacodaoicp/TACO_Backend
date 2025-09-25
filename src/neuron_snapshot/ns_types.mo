@@ -199,6 +199,19 @@ module {
     total_staked_vp_by_hotkey_setters : Nat;
   };
 
+  // DAO Voting System Types  
+  public type DAOVoteDecision = {
+    #Adopt;
+    #Reject;
+  };
+
+  public type DAOVote = {
+    decision : DAOVoteDecision;
+    voting_power : Nat;
+    timestamp : Timestamp;
+    voter_principal : Principal;
+  };
+
   public type Self = actor {
     // Snapshot management
     take_neuron_snapshot : shared () -> async TakeNeuronSnapshotResult;
