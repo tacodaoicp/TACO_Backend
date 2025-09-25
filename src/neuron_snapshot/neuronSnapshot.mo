@@ -93,6 +93,9 @@ shared deployer actor class neuronSnapshot() = this {
   
   // Track highest NNS proposal ID we have processed (not necessarily copied)
   stable var highestProcessedNNSProposalId : Nat64 = 138609;
+  
+  // Track auto-processing state to prevent infinite loops and allow emergency stopping
+  stable var isAutoProcessingNNSProposals : Bool = false;
 
   // Test mode variables
   stable var test = false;
@@ -1076,6 +1079,110 @@ shared deployer actor class neuronSnapshot() = this {
     logger.info("NNSPropCopy", "Cleared " # Nat.toText(countBeforeClear) # " copied NNS proposals by " # Principal.toText(caller), "clearCopiedNNSProposals");
     
     countBeforeClear;
+  };
+
+  // Start auto-processing all new NNS proposals in 10-proposal chunks (admin only)
+  public shared ({ caller }) func startAutoProcessNNSProposals(proposerSubaccount : Blob) : async Bool {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller trying to start auto-processing: " # Principal.toText(caller), "startAutoProcessNNSProposals");
+      return false;
+    };
+
+    if (isAutoProcessingNNSProposals) {
+      logger.warn("NNSPropCopy", "Auto-processing is already running, ignoring start request from " # Principal.toText(caller), "startAutoProcessNNSProposals");
+      return false;
+    };
+
+    isAutoProcessingNNSProposals := true;
+    logger.info("NNSPropCopy", "Starting auto-processing of NNS proposals by " # Principal.toText(caller), "startAutoProcessNNSProposals");
+    
+    // Start the recursive processing
+    await autoProcessNNSProposalsChunk(proposerSubaccount);
+    
+    true;
+  };
+
+  // Internal recursive method to process proposals in chunks
+  private func autoProcessNNSProposalsChunk(proposerSubaccount : Blob) : async () {
+    if (not isAutoProcessingNNSProposals) {
+      logger.info("NNSPropCopy", "Auto-processing stopped via emergency stop", "autoProcessNNSProposalsChunk");
+      return;
+    };
+
+    logger.info("NNSPropCopy", "Processing chunk of up to 10 NNS proposals (starting from ID: " # Nat64.toText(highestProcessedNNSProposalId) # ")", "autoProcessNNSProposalsChunk");
+
+    try {
+      // Process up to 10 proposals
+      let result = await NNSPropCopy.processSequentialNNSProposals(
+        highestProcessedNNSProposalId,
+        10, // Fixed chunk size of 10
+        copiedNNSProposals,
+        nns_gov_canister,
+        sns_gov_canister,
+        proposerSubaccount,
+        logger
+      );
+
+      switch (result) {
+        case (#ok(data)) {
+          highestProcessedNNSProposalId := data.highest_processed_id;
+          
+          logger.info(
+            "NNSPropCopy", 
+            "Auto-processing chunk completed: " # Nat.toText(data.processed_count) # " processed, " #
+            Nat.toText(data.new_copied_count) # " copied, highest ID: " # Nat64.toText(data.highest_processed_id),
+            "autoProcessNNSProposalsChunk"
+          );
+
+          // If we processed exactly 10 proposals, there might be more
+          if (data.processed_count == 10) {
+            logger.info("NNSPropCopy", "Found 10 proposals, scheduling next chunk via timer", "autoProcessNNSProposalsChunk");
+            
+            // Schedule next chunk via 0-second timer to avoid instruction limit
+            let timerId = Timer.setTimer<system>(#seconds(0), func() : async () {
+              await autoProcessNNSProposalsChunk(proposerSubaccount);
+            });
+            
+            ignore timerId; // We don't need to track the timer ID
+          } else {
+            // Less than 10 proposals found, we're done
+            isAutoProcessingNNSProposals := false;
+            logger.info("NNSPropCopy", "Auto-processing completed - found only " # Nat.toText(data.processed_count) # " proposals, stopping", "autoProcessNNSProposalsChunk");
+          };
+        };
+        case (#err(error)) {
+          isAutoProcessingNNSProposals := false;
+          logger.error("NNSPropCopy", "Auto-processing failed with error: " # debug_show(error) # " - stopping", "autoProcessNNSProposalsChunk");
+        };
+      };
+    } catch (error) {
+      isAutoProcessingNNSProposals := false;
+      logger.error("NNSPropCopy", "Auto-processing crashed with exception: " # Error.message(error) # " - stopping", "autoProcessNNSProposalsChunk");
+    };
+  };
+
+  // Emergency stop for auto-processing (admin only)
+  public shared ({ caller }) func stopAutoProcessNNSProposals() : async Bool {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller trying to stop auto-processing: " # Principal.toText(caller), "stopAutoProcessNNSProposals");
+      return false;
+    };
+
+    let wasRunning = isAutoProcessingNNSProposals;
+    isAutoProcessingNNSProposals := false;
+    
+    if (wasRunning) {
+      logger.info("NNSPropCopy", "Emergency stop activated by " # Principal.toText(caller) # " - auto-processing will halt", "stopAutoProcessNNSProposals");
+    } else {
+      logger.info("NNSPropCopy", "Stop requested by " # Principal.toText(caller) # " but auto-processing was not running", "stopAutoProcessNNSProposals");
+    };
+    
+    wasRunning;
+  };
+
+  // Check if auto-processing is currently running
+  public query func isAutoProcessingRunning() : async Bool {
+    isAutoProcessingNNSProposals;
   };
 
 /* NB: Turn on again after initial setup
