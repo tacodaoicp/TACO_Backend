@@ -1,1 +1,218 @@
-Spec.
+TACO DAO - NNS Proposal Voting System Specification
+=====================================================
+
+Overview
+--------
+The TACO DAO implements a sophisticated voting system that allows DAO members to vote on NNS (Network Nervous System) proposals using their TACO neurons, without risking their staked tokens. The system copies relevant NNS proposals to SNS motion proposals for discussion, collects DAO member votes on the backend, and automatically submits the collective decision to the NNS when the voting deadline approaches.
+
+System Architecture
+------------------
+
+1. Proposal Copying Pipeline
+   - Automatically monitors NNS governance for new proposals
+   - Filters proposals by topic (SNS & Neurons' Fund, Node Admin, Node Provider Rewards, Participant Management)
+   - Creates corresponding SNS motion proposals with standardized text and links
+   - Tracks mapping between NNS and SNS proposal IDs
+
+2. DAO Voting Backend
+   - Collects votes from DAO members using their TACO neurons
+   - Validates neuron ownership via SNS governance calls
+   - Calculates voting power using existing VP calculation utilities
+   - Prevents duplicate votes and unauthorized access
+   - Stores votes persistently across canister upgrades
+
+3. Automated NNS Vote Submission (Future)
+   - Monitors NNS proposal deadlines
+   - Tallies DAO votes when 1 hour remains before NNS voting closes
+   - Submits collective decision to NNS governance
+   - Marks proposals as voted to prevent re-voting
+
+Data Structures
+--------------
+
+Core Types:
+```
+DAOVoteDecision = #Adopt | #Reject
+DAOVote = {
+  decision: DAOVoteDecision;
+  voting_power: Nat;
+  timestamp: Timestamp;
+  voter_principal: Principal;
+}
+```
+
+Stable Storage:
+- copiedNNSProposals: Map<Nat64, Nat64> (NNS ID -> SNS ID)
+- daoVotedNNSProposals: Map<Nat64, Bool> (NNS ID -> voted status)
+- daoVotes: Map<Nat64, Map<Blob, DAOVote>> (SNS ID -> Neuron ID -> Vote)
+- highestProcessedNNSProposalId: Nat64 (tracking processed proposals)
+
+Workflow
+--------
+
+Phase 1: Proposal Discovery & Copying
+1. Background process monitors NNS governance using get_proposal_info
+2. Sequential processing from last processed ID + 1
+3. Topic filtering: only copy proposals with topics 5, 6, 10, 14
+4. Guard check ensures only approved topics are copied
+5. SNS motion proposal created with:
+   - Standard template text
+   - Link to original NNS proposal
+   - Original proposal ID, type, title, summary
+6. Mapping stored: NNS Proposal ID -> SNS Proposal ID
+
+Phase 2: DAO Member Voting
+1. Frontend displays available proposals via getVotableProposals()
+2. DAO members submit votes using submitDAOVotes():
+   - Specify SNS proposal ID
+   - Provide array of neuron IDs they want to vote with
+   - Choose decision: #Adopt or #Reject
+3. Backend validation:
+   - Verify SNS proposal exists in copiedNNSProposals
+   - Confirm DAO hasn't already voted on corresponding NNS proposal
+   - Call SNS governance list_neurons to verify caller owns neurons
+   - Filter out neurons that already voted
+   - Calculate voting power for each neuron
+4. Vote storage:
+   - Record decision, voting power, timestamp, voter principal
+   - Prevent duplicate votes per neuron per proposal
+5. Real-time tallying available via getDAOVoteTally()
+
+Phase 3: NNS Vote Submission (Future Implementation)
+1. Monitor NNS proposal deadlines continuously
+2. When 1 hour remains before voting closes:
+   - Retrieve all DAO votes for the proposal
+   - Calculate total voting power for Adopt vs Reject
+   - Determine winning decision based on voting power majority
+   - Submit vote to NNS governance using backend neuron
+   - Mark NNS proposal as voted in daoVotedNNSProposals
+3. Logging and audit trail for all automated votes
+
+Security Model
+-------------
+
+Access Control:
+- Neuron ownership verified via SNS governance list_neurons call
+- Only neurons returned for caller's principal can be used
+- Admin functions restricted to master admin, controllers, DAO backend, SNS governance
+- Vote submission open to all users (with neuron verification)
+
+Data Integrity:
+- Duplicate vote prevention at neuron level
+- Immutable vote records once cast
+- Stable storage survives canister upgrades
+- Comprehensive logging for audit trails
+
+Fraud Prevention:
+- Real-time neuron ownership verification
+- Voting power calculated from current neuron state
+- No pre-computed or cached voting power to prevent stale data attacks
+- One vote per neuron per proposal maximum
+
+API Reference
+------------
+
+Public Functions (DAO Members):
+- submitDAOVotes(snsProposalId, neuronIds, decision) -> Result<VoteResult, Text>
+- getDAOVoteTally(snsProposalId) -> ?VoteTally
+- hasNeuronVoted(snsProposalId, neuronId) -> ?DAOVote
+- getVotableProposals() -> [(Nat64, Nat64)]
+- hasDAOVoted(nnsProposalId) -> Bool
+
+Query Functions:
+- getDAOVotingProposalsCount() -> Nat
+- getDAOVotedNNSProposalsCount() -> Nat
+- getCopiedNNSProposals() -> [(Nat64, Nat64)]
+- isNNSProposalCopied(nnsProposalId) -> ?Nat64
+
+Admin Functions:
+- getDAOVotesForProposal(snsProposalId) -> [(Blob, DAOVote)]
+- markNNSProposalAsVoted(nnsProposalId) -> Bool
+- clearDAOVotesForProposal(snsProposalId) -> Nat
+- clearCopiedNNSProposals() -> Nat
+
+Proposal Processing:
+- processNewestNNSProposals(limit, proposerSubaccount) -> ProcessResult
+- startAutoProcessNNSProposals(proposerSubaccount) -> Bool
+- stopAutoProcessNNSProposals() -> Bool
+- isAutoProcessingRunning() -> Bool
+
+Error Handling
+-------------
+
+Vote Submission Errors:
+- "SNS proposal not found in copied proposals list"
+- "DAO has already voted on this NNS proposal"
+- "Failed to verify neuron access"
+
+Result Categories:
+- successful_votes: Count of votes successfully recorded
+- skipped_already_voted: Count of neurons that already voted
+- skipped_no_access: Count of neurons caller doesn't control
+- total_voting_power: Sum of voting power for successful votes
+
+Logging:
+- All vote submissions logged with caller, proposal ID, neuron count
+- Vote tallies logged for monitoring
+- Access violations logged for security audit
+- Automated processing results logged for transparency
+
+Future Enhancements
+------------------
+
+Immediate (Phase 3):
+1. NNS deadline monitoring system
+2. Automated vote submission to NNS governance
+3. Vote execution logging and confirmation
+4. Emergency override mechanisms
+
+Medium-term:
+1. Voting delegation system
+2. Proposal discussion threads
+3. Vote change mechanisms (before NNS submission)
+4. Historical voting analytics
+
+Long-term:
+1. Multi-signature requirements for critical proposals
+2. Quadratic voting mechanisms
+3. Proposal impact assessment
+4. Cross-chain governance integration
+
+Governance Parameters
+--------------------
+
+Configurable Settings:
+- Topic filter list (currently: 5, 6, 10, 14)
+- Vote submission timing (currently: 1 hour before NNS deadline)
+- Processing batch size (currently: 10 proposals per chunk)
+- Maximum neuron limit per vote call (currently: 1000)
+
+Fixed Parameters:
+- One vote per neuron per proposal
+- Voting power calculated real-time
+- Votes immutable once cast
+- Admin authorization required for state changes
+
+Monitoring & Metrics
+-------------------
+
+Key Metrics:
+- Total proposals copied vs available
+- DAO participation rate per proposal
+- Voting power distribution per decision
+- Time between proposal copy and DAO vote
+- Success rate of automated NNS submissions
+
+Health Indicators:
+- Processing lag behind NNS proposals
+- Vote submission success rate
+- Neuron verification failure rate
+- System uptime and availability
+
+Audit Trail:
+- All vote submissions with timestamps
+- Neuron ownership verification logs
+- Automated NNS vote submissions
+- Admin actions and state changes
+
+This specification provides a comprehensive framework for the TACO DAO's NNS proposal voting system, ensuring transparency, security, and democratic participation while protecting member assets.
