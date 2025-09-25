@@ -13,6 +13,7 @@ import Map "mo:map/Map";
 import Logger "../helper/logger";
 import NNSTypes "./nns_types";
 import Debug "mo:base/Debug";
+import Principal "mo:base/Principal";
 
 module {
 
@@ -120,6 +121,7 @@ module {
   public type NNSGovernanceActor = actor {
     get_proposal_info : shared query (Nat64) -> async ?NNSTypes.ProposalInfo;
     list_proposals : shared query (NNSTypes.ListProposalInfo) -> async NNSTypes.ListProposalInfoResponse;
+    manage_neuron : shared (NNSTypes.ManageNeuron) -> async NNSTypes.ManageNeuronResponse;
   };
 
   // SNS Proposal types for fetching proposals
@@ -816,6 +818,64 @@ module {
     } catch (error) {
       let errorMsg = "Network error while processing proposals: " # Error.message(error);
       logger.error("NNSPropCopy", errorMsg, "processSequentialNNSProposals");
+      return #err(#NetworkError(errorMsg));
+    };
+  };
+
+  // Vote on NNS proposal using TACO DAO's neuron
+  public func voteOnNNSProposal(
+    nnsProposalId : Nat64, 
+    vote : Int32, 
+    nnsGovernanceCanisterId : Principal,
+    tacoDAONeuronId : NNSTypes.NeuronId,
+    logger : Logger.Logger
+  ) : async Result.Result<Text, CopyNNSProposalError> {
+    logger.info("NNSPropCopy", "Voting on NNS proposal " # Nat64.toText(nnsProposalId) # " with vote: " # Int32.toText(vote), "voteOnNNSProposal");
+
+    try {
+      // Create NNS governance actor
+      let nnsGovernance : NNSGovernanceActor = actor(Principal.toText(nnsGovernanceCanisterId));
+
+      // Create manage neuron command to vote
+      let manageNeuronRequest : NNSTypes.ManageNeuron = {
+        id = null;
+        command = ?#RegisterVote({
+          vote = vote;
+          proposal = ?{ id = nnsProposalId };
+        });
+        neuron_id_or_subaccount = ?#NeuronId(tacoDAONeuronId);
+      };
+
+      logger.info("NNSPropCopy", "Submitting vote to NNS governance", "voteOnNNSProposal");
+      Debug.print("manageNeuronRequest: " # debug_show(manageNeuronRequest));
+      return #err(#NetworkError("TESTING"));
+
+/*
+      // Submit the vote to NNS governance
+      let response = await nnsGovernance.manage_neuron(manageNeuronRequest);
+
+      switch (response.command) {
+        case (?#RegisterVote(_)) {
+          let voteText = if (vote == 1) { "Yes" } else { "No" };
+          let successMsg = "Successfully voted " # voteText # " on NNS proposal " # Nat64.toText(nnsProposalId);
+          logger.info("NNSPropCopy", successMsg, "voteOnNNSProposal");
+          return #ok(successMsg);
+        };
+        case (?#Error(error)) {
+          let errorMsg = "NNS governance error: " # debug_show(error);
+          logger.error("NNSPropCopy", errorMsg, "voteOnNNSProposal");
+          return #err(#NetworkError(errorMsg));
+        };
+        case (_) {
+          let errorMsg = "Unexpected response from NNS governance: " # debug_show(response);
+          logger.error("NNSPropCopy", errorMsg, "voteOnNNSProposal");
+          return #err(#NetworkError(errorMsg));
+        };
+      };
+*/
+    } catch (error) {
+      let errorMsg = "Network error while voting on NNS proposal: " # Error.message(error);
+      logger.error("NNSPropCopy", errorMsg, "voteOnNNSProposal");
       return #err(#NetworkError(errorMsg));
     };
   };

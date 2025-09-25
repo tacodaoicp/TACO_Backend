@@ -7,6 +7,7 @@ import Time "mo:base/Time";
 import Timer "mo:base/Timer";
 import Principal "mo:base/Principal";
 import T "./ns_types";
+import NNSTypes "./nns_types";
 import Map "mo:map/Map";
 import calcHelp "./VPcalculation";
 import Vector "mo:vector";
@@ -51,6 +52,9 @@ shared deployer actor class neuronSnapshot() = this {
 
   // NNS Governance Canister ID (mainnet)
   let nns_governance_canister_id = Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai");
+  
+  // TACO DAO Neuron ID for NNS voting (TODO: Set actual neuron ID)
+  let taco_dao_neuron_id : NNSTypes.NeuronId = { id = 1833423628191905776 }; // TACO DAO Named Neuron ID
 
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
@@ -1446,6 +1450,101 @@ shared deployer actor class neuronSnapshot() = this {
     Map.set(daoVotedNNSProposals, n64hash, nnsProposalId, true);
     logger.info("DAOVoting", "NNS proposal " # Nat64.toText(nnsProposalId) # " marked as voted by " # Principal.toText(caller), "markNNSProposalAsVoted");
     true;
+  };
+
+  // Vote on NNS proposal based on DAO collective decision
+  public shared ({ caller }) func voteOnNNSProposal(snsProposalId : Nat64) : async Result.Result<{
+    nns_proposal_id : Nat64;
+    dao_decision : Text; // "Adopt" or "Reject"
+    adopt_vp : Nat;
+    reject_vp : Nat;
+    total_vp : Nat;
+  }, Text> {
+    // Authorization check
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal)) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to vote on NNS proposal: " # Principal.toText(caller), "voteOnNNSProposal");
+      return #err("Unauthorized: Only admins can trigger NNS voting");
+    };
+
+    logger.info("DAOVoting", "Starting NNS vote for SNS proposal " # Nat64.toText(snsProposalId) # " by " # Principal.toText(caller), "voteOnNNSProposal");
+
+    // Find the corresponding NNS proposal ID
+    let nnsProposalId = switch (findNNSProposalForSNS(snsProposalId)) {
+      case (null) {
+        logger.warn("DAOVoting", "SNS proposal " # Nat64.toText(snsProposalId) # " not found in copied proposals", "voteOnNNSProposal");
+        return #err("SNS proposal not found in copied proposals list");
+      };
+      case (?id) { id };
+    };
+
+    // Check if DAO has already voted on this NNS proposal
+    switch (Map.get(daoVotedNNSProposals, n64hash, nnsProposalId)) {
+      case (?true) {
+        logger.warn("DAOVoting", "DAO has already voted on NNS proposal " # Nat64.toText(nnsProposalId), "voteOnNNSProposal");
+        return #err("DAO has already voted on this NNS proposal");
+      };
+      case (_) { /* Continue */ };
+    };
+
+    // Get DAO vote tally for this SNS proposal
+    let voteTally = switch (Map.get(daoVotes, n64hash, snsProposalId)) {
+      case (null) {
+        logger.warn("DAOVoting", "No DAO votes found for SNS proposal " # Nat64.toText(snsProposalId), "voteOnNNSProposal");
+        return #err("No DAO votes found for this proposal");
+      };
+      case (?proposalVotes) {
+        var adoptVP : Nat = 0;
+        var rejectVP : Nat = 0;
+
+        for ((neuronId, vote) in Map.entries(proposalVotes)) {
+          switch (vote.decision) {
+            case (#Adopt) { adoptVP += vote.voting_power };
+            case (#Reject) { rejectVP += vote.voting_power };
+          };
+        };
+
+        { adopt_vp = adoptVP; reject_vp = rejectVP; total_vp = adoptVP + rejectVP };
+      };
+    };
+
+    // Determine DAO decision based on voting power
+    if (voteTally.total_vp == 0) {
+      logger.warn("DAOVoting", "No voting power found in DAO votes for SNS proposal " # Nat64.toText(snsProposalId), "voteOnNNSProposal");
+      return #err("No voting power in DAO votes");
+    };
+
+    let daoDecision = if (voteTally.adopt_vp > voteTally.reject_vp) { "Adopt" } else { "Reject" };
+    let nnsVote : Int32 = if (voteTally.adopt_vp > voteTally.reject_vp) { 1 } else { 2 }; // 1 = Yes, 2 = No
+
+    logger.info("DAOVoting", "DAO decision for NNS proposal " # Nat64.toText(nnsProposalId) # ": " # daoDecision # " (Adopt: " # Nat.toText(voteTally.adopt_vp) # " VP, Reject: " # Nat.toText(voteTally.reject_vp) # " VP)", "voteOnNNSProposal");
+
+    // Vote on the NNS proposal
+    try {
+      let voteResult = await NNSPropCopy.voteOnNNSProposal(nnsProposalId, nnsVote, nns_governance_canister_id, taco_dao_neuron_id, logger);
+      switch (voteResult) {
+        case (#ok(_)) {
+          // Mark this NNS proposal as voted
+          Map.set(daoVotedNNSProposals, n64hash, nnsProposalId, true);
+          
+          logger.info("DAOVoting", "Successfully voted " # daoDecision # " on NNS proposal " # Nat64.toText(nnsProposalId), "voteOnNNSProposal");
+          
+          #ok({
+            nns_proposal_id = nnsProposalId;
+            dao_decision = daoDecision;
+            adopt_vp = voteTally.adopt_vp;
+            reject_vp = voteTally.reject_vp;
+            total_vp = voteTally.total_vp;
+          });
+        };
+        case (#err(error)) {
+          logger.error("DAOVoting", "Failed to vote on NNS proposal " # Nat64.toText(nnsProposalId) # ": " # debug_show(error), "voteOnNNSProposal");
+          #err("Failed to vote on NNS proposal: " # debug_show(error));
+        };
+      };
+    } catch (error) {
+      logger.error("DAOVoting", "Exception while voting on NNS proposal " # Nat64.toText(nnsProposalId) # ": " # Error.message(error), "voteOnNNSProposal");
+      #err("Exception while voting on NNS proposal: " # Error.message(error));
+    };
   };
 
   // Clear all DAO votes for a specific SNS proposal (admin only)
