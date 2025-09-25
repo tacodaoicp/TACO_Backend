@@ -870,26 +870,6 @@ shared deployer actor class neuronSnapshot() = this {
     ];
   };
 
-  // Test function to demonstrate topic filtering for NNS proposals
-  public query func testTopicFiltering() : async [(Int32, Text, Bool)] {
-    [
-      (0, NNSPropCopy.getTopicName(0), NNSPropCopy.shouldCopyTopic(0)),
-      (1, NNSPropCopy.getTopicName(1), NNSPropCopy.shouldCopyTopic(1)),
-      (2, NNSPropCopy.getTopicName(2), NNSPropCopy.shouldCopyTopic(2)),
-      (3, NNSPropCopy.getTopicName(3), NNSPropCopy.shouldCopyTopic(3)),
-      (4, NNSPropCopy.getTopicName(4), NNSPropCopy.shouldCopyTopic(4)),
-      (5, NNSPropCopy.getTopicName(5), NNSPropCopy.shouldCopyTopic(5)), // Node Admin - should copy
-      (6, NNSPropCopy.getTopicName(6), NNSPropCopy.shouldCopyTopic(6)), // Participant Management - should copy
-      (7, NNSPropCopy.getTopicName(7), NNSPropCopy.shouldCopyTopic(7)),
-      (8, NNSPropCopy.getTopicName(8), NNSPropCopy.shouldCopyTopic(8)),
-      (9, NNSPropCopy.getTopicName(9), NNSPropCopy.shouldCopyTopic(9)),
-      (10, NNSPropCopy.getTopicName(10), NNSPropCopy.shouldCopyTopic(10)), // Node Provider Rewards - should copy
-      (11, NNSPropCopy.getTopicName(11), NNSPropCopy.shouldCopyTopic(11)),
-      (12, NNSPropCopy.getTopicName(12), NNSPropCopy.shouldCopyTopic(12)),
-      (13, NNSPropCopy.getTopicName(13), NNSPropCopy.shouldCopyTopic(13)),
-      (14, NNSPropCopy.getTopicName(14), NNSPropCopy.shouldCopyTopic(14)) // SNS & Neurons' Fund - should copy
-    ];
-  };
 
   // Get full SNS proposal details
   public shared ({ caller }) func getSNSProposal(

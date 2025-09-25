@@ -91,13 +91,13 @@ module {
   public type ShouldCopyProposalResult = Result.Result<Bool, CopyNNSProposalError>;
 
   // NNS Governance Topic IDs that should be copied to SNS
-  // Based on common NNS governance topic classifications
+  // Based on the official Topic enum from governance.proto
   // Reference: https://github.com/dfinity/ic/blob/b716b47d017d2384a1860bf5e569d66e8072e94d/rs/nns/governance/proto/ic_nns_governance/pb/v1/governance.proto#L41
   private let TOPICS_TO_COPY : [Int32] = [
-    5,  // Node Admin  
-    6,  // Participant Management
-    10,  // Node Provider Rewards
-    14,  // SNS & Neurons' Fund
+    5,  // TOPIC_NODE_ADMIN - Node Admin
+    6,  // TOPIC_PARTICIPANT_MANAGEMENT - Participant Management  
+    10, // TOPIC_NODE_PROVIDER_REWARDS - Node Provider Rewards
+    14, // TOPIC_SNS_AND_COMMUNITY_FUND - SNS & Community Fund
   ];
 
   // NNS Governance canister actor type
@@ -242,24 +242,26 @@ module {
   };
 
   // Helper function to get topic name from topic ID
+  // Based on the official Topic enum from governance.proto
   // Reference: https://github.com/dfinity/ic/blob/b716b47d017d2384a1860bf5e569d66e8072e94d/rs/nns/governance/proto/ic_nns_governance/pb/v1/governance.proto#L41
   public func getTopicName(topicId : Int32) : Text {
     switch (topicId) {
-      case (0) { "Unspecified" };
-      case (1) { "Neuron Management" };
-      case (2) { "Exchange Rate" };
-      case (3) { "Network Economics" };
-      case (4) { "Governance" };
-      case (5) { "Node Admin" };
-      case (6) { "Participant Management" };
-      case (7) { "Subnet Management" };
-      case (8) { "Network Canister Management" };
-      case (9) { "KYC" };
-      case (10) { "Node Provider Rewards" };
-      case (11) { "Motion" };
-      case (12) { "API Boundary Node Administration" };
-      case (13) { "Subnet Rental" };
-      case (14) { "SNS & Neurons' Fund" };
+      case (0) { "Unspecified" }; // TOPIC_UNSPECIFIED
+      case (1) { "Neuron Management" }; // TOPIC_NEURON_MANAGEMENT
+      case (2) { "Exchange Rate" }; // TOPIC_EXCHANGE_RATE
+      case (3) { "Network Economics" }; // TOPIC_NETWORK_ECONOMICS
+      case (4) { "Governance" }; // TOPIC_GOVERNANCE
+      case (5) { "Node Admin" }; // TOPIC_NODE_ADMIN
+      case (6) { "Participant Management" }; // TOPIC_PARTICIPANT_MANAGEMENT
+      case (7) { "Subnet Management" }; // TOPIC_SUBNET_MANAGEMENT
+      case (8) { "Network Canister Management" }; // TOPIC_NETWORK_CANISTER_MANAGEMENT
+      case (9) { "KYC" }; // TOPIC_KYC
+      case (10) { "Node Provider Rewards" }; // TOPIC_NODE_PROVIDER_REWARDS
+      case (11) { "SNS Decentralization Sale (Deprecated)" }; // TOPIC_SNS_DECENTRALIZATION_SALE (superseded)
+      case (12) { "Subnet Replica Version Management" }; // TOPIC_SUBNET_REPLICA_VERSION_MANAGEMENT
+      case (13) { "Replica Version Management" }; // TOPIC_REPLICA_VERSION_MANAGEMENT
+      case (14) { "SNS & Community Fund" }; // TOPIC_SNS_AND_COMMUNITY_FUND
+      case (15) { "API Boundary Node Management" }; // TOPIC_API_BOUNDARY_NODE_MANAGEMENT
       case (_) { "Unknown Topic (" # Int32.toText(topicId) # ")" };
     };
   };
