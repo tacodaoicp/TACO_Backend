@@ -1063,6 +1063,21 @@ shared deployer actor class neuronSnapshot() = this {
     logger.info("NNSPropCopy", "Highest processed NNS proposal ID updated from " # Nat64.toText(oldId) # " to " # Nat64.toText(proposalId) # " by " # Principal.toText(caller), "setHighestProcessedNNSProposalId");
   };
 
+  // Clear all copied NNS proposals (admin only)
+  public shared ({ caller }) func clearCopiedNNSProposals() : async Nat {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller trying to clear copied proposals: " # Principal.toText(caller), "clearCopiedNNSProposals");
+      return 0;
+    };
+
+    let countBeforeClear = Map.size(copiedNNSProposals);
+    copiedNNSProposals := Map.new<Nat64, Nat64>();
+    
+    logger.info("NNSPropCopy", "Cleared " # Nat.toText(countBeforeClear) # " copied NNS proposals by " # Principal.toText(caller), "clearCopiedNNSProposals");
+    
+    countBeforeClear;
+  };
+
 /* NB: Turn on again after initial setup
   system func inspect({
     arg : Blob;
