@@ -242,20 +242,24 @@ module {
   };
 
   // Helper function to get topic name from topic ID
+  // Reference: https://github.com/dfinity/ic/blob/b716b47d017d2384a1860bf5e569d66e8072e94d/rs/nns/governance/proto/ic_nns_governance/pb/v1/governance.proto#L41
   public func getTopicName(topicId : Int32) : Text {
     switch (topicId) {
       case (0) { "Unspecified" };
       case (1) { "Neuron Management" };
       case (2) { "Exchange Rate" };
       case (3) { "Network Economics" };
-      case (4) { "SNS & Neurons' Fund" };
+      case (4) { "Governance" };
       case (5) { "Node Admin" };
-      case (6) { "Node Provider Rewards" };
-      case (7) { "Participant Management" };
-      case (8) { "Subnet Management" };
-      case (9) { "Network Canister Management" };
-      case (10) { "KYC" };
+      case (6) { "Participant Management" };
+      case (7) { "Subnet Management" };
+      case (8) { "Network Canister Management" };
+      case (9) { "KYC" };
+      case (10) { "Node Provider Rewards" };
       case (11) { "Motion" };
+      case (12) { "API Boundary Node Administration" };
+      case (13) { "Subnet Rental" };
+      case (14) { "SNS & Neurons' Fund" };
       case (_) { "Unknown Topic (" # Int32.toText(topicId) # ")" };
     };
   };
@@ -354,6 +358,27 @@ module {
           return #err(#NNSProposalNotFound);
         };
         case (?nnsProposal) {
+          // First check if this proposal topic should be copied
+          let topicId = nnsProposal.topic;
+          let topicName = getTopicName(topicId);
+          
+          if (not shouldCopyTopic(topicId)) {
+            logger.warn(
+              "NNSPropCopy", 
+              "Refusing to copy NNS proposal " # Nat64.toText(nnsProposalId) # 
+              " - topic '" # topicName # "' (ID: " # Int32.toText(topicId) # ") is not in copy list",
+              "copyNNSProposal"
+            );
+            return #err(#InvalidProposalData("Proposal topic '" # topicName # "' should not be copied to SNS"));
+          };
+          
+          logger.info(
+            "NNSPropCopy",
+            "Topic check passed for NNS proposal " # Nat64.toText(nnsProposalId) # 
+            " - topic '" # topicName # "' (ID: " # Int32.toText(topicId) # ") is approved for copying",
+            "copyNNSProposal"
+          );
+
           // Extract proposal details
           let proposalAction = switch (nnsProposal.proposal) {
             case (null) { null };
