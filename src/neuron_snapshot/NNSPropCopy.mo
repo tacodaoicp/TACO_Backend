@@ -101,6 +101,7 @@ module {
     new_copied_count : Nat;
     already_copied_count : Nat;
     skipped_count : Nat;
+    error_count : Nat;
     highest_processed_id : Nat64;
     newly_copied_proposals : [(Nat64, Nat64)]; // (NNS Proposal ID, SNS Proposal ID)
   }, CopyNNSProposalError>;
@@ -694,6 +695,7 @@ module {
       var newCopiedCount : Nat = 0;
       var alreadyCopiedCount : Nat = 0;
       var skippedCount : Nat = 0;
+      var errorCount : Nat = 0;
       var currentProposalId : Nat64 = nextProposalId;
       var highestProcessedId : Nat64 = startFromId;
       let newlyCopiedProposals = Buffer.Buffer<(Nat64, Nat64)>(maxProposals);
@@ -768,7 +770,7 @@ module {
                         "Failed to copy NNS proposal " # Nat64.toText(currentProposalId) # ": " # debug_show(error),
                         "processSequentialNNSProposals"
                       );
-                      skippedCount += 1;
+                      errorCount += 1;
                       // Continue processing other proposals even if one fails
                     };
                   };
@@ -795,6 +797,7 @@ module {
         new_copied_count = newCopiedCount;
         already_copied_count = alreadyCopiedCount;
         skipped_count = skippedCount;
+        error_count = errorCount;
         highest_processed_id = highestProcessedId;
         newly_copied_proposals = Buffer.toArray(newlyCopiedProposals);
       };
@@ -803,7 +806,8 @@ module {
         "NNSPropCopy",
         "Completed sequential processing: " # Nat.toText(processedCount) # " proposals processed, " #
         Nat.toText(newCopiedCount) # " newly copied, " # Nat.toText(alreadyCopiedCount) # 
-        " already copied, " # Nat.toText(skippedCount) # " skipped, highest ID: " # Nat64.toText(highestProcessedId),
+        " already copied, " # Nat.toText(skippedCount) # " skipped, " # Nat.toText(errorCount) # 
+        " errors, highest ID: " # Nat64.toText(highestProcessedId),
         "processSequentialNNSProposals"
       );
 

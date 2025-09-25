@@ -1130,7 +1130,9 @@ shared deployer actor class neuronSnapshot() = this {
           logger.info(
             "NNSPropCopy", 
             "Auto-processing chunk completed: " # Nat.toText(data.processed_count) # " processed, " #
-            Nat.toText(data.new_copied_count) # " copied, highest ID: " # Nat64.toText(data.highest_processed_id),
+            Nat.toText(data.new_copied_count) # " copied, " # Nat.toText(data.already_copied_count) # 
+            " already copied, " # Nat.toText(data.skipped_count) # " skipped, " # Nat.toText(data.error_count) # 
+            " errors, highest ID: " # Nat64.toText(data.highest_processed_id),
             "autoProcessNNSProposalsChunk"
           );
 
