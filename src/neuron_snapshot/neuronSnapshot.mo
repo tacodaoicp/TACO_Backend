@@ -90,6 +90,9 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Track which NNS proposals we have already copied (to avoid duplicates)
   stable var copiedNNSProposals : Map.Map<Nat64, Nat64> = Map.new<Nat64, Nat64>(); // NNS Proposal ID -> SNS Proposal ID
+  
+  // Track highest NNS proposal ID we have processed (not necessarily copied)
+  stable var highestProcessedNNSProposalId : Nat64 = 138609;
 
   // Test mode variables
   stable var test = false;
@@ -964,7 +967,7 @@ shared deployer actor class neuronSnapshot() = this {
   public shared ({ caller }) func processNewestNNSProposals(
     limit : ?Nat32,
     proposerSubaccount : Blob
-  ) : async NNSPropCopy.ProcessNewestProposalsResult {
+  ) : async NNSPropCopy.ProcessSequentialProposalsResult {
     let effectiveLimit = switch (limit) { case (?l) { l }; case (null) { 20 : Nat32 }; };
     logger.info("NNSPropCopy", "Process newest proposals request by " # Principal.toText(caller) # " (limit: " # Nat32.toText(effectiveLimit) # ")", "processNewestNNSProposals");
     
@@ -975,14 +978,28 @@ shared deployer actor class neuronSnapshot() = this {
     };
 
     // Call the NNSPropCopy module function
-    await NNSPropCopy.processNewestNNSProposals(
-      effectiveLimit,
+    let result = await NNSPropCopy.processSequentialNNSProposals(
+      highestProcessedNNSProposalId,
+      Nat32.toNat(effectiveLimit),
       copiedNNSProposals,
       nns_gov_canister,
       sns_gov_canister,
       proposerSubaccount,
       logger
     );
+
+    // Update the stable variable with the highest processed proposal ID
+    switch (result) {
+      case (#ok(data)) {
+        highestProcessedNNSProposalId := data.highest_processed_id;
+        logger.info("NNSPropCopy", "Updated highest processed NNS proposal ID to: " # Nat64.toText(data.highest_processed_id), "processNewestNNSProposals");
+      };
+      case (#err(_)) {
+        // Don't update on error
+      };
+    };
+
+    result;
   };
 
   // Get the count of copied NNS proposals
@@ -1027,6 +1044,23 @@ shared deployer actor class neuronSnapshot() = this {
         logger.warn("NNSPropCopy", "No copied proposal found for NNS ID: " # Nat64.toText(nnsProposalId), "removeCopiedNNSProposal");
       };
     };
+  };
+
+  // Get the current highest processed NNS proposal ID
+  public query func getHighestProcessedNNSProposalId() : async Nat64 {
+    highestProcessedNNSProposalId;
+  };
+
+  // Set the highest processed NNS proposal ID (admin only)
+  public shared ({ caller }) func setHighestProcessedNNSProposalId(proposalId : Nat64) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller trying to set highest processed ID: " # Principal.toText(caller), "setHighestProcessedNNSProposalId");
+      return;
+    };
+
+    let oldId = highestProcessedNNSProposalId;
+    highestProcessedNNSProposalId := proposalId;
+    logger.info("NNSPropCopy", "Highest processed NNS proposal ID updated from " # Nat64.toText(oldId) # " to " # Nat64.toText(proposalId) # " by " # Principal.toText(caller), "setHighestProcessedNNSProposalId");
   };
 
 /* NB: Turn on again after initial setup

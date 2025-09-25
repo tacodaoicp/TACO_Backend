@@ -1,6 +1,6 @@
 import Text "mo:base/Text";
 import Nat "mo:base/Nat";
-import Nat32 "mo:base/Nat32";
+import _Nat32 "mo:base/Nat32";
 import Nat64 "mo:base/Nat64";
 import Int32 "mo:base/Int32";
 import Result "mo:base/Result";
@@ -95,12 +95,13 @@ module {
   // Result type for checking if proposal should be copied
   public type ShouldCopyProposalResult = Result.Result<Bool, CopyNNSProposalError>;
 
-  // Result types for processing newest proposals
-  public type ProcessNewestProposalsResult = Result.Result<{
-    fetched_count : Nat;
+  // Result types for processing sequential proposals
+  public type ProcessSequentialProposalsResult = Result.Result<{
+    processed_count : Nat;
     new_copied_count : Nat;
     already_copied_count : Nat;
     skipped_count : Nat;
+    highest_processed_id : Nat64;
     newly_copied_proposals : [(Nat64, Nat64)]; // (NNS Proposal ID, SNS Proposal ID)
   }, CopyNNSProposalError>;
 
@@ -438,7 +439,8 @@ module {
           logger.info("NNSPropCopy", "Submitting motion proposal to SNS governance", "copyNNSProposal");
           
           if (not test_doSendSNSProp) {
-          Debug.print("manageNeuronRequest: " # debug_show(manageNeuronRequest));
+          //Debug.print("manageNeuronRequest: " # debug_show(manageNeuronRequest));
+          Debug.print("manageNeuronRequest: " # debug_show(nnsProposalId));
           return #err(#NetworkError("TESTING"))
           } else {
           let response = await snsGovernance.manage_neuron(manageNeuronRequest);
@@ -673,71 +675,54 @@ module {
     };
   };
 
-  // Function to process newest NNS proposals and copy relevant ones we haven't copied yet
-  public func processNewestNNSProposals(
-    limit : Nat32,
+  // Function to process NNS proposals sequentially starting from last processed ID + 1
+  public func processSequentialNNSProposals(
+    startFromId : Nat64,
+    maxProposals : Nat,
     copiedProposals : Map.Map<Nat64, Nat64>,
     nnsGovernance : NNSGovernanceActor,
     snsGovernance : SNSGovernanceActor,
     proposerSubaccount : Blob,
     logger : Logger.Logger
-  ) : async ProcessNewestProposalsResult {
+  ) : async ProcessSequentialProposalsResult {
     let { n64hash; phash = _ } = Map;
-    logger.info("NNSPropCopy", "Starting to process " # Nat32.toText(limit) # " newest NNS proposals", "processNewestNNSProposals");
+    let nextProposalId = startFromId + 1;
+    logger.info("NNSPropCopy", "Starting sequential processing from NNS proposal ID " # Nat64.toText(nextProposalId) # " (max " # Nat.toText(maxProposals) # " proposals)", "processSequentialNNSProposals");
 
     try {
-      // Create list of topics we're NOT interested in (for efficiency)
-      let excludeTopics : [Int32] = [
-        0,  // Unspecified
-        1,  // Neuron Management
-        2,  // Exchange Rate
-        3,  // Network Economics
-        4,  // Governance
-        7,  // Subnet Management
-        8,  // Network Canister Management
-        9,  // KYC
-        11, // SNS Decentralization Sale (Deprecated)
-        12, // Subnet Replica Version Management
-        13, // Replica Version Management
-        15, // API Boundary Node Management
-      ];
-
-      // Fetch newest proposals from NNS governance
-      let listRequest : NNSTypes.ListProposalInfo = {
-        include_reward_status = [];
-        omit_large_fields = ?true; // Exclude large fields for efficiency
-        before_proposal = null; // Get newest proposals
-        limit = limit;
-        exclude_topic = excludeTopics; // Exclude topics we're not interested in
-        include_all_manage_neuron_proposals = ?false;
-        include_status = [];
-      };
-
-      let response = await nnsGovernance.list_proposals(listRequest);
-      let proposals = response.proposal_info;
-
-      logger.info("NNSPropCopy", "Fetched " # Nat.toText(proposals.size()) # " newest proposals from NNS governance", "processNewestNNSProposals");
-
+      var processedCount : Nat = 0;
       var newCopiedCount : Nat = 0;
       var alreadyCopiedCount : Nat = 0;
       var skippedCount : Nat = 0;
-      let newlyCopiedProposals = Buffer.Buffer<(Nat64, Nat64)>(10);
+      var currentProposalId : Nat64 = nextProposalId;
+      var highestProcessedId : Nat64 = startFromId;
+      let newlyCopiedProposals = Buffer.Buffer<(Nat64, Nat64)>(maxProposals);
 
-      // Process each proposal (they come in newest-first order)
-      for (proposal in proposals.vals()) {
-        switch (proposal.id) {
+      // Process proposals sequentially until we hit maxProposals or find no more proposals
+      var continueProcessing = true;
+      while (processedCount < maxProposals and continueProcessing) {
+        logger.info("NNSPropCopy", "Checking NNS proposal ID " # Nat64.toText(currentProposalId), "processSequentialNNSProposals");
+        
+        // Try to get this specific proposal
+        let proposalOpt = await nnsGovernance.get_proposal_info(currentProposalId);
+        
+        switch (proposalOpt) {
           case (null) {
-            logger.warn("NNSPropCopy", "Skipping proposal with no ID", "processNewestNNSProposals");
-            skippedCount += 1;
+            logger.info("NNSPropCopy", "No proposal found for ID " # Nat64.toText(currentProposalId) # " - stopping sequential processing", "processSequentialNNSProposals");
+            // No more proposals found, stop processing
+            continueProcessing := false;
           };
-          case (?proposalId) {
-            let nnsProposalId = proposalId.id;
+          case (?proposal) {
+            processedCount += 1;
+            highestProcessedId := currentProposalId;
+            
+            logger.info("NNSPropCopy", "Found NNS proposal " # Nat64.toText(currentProposalId) # " - processing", "processSequentialNNSProposals");
             
             // Check if we've already copied this proposal
-            switch (Map.get(copiedProposals, n64hash, nnsProposalId)) {
+            switch (Map.get(copiedProposals, n64hash, currentProposalId)) {
               case (?snsProposalId) {
                 alreadyCopiedCount += 1;
-                logger.info("NNSPropCopy", "NNS proposal " # Nat64.toText(nnsProposalId) # " already copied to SNS proposal " # Nat64.toText(snsProposalId) # " - skipping", "processNewestNNSProposals");
+                logger.info("NNSPropCopy", "NNS proposal " # Nat64.toText(currentProposalId) # " already copied to SNS proposal " # Nat64.toText(snsProposalId) # " - skipping", "processSequentialNNSProposals");
               };
               case (null) {
                 // Not copied yet, check if we should copy it
@@ -748,14 +733,14 @@ module {
                 if (shouldCopy) {
                   logger.info(
                     "NNSPropCopy",
-                    "NNS proposal " # Nat64.toText(nnsProposalId) # " has copyable topic: " # topicName # 
+                    "NNS proposal " # Nat64.toText(currentProposalId) # " has copyable topic: " # topicName # 
                     " (ID: " # Int32.toText(topicId) # ") and hasn't been copied yet - attempting to copy",
-                    "processNewestNNSProposals"
+                    "processSequentialNNSProposals"
                   );
 
                   // Attempt to copy the proposal
                   let copyResult = await copyNNSProposal(
-                    nnsProposalId,
+                    currentProposalId,
                     nnsGovernance,
                     snsGovernance,
                     proposerSubaccount,
@@ -765,23 +750,23 @@ module {
                   switch (copyResult) {
                     case (#ok(snsProposalId)) {
                       newCopiedCount += 1;
-                      newlyCopiedProposals.add((nnsProposalId, snsProposalId));
+                      newlyCopiedProposals.add((currentProposalId, snsProposalId));
                       
                       // Add to the copied proposals map
-                      Map.set(copiedProposals, n64hash, nnsProposalId, snsProposalId);
+                      Map.set(copiedProposals, n64hash, currentProposalId, snsProposalId);
                       
                       logger.info(
                         "NNSPropCopy",
-                        "Successfully copied NNS proposal " # Nat64.toText(nnsProposalId) # 
+                        "Successfully copied NNS proposal " # Nat64.toText(currentProposalId) # 
                         " to SNS proposal " # Nat64.toText(snsProposalId),
-                        "processNewestNNSProposals"
+                        "processSequentialNNSProposals"
                       );
                     };
                     case (#err(error)) {
                       logger.error(
                         "NNSPropCopy",
-                        "Failed to copy NNS proposal " # Nat64.toText(nnsProposalId) # ": " # debug_show(error),
-                        "processNewestNNSProposals"
+                        "Failed to copy NNS proposal " # Nat64.toText(currentProposalId) # ": " # debug_show(error),
+                        "processSequentialNNSProposals"
                       );
                       skippedCount += 1;
                       // Continue processing other proposals even if one fails
@@ -791,38 +776,42 @@ module {
                   skippedCount += 1;
                   logger.info(
                     "NNSPropCopy",
-                    "NNS proposal " # Nat64.toText(nnsProposalId) # " has non-copyable topic: " # topicName # 
+                    "NNS proposal " # Nat64.toText(currentProposalId) # " has non-copyable topic: " # topicName # 
                     " (ID: " # Int32.toText(topicId) # ") - skipping",
-                    "processNewestNNSProposals"
+                    "processSequentialNNSProposals"
                   );
                 };
               };
             };
+            
+            // Move to next proposal ID
+            currentProposalId += 1;
           };
         };
       };
 
       let result = {
-        fetched_count = proposals.size();
+        processed_count = processedCount;
         new_copied_count = newCopiedCount;
         already_copied_count = alreadyCopiedCount;
         skipped_count = skippedCount;
+        highest_processed_id = highestProcessedId;
         newly_copied_proposals = Buffer.toArray(newlyCopiedProposals);
       };
 
       logger.info(
         "NNSPropCopy",
-        "Completed processing: " # Nat.toText(proposals.size()) # " proposals fetched, " #
+        "Completed sequential processing: " # Nat.toText(processedCount) # " proposals processed, " #
         Nat.toText(newCopiedCount) # " newly copied, " # Nat.toText(alreadyCopiedCount) # 
-        " already copied, " # Nat.toText(skippedCount) # " skipped",
-        "processNewestNNSProposals"
+        " already copied, " # Nat.toText(skippedCount) # " skipped, highest ID: " # Nat64.toText(highestProcessedId),
+        "processSequentialNNSProposals"
       );
 
       return #ok(result);
 
     } catch (error) {
       let errorMsg = "Network error while processing proposals: " # Error.message(error);
-      logger.error("NNSPropCopy", errorMsg, "processNewestNNSProposals");
+      logger.error("NNSPropCopy", errorMsg, "processSequentialNNSProposals");
       return #err(#NetworkError(errorMsg));
     };
   };
