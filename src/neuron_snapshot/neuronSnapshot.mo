@@ -17,6 +17,7 @@ import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import Error "mo:base/Error";
 import Array "mo:base/Array";
+import Result "mo:base/Result";
 import CanisterIds "../helper/CanisterIds";
 import NNSPropCopy "./NNSPropCopy";
 
@@ -869,6 +870,24 @@ shared deployer actor class neuronSnapshot() = this {
     ];
   };
 
+  // Test function to demonstrate topic filtering for NNS proposals
+  public query func testTopicFiltering() : async [(Int32, Text, Bool)] {
+    [
+      (0, NNSPropCopy.getTopicName(0), NNSPropCopy.shouldCopyTopic(0)),
+      (1, NNSPropCopy.getTopicName(1), NNSPropCopy.shouldCopyTopic(1)),
+      (2, NNSPropCopy.getTopicName(2), NNSPropCopy.shouldCopyTopic(2)),
+      (3, NNSPropCopy.getTopicName(3), NNSPropCopy.shouldCopyTopic(3)),
+      (4, NNSPropCopy.getTopicName(4), NNSPropCopy.shouldCopyTopic(4)), // SNS & Neurons' Fund - should copy
+      (5, NNSPropCopy.getTopicName(5), NNSPropCopy.shouldCopyTopic(5)), // Node Admin - should copy
+      (6, NNSPropCopy.getTopicName(6), NNSPropCopy.shouldCopyTopic(6)), // Node Provider Rewards - should copy
+      (7, NNSPropCopy.getTopicName(7), NNSPropCopy.shouldCopyTopic(7)), // Participant Management - should copy
+      (8, NNSPropCopy.getTopicName(8), NNSPropCopy.shouldCopyTopic(8)),
+      (9, NNSPropCopy.getTopicName(9), NNSPropCopy.shouldCopyTopic(9)),
+      (10, NNSPropCopy.getTopicName(10), NNSPropCopy.shouldCopyTopic(10)),
+      (11, NNSPropCopy.getTopicName(11), NNSPropCopy.shouldCopyTopic(11))
+    ];
+  };
+
   // Get full SNS proposal details
   public shared ({ caller }) func getSNSProposal(
     proposalId : Nat64
@@ -905,6 +924,52 @@ shared deployer actor class neuronSnapshot() = this {
     await NNSPropCopy.getSNSProposalSummary(
       proposalId,
       sns_gov_canister,
+      logger
+    );
+  };
+
+  // Check if an NNS proposal should be copied based on its topic
+  public shared ({ caller }) func shouldCopyNNSProposal(
+    nnsProposalId : Nat64
+  ) : async NNSPropCopy.ShouldCopyProposalResult {
+    logger.info("NNSPropCopy", "Should copy check request by " # Principal.toText(caller) # " for NNS proposal: " # Nat64.toText(nnsProposalId), "shouldCopyNNSProposal");
+    
+    // Authorization check - only master admin, controllers, DAO backend, or SNS governance can call this
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller: " # Principal.toText(caller), "shouldCopyNNSProposal");
+      return #err(#UnauthorizedCaller);
+    };
+
+    // Call the NNSPropCopy module function
+    await NNSPropCopy.shouldCopyNNSProposal(
+      nnsProposalId,
+      nns_gov_canister,
+      logger
+    );
+  };
+
+  // Get detailed information about whether an NNS proposal should be copied
+  public shared ({ caller }) func getNNSProposalCopyInfo(
+    nnsProposalId : Nat64
+  ) : async Result.Result<{
+    proposal_id : Nat64;
+    topic_id : Int32;
+    topic_name : Text;
+    should_copy : Bool;
+    reason : Text;
+  }, NNSPropCopy.CopyNNSProposalError> {
+    logger.info("NNSPropCopy", "Copy info request by " # Principal.toText(caller) # " for NNS proposal: " # Nat64.toText(nnsProposalId), "getNNSProposalCopyInfo");
+    
+    // Authorization check - only master admin, controllers, DAO backend, or SNS governance can call this
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("NNSPropCopy", "Unauthorized caller: " # Principal.toText(caller), "getNNSProposalCopyInfo");
+      return #err(#UnauthorizedCaller);
+    };
+
+    // Call the NNSPropCopy module function
+    await NNSPropCopy.getNNSProposalCopyInfo(
+      nnsProposalId,
+      nns_gov_canister,
       logger
     );
   };

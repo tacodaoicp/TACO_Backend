@@ -87,6 +87,19 @@ module {
     #InvalidProposalData : Text;
   };
 
+  // Result type for checking if proposal should be copied
+  public type ShouldCopyProposalResult = Result.Result<Bool, CopyNNSProposalError>;
+
+  // NNS Governance Topic IDs that should be copied to SNS
+  // Based on common NNS governance topic classifications
+  // Reference: https://github.com/dfinity/ic/blob/b716b47d017d2384a1860bf5e569d66e8072e94d/rs/nns/governance/proto/ic_nns_governance/pb/v1/governance.proto#L41
+  private let TOPICS_TO_COPY : [Int32] = [
+    5,  // Node Admin  
+    6,  // Participant Management
+    10,  // Node Provider Rewards
+    14,  // SNS & Neurons' Fund
+  ];
+
   // NNS Governance canister actor type
   public type NNSGovernanceActor = actor {
     get_proposal_info : shared query (Nat64) -> async ?NNSTypes.ProposalInfo;
@@ -226,6 +239,35 @@ module {
   // Helper function to generate NNS proposal link
   public func generateNNSProposalLink(proposalId : Nat64) : Text {
     "https://nns.ic0.app/proposal/?u=qoctq-giaaa-aaaaa-aaaea-cai&proposal=" # Nat64.toText(proposalId);
+  };
+
+  // Helper function to get topic name from topic ID
+  public func getTopicName(topicId : Int32) : Text {
+    switch (topicId) {
+      case (0) { "Unspecified" };
+      case (1) { "Neuron Management" };
+      case (2) { "Exchange Rate" };
+      case (3) { "Network Economics" };
+      case (4) { "SNS & Neurons' Fund" };
+      case (5) { "Node Admin" };
+      case (6) { "Node Provider Rewards" };
+      case (7) { "Participant Management" };
+      case (8) { "Subnet Management" };
+      case (9) { "Network Canister Management" };
+      case (10) { "KYC" };
+      case (11) { "Motion" };
+      case (_) { "Unknown Topic (" # Int32.toText(topicId) # ")" };
+    };
+  };
+
+  // Helper function to check if a topic should be copied
+  public func shouldCopyTopic(topicId : Int32) : Bool {
+    for (copyTopicId in TOPICS_TO_COPY.vals()) {
+      if (topicId == copyTopicId) {
+        return true;
+      };
+    };
+    false;
   };
 
   // Test function to verify template formatting
@@ -495,6 +537,98 @@ module {
         logger.info("SNSProposal", "Successfully created summary for proposal " # Nat64.toText(proposalId), "getSNSProposalSummary");
         return #ok(summary);
       };
+    };
+  };
+
+  // Function to check if an NNS proposal should be copied based on topic
+  public func shouldCopyNNSProposal(
+    nnsProposalId : Nat64,
+    nnsGovernance : NNSGovernanceActor,
+    logger : Logger.Logger
+  ) : async ShouldCopyProposalResult {
+    logger.info("NNSPropCopy", "Checking if NNS proposal " # Nat64.toText(nnsProposalId) # " should be copied", "shouldCopyNNSProposal");
+
+    try {
+      // Fetch the NNS proposal
+      let nnsProposalOpt = await nnsGovernance.get_proposal_info(nnsProposalId);
+      
+      switch (nnsProposalOpt) {
+        case (null) {
+          logger.warn("NNSPropCopy", "NNS proposal not found: " # Nat64.toText(nnsProposalId), "shouldCopyNNSProposal");
+          return #err(#NNSProposalNotFound);
+        };
+        case (?nnsProposal) {
+          let topicId = nnsProposal.topic;
+          let topicName = getTopicName(topicId);
+          let shouldCopy = shouldCopyTopic(topicId);
+          
+          logger.info(
+            "NNSPropCopy", 
+            "NNS proposal " # Nat64.toText(nnsProposalId) # " has topic: " # topicName # 
+            " (ID: " # Int32.toText(topicId) # "), should copy: " # (if shouldCopy "yes" else "no"),
+            "shouldCopyNNSProposal"
+          );
+          
+          return #ok(shouldCopy);
+        };
+      };
+    } catch (error) {
+      let errorMsg = "Network error while checking proposal: " # Error.message(error);
+      logger.error("NNSPropCopy", errorMsg, "shouldCopyNNSProposal");
+      return #err(#NetworkError(errorMsg));
+    };
+  };
+
+  // Function to get detailed information about whether a proposal should be copied
+  public func getNNSProposalCopyInfo(
+    nnsProposalId : Nat64,
+    nnsGovernance : NNSGovernanceActor,
+    logger : Logger.Logger
+  ) : async Result.Result<{
+    proposal_id : Nat64;
+    topic_id : Int32;
+    topic_name : Text;
+    should_copy : Bool;
+    reason : Text;
+  }, CopyNNSProposalError> {
+    logger.info("NNSPropCopy", "Getting copy info for NNS proposal " # Nat64.toText(nnsProposalId), "getNNSProposalCopyInfo");
+
+    try {
+      // Fetch the NNS proposal
+      let nnsProposalOpt = await nnsGovernance.get_proposal_info(nnsProposalId);
+      
+      switch (nnsProposalOpt) {
+        case (null) {
+          logger.warn("NNSPropCopy", "NNS proposal not found: " # Nat64.toText(nnsProposalId), "getNNSProposalCopyInfo");
+          return #err(#NNSProposalNotFound);
+        };
+        case (?nnsProposal) {
+          let topicId = nnsProposal.topic;
+          let topicName = getTopicName(topicId);
+          let shouldCopy = shouldCopyTopic(topicId);
+          
+          let reason = if (shouldCopy) {
+            "Topic '" # topicName # "' is in the list of topics to copy to SNS";
+          } else {
+            "Topic '" # topicName # "' is not in the list of topics to copy to SNS";
+          };
+          
+          let info = {
+            proposal_id = nnsProposalId;
+            topic_id = topicId;
+            topic_name = topicName;
+            should_copy = shouldCopy;
+            reason = reason;
+          };
+          
+          logger.info("NNSPropCopy", "Copy info generated for proposal " # Nat64.toText(nnsProposalId), "getNNSProposalCopyInfo");
+          return #ok(info);
+        };
+      };
+    } catch (error) {
+      let errorMsg = "Network error while getting copy info: " # Error.message(error);
+      logger.error("NNSPropCopy", errorMsg, "getNNSProposalCopyInfo");
+      return #err(#NetworkError(errorMsg));
     };
   };
 }
