@@ -1,4 +1,35 @@
 export const idlFactory = ({ IDL }) => {
+  const Result_3 = IDL.Variant({
+    'ok' : IDL.Record({
+      'votes_successful' : IDL.Nat,
+      'results' : IDL.Vec(
+        IDL.Record({
+          'nns_proposal_id' : IDL.Nat64,
+          'vote_result' : IDL.Variant({
+            'error' : IDL.Text,
+            'already_voted' : IDL.Text,
+            'success' : IDL.Record({
+              'adopt_vp' : IDL.Nat,
+              'dao_decision' : IDL.Text,
+              'reject_vp' : IDL.Nat,
+              'total_vp' : IDL.Nat,
+            }),
+            'no_dao_votes' : IDL.Text,
+          }),
+          'time_remaining_seconds' : IDL.Opt(IDL.Int64),
+          'sns_proposal_id' : IDL.Nat64,
+        })
+      ),
+      'votes_no_dao_votes' : IDL.Nat,
+      'total_proposals_checked' : IDL.Nat,
+      'urgent_proposals_found' : IDL.Nat,
+      'votes_failed' : IDL.Nat,
+      'max_proposals_limit' : IDL.Nat,
+      'votes_already_voted' : IDL.Nat,
+      'votes_attempted' : IDL.Nat,
+    }),
+    'err' : IDL.Text,
+  });
   const SnapshotId = IDL.Nat;
   const CancelNeuronSnapshotError = IDL.Variant({
     'NotTakingSnapshot' : IDL.Null,
@@ -26,11 +57,20 @@ export const idlFactory = ({ IDL }) => {
     'total_staked_vp_by_hotkey_setters' : IDL.Nat,
     'total_staked_vp' : IDL.Nat,
   });
+  const Timestamp = IDL.Nat64;
+  const DAONNSVoteRecord = IDL.Record({
+    'nns_proposal_id' : IDL.Nat64,
+    'adopt_vp' : IDL.Nat,
+    'dao_decision' : IDL.Text,
+    'reject_vp' : IDL.Nat,
+    'total_vp' : IDL.Nat,
+    'vote_timestamp' : Timestamp,
+    'voted_by_principal' : IDL.Principal,
+  });
   const DAOVoteDecision = IDL.Variant({
     'Reject' : IDL.Null,
     'Adopt' : IDL.Null,
   });
-  const Timestamp = IDL.Nat64;
   const DAOVote = IDL.Record({
     'decision' : DAOVoteDecision,
     'voter_principal' : IDL.Principal,
@@ -49,7 +89,7 @@ export const idlFactory = ({ IDL }) => {
     'message' : IDL.Text,
     'timestamp' : IDL.Int,
   });
-  const Result_1 = IDL.Variant({
+  const Result_2 = IDL.Variant({
     'ok' : IDL.Record({
       'should_copy' : IDL.Bool,
       'topic_name' : IDL.Text,
@@ -218,7 +258,7 @@ export const idlFactory = ({ IDL }) => {
     'ok' : IDL.Bool,
     'err' : CopyNNSProposalError,
   });
-  const Result = IDL.Variant({
+  const Result_1 = IDL.Variant({
     'ok' : IDL.Record({
       'skipped_already_voted' : IDL.Nat,
       'skipped_no_access' : IDL.Nat,
@@ -235,17 +275,31 @@ export const idlFactory = ({ IDL }) => {
     'Ok' : SnapshotId,
     'Err' : TakeNeuronSnapshotError,
   });
+  const Result = IDL.Variant({
+    'ok' : IDL.Record({
+      'nns_proposal_id' : IDL.Nat64,
+      'adopt_vp' : IDL.Nat,
+      'dao_decision' : IDL.Text,
+      'reject_vp' : IDL.Nat,
+      'total_vp' : IDL.Nat,
+    }),
+    'err' : IDL.Text,
+  });
   const neuronSnapshot = IDL.Service({
     'addCopiedNNSProposal' : IDL.Func([IDL.Nat64, IDL.Nat64], [], []),
-    'cancel_neuron_snapshot' : IDL.Func([], [CancelNeuronSnapshotResult], []),
-    'clearCopiedNNSProposals' : IDL.Func([], [IDL.Nat], []),
-    'clearDAOVotesForProposal' : IDL.Func([IDL.Nat64], [IDL.Nat], []),
-    'clearLogs' : IDL.Func([], [], []),
-    'copyNNSProposal' : IDL.Func(
-        [IDL.Nat64, IDL.Vec(IDL.Nat8)],
-        [CopyNNSProposalResult],
+    'autoVoteOnProposalsExpiringWithinOneHour' : IDL.Func([], [Result_3], []),
+    'autoVoteOnUrgentProposals' : IDL.Func(
+        [IDL.Nat64, IDL.Nat],
+        [Result_3],
         [],
       ),
+    'cancel_neuron_snapshot' : IDL.Func([], [CancelNeuronSnapshotResult], []),
+    'clearCopiedNNSProposals' : IDL.Func([], [IDL.Nat], []),
+    'clearDAOVotedNNSProposals' : IDL.Func([], [IDL.Nat], []),
+    'clearDAOVotesForProposal' : IDL.Func([IDL.Nat64], [IDL.Nat], []),
+    'clearLogs' : IDL.Func([], [], []),
+    'copyNNSProposal' : IDL.Func([IDL.Nat64], [CopyNNSProposalResult], []),
+    'getAutoVotingThresholdSeconds' : IDL.Func([], [IDL.Nat64], ['query']),
     'getCopiedNNSProposals' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Nat64, IDL.Nat64))],
@@ -255,6 +309,11 @@ export const idlFactory = ({ IDL }) => {
     'getCumulativeValuesAtSnapshot' : IDL.Func(
         [IDL.Opt(SnapshotId)],
         [IDL.Opt(CumulativeVP)],
+        ['query'],
+      ),
+    'getDAOVoteRecord' : IDL.Func(
+        [IDL.Nat64],
+        [IDL.Opt(DAONNSVoteRecord)],
         ['query'],
       ),
     'getDAOVoteTally' : IDL.Func(
@@ -293,7 +352,12 @@ export const idlFactory = ({ IDL }) => {
         ['query'],
       ),
     'getMaxNeuronSnapshots' : IDL.Func([], [IDL.Nat], ['query']),
-    'getNNSProposalCopyInfo' : IDL.Func([IDL.Nat64], [Result_1], []),
+    'getNNSProposalCopyInfo' : IDL.Func([IDL.Nat64], [Result_2], []),
+    'getNNSProposalIdForSNS' : IDL.Func(
+        [IDL.Nat64],
+        [IDL.Opt(IDL.Nat64)],
+        ['query'],
+      ),
     'getNeuronDataForDAO' : IDL.Func(
         [SnapshotId, IDL.Nat, IDL.Nat],
         [
@@ -307,16 +371,63 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getPeriodicTimerIntervalSeconds' : IDL.Func([], [IDL.Nat64], ['query']),
+    'getPeriodicTimerStatus' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'timer_id' : IDL.Opt(IDL.Nat),
+            'last_run_time' : IDL.Opt(IDL.Nat64),
+            'next_run_time' : IDL.Opt(IDL.Nat64),
+            'interval_seconds' : IDL.Nat64,
+            'is_running' : IDL.Bool,
+          }),
+        ],
+        ['query'],
+      ),
+    'getProposerSubaccount' : IDL.Func([], [IDL.Vec(IDL.Nat8)], ['query']),
     'getSNSProposal' : IDL.Func([IDL.Nat64], [GetSNSProposalFullResult], []),
     'getSNSProposalSummary' : IDL.Func(
         [IDL.Nat64],
         [GetSNSProposalSummaryResult],
         [],
       ),
+    'getUrgentVotableProposals' : IDL.Func(
+        [IDL.Nat64],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'is_expired' : IDL.Bool,
+              'nns_proposal_id' : IDL.Nat64,
+              'proposal_timestamp_seconds' : IDL.Opt(IDL.Nat64),
+              'deadline_timestamp_seconds' : IDL.Opt(IDL.Nat64),
+              'time_remaining_seconds' : IDL.Opt(IDL.Int64),
+              'sns_proposal_id' : IDL.Nat64,
+            })
+          ),
+        ],
+        [],
+      ),
     'getVotableProposals' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Nat64, IDL.Nat64))],
         ['query'],
+      ),
+    'getVotableProposalsWithTimeLeft' : IDL.Func(
+        [],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'is_expired' : IDL.Bool,
+              'nns_proposal_id' : IDL.Nat64,
+              'proposal_timestamp_seconds' : IDL.Opt(IDL.Nat64),
+              'deadline_timestamp_seconds' : IDL.Opt(IDL.Nat64),
+              'time_remaining_seconds' : IDL.Opt(IDL.Int64),
+              'sns_proposal_id' : IDL.Nat64,
+            })
+          ),
+        ],
+        [],
       ),
     'get_neuron_snapshot_curr_neuron_id' : IDL.Func(
         [],
@@ -352,6 +463,7 @@ export const idlFactory = ({ IDL }) => {
         ['query'],
       ),
     'isAutoProcessingRunning' : IDL.Func([], [IDL.Bool], ['query']),
+    'isAutoVotingRunning' : IDL.Func([], [IDL.Bool], ['query']),
     'isNNSProposalCopied' : IDL.Func(
         [IDL.Nat64],
         [IDL.Opt(IDL.Nat64)],
@@ -359,14 +471,17 @@ export const idlFactory = ({ IDL }) => {
       ),
     'markNNSProposalAsVoted' : IDL.Func([IDL.Nat64], [IDL.Bool], []),
     'processNewestNNSProposals' : IDL.Func(
-        [IDL.Opt(IDL.Nat32), IDL.Vec(IDL.Nat8)],
+        [IDL.Opt(IDL.Nat32)],
         [ProcessSequentialProposalsResult],
         [],
       ),
     'removeCopiedNNSProposal' : IDL.Func([IDL.Nat64], [], []),
+    'setAutoVotingThresholdSeconds' : IDL.Func([IDL.Nat64], [], []),
     'setHighestProcessedNNSProposalId' : IDL.Func([IDL.Nat64], [], []),
     'setLogAdmin' : IDL.Func([IDL.Principal], [], []),
     'setMaxNeuronSnapshots' : IDL.Func([IDL.Nat], [], []),
+    'setPeriodicTimerIntervalSeconds' : IDL.Func([IDL.Nat64], [], []),
+    'setProposerSubaccount' : IDL.Func([IDL.Vec(IDL.Nat8)], [], []),
     'setSnsGovernanceCanisterId' : IDL.Func([IDL.Principal], [], []),
     'setTest' : IDL.Func([IDL.Bool], [], []),
     'shouldCopyNNSProposal' : IDL.Func(
@@ -374,15 +489,15 @@ export const idlFactory = ({ IDL }) => {
         [ShouldCopyProposalResult],
         [],
       ),
-    'startAutoProcessNNSProposals' : IDL.Func(
-        [IDL.Vec(IDL.Nat8)],
-        [IDL.Bool],
-        [],
-      ),
+    'startAutoProcessNNSProposals' : IDL.Func([], [IDL.Bool], []),
+    'startAutoVoteOnUrgentProposals' : IDL.Func([], [IDL.Bool], []),
+    'startPeriodicTimer' : IDL.Func([], [IDL.Bool], []),
     'stopAutoProcessNNSProposals' : IDL.Func([], [IDL.Bool], []),
+    'stopAutoVoteOnUrgentProposals' : IDL.Func([], [IDL.Bool], []),
+    'stopPeriodicTimer' : IDL.Func([], [IDL.Bool], []),
     'submitDAOVotes' : IDL.Func(
         [IDL.Nat64, IDL.Vec(IDL.Vec(IDL.Nat8)), DAOVoteDecision],
-        [Result],
+        [Result_1],
         [],
       ),
     'take_neuron_snapshot' : IDL.Func([], [TakeNeuronSnapshotResult], []),
@@ -392,6 +507,7 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(IDL.Tuple(IDL.Text, VotingStatus))],
         ['query'],
       ),
+    'voteOnNNSProposal' : IDL.Func([IDL.Nat64], [Result], []),
   });
   return neuronSnapshot;
 };

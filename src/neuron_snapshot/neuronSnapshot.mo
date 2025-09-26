@@ -55,8 +55,6 @@ shared deployer actor class neuronSnapshot() = this {
   // NNS Governance Canister ID (mainnet)
   let nns_governance_canister_id = Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai");
   
-  // TACO DAO Neuron ID for NNS voting (TODO: Set actual neuron ID)
-  let taco_dao_neuron_id : NNSTypes.NeuronId = { id = 1833423628191905776 }; // TACO DAO Named Neuron ID
 
   let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
@@ -73,6 +71,14 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Non-stable periodic timer ID (reset after upgrades)
   var periodicTimerId : ?Nat = null;
+
+  
+  // Proposer subaccount for NNS proposal copying
+  stable var proposerSubaccount : Blob = Blob.fromArray([]); // Default to empty subaccount
+
+  // TACO DAO Neuron ID for NNS voting
+  let taco_dao_neuron_id : NNSTypes.NeuronId = { id = 1833423628191905776 }; // TACO DAO Named Neuron ID
+
 
   stable var neuron_snapshots : List.List<T.NeuronSnapshot> = List.nil();
 
@@ -872,8 +878,7 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Copy an NNS proposal to create an SNS motion proposal
   public shared ({ caller }) func copyNNSProposal(
-    nnsProposalId : Nat64,
-    proposerSubaccount : Blob
+    nnsProposalId : Nat64
   ) : async NNSPropCopy.CopyNNSProposalResult {
     logger.info("NNSPropCopy", "Copy NNS proposal request by " # Principal.toText(caller), "copyNNSProposal");
     
@@ -883,7 +888,7 @@ shared deployer actor class neuronSnapshot() = this {
       return #err(#UnauthorizedCaller);
     };
 
-    // Call the NNSPropCopy module function
+    // Call the NNSPropCopy module function using the stable proposer subaccount
     await NNSPropCopy.copyNNSProposal(
       nnsProposalId,
       nns_gov_canister,
@@ -998,8 +1003,7 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Process newest NNS proposals and automatically copy relevant ones we haven't copied yet
   public shared ({ caller }) func processNewestNNSProposals(
-    limit : ?Nat32,
-    proposerSubaccount : Blob
+    limit : ?Nat32
   ) : async NNSPropCopy.ProcessSequentialProposalsResult {
     let effectiveLimit = switch (limit) { case (?l) { l }; case (null) { 20 : Nat32 }; };
     logger.info("NNSPropCopy", "Process newest proposals request by " # Principal.toText(caller) # " (limit: " # Nat32.toText(effectiveLimit) # ")", "processNewestNNSProposals");
@@ -1010,7 +1014,7 @@ shared deployer actor class neuronSnapshot() = this {
       return #err(#UnauthorizedCaller);
     };
 
-    // Call the NNSPropCopy module function
+    // Call the NNSPropCopy module function using the stable proposer subaccount
     let result = await NNSPropCopy.processSequentialNNSProposals(
       highestProcessedNNSProposalId,
       Nat32.toNat(effectiveLimit),
@@ -1112,7 +1116,7 @@ shared deployer actor class neuronSnapshot() = this {
   };
 
   // Start auto-processing all new NNS proposals in 10-proposal chunks (admin only)
-  public shared ({ caller }) func startAutoProcessNNSProposals(proposerSubaccount : Blob) : async Bool {
+  public shared ({ caller }) func startAutoProcessNNSProposals() : async Bool {
     if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
       logger.warn("NNSPropCopy", "Unauthorized caller trying to start auto-processing: " # Principal.toText(caller), "startAutoProcessNNSProposals");
       return false;
@@ -1126,14 +1130,14 @@ shared deployer actor class neuronSnapshot() = this {
     isAutoProcessingNNSProposals := true;
     logger.info("NNSPropCopy", "Starting auto-processing of NNS proposals by " # Principal.toText(caller), "startAutoProcessNNSProposals");
     
-    // Start the recursive processing
-    await autoProcessNNSProposalsChunk(proposerSubaccount);
+    // Start the recursive processing using the stable proposer subaccount
+    await autoProcessNNSProposalsChunk();
     
     true;
   };
 
   // Internal recursive method to process proposals in chunks
-  private func autoProcessNNSProposalsChunk(proposerSubaccount : Blob) : async () {
+  private func autoProcessNNSProposalsChunk() : async () {
     if (not isAutoProcessingNNSProposals) {
       logger.info("NNSPropCopy", "Auto-processing stopped via emergency stop", "autoProcessNNSProposalsChunk");
       return;
@@ -1142,7 +1146,7 @@ shared deployer actor class neuronSnapshot() = this {
     logger.info("NNSPropCopy", "Processing chunk of up to 10 NNS proposals (starting from ID: " # Nat64.toText(highestProcessedNNSProposalId) # ")", "autoProcessNNSProposalsChunk");
 
     try {
-      // Process up to 10 proposals
+      // Process up to 10 proposals using the stable proposer subaccount
       let result = await NNSPropCopy.processSequentialNNSProposals(
         highestProcessedNNSProposalId,
         10, // Fixed chunk size of 10
@@ -1172,7 +1176,7 @@ shared deployer actor class neuronSnapshot() = this {
             
             // Schedule next chunk via 0-second timer to avoid instruction limit
             let timerId = Timer.setTimer<system>(#seconds(0), func() : async () {
-              await autoProcessNNSProposalsChunk(proposerSubaccount);
+              await autoProcessNNSProposalsChunk();
             });
             
             ignore timerId; // We don't need to track the timer ID
@@ -1249,7 +1253,7 @@ shared deployer actor class neuronSnapshot() = this {
 
     try {
       // Process up to 3 urgent proposals with configurable threshold
-      let result = await autoVoteOnUrgentProposals(autoVotingThresholdSeconds, 3);
+      let result = await autoVoteOnUrgentProposals(autoVotingThresholdSeconds, 1);
       
       switch (result) {
         case (#ok(data)) {
@@ -1376,6 +1380,22 @@ shared deployer actor class neuronSnapshot() = this {
     logger.info("PeriodicTimer", "Periodic timer interval updated from " # Nat64.toText(oldInterval) # "s to " # Nat64.toText(intervalSeconds) # "s by " # Principal.toText(caller), "setPeriodicTimerIntervalSeconds");
   };
 
+  // Get the current proposer subaccount
+  public query func getProposerSubaccount() : async Blob {
+    proposerSubaccount;
+  };
+
+  // Set the proposer subaccount (admin only)
+  public shared ({ caller }) func setProposerSubaccount(subaccount : Blob) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("Config", "Unauthorized caller trying to set proposer subaccount: " # Principal.toText(caller), "setProposerSubaccount");
+      return;
+    };
+
+    proposerSubaccount := subaccount;
+    logger.info("Config", "Proposer subaccount updated by " # Principal.toText(caller), "setProposerSubaccount");
+  };
+
   // Get periodic timer status information
   public query func getPeriodicTimerStatus() : async {
     is_running : Bool;
@@ -1455,7 +1475,7 @@ shared deployer actor class neuronSnapshot() = this {
     try {
       // 1. Start auto-processing NNS proposals (via 0-second timer)
       let processTimerId = Timer.setTimer<system>(#seconds(0), func() : async () {
-        let _ = await startAutoProcessNNSProposals(Blob.fromArray([])); // Empty subaccount
+        let _ = await startAutoProcessNNSProposals(); // Uses stable proposer subaccount
       });
       ignore processTimerId;
       
