@@ -106,6 +106,9 @@ shared deployer actor class neuronSnapshot() = this {
   // Track auto-voting state to prevent infinite loops and allow emergency stopping
   stable var isAutoVotingOnUrgentProposals : Bool = false;
 
+  // Auto-voting threshold in seconds (default: 2 hours = 7200 seconds)
+  stable var autoVotingThresholdSeconds : Nat64 = 7200;
+
   // DAO Voting System - Track which NNS proposals the DAO has already voted on
   stable var daoVotedNNSProposals : Map.Map<Nat64, Bool> = Map.new<Nat64, Bool>(); // NNS Proposal ID -> true (voted)
   stable var daoVotedNNSProposals2 : Map.Map<Nat64, T.DAONNSVoteRecord> = Map.new<Nat64, T.DAONNSVoteRecord>(); // NNS Proposal ID -> Vote Record
@@ -1232,11 +1235,11 @@ shared deployer actor class neuronSnapshot() = this {
       return;
     };
 
-    logger.info("DAOVoting", "Processing batch of up to 3 urgent proposals (2-hour threshold)", "autoVoteOnUrgentProposalsChunk");
+    logger.info("DAOVoting", "Processing batch of up to 3 urgent proposals (" # Nat64.toText(autoVotingThresholdSeconds) # "s threshold)", "autoVoteOnUrgentProposalsChunk");
 
     try {
-      // Process up to 3 urgent proposals with 2-hour threshold
-      let result = await autoVoteOnUrgentProposals(7200, 3); // 2 hours = 7200 seconds, max 3 proposals
+      // Process up to 3 urgent proposals with configurable threshold
+      let result = await autoVoteOnUrgentProposals(autoVotingThresholdSeconds, 3);
       
       switch (result) {
         case (#ok(data)) {
@@ -1301,6 +1304,29 @@ shared deployer actor class neuronSnapshot() = this {
   // Check if auto-voting is currently running
   public query func isAutoVotingRunning() : async Bool {
     isAutoVotingOnUrgentProposals;
+  };
+
+  // Get the current auto-voting threshold in seconds
+  public query func getAutoVotingThresholdSeconds() : async Nat64 {
+    autoVotingThresholdSeconds;
+  };
+
+  // Set the auto-voting threshold in seconds (admin only)
+  public shared ({ caller }) func setAutoVotingThresholdSeconds(thresholdSeconds : Nat64) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to set auto-voting threshold: " # Principal.toText(caller), "setAutoVotingThresholdSeconds");
+      return;
+    };
+
+    if (thresholdSeconds == 0) {
+      logger.error("DAOVoting", "Invalid threshold: cannot be zero", "setAutoVotingThresholdSeconds");
+      return;
+    };
+
+    let oldThreshold = autoVotingThresholdSeconds;
+    autoVotingThresholdSeconds := thresholdSeconds;
+    
+    logger.info("DAOVoting", "Auto-voting threshold updated from " # Nat64.toText(oldThreshold) # "s to " # Nat64.toText(thresholdSeconds) # "s by " # Principal.toText(caller), "setAutoVotingThresholdSeconds");
   };
 
   // DAO Voting System Functions
