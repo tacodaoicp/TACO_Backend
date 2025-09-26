@@ -103,6 +103,7 @@ shared deployer actor class neuronSnapshot() = this {
 
   // DAO Voting System - Track which NNS proposals the DAO has already voted on
   stable var daoVotedNNSProposals : Map.Map<Nat64, Bool> = Map.new<Nat64, Bool>(); // NNS Proposal ID -> true (voted)
+  stable var daoVotedNNSProposals2 : Map.Map<Nat64, T.DAONNSVoteRecord> = Map.new<Nat64, T.DAONNSVoteRecord>(); // NNS Proposal ID -> Vote Record
   
   // DAO Voting System - Track votes per SNS proposal per neuron  
   // Structure: SNS Proposal ID -> Neuron ID -> Vote Details
@@ -1223,9 +1224,9 @@ shared deployer actor class neuronSnapshot() = this {
     };
 
     // Check if DAO has already voted on the corresponding NNS proposal
-    switch (Map.get(daoVotedNNSProposals, n64hash, correspondingNNSProposal)) {
-      case (?true) {
-        logger.warn("DAOVoting", "DAO has already voted on NNS proposal " # Nat64.toText(correspondingNNSProposal), "submitDAOVotes");
+    switch (Map.get(daoVotedNNSProposals2, n64hash, correspondingNNSProposal)) {
+      case (?voteRecord) {
+        logger.warn("DAOVoting", "DAO has already voted on NNS proposal " # Nat64.toText(correspondingNNSProposal) # " (" # voteRecord.dao_decision # ")", "submitDAOVotes");
         return #err("DAO has already voted on this NNS proposal");
       };
       case (_) { /* Continue */ };
@@ -1424,8 +1425,8 @@ shared deployer actor class neuronSnapshot() = this {
     Array.filter<(Nat64, Nat64)>(
       Iter.toArray(Map.entries(copiedNNSProposals)),
       func((nnsId, snsId)) {
-        switch (Map.get(daoVotedNNSProposals, n64hash, nnsId)) {
-          case (?true) { false }; // Already voted
+        switch (Map.get(daoVotedNNSProposals2, n64hash, nnsId)) {
+          case (?voteRecord) { false }; // Already voted
           case (_) { true }; // Available for voting
         };
       }
@@ -1434,10 +1435,15 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Check if DAO has already voted on an NNS proposal
   public query func hasDAOVoted(nnsProposalId : Nat64) : async Bool {
-    switch (Map.get(daoVotedNNSProposals, n64hash, nnsProposalId)) {
-      case (?true) { true };
+    switch (Map.get(daoVotedNNSProposals2, n64hash, nnsProposalId)) {
+      case (?voteRecord) { true };
       case (_) { false };
     };
+  };
+
+  // Get detailed DAO vote record for an NNS proposal
+  public query func getDAOVoteRecord(nnsProposalId : Nat64) : async ?T.DAONNSVoteRecord {
+    Map.get(daoVotedNNSProposals2, n64hash, nnsProposalId);
   };
 
   // Mark an NNS proposal as voted by DAO (admin only)
@@ -1447,8 +1453,19 @@ shared deployer actor class neuronSnapshot() = this {
       return false;
     };
 
-    Map.set(daoVotedNNSProposals, n64hash, nnsProposalId, true);
-    logger.info("DAOVoting", "NNS proposal " # Nat64.toText(nnsProposalId) # " marked as voted by " # Principal.toText(caller), "markNNSProposalAsVoted");
+    // Create a manual vote record (admin override)
+    let manualVoteRecord : T.DAONNSVoteRecord = {
+      nns_proposal_id = nnsProposalId;
+      dao_decision = "Manual";
+      adopt_vp = 0;
+      reject_vp = 0;
+      total_vp = 0;
+      vote_timestamp = Nat64.fromNat(Int.abs(Time.now()));
+      voted_by_principal = caller;
+    };
+    
+    Map.set(daoVotedNNSProposals2, n64hash, nnsProposalId, manualVoteRecord);
+    logger.info("DAOVoting", "NNS proposal " # Nat64.toText(nnsProposalId) # " manually marked as voted by " # Principal.toText(caller), "markNNSProposalAsVoted");
     true;
   };
 
@@ -1478,9 +1495,9 @@ shared deployer actor class neuronSnapshot() = this {
     };
 
     // Check if DAO has already voted on this NNS proposal
-    switch (Map.get(daoVotedNNSProposals, n64hash, nnsProposalId)) {
-      case (?true) {
-        logger.warn("DAOVoting", "DAO has already voted on NNS proposal " # Nat64.toText(nnsProposalId), "voteOnNNSProposal");
+    switch (Map.get(daoVotedNNSProposals2, n64hash, nnsProposalId)) {
+      case (?voteRecord) {
+        logger.warn("DAOVoting", "DAO has already voted on NNS proposal " # Nat64.toText(nnsProposalId) # " (" # voteRecord.dao_decision # ")", "voteOnNNSProposal");
         return #err("DAO has already voted on this NNS proposal");
       };
       case (_) { /* Continue */ };
@@ -1523,8 +1540,19 @@ shared deployer actor class neuronSnapshot() = this {
       let voteResult = await NNSPropCopy.voteOnNNSProposal(nnsProposalId, nnsVote, nns_governance_canister_id, taco_dao_neuron_id, logger);
       switch (voteResult) {
         case (#ok(_)) {
-          // Mark this NNS proposal as voted
-          Map.set(daoVotedNNSProposals, n64hash, nnsProposalId, true);
+          // Create detailed vote record
+          let voteRecord : T.DAONNSVoteRecord = {
+            nns_proposal_id = nnsProposalId;
+            dao_decision = daoDecision;
+            adopt_vp = voteTally.adopt_vp;
+            reject_vp = voteTally.reject_vp;
+            total_vp = voteTally.total_vp;
+            vote_timestamp = Nat64.fromNat(Int.abs(Time.now()));
+            voted_by_principal = caller;
+          };
+          
+          // Mark this NNS proposal as voted with detailed record
+          Map.set(daoVotedNNSProposals2, n64hash, nnsProposalId, voteRecord);
           
           logger.info("DAOVoting", "Successfully voted " # daoDecision # " on NNS proposal " # Nat64.toText(nnsProposalId), "voteOnNNSProposal");
           
@@ -1572,7 +1600,7 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Get count of NNS proposals DAO has voted on
   public query func getDAOVotedNNSProposalsCount() : async Nat {
-    Map.size(daoVotedNNSProposals);
+    Map.size(daoVotedNNSProposals2);
   };
 
 /* NB: Turn on again after initial setup

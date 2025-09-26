@@ -254,4 +254,15 @@ module {
     setTest : shared (enabled : Bool) -> async ();
   };
 
+  // DAO NNS Vote Record - stores details of when DAO voted on an NNS proposal
+  public type DAONNSVoteRecord = {
+    nns_proposal_id : Nat64;
+    dao_decision : Text; // "Adopt" or "Reject"
+    adopt_vp : Nat;
+    reject_vp : Nat;
+    total_vp : Nat;
+    vote_timestamp : Timestamp;
+    voted_by_principal : Principal; // Who triggered the NNS vote
+  };
+
 };
