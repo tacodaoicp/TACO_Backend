@@ -1,7 +1,9 @@
 import Int "mo:base/Int";
+import Int64 "mo:base/Int64";
 import Nat32 "mo:base/Nat32";
 import Nat64 "mo:base/Nat64";
 import Nat "mo:base/Nat";
+import Bool "mo:base/Bool";
 import List "mo:base/List";
 import Time "mo:base/Time";
 import Timer "mo:base/Timer";
@@ -1357,6 +1359,16 @@ shared deployer actor class neuronSnapshot() = this {
     null;
   };
 
+  // Public function to find NNS proposal ID for a given SNS proposal ID
+  public query func getNNSProposalIdForSNS(snsProposalId : Nat64) : async ?Nat64 {
+    for ((nnsId, snsId) in Map.entries(copiedNNSProposals)) {
+      if (snsId == snsProposalId) {
+        return ?nnsId;
+      };
+    };
+    null;
+  };
+
   // Get vote tally for a specific SNS proposal
   public query func getDAOVoteTally(snsProposalId : Nat64) : async ?{
     adopt_votes : Nat;
@@ -1431,6 +1443,169 @@ shared deployer actor class neuronSnapshot() = this {
         };
       }
     );
+  };
+
+  // Helper function to format time remaining in a human-readable way
+  private func formatTimeRemaining(seconds: Int64) : Text {
+    let absSeconds = Int64.abs(seconds);
+    let days = absSeconds / 86400;
+    let hours = (absSeconds % 86400) / 3600;
+    let minutes = (absSeconds % 3600) / 60;
+    let remainingSeconds = absSeconds % 60;
+    
+    if (seconds < 0) {
+      "Expired " # Int64.toText(days) # "d " # Int64.toText(hours) # "h " # Int64.toText(minutes) # "m ago"
+    } else if (days > 0) {
+      Int64.toText(days) # "d " # Int64.toText(hours) # "h " # Int64.toText(minutes) # "m"
+    } else if (hours > 0) {
+      Int64.toText(hours) # "h " # Int64.toText(minutes) # "m"
+    } else if (minutes > 0) {
+      Int64.toText(minutes) # "m " # Int64.toText(remainingSeconds) # "s"
+    } else {
+      Int64.toText(remainingSeconds) # "s"
+    }
+  };
+
+  // Get list of SNS proposals available for DAO voting with time remaining information
+  public shared ({ caller }) func getVotableProposalsWithTimeLeft() : async [{
+    nns_proposal_id : Nat64;
+    sns_proposal_id : Nat64;
+    time_remaining_seconds : ?Int64; // null if no deadline, negative if expired
+    deadline_timestamp_seconds : ?Nat64;
+    proposal_timestamp_seconds : ?Nat64;
+    is_expired : Bool;
+  }] {
+    logger.info("DAOVoting", "Fetching votable proposals with time left by " # Principal.toText(caller), "getVotableProposalsWithTimeLeft");
+    
+    // Get current timestamp in seconds
+    let currentTimestamp = get_current_timestamp() / 1_000_000_000; // Convert nanoseconds to seconds
+    
+    // Get all votable proposals
+    let votableProposals = Array.filter<(Nat64, Nat64)>(
+      Iter.toArray(Map.entries(copiedNNSProposals)),
+      func((nnsId, snsId)) {
+        switch (Map.get(daoVotedNNSProposals2, n64hash, nnsId)) {
+          case (?voteRecord) { false }; // Already voted
+          case (_) { true }; // Available for voting
+        };
+      }
+    );
+    
+    let results = Vector.new<{
+      nns_proposal_id : Nat64;
+      sns_proposal_id : Nat64;
+      time_remaining_seconds : ?Int64;
+      deadline_timestamp_seconds : ?Nat64;
+      proposal_timestamp_seconds : ?Nat64;
+      is_expired : Bool;
+    }>();
+    
+    // Fetch proposal info for each votable proposal
+    for ((nnsId, snsId) in votableProposals.vals()) {
+      try {
+        let proposalInfoOpt = await nns_gov_canister.get_proposal_info(nnsId);
+        
+        switch (proposalInfoOpt) {
+          case (?proposalInfo) {
+            let timeRemaining = switch (proposalInfo.deadline_timestamp_seconds) {
+              case (?deadline) {
+                let remaining = Int64.fromNat64(deadline) - Int64.fromNat64(currentTimestamp);
+                ?remaining;
+              };
+              case (null) { null }; // No deadline set
+            };
+            
+            let isExpired = switch (proposalInfo.deadline_timestamp_seconds) {
+              case (?deadline) { currentTimestamp >= deadline };
+              case (null) { false }; // No deadline, so not expired
+            };
+            
+            let proposalResult = {
+              nns_proposal_id = nnsId;
+              sns_proposal_id = snsId;
+              time_remaining_seconds = timeRemaining;
+              deadline_timestamp_seconds = proposalInfo.deadline_timestamp_seconds;
+              proposal_timestamp_seconds = ?proposalInfo.proposal_timestamp_seconds;
+              is_expired = isExpired;
+            };
+            
+            Vector.add(results, proposalResult);
+            
+            logger.info("DAOVoting", "NNS proposal " # Nat64.toText(nnsId) # " - Time remaining: " # 
+              (switch (timeRemaining) { 
+                case (?t) { formatTimeRemaining(t) }; 
+                case (null) { "no deadline" }; 
+              }) # ", Expired: " # Bool.toText(isExpired), "getVotableProposalsWithTimeLeft");
+          };
+          case (null) {
+            // Proposal not found, include it but mark as potentially expired/invalid
+            let proposalResult = {
+              nns_proposal_id = nnsId;
+              sns_proposal_id = snsId;
+              time_remaining_seconds = null;
+              deadline_timestamp_seconds = null;
+              proposal_timestamp_seconds = null;
+              is_expired = true; // Assume expired if we can't fetch it
+            };
+            
+            Vector.add(results, proposalResult);
+            logger.warn("DAOVoting", "NNS proposal " # Nat64.toText(nnsId) # " not found in NNS governance", "getVotableProposalsWithTimeLeft");
+          };
+        };
+      } catch (error) {
+        // Handle network errors or other issues
+        let proposalResult = {
+          nns_proposal_id = nnsId;
+          sns_proposal_id = snsId;
+          time_remaining_seconds = null;
+          deadline_timestamp_seconds = null;
+          proposal_timestamp_seconds = null;
+          is_expired = true; // Assume expired on error
+        };
+        
+        Vector.add(results, proposalResult);
+        logger.error("DAOVoting", "Error fetching NNS proposal " # Nat64.toText(nnsId) # ": " # Error.message(error), "getVotableProposalsWithTimeLeft");
+      };
+    };
+    
+    let resultsArray = Vector.toArray(results);
+    logger.info("DAOVoting", "Retrieved " # Nat.toText(resultsArray.size()) # " votable proposals with timing info", "getVotableProposalsWithTimeLeft");
+    resultsArray;
+  };
+
+  // Get votable proposals that are expiring within the specified number of hours (urgent voting needed)
+  public shared ({ caller }) func getUrgentVotableProposals(hoursThreshold : Nat64) : async [{
+    nns_proposal_id : Nat64;
+    sns_proposal_id : Nat64;
+    time_remaining_seconds : ?Int64;
+    deadline_timestamp_seconds : ?Nat64;
+    proposal_timestamp_seconds : ?Nat64;
+    is_expired : Bool;
+  }] {
+    logger.info("DAOVoting", "Fetching urgent votable proposals (threshold: " # Nat64.toText(hoursThreshold) # "h) by " # Principal.toText(caller), "getUrgentVotableProposals");
+    
+    let allProposalsWithTime = await getVotableProposalsWithTimeLeft();
+    let thresholdSeconds = Int64.fromNat64(hoursThreshold * 3600); // Convert hours to seconds
+    
+    let urgentProposals = Array.filter<{
+      nns_proposal_id : Nat64;
+      sns_proposal_id : Nat64;
+      time_remaining_seconds : ?Int64;
+      deadline_timestamp_seconds : ?Nat64;
+      proposal_timestamp_seconds : ?Nat64;
+      is_expired : Bool;
+    }>(allProposalsWithTime, func(proposal) {
+      switch (proposal.time_remaining_seconds) {
+        case (?timeRemaining) {
+          // Include if expired or expiring within threshold
+          timeRemaining <= thresholdSeconds
+        };
+        case (null) { false }; // No deadline, not urgent
+      }
+    });
+    
+    logger.info("DAOVoting", "Found " # Nat.toText(urgentProposals.size()) # " urgent proposals out of " # Nat.toText(allProposalsWithTime.size()) # " total", "getUrgentVotableProposals");
+    urgentProposals;
   };
 
   // Check if DAO has already voted on an NNS proposal
