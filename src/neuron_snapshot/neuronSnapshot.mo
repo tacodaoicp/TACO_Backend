@@ -124,6 +124,16 @@ shared deployer actor class neuronSnapshot() = this {
   // Auto-voting threshold in seconds (default: 2 hours = 7200 seconds)
   stable var autoVotingThresholdSeconds : Nat64 = 7200;
 
+  // Default voting behavior when no DAO votes exist or there's a tie
+  public type DefaultVoteBehavior = {
+    #VoteAdopt;   // Vote Adopt by default
+    #VoteReject;  // Vote Reject by default  
+    #Skip;        // Skip voting (current behavior)
+  };
+
+  // Default vote behavior (default: Vote Adopt)
+  stable var defaultVoteBehavior : DefaultVoteBehavior = #VoteAdopt;
+
   // Periodic timer interval in seconds (default: 1 hour = 3600 seconds)
   stable var periodicTimerIntervalSeconds : Nat64 = 3600;
 
@@ -1345,6 +1355,36 @@ shared deployer actor class neuronSnapshot() = this {
     autoVotingThresholdSeconds;
   };
 
+  // Get the current default vote behavior
+  public query func getDefaultVoteBehavior() : async DefaultVoteBehavior {
+    defaultVoteBehavior;
+  };
+
+  // Set the default vote behavior (admin only)
+  public shared ({ caller }) func setDefaultVoteBehavior(behavior : DefaultVoteBehavior) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to set default vote behavior: " # Principal.toText(caller), "setDefaultVoteBehavior");
+      return;
+    };
+
+    let oldBehavior = defaultVoteBehavior;
+    defaultVoteBehavior := behavior;
+    
+    let behaviorText = switch (behavior) {
+      case (#VoteAdopt) { "Vote Adopt" };
+      case (#VoteReject) { "Vote Reject" };
+      case (#Skip) { "Skip" };
+    };
+    
+    let oldBehaviorText = switch (oldBehavior) {
+      case (#VoteAdopt) { "Vote Adopt" };
+      case (#VoteReject) { "Vote Reject" };
+      case (#Skip) { "Skip" };
+    };
+    
+    logger.info("DAOVoting", "Default vote behavior updated from '" # oldBehaviorText # "' to '" # behaviorText # "' by " # Principal.toText(caller), "setDefaultVoteBehavior");
+  };
+
   // Set the auto-voting threshold in seconds (admin only)
   public shared ({ caller }) func setAutoVotingThresholdSeconds(thresholdSeconds : Nat64) : async () {
     if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
@@ -2293,8 +2333,21 @@ shared deployer actor class neuronSnapshot() = this {
     // Get DAO vote tally for this SNS proposal
     let voteTally = switch (Map.get(daoVotes, n64hash, snsProposalId)) {
       case (null) {
-        logger.warn("DAOVoting", "No DAO votes found for SNS proposal " # Nat64.toText(snsProposalId), "voteOnNNSProposal");
-        return #err("No DAO votes found for this proposal");
+        // No DAO votes found - check default behavior
+        switch (defaultVoteBehavior) {
+          case (#Skip) {
+            logger.warn("DAOVoting", "No DAO votes found for SNS proposal " # Nat64.toText(snsProposalId) # " - skipping per default behavior", "voteOnNNSProposal");
+            return #err("No DAO votes found for this proposal");
+          };
+          case (#VoteAdopt) {
+            logger.info("DAOVoting", "No DAO votes found for SNS proposal " # Nat64.toText(snsProposalId) # " - using default behavior: Vote Adopt", "voteOnNNSProposal");
+            { adopt_vp = 1; reject_vp = 0; total_vp = 1 }; // Use symbolic voting power
+          };
+          case (#VoteReject) {
+            logger.info("DAOVoting", "No DAO votes found for SNS proposal " # Nat64.toText(snsProposalId) # " - using default behavior: Vote Reject", "voteOnNNSProposal");
+            { adopt_vp = 0; reject_vp = 1; total_vp = 1 }; // Use symbolic voting power
+          };
+        };
       };
       case (?proposalVotes) {
         var adoptVP : Nat = 0;
@@ -2317,8 +2370,30 @@ shared deployer actor class neuronSnapshot() = this {
       return #err("No voting power in DAO votes");
     };
 
-    let daoDecision = if (voteTally.adopt_vp > voteTally.reject_vp) { "Adopt" } else { "Reject" };
-    let nnsVote : Int32 = if (voteTally.adopt_vp > voteTally.reject_vp) { 1 } else { 2 }; // 1 = Yes, 2 = No
+    // Handle ties and clear winners
+    let (daoDecision, nnsVote) = if (voteTally.adopt_vp > voteTally.reject_vp) {
+      // Clear Adopt winner
+      ("Adopt", 1 : Int32)
+    } else if (voteTally.reject_vp > voteTally.adopt_vp) {
+      // Clear Reject winner
+      ("Reject", 2 : Int32)
+    } else {
+      // Tie case - use default behavior
+      switch (defaultVoteBehavior) {
+        case (#Skip) {
+          logger.warn("DAOVoting", "Tie in DAO votes for SNS proposal " # Nat64.toText(snsProposalId) # " (Adopt: " # Nat.toText(voteTally.adopt_vp) # " VP, Reject: " # Nat.toText(voteTally.reject_vp) # " VP) - skipping per default behavior", "voteOnNNSProposal");
+          return #err("Tie in DAO votes - skipping per default behavior");
+        };
+        case (#VoteAdopt) {
+          logger.info("DAOVoting", "Tie in DAO votes for SNS proposal " # Nat64.toText(snsProposalId) # " (Adopt: " # Nat.toText(voteTally.adopt_vp) # " VP, Reject: " # Nat.toText(voteTally.reject_vp) # " VP) - using default behavior: Vote Adopt", "voteOnNNSProposal");
+          ("Adopt", 1 : Int32)
+        };
+        case (#VoteReject) {
+          logger.info("DAOVoting", "Tie in DAO votes for SNS proposal " # Nat64.toText(snsProposalId) # " (Adopt: " # Nat.toText(voteTally.adopt_vp) # " VP, Reject: " # Nat.toText(voteTally.reject_vp) # " VP) - using default behavior: Vote Reject", "voteOnNNSProposal");
+          ("Reject", 2 : Int32)
+        };
+      };
+    };
 
     logger.info("DAOVoting", "DAO decision for NNS proposal " # Nat64.toText(nnsProposalId) # ": " # daoDecision # " (Adopt: " # Nat.toText(voteTally.adopt_vp) # " VP, Reject: " # Nat.toText(voteTally.reject_vp) # " VP)", "voteOnNNSProposal");
 
