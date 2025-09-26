@@ -1401,6 +1401,11 @@ shared deployer actor class neuronSnapshot() = this {
     taco_dao_neuron_id;
   };
 
+  // Get SNS proposal ID for a given NNS proposal ID
+  public query func getSNSProposalIdForNNS(nnsProposalId : Nat64) : async ?Nat64 {
+    Map.get(copiedNNSProposals, Map.n64hash, nnsProposalId);
+  };
+
   // Set the TACO DAO neuron ID (admin only)
   public shared ({ caller }) func setTacoDAONeuronId(neuronId : Nat64) : async () {
     if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
