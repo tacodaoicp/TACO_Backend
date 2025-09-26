@@ -1609,9 +1609,10 @@ shared deployer actor class neuronSnapshot() = this {
   };
 
   // Automatically vote on NNS proposals that are expiring within the specified time threshold
-  public shared ({ caller }) func autoVoteOnUrgentProposals(timeThresholdSeconds : Nat64) : async Result.Result<{
+  public shared ({ caller }) func autoVoteOnUrgentProposals(timeThresholdSeconds : Nat64, maxProposalsToVote : Nat) : async Result.Result<{
     total_proposals_checked : Nat;
     urgent_proposals_found : Nat;
+    max_proposals_limit : Nat;
     votes_attempted : Nat;
     votes_successful : Nat;
     votes_failed : Nat;
@@ -1640,7 +1641,7 @@ shared deployer actor class neuronSnapshot() = this {
       return #err("Unauthorized: Only admins can trigger automated NNS voting");
     };
 
-    logger.info("DAOVoting", "Starting automated voting for proposals expiring within " # Nat64.toText(timeThresholdSeconds) # " seconds, triggered by " # Principal.toText(caller), "autoVoteOnUrgentProposals");
+    logger.info("DAOVoting", "Starting automated voting for proposals expiring within " # Nat64.toText(timeThresholdSeconds) # " seconds (max " # Nat.toText(maxProposalsToVote) # " proposals), triggered by " # Principal.toText(caller), "autoVoteOnUrgentProposals");
 
     try {
       // Get all votable proposals with timing information
@@ -1666,7 +1667,16 @@ shared deployer actor class neuronSnapshot() = this {
         }
       });
 
-      logger.info("DAOVoting", "Found " # Nat.toText(urgentProposals.size()) # " urgent proposals to potentially vote on", "autoVoteOnUrgentProposals");
+      // Apply the limit to the number of proposals to process
+      let limitedUrgentProposals = if (urgentProposals.size() <= maxProposalsToVote) {
+        urgentProposals;
+      } else {
+        // Take only the first maxProposalsToVote proposals
+        // Note: In the future, we could add sorting by time remaining to prioritize most urgent
+        Array.subArray(urgentProposals, 0, maxProposalsToVote);
+      };
+
+      logger.info("DAOVoting", "Found " # Nat.toText(urgentProposals.size()) # " urgent proposals, will vote on " # Nat.toText(limitedUrgentProposals.size()) # " (limited by max " # Nat.toText(maxProposalsToVote) # ")", "autoVoteOnUrgentProposals");
 
       let results = Vector.new<{
         nns_proposal_id : Nat64;
@@ -1691,8 +1701,8 @@ shared deployer actor class neuronSnapshot() = this {
       var votesAlreadyVoted : Nat = 0;
       var votesNoDAOVotes : Nat = 0;
 
-      // Process each urgent proposal
-      for (proposal in urgentProposals.vals()) {
+      // Process each urgent proposal (limited by maxProposalsToVote)
+      for (proposal in limitedUrgentProposals.vals()) {
         let timeRemainingText = switch (proposal.time_remaining_seconds) {
           case (?t) { formatTimeRemaining(t) };
           case (null) { "no deadline" };
@@ -1759,6 +1769,7 @@ shared deployer actor class neuronSnapshot() = this {
       let finalResults = {
         total_proposals_checked = allProposalsWithTime.size();
         urgent_proposals_found = urgentProposals.size();
+        max_proposals_limit = maxProposalsToVote;
         votes_attempted = votesAttempted;
         votes_successful = votesSuccessful;
         votes_failed = votesFailed;
@@ -1769,6 +1780,7 @@ shared deployer actor class neuronSnapshot() = this {
 
       logger.info("DAOVoting", "Automated voting completed - Checked: " # Nat.toText(finalResults.total_proposals_checked) # 
         ", Urgent: " # Nat.toText(finalResults.urgent_proposals_found) # 
+        ", Limit: " # Nat.toText(finalResults.max_proposals_limit) # 
         ", Attempted: " # Nat.toText(finalResults.votes_attempted) # 
         ", Successful: " # Nat.toText(finalResults.votes_successful) # 
         ", Failed: " # Nat.toText(finalResults.votes_failed) # 
@@ -1786,9 +1798,11 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Convenience function to automatically vote on proposals expiring within 1 hour (3600 seconds)
   // This aligns with the specification requirement to vote when "1 hour remains before NNS voting closes"
+  // Default limit of 10 proposals to prevent instruction limit issues
   public shared ({ caller }) func autoVoteOnProposalsExpiringWithinOneHour() : async Result.Result<{
     total_proposals_checked : Nat;
     urgent_proposals_found : Nat;
+    max_proposals_limit : Nat;
     votes_attempted : Nat;
     votes_successful : Nat;
     votes_failed : Nat;
@@ -1811,8 +1825,8 @@ shared deployer actor class neuronSnapshot() = this {
       };
     }];
   }, Text> {
-    logger.info("DAOVoting", "Auto-voting on proposals expiring within 1 hour, triggered by " # Principal.toText(caller), "autoVoteOnProposalsExpiringWithinOneHour");
-    await autoVoteOnUrgentProposals(3600); // 1 hour = 3600 seconds
+    logger.info("DAOVoting", "Auto-voting on proposals expiring within 1 hour (limit: 10), triggered by " # Principal.toText(caller), "autoVoteOnProposalsExpiringWithinOneHour");
+    await autoVoteOnUrgentProposals(3600, 10); // 1 hour = 3600 seconds, max 10 proposals
   };
 
   // Check if DAO has already voted on an NNS proposal
