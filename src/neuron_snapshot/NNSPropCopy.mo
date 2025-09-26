@@ -360,7 +360,7 @@ module {
     };
   };
 
-  let (test_doSendSNSProp) = false;
+  let (test_doSendSNSProp) = true;
 
   // Main function to copy an NNS proposal to SNS
   public func copyNNSProposal(
@@ -827,7 +827,7 @@ module {
     };
   };
 
-  let test_doSendNNSProp = false;
+  let test_doSendNNSProp = true;
 
   // Vote on NNS proposal using TACO DAO's neuron
   public func voteOnNNSProposal(
