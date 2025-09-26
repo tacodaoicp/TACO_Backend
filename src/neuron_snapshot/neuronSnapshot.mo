@@ -103,6 +103,9 @@ shared deployer actor class neuronSnapshot() = this {
   // Track auto-processing state to prevent infinite loops and allow emergency stopping
   stable var isAutoProcessingNNSProposals : Bool = false;
 
+  // Track auto-voting state to prevent infinite loops and allow emergency stopping
+  stable var isAutoVotingOnUrgentProposals : Bool = false;
+
   // DAO Voting System - Track which NNS proposals the DAO has already voted on
   stable var daoVotedNNSProposals : Map.Map<Nat64, Bool> = Map.new<Nat64, Bool>(); // NNS Proposal ID -> true (voted)
   stable var daoVotedNNSProposals2 : Map.Map<Nat64, T.DAONNSVoteRecord> = Map.new<Nat64, T.DAONNSVoteRecord>(); // NNS Proposal ID -> Vote Record
@@ -1199,6 +1202,105 @@ shared deployer actor class neuronSnapshot() = this {
   // Check if auto-processing is currently running
   public query func isAutoProcessingRunning() : async Bool {
     isAutoProcessingNNSProposals;
+  };
+
+  // Start auto-voting on urgent proposals in batches (admin only)
+  public shared ({ caller }) func startAutoVoteOnUrgentProposals() : async Bool {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to start auto-voting: " # Principal.toText(caller), "startAutoVoteOnUrgentProposals");
+      return false;
+    };
+
+    if (isAutoVotingOnUrgentProposals) {
+      logger.warn("DAOVoting", "Auto-voting is already running, ignoring start request from " # Principal.toText(caller), "startAutoVoteOnUrgentProposals");
+      return false;
+    };
+
+    isAutoVotingOnUrgentProposals := true;
+    logger.info("DAOVoting", "Starting auto-voting on urgent proposals by " # Principal.toText(caller), "startAutoVoteOnUrgentProposals");
+    
+    // Start the recursive processing
+    await autoVoteOnUrgentProposalsChunk();
+    
+    true;
+  };
+
+  // Internal recursive method to process urgent proposals in batches
+  private func autoVoteOnUrgentProposalsChunk() : async () {
+    if (not isAutoVotingOnUrgentProposals) {
+      logger.info("DAOVoting", "Auto-voting stopped via emergency stop", "autoVoteOnUrgentProposalsChunk");
+      return;
+    };
+
+    logger.info("DAOVoting", "Processing batch of up to 3 urgent proposals (2-hour threshold)", "autoVoteOnUrgentProposalsChunk");
+
+    try {
+      // Process up to 3 urgent proposals with 2-hour threshold
+      let result = await autoVoteOnUrgentProposals(7200, 3); // 2 hours = 7200 seconds, max 3 proposals
+      
+      switch (result) {
+        case (#ok(data)) {
+          logger.info(
+            "DAOVoting", 
+            "Auto-voting batch completed: " # Nat.toText(data.urgent_proposals_found) # " urgent found, " #
+            Nat.toText(data.votes_attempted) # " attempted, " # Nat.toText(data.votes_successful) # " successful, " #
+            Nat.toText(data.votes_failed) # " failed, " # Nat.toText(data.votes_already_voted) # " already voted, " #
+            Nat.toText(data.votes_no_dao_votes) # " no DAO votes",
+            "autoVoteOnUrgentProposalsChunk"
+          );
+
+          // Check if there are more urgent proposals to process
+          // If we found urgent proposals and attempted to vote on some, there might be more
+          let moreUrgentProposalsRemain = data.urgent_proposals_found > data.votes_attempted;
+          
+          if (moreUrgentProposalsRemain) {
+            logger.info("DAOVoting", "More urgent proposals remain (" # Nat.toText(data.urgent_proposals_found - data.votes_attempted) # "), scheduling next batch via timer", "autoVoteOnUrgentProposalsChunk");
+            
+            // Schedule next batch via 0-second timer to avoid instruction limit
+            let timerId = Timer.setTimer<system>(#seconds(0), func() : async () {
+              await autoVoteOnUrgentProposalsChunk();
+            });
+            
+            ignore timerId; // We don't need to track the timer ID
+          } else {
+            // No more urgent proposals, stop auto-voting
+            isAutoVotingOnUrgentProposals := false;
+            logger.info("DAOVoting", "Auto-voting completed - no more urgent proposals found, stopping", "autoVoteOnUrgentProposalsChunk");
+          };
+        };
+        case (#err(error)) {
+          isAutoVotingOnUrgentProposals := false;
+          logger.error("DAOVoting", "Auto-voting failed with error: " # error # " - stopping", "autoVoteOnUrgentProposalsChunk");
+        };
+      };
+    } catch (error) {
+      isAutoVotingOnUrgentProposals := false;
+      logger.error("DAOVoting", "Auto-voting crashed with exception: " # Error.message(error) # " - stopping", "autoVoteOnUrgentProposalsChunk");
+    };
+  };
+
+  // Emergency stop for auto-voting (admin only)
+  public shared ({ caller }) func stopAutoVoteOnUrgentProposals() : async Bool {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to stop auto-voting: " # Principal.toText(caller), "stopAutoVoteOnUrgentProposals");
+      return false;
+    };
+
+    let wasRunning = isAutoVotingOnUrgentProposals;
+    isAutoVotingOnUrgentProposals := false;
+    
+    if (wasRunning) {
+      logger.info("DAOVoting", "Emergency stop activated by " # Principal.toText(caller) # " - auto-voting will halt", "stopAutoVoteOnUrgentProposals");
+    } else {
+      logger.info("DAOVoting", "Stop requested by " # Principal.toText(caller) # " but auto-voting was not running", "stopAutoVoteOnUrgentProposals");
+    };
+    
+    wasRunning;
+  };
+
+  // Check if auto-voting is currently running
+  public query func isAutoVotingRunning() : async Bool {
+    isAutoVotingOnUrgentProposals;
   };
 
   // DAO Voting System Functions
