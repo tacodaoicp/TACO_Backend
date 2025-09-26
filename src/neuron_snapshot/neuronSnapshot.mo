@@ -1608,6 +1608,213 @@ shared deployer actor class neuronSnapshot() = this {
     urgentProposals;
   };
 
+  // Automatically vote on NNS proposals that are expiring within the specified time threshold
+  public shared ({ caller }) func autoVoteOnUrgentProposals(timeThresholdSeconds : Nat64) : async Result.Result<{
+    total_proposals_checked : Nat;
+    urgent_proposals_found : Nat;
+    votes_attempted : Nat;
+    votes_successful : Nat;
+    votes_failed : Nat;
+    votes_already_voted : Nat;
+    votes_no_dao_votes : Nat;
+    results : [{
+      nns_proposal_id : Nat64;
+      sns_proposal_id : Nat64;
+      time_remaining_seconds : ?Int64;
+      vote_result : {
+        #success : {
+          dao_decision : Text;
+          adopt_vp : Nat;
+          reject_vp : Nat;
+          total_vp : Nat;
+        };
+        #already_voted : Text;
+        #no_dao_votes : Text;
+        #error : Text;
+      };
+    }];
+  }, Text> {
+    // Authorization check - only master admin, controllers, or DAO backend can trigger auto-voting
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal)) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to trigger auto-voting: " # Principal.toText(caller), "autoVoteOnUrgentProposals");
+      return #err("Unauthorized: Only admins can trigger automated NNS voting");
+    };
+
+    logger.info("DAOVoting", "Starting automated voting for proposals expiring within " # Nat64.toText(timeThresholdSeconds) # " seconds, triggered by " # Principal.toText(caller), "autoVoteOnUrgentProposals");
+
+    try {
+      // Get all votable proposals with timing information
+      let allProposalsWithTime = await getVotableProposalsWithTimeLeft();
+      let thresholdSecondsInt64 = Int64.fromNat64(timeThresholdSeconds);
+      
+      // Filter for urgent proposals
+      let urgentProposals = Array.filter<{
+        nns_proposal_id : Nat64;
+        sns_proposal_id : Nat64;
+        time_remaining_seconds : ?Int64;
+        deadline_timestamp_seconds : ?Nat64;
+        proposal_timestamp_seconds : ?Nat64;
+        is_expired : Bool;
+      }>(allProposalsWithTime, func(proposal) {
+        switch (proposal.time_remaining_seconds) {
+          case (?timeRemaining) {
+            // Include if time remaining is less than or equal to threshold
+            // This includes expired proposals (negative time)
+            timeRemaining <= thresholdSecondsInt64
+          };
+          case (null) { false }; // No deadline, not urgent
+        }
+      });
+
+      logger.info("DAOVoting", "Found " # Nat.toText(urgentProposals.size()) # " urgent proposals to potentially vote on", "autoVoteOnUrgentProposals");
+
+      let results = Vector.new<{
+        nns_proposal_id : Nat64;
+        sns_proposal_id : Nat64;
+        time_remaining_seconds : ?Int64;
+        vote_result : {
+          #success : {
+            dao_decision : Text;
+            adopt_vp : Nat;
+            reject_vp : Nat;
+            total_vp : Nat;
+          };
+          #already_voted : Text;
+          #no_dao_votes : Text;
+          #error : Text;
+        };
+      }>();
+
+      var votesAttempted : Nat = 0;
+      var votesSuccessful : Nat = 0;
+      var votesFailed : Nat = 0;
+      var votesAlreadyVoted : Nat = 0;
+      var votesNoDAOVotes : Nat = 0;
+
+      // Process each urgent proposal
+      for (proposal in urgentProposals.vals()) {
+        let timeRemainingText = switch (proposal.time_remaining_seconds) {
+          case (?t) { formatTimeRemaining(t) };
+          case (null) { "no deadline" };
+        };
+
+        logger.info("DAOVoting", "Processing urgent proposal - NNS: " # Nat64.toText(proposal.nns_proposal_id) # ", SNS: " # Nat64.toText(proposal.sns_proposal_id) # ", Time remaining: " # timeRemainingText, "autoVoteOnUrgentProposals");
+
+        votesAttempted += 1;
+
+        // Attempt to vote on this NNS proposal
+        let voteResult = await voteOnNNSProposal(proposal.sns_proposal_id);
+        
+        let resultEntry = switch (voteResult) {
+          case (#ok(voteData)) {
+            votesSuccessful += 1;
+            logger.info("DAOVoting", "Successfully voted " # voteData.dao_decision # " on NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # " with " # Nat.toText(voteData.total_vp) # " VP", "autoVoteOnUrgentProposals");
+            {
+              nns_proposal_id = proposal.nns_proposal_id;
+              sns_proposal_id = proposal.sns_proposal_id;
+              time_remaining_seconds = proposal.time_remaining_seconds;
+              vote_result = #success({
+                dao_decision = voteData.dao_decision;
+                adopt_vp = voteData.adopt_vp;
+                reject_vp = voteData.reject_vp;
+                total_vp = voteData.total_vp;
+              });
+            };
+          };
+          case (#err(errorMsg)) {
+            if (errorMsg == "DAO has already voted on this NNS proposal") {
+              votesAlreadyVoted += 1;
+              logger.info("DAOVoting", "NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # " already voted on", "autoVoteOnUrgentProposals");
+              {
+                nns_proposal_id = proposal.nns_proposal_id;
+                sns_proposal_id = proposal.sns_proposal_id;
+                time_remaining_seconds = proposal.time_remaining_seconds;
+                vote_result = #already_voted(errorMsg);
+              };
+            } else if (errorMsg == "No DAO votes found for this proposal") {
+              votesNoDAOVotes += 1;
+              logger.warn("DAOVoting", "No DAO member votes found for SNS proposal " # Nat64.toText(proposal.sns_proposal_id), "autoVoteOnUrgentProposals");
+              {
+                nns_proposal_id = proposal.nns_proposal_id;
+                sns_proposal_id = proposal.sns_proposal_id;
+                time_remaining_seconds = proposal.time_remaining_seconds;
+                vote_result = #no_dao_votes(errorMsg);
+              };
+            } else {
+              votesFailed += 1;
+              logger.error("DAOVoting", "Failed to vote on NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # ": " # errorMsg, "autoVoteOnUrgentProposals");
+              {
+                nns_proposal_id = proposal.nns_proposal_id;
+                sns_proposal_id = proposal.sns_proposal_id;
+                time_remaining_seconds = proposal.time_remaining_seconds;
+                vote_result = #error(errorMsg);
+              };
+            };
+          };
+        };
+
+        Vector.add(results, resultEntry);
+      };
+
+      let finalResults = {
+        total_proposals_checked = allProposalsWithTime.size();
+        urgent_proposals_found = urgentProposals.size();
+        votes_attempted = votesAttempted;
+        votes_successful = votesSuccessful;
+        votes_failed = votesFailed;
+        votes_already_voted = votesAlreadyVoted;
+        votes_no_dao_votes = votesNoDAOVotes;
+        results = Vector.toArray(results);
+      };
+
+      logger.info("DAOVoting", "Automated voting completed - Checked: " # Nat.toText(finalResults.total_proposals_checked) # 
+        ", Urgent: " # Nat.toText(finalResults.urgent_proposals_found) # 
+        ", Attempted: " # Nat.toText(finalResults.votes_attempted) # 
+        ", Successful: " # Nat.toText(finalResults.votes_successful) # 
+        ", Failed: " # Nat.toText(finalResults.votes_failed) # 
+        ", Already voted: " # Nat.toText(finalResults.votes_already_voted) # 
+        ", No DAO votes: " # Nat.toText(finalResults.votes_no_dao_votes), "autoVoteOnUrgentProposals");
+
+      #ok(finalResults);
+
+    } catch (error) {
+      let errorMsg = "Exception during automated voting: " # Error.message(error);
+      logger.error("DAOVoting", errorMsg, "autoVoteOnUrgentProposals");
+      #err(errorMsg);
+    };
+  };
+
+  // Convenience function to automatically vote on proposals expiring within 1 hour (3600 seconds)
+  // This aligns with the specification requirement to vote when "1 hour remains before NNS voting closes"
+  public shared ({ caller }) func autoVoteOnProposalsExpiringWithinOneHour() : async Result.Result<{
+    total_proposals_checked : Nat;
+    urgent_proposals_found : Nat;
+    votes_attempted : Nat;
+    votes_successful : Nat;
+    votes_failed : Nat;
+    votes_already_voted : Nat;
+    votes_no_dao_votes : Nat;
+    results : [{
+      nns_proposal_id : Nat64;
+      sns_proposal_id : Nat64;
+      time_remaining_seconds : ?Int64;
+      vote_result : {
+        #success : {
+          dao_decision : Text;
+          adopt_vp : Nat;
+          reject_vp : Nat;
+          total_vp : Nat;
+        };
+        #already_voted : Text;
+        #no_dao_votes : Text;
+        #error : Text;
+      };
+    }];
+  }, Text> {
+    logger.info("DAOVoting", "Auto-voting on proposals expiring within 1 hour, triggered by " # Principal.toText(caller), "autoVoteOnProposalsExpiringWithinOneHour");
+    await autoVoteOnUrgentProposals(3600); // 1 hour = 3600 seconds
+  };
+
   // Check if DAO has already voted on an NNS proposal
   public query func hasDAOVoted(nnsProposalId : Nat64) : async Bool {
     switch (Map.get(daoVotedNNSProposals2, n64hash, nnsProposalId)) {
