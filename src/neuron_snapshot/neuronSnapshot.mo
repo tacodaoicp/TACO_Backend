@@ -115,6 +115,12 @@ shared deployer actor class neuronSnapshot() = this {
   // Track auto-voting state to prevent infinite loops and allow emergency stopping
   stable var isAutoVotingOnUrgentProposals : Bool = false;
 
+  // Auto-voting round counter to prevent re-attempting same proposals in one session
+  stable var autoVotingRoundCounter : Nat64 = 0;
+
+  // Track which NNS proposals we've attempted in the current round (non-stable, resets on upgrade)
+  var attemptedProposalsThisRound : Map.Map<Nat64, Nat64> = Map.new<Nat64, Nat64>(); // NNS Proposal ID -> Round ID
+
   // Auto-voting threshold in seconds (default: 2 hours = 7200 seconds)
   stable var autoVotingThresholdSeconds : Nat64 = 7200;
 
@@ -1234,7 +1240,10 @@ shared deployer actor class neuronSnapshot() = this {
     };
 
     isAutoVotingOnUrgentProposals := true;
-    logger.info("DAOVoting", "Starting auto-voting on urgent proposals by " # Principal.toText(caller), "startAutoVoteOnUrgentProposals");
+    
+    // Increment the round counter for this auto-voting session
+    autoVotingRoundCounter += 1;
+    logger.info("DAOVoting", "Starting auto-voting on urgent proposals (round " # Nat64.toText(autoVotingRoundCounter) # ") by " # Principal.toText(caller), "startAutoVoteOnUrgentProposals");
     
     // Start the recursive processing
     await autoVoteOnUrgentProposalsChunk();
@@ -1266,11 +1275,12 @@ shared deployer actor class neuronSnapshot() = this {
             "autoVoteOnUrgentProposalsChunk"
           );
 
-          // Check if there are more urgent proposals to process
+          // Check if there are more urgent proposals to process and if we actually attempted any votes
           // If we found urgent proposals and attempted to vote on some, there might be more
           let moreUrgentProposalsRemain = data.urgent_proposals_found > data.votes_attempted;
+          let attemptedAnyVotes = data.votes_attempted > 0;
           
-          if (moreUrgentProposalsRemain) {
+          if (moreUrgentProposalsRemain and attemptedAnyVotes) {
             logger.info("DAOVoting", "More urgent proposals remain (" # Nat.toText(data.urgent_proposals_found - data.votes_attempted) # "), scheduling next batch via timer", "autoVoteOnUrgentProposalsChunk");
             
             // Schedule next batch via 0-second timer to avoid instruction limit
@@ -1280,9 +1290,14 @@ shared deployer actor class neuronSnapshot() = this {
             
             ignore timerId; // We don't need to track the timer ID
           } else {
-            // No more urgent proposals, stop auto-voting
+            // No more urgent proposals or no votes attempted in this round, stop auto-voting
             isAutoVotingOnUrgentProposals := false;
-            logger.info("DAOVoting", "Auto-voting completed - no more urgent proposals found, stopping", "autoVoteOnUrgentProposalsChunk");
+            let reason = if (not attemptedAnyVotes) {
+              "no new proposals to attempt in this round";
+            } else {
+              "no more urgent proposals found";
+            };
+            logger.info("DAOVoting", "Auto-voting completed - " # reason # ", stopping", "autoVoteOnUrgentProposalsChunk");
           };
         };
         case (#err(error)) {
@@ -1318,6 +1333,11 @@ shared deployer actor class neuronSnapshot() = this {
   // Check if auto-voting is currently running
   public query func isAutoVotingRunning() : async Bool {
     isAutoVotingOnUrgentProposals;
+  };
+
+  // Get the current auto-voting round counter
+  public query func getAutoVotingRoundCounter() : async Nat64 {
+    autoVotingRoundCounter;
   };
 
   // Get the current auto-voting threshold in seconds
@@ -2043,62 +2063,80 @@ shared deployer actor class neuronSnapshot() = this {
           case (null) { "no deadline" };
         };
 
-        logger.info("DAOVoting", "Processing urgent proposal - NNS: " # Nat64.toText(proposal.nns_proposal_id) # ", SNS: " # Nat64.toText(proposal.sns_proposal_id) # ", Time remaining: " # timeRemainingText, "autoVoteOnUrgentProposals");
-
-        votesAttempted += 1;
-
-        // Attempt to vote on this NNS proposal
-        let voteResult = await voteOnNNSProposal(proposal.sns_proposal_id);
-        
-        let resultEntry = switch (voteResult) {
-          case (#ok(voteData)) {
-            votesSuccessful += 1;
-            logger.info("DAOVoting", "Successfully voted " # voteData.dao_decision # " on NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # " with " # Nat.toText(voteData.total_vp) # " VP", "autoVoteOnUrgentProposals");
-            {
-              nns_proposal_id = proposal.nns_proposal_id;
-              sns_proposal_id = proposal.sns_proposal_id;
-              time_remaining_seconds = proposal.time_remaining_seconds;
-              vote_result = #success({
-                dao_decision = voteData.dao_decision;
-                adopt_vp = voteData.adopt_vp;
-                reject_vp = voteData.reject_vp;
-                total_vp = voteData.total_vp;
-              });
-            };
-          };
-          case (#err(errorMsg)) {
-            if (errorMsg == "DAO has already voted on this NNS proposal") {
-              votesAlreadyVoted += 1;
-              logger.info("DAOVoting", "NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # " already voted on", "autoVoteOnUrgentProposals");
-              {
-                nns_proposal_id = proposal.nns_proposal_id;
-                sns_proposal_id = proposal.sns_proposal_id;
-                time_remaining_seconds = proposal.time_remaining_seconds;
-                vote_result = #already_voted(errorMsg);
-              };
-            } else if (errorMsg == "No DAO votes found for this proposal") {
-              votesNoDAOVotes += 1;
-              logger.warn("DAOVoting", "No DAO member votes found for SNS proposal " # Nat64.toText(proposal.sns_proposal_id), "autoVoteOnUrgentProposals");
-              {
-                nns_proposal_id = proposal.nns_proposal_id;
-                sns_proposal_id = proposal.sns_proposal_id;
-                time_remaining_seconds = proposal.time_remaining_seconds;
-                vote_result = #no_dao_votes(errorMsg);
-              };
+        // Check if we've already attempted this NNS proposal in the current round
+        let shouldSkip = switch (Map.get(attemptedProposalsThisRound, n64hash, proposal.nns_proposal_id)) {
+          case (?roundId) {
+            if (roundId == autoVotingRoundCounter) {
+              logger.info("DAOVoting", "Skipping NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # " - already attempted in round " # Nat64.toText(roundId), "autoVoteOnUrgentProposals");
+              true; // Skip this proposal
             } else {
-              votesFailed += 1;
-              logger.error("DAOVoting", "Failed to vote on NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # ": " # errorMsg, "autoVoteOnUrgentProposals");
-              {
-                nns_proposal_id = proposal.nns_proposal_id;
-                sns_proposal_id = proposal.sns_proposal_id;
-                time_remaining_seconds = proposal.time_remaining_seconds;
-                vote_result = #error(errorMsg);
-              };
+              false; // Different round, can process
             };
           };
+          case (null) { false }; // Not attempted yet, can process
         };
 
-        Vector.add(results, resultEntry);
+        if (not shouldSkip) {
+          logger.info("DAOVoting", "Processing urgent proposal - NNS: " # Nat64.toText(proposal.nns_proposal_id) # ", SNS: " # Nat64.toText(proposal.sns_proposal_id) # ", Time remaining: " # timeRemainingText, "autoVoteOnUrgentProposals");
+
+          // Mark this proposal as attempted in the current round
+          Map.set(attemptedProposalsThisRound, n64hash, proposal.nns_proposal_id, autoVotingRoundCounter);
+          
+          votesAttempted += 1;
+
+          // Attempt to vote on this NNS proposal
+          let voteResult = await voteOnNNSProposal(proposal.sns_proposal_id);
+          
+          let resultEntry = switch (voteResult) {
+            case (#ok(voteData)) {
+              votesSuccessful += 1;
+              logger.info("DAOVoting", "Successfully voted " # voteData.dao_decision # " on NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # " with " # Nat.toText(voteData.total_vp) # " VP", "autoVoteOnUrgentProposals");
+              {
+                nns_proposal_id = proposal.nns_proposal_id;
+                sns_proposal_id = proposal.sns_proposal_id;
+                time_remaining_seconds = proposal.time_remaining_seconds;
+                vote_result = #success({
+                  dao_decision = voteData.dao_decision;
+                  adopt_vp = voteData.adopt_vp;
+                  reject_vp = voteData.reject_vp;
+                  total_vp = voteData.total_vp;
+                });
+              };
+            };
+            case (#err(errorMsg)) {
+              if (errorMsg == "DAO has already voted on this NNS proposal") {
+                votesAlreadyVoted += 1;
+                logger.info("DAOVoting", "NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # " already voted on", "autoVoteOnUrgentProposals");
+                {
+                  nns_proposal_id = proposal.nns_proposal_id;
+                  sns_proposal_id = proposal.sns_proposal_id;
+                  time_remaining_seconds = proposal.time_remaining_seconds;
+                  vote_result = #already_voted(errorMsg);
+                };
+              } else if (errorMsg == "No DAO votes found for this proposal") {
+                votesNoDAOVotes += 1;
+                logger.warn("DAOVoting", "No DAO member votes found for SNS proposal " # Nat64.toText(proposal.sns_proposal_id), "autoVoteOnUrgentProposals");
+                {
+                  nns_proposal_id = proposal.nns_proposal_id;
+                  sns_proposal_id = proposal.sns_proposal_id;
+                  time_remaining_seconds = proposal.time_remaining_seconds;
+                  vote_result = #no_dao_votes(errorMsg);
+                };
+              } else {
+                votesFailed += 1;
+                logger.error("DAOVoting", "Failed to vote on NNS proposal " # Nat64.toText(proposal.nns_proposal_id) # ": " # errorMsg, "autoVoteOnUrgentProposals");
+                {
+                  nns_proposal_id = proposal.nns_proposal_id;
+                  sns_proposal_id = proposal.sns_proposal_id;
+                  time_remaining_seconds = proposal.time_remaining_seconds;
+                  vote_result = #error(errorMsg);
+                };
+              };
+            };
+          };
+
+          Vector.add(results, resultEntry);
+        };
       };
 
       let finalResults = {
