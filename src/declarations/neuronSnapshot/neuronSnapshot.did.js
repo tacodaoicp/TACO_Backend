@@ -186,6 +186,7 @@ export const idlFactory = ({ IDL }) => {
     'ok' : SNSProposalSummary,
     'err' : SNSProposalError,
   });
+  const NeuronId__1 = IDL.Record({ 'id' : IDL.Nat64 });
   const NeuronId = IDL.Record({ 'id' : IDL.Vec(IDL.Nat8) });
   const NeuronSnapshotError = IDL.Variant({
     'Timeout' : IDL.Null,
@@ -392,6 +393,7 @@ export const idlFactory = ({ IDL }) => {
         [GetSNSProposalSummaryResult],
         [],
       ),
+    'getTacoDAONeuronId' : IDL.Func([], [NeuronId__1], ['query']),
     'getUrgentVotableProposals' : IDL.Func(
         [IDL.Nat64],
         [
@@ -483,6 +485,7 @@ export const idlFactory = ({ IDL }) => {
     'setPeriodicTimerIntervalSeconds' : IDL.Func([IDL.Nat64], [], []),
     'setProposerSubaccount' : IDL.Func([IDL.Vec(IDL.Nat8)], [], []),
     'setSnsGovernanceCanisterId' : IDL.Func([IDL.Principal], [], []),
+    'setTacoDAONeuronId' : IDL.Func([IDL.Nat64], [], []),
     'setTest' : IDL.Func([IDL.Bool], [], []),
     'shouldCopyNNSProposal' : IDL.Func(
         [IDL.Nat64],

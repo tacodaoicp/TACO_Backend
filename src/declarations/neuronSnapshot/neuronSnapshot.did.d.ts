@@ -84,6 +84,7 @@ export interface Neuron {
   'neuron_fees_e8s' : bigint,
 }
 export interface NeuronId { 'id' : Uint8Array | number[] }
+export interface NeuronId__1 { 'id' : bigint }
 export interface NeuronPermission {
   'principal' : [] | [Principal],
   'permission_type' : Int32Array | number[],
@@ -322,6 +323,7 @@ export interface neuronSnapshot {
   'getProposerSubaccount' : ActorMethod<[], Uint8Array | number[]>,
   'getSNSProposal' : ActorMethod<[bigint], GetSNSProposalFullResult>,
   'getSNSProposalSummary' : ActorMethod<[bigint], GetSNSProposalSummaryResult>,
+  'getTacoDAONeuronId' : ActorMethod<[], NeuronId__1>,
   'getUrgentVotableProposals' : ActorMethod<
     [bigint],
     Array<
@@ -386,6 +388,7 @@ export interface neuronSnapshot {
   'setPeriodicTimerIntervalSeconds' : ActorMethod<[bigint], undefined>,
   'setProposerSubaccount' : ActorMethod<[Uint8Array | number[]], undefined>,
   'setSnsGovernanceCanisterId' : ActorMethod<[Principal], undefined>,
+  'setTacoDAONeuronId' : ActorMethod<[bigint], undefined>,
   'setTest' : ActorMethod<[boolean], undefined>,
   'shouldCopyNNSProposal' : ActorMethod<[bigint], ShouldCopyProposalResult>,
   'startAutoProcessNNSProposals' : ActorMethod<[], boolean>,

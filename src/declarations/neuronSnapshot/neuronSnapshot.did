@@ -66,6 +66,7 @@ type neuronSnapshot =
    getSNSProposal: (proposalId: nat64) -> (GetSNSProposalFullResult);
    getSNSProposalSummary: (proposalId: nat64) ->
     (GetSNSProposalSummaryResult);
+   getTacoDAONeuronId: () -> (NeuronId__1) query;
    getUrgentVotableProposals: (hoursThreshold: nat64) ->
     (vec
       record {
@@ -117,6 +118,7 @@ type neuronSnapshot =
    setPeriodicTimerIntervalSeconds: (intervalSeconds: nat64) -> ();
    setProposerSubaccount: (subaccount: blob) -> ();
    setSnsGovernanceCanisterId: (canisterId: principal) -> ();
+   setTacoDAONeuronId: (neuronId: nat64) -> ();
    setTest: (enabled: bool) -> ();
    shouldCopyNNSProposal: (nnsProposalId: nat64) ->
     (ShouldCopyProposalResult);
@@ -350,6 +352,7 @@ type NeuronPermission =
    permission_type: vec int32;
    "principal": opt principal;
  };
+type NeuronId__1 = record {id: nat64;};
 type NeuronId = record {id: blob;};
 type Neuron = 
  record {

@@ -73,11 +73,11 @@ shared deployer actor class neuronSnapshot() = this {
   var periodicTimerId : ?Nat = null;
 
   
-  // Proposer subaccount for NNS proposal copying
-  stable var proposerSubaccount : Blob = Blob.fromArray([]); // Default to empty subaccount
+  // Proposer subaccount for NNS proposal copying (hex: 712b9424940499b2a59979c3605c83772b636f8fce15bc963937da4812f89928)
+  stable var proposerSubaccount : Blob = Blob.fromArray([0x71, 0x2b, 0x94, 0x24, 0x94, 0x04, 0x99, 0xb2, 0xa5, 0x99, 0x79, 0xc3, 0x60, 0x5c, 0x83, 0x77, 0x2b, 0x63, 0x6f, 0x8f, 0xce, 0x15, 0xbc, 0x96, 0x39, 0x37, 0xda, 0x48, 0x12, 0xf8, 0x99, 0x28]);
 
   // TACO DAO Neuron ID for NNS voting
-  let taco_dao_neuron_id : NNSTypes.NeuronId = { id = 1833423628191905776 }; // TACO DAO Named Neuron ID
+  stable var taco_dao_neuron_id : NNSTypes.NeuronId = { id = 1833423628191905776 }; // TACO DAO Named Neuron ID
 
 
   stable var neuron_snapshots : List.List<T.NeuronSnapshot> = List.nil();
@@ -1394,6 +1394,23 @@ shared deployer actor class neuronSnapshot() = this {
 
     proposerSubaccount := subaccount;
     logger.info("Config", "Proposer subaccount updated by " # Principal.toText(caller), "setProposerSubaccount");
+  };
+
+  // Get the current TACO DAO neuron ID
+  public query func getTacoDAONeuronId() : async NNSTypes.NeuronId {
+    taco_dao_neuron_id;
+  };
+
+  // Set the TACO DAO neuron ID (admin only)
+  public shared ({ caller }) func setTacoDAONeuronId(neuronId : Nat64) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("Config", "Unauthorized caller trying to set TACO DAO neuron ID: " # Principal.toText(caller), "setTacoDAONeuronId");
+      return;
+    };
+
+    let oldNeuronId = taco_dao_neuron_id.id;
+    taco_dao_neuron_id := { id = neuronId };
+    logger.info("Config", "TACO DAO neuron ID updated from " # Nat64.toText(oldNeuronId) # " to " # Nat64.toText(neuronId) # " by " # Principal.toText(caller), "setTacoDAONeuronId");
   };
 
   // Get periodic timer status information
