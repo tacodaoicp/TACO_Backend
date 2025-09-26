@@ -298,17 +298,6 @@ module {
     false;
   };
 
-  // Test function to verify template formatting
-  public func testFormatProposalText() : Text {
-    formatProposalText(
-      138601,
-      "Motion",
-      "Test Proposal Title",
-      "This is a test summary of the original proposal.",
-      "https://nns.ic0.app/proposal/?u=qoctq-giaaa-aaaaa-aaaea-cai&proposal=138601"
-    );
-  };
-
   // Helper function to calculate current timestamp in seconds
   private func getCurrentTimestampSeconds() : Nat64 {
     Nat64.fromNat(Int.abs(Time.now()) / 1_000_000_000);

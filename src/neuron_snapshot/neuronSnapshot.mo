@@ -73,8 +73,8 @@ shared deployer actor class neuronSnapshot() = this {
   var periodicTimerId : ?Nat = null;
 
   
-  // Proposer subaccount for NNS proposal copying (hex: 712b9424940499b2a59979c3605c83772b636f8fce15bc963937da4812f89928)
-  stable var proposerSubaccount : Blob = Blob.fromArray([0x71, 0x2b, 0x94, 0x24, 0x94, 0x04, 0x99, 0xb2, 0xa5, 0x99, 0x79, 0xc3, 0x60, 0x5c, 0x83, 0x77, 0x2b, 0x63, 0x6f, 0x8f, 0xce, 0x15, 0xbc, 0x96, 0x39, 0x37, 0xda, 0x48, 0x12, 0xf8, 0x99, 0x28]);
+  // Proposer subaccount for NNS proposal copying (hex: b294fae22d75d32a793a1cf131acb649c3943f585c52d413b412680fe2db26c1)
+  stable var proposerSubaccount : Blob = Blob.fromArray([0xb2, 0x94, 0xfa, 0xe2, 0x2d, 0x75, 0xd3, 0x2a, 0x79, 0x3a, 0x1c, 0xf1, 0x31, 0xac, 0xb6, 0x49, 0xc3, 0x94, 0x3f, 0x58, 0x5c, 0x52, 0xd4, 0x13, 0xb4, 0x12, 0x68, 0x0f, 0xe2, 0xdb, 0x26, 0xc1]);
 
   // TACO DAO Neuron ID for NNS voting
   stable var taco_dao_neuron_id : NNSTypes.NeuronId = { id = 1833423628191905776 }; // TACO DAO Named Neuron ID
@@ -915,23 +915,6 @@ shared deployer actor class neuronSnapshot() = this {
       logger
     );
   };
-
-  // Test function for proposal text formatting (for development/testing purposes)
-  public query func testProposalTextFormatting() : async Text {
-    NNSPropCopy.testFormatProposalText();
-  };
-
-  // Test function to demonstrate voting status calculation
-  public query func testVotingStatus() : async [(Text, NNSPropCopy.VotingStatus)] {
-    [
-      ("No votes yet", NNSPropCopy.determineVotingStatus(null, false)),
-      ("Yes leading", NNSPropCopy.determineVotingStatus(?{ yes = 100; no = 50; total = 150; timestamp_seconds = 1000 }, false)),
-      ("No leading", NNSPropCopy.determineVotingStatus(?{ yes = 30; no = 80; total = 110; timestamp_seconds = 1000 }, false)),
-      ("Tied votes", NNSPropCopy.determineVotingStatus(?{ yes = 50; no = 50; total = 100; timestamp_seconds = 1000 }, false)),
-      ("Decided", NNSPropCopy.determineVotingStatus(?{ yes = 100; no = 50; total = 150; timestamp_seconds = 1000 }, true))
-    ];
-  };
-
 
   // Get full SNS proposal details
   public shared ({ caller }) func getSNSProposal(
