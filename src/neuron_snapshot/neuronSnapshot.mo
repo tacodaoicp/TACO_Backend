@@ -141,8 +141,10 @@ shared deployer actor class neuronSnapshot() = this {
   stable var periodicTimerLastRunTime : ?Nat64 = null; // Last execution timestamp
   stable var periodicTimerNextRunTime : ?Nat64 = null; // Next scheduled execution timestamp
 
-  // DAO Voting System - Track which NNS proposals the DAO has already voted on
+  // TODO: retire with a migrathion path expression. This is here for backwards compatibility.
   stable var daoVotedNNSProposals : Map.Map<Nat64, Bool> = Map.new<Nat64, Bool>(); // NNS Proposal ID -> true (voted)
+
+  // DAO Voting System - Track which NNS proposals the DAO has already voted on
   stable var daoVotedNNSProposals2 : Map.Map<Nat64, T.DAONNSVoteRecord> = Map.new<Nat64, T.DAONNSVoteRecord>(); // NNS Proposal ID -> Vote Record
   
   // DAO Voting System - Track votes per SNS proposal per neuron  
