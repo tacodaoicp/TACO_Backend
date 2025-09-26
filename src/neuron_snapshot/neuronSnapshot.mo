@@ -1176,7 +1176,7 @@ shared deployer actor class neuronSnapshot() = this {
             
             // Schedule next chunk via 0-second timer to avoid instruction limit
             let timerId = Timer.setTimer<system>(#seconds(0), func() : async () {
-              await autoProcessNNSProposalsChunk();
+              let _ = autoProcessNNSProposalsChunk(); // Don't await to avoid self-call
             });
             
             ignore timerId; // We don't need to track the timer ID
@@ -1275,7 +1275,7 @@ shared deployer actor class neuronSnapshot() = this {
             
             // Schedule next batch via 0-second timer to avoid instruction limit
             let timerId = Timer.setTimer<system>(#seconds(0), func() : async () {
-              await autoVoteOnUrgentProposalsChunk();
+              let _ = autoVoteOnUrgentProposalsChunk(); // Don't await to avoid self-call
             });
             
             ignore timerId; // We don't need to track the timer ID
