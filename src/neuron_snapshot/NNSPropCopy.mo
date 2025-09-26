@@ -822,7 +822,7 @@ module {
     };
   };
 
-  let test_doSendNNSProp = true;
+  let test_doSendNNSProp = false;
 
   // Vote on NNS proposal using TACO DAO's neuron
   public func voteOnNNSProposal(
