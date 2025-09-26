@@ -1189,7 +1189,7 @@ shared deployer actor class neuronSnapshot() = this {
           } else {
             // Less than 10 proposals found, we're done
             isAutoProcessingNNSProposals := false;
-            logger.info("NNSPropCopy", "Auto-processing completed - found only " # Nat.toText(data.processed_count) # " proposals, stopping", "autoProcessNNSProposalsChunk");
+            logger.info("NNSPropCopy", "🛑 Auto-processing STOPPED - found only " # Nat.toText(data.processed_count) # " proposals", "autoProcessNNSProposalsChunk");
           };
         };
         case (#err(error)) {
@@ -1293,11 +1293,11 @@ shared deployer actor class neuronSnapshot() = this {
             // No more urgent proposals or no votes attempted in this round, stop auto-voting
             isAutoVotingOnUrgentProposals := false;
             let reason = if (not attemptedAnyVotes) {
-              "no new proposals to attempt in this round";
+              "no new proposals to attempt in this round (round " # Nat64.toText(autoVotingRoundCounter) # ")";
             } else {
               "no more urgent proposals found";
             };
-            logger.info("DAOVoting", "Auto-voting completed - " # reason # ", stopping", "autoVoteOnUrgentProposalsChunk");
+            logger.info("DAOVoting", "🛑 Auto-voting STOPPED - " # reason, "autoVoteOnUrgentProposalsChunk");
           };
         };
         case (#err(error)) {
@@ -2031,7 +2031,25 @@ shared deployer actor class neuronSnapshot() = this {
         Array.subArray(urgentProposals, 0, maxProposalsToVote);
       };
 
-      logger.info("DAOVoting", "Found " # Nat.toText(urgentProposals.size()) # " urgent proposals, will vote on " # Nat.toText(limitedUrgentProposals.size()) # " (limited by max " # Nat.toText(maxProposalsToVote) # ")", "autoVoteOnUrgentProposals");
+      logger.info("DAOVoting", "📊 Analysis: Total=" # Nat.toText(allProposalsWithTime.size()) # ", Urgent=" # Nat.toText(urgentProposals.size()) # ", WillProcess=" # Nat.toText(limitedUrgentProposals.size()) # " (max=" # Nat.toText(maxProposalsToVote) # ", threshold=" # Nat64.toText(timeThresholdSeconds) # "s)", "autoVoteOnUrgentProposals");
+
+      // Early exit if no urgent proposals to process
+      if (limitedUrgentProposals.size() == 0) {
+        let finalResults = {
+          total_proposals_checked = allProposalsWithTime.size();
+          urgent_proposals_found = urgentProposals.size();
+          max_proposals_limit = maxProposalsToVote;
+          votes_attempted = 0;
+          votes_successful = 0;
+          votes_failed = 0;
+          votes_already_voted = 0;
+          votes_no_dao_votes = 0;
+          results = [];
+        };
+
+        logger.info("DAOVoting", "⏭️  No urgent proposals to process - early exit", "autoVoteOnUrgentProposals");
+        return #ok(finalResults);
+      };
 
       let results = Vector.new<{
         nns_proposal_id : Nat64;
