@@ -28,7 +28,7 @@ module {
     "- **Link:** {link}\n\n" #
     "**Original Summary:**\n{summary}\n\n" #
     "---\n\n" #
-    "## 🗳️ How to Vote:\n\n" #
+    "## How to Vote:\n\n" #
     "1. **Vote ADOPT on this SNS motion** (to avoid rejection costs and confirm the proposal)\n" #
     "2. **Cast your real vote** at: **https://tacodao.com/nnsprop/{proposal_id}**\n\n" #
     "Your voting power on the web app is calculated using your staked TACO DAO neurons. The collective outcome of these \"local votes\" will determine how our DAO's NNS neuron votes on the original NNS proposal.\n\n" #
@@ -446,8 +446,9 @@ module {
           logger.info("NNSPropCopy", "Submitting motion proposal to SNS governance", "copyNNSProposal");
           
           if (not test_doSendSNSProp) {
-          //Debug.print("manageNeuronRequest: " # debug_show(manageNeuronRequest));
-          Debug.print("manageNeuronRequest: " # debug_show(nnsProposalId));
+          //logger.info("NNSPropCopy", debug_show(snsProposal), "copyNNSProposal");
+          Debug.print("manageNeuronRequest: " # debug_show(snsProposal));
+          //Debug.print("manageNeuronRequest: " # debug_show(nnsProposalId));
           return #err(#NetworkError("TESTING"))
           } else {
           let response = await snsGovernance.manage_neuron(manageNeuronRequest);
