@@ -1999,6 +1999,21 @@ shared deployer actor class neuronSnapshot() = this {
     Map.size(daoVotedNNSProposals2);
   };
 
+  // Clear all DAO voted NNS proposals (admin only)
+  public shared ({ caller }) func clearDAOVotedNNSProposals() : async Nat {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("DAOVoting", "Unauthorized caller trying to clear DAO voted NNS proposals: " # Principal.toText(caller), "clearDAOVotedNNSProposals");
+      return 0;
+    };
+
+    let countBeforeClear = Map.size(daoVotedNNSProposals2);
+    daoVotedNNSProposals2 := Map.new<Nat64, T.DAONNSVoteRecord>();
+    
+    logger.info("DAOVoting", "Cleared " # Nat.toText(countBeforeClear) # " DAO voted NNS proposals by " # Principal.toText(caller), "clearDAOVotedNNSProposals");
+    
+    countBeforeClear;
+  };
+
 /* NB: Turn on again after initial setup
   system func inspect({
     arg : Blob;
