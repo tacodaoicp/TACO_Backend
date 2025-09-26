@@ -71,6 +71,9 @@ shared deployer actor class neuronSnapshot() = this {
 
   var snapshotTimerId : Nat = 0;
 
+  // Non-stable periodic timer ID (reset after upgrades)
+  var periodicTimerId : ?Nat = null;
+
   stable var neuron_snapshots : List.List<T.NeuronSnapshot> = List.nil();
 
   // The latest snaphsot id
@@ -108,6 +111,13 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Auto-voting threshold in seconds (default: 2 hours = 7200 seconds)
   stable var autoVotingThresholdSeconds : Nat64 = 7200;
+
+  // Periodic timer interval in seconds (default: 1 hour = 3600 seconds)
+  stable var periodicTimerIntervalSeconds : Nat64 = 3600;
+
+  // Periodic timer state tracking
+  stable var periodicTimerLastRunTime : ?Nat64 = null; // Last execution timestamp
+  stable var periodicTimerNextRunTime : ?Nat64 = null; // Next scheduled execution timestamp
 
   // DAO Voting System - Track which NNS proposals the DAO has already voted on
   stable var daoVotedNNSProposals : Map.Map<Nat64, Bool> = Map.new<Nat64, Bool>(); // NNS Proposal ID -> true (voted)
@@ -1323,10 +1333,155 @@ shared deployer actor class neuronSnapshot() = this {
       return;
     };
 
+    // Validate that threshold is larger than periodic timer interval
+    if (thresholdSeconds <= periodicTimerIntervalSeconds) {
+      logger.error("DAOVoting", "Invalid threshold: auto-voting threshold (" # Nat64.toText(thresholdSeconds) # "s) must be larger than periodic timer interval (" # Nat64.toText(periodicTimerIntervalSeconds) # "s)", "setAutoVotingThresholdSeconds");
+      return;
+    };
+
     let oldThreshold = autoVotingThresholdSeconds;
     autoVotingThresholdSeconds := thresholdSeconds;
     
     logger.info("DAOVoting", "Auto-voting threshold updated from " # Nat64.toText(oldThreshold) # "s to " # Nat64.toText(thresholdSeconds) # "s by " # Principal.toText(caller), "setAutoVotingThresholdSeconds");
+  };
+
+  // Periodic Timer System - Master timer that orchestrates all automated processes
+
+  // Get the current periodic timer interval in seconds
+  public query func getPeriodicTimerIntervalSeconds() : async Nat64 {
+    periodicTimerIntervalSeconds;
+  };
+
+  // Set the periodic timer interval in seconds (admin only)
+  public shared ({ caller }) func setPeriodicTimerIntervalSeconds(intervalSeconds : Nat64) : async () {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("PeriodicTimer", "Unauthorized caller trying to set periodic timer interval: " # Principal.toText(caller), "setPeriodicTimerIntervalSeconds");
+      return;
+    };
+
+    if (intervalSeconds == 0) {
+      logger.error("PeriodicTimer", "Invalid interval: cannot be zero", "setPeriodicTimerIntervalSeconds");
+      return;
+    };
+
+    // Validate that auto-voting threshold is larger than timer interval
+    if (autoVotingThresholdSeconds <= intervalSeconds) {
+      logger.error("PeriodicTimer", "Invalid interval: auto-voting threshold (" # Nat64.toText(autoVotingThresholdSeconds) # "s) must be larger than timer interval (" # Nat64.toText(intervalSeconds) # "s)", "setPeriodicTimerIntervalSeconds");
+      return;
+    };
+
+    let oldInterval = periodicTimerIntervalSeconds;
+    periodicTimerIntervalSeconds := intervalSeconds;
+    
+    logger.info("PeriodicTimer", "Periodic timer interval updated from " # Nat64.toText(oldInterval) # "s to " # Nat64.toText(intervalSeconds) # "s by " # Principal.toText(caller), "setPeriodicTimerIntervalSeconds");
+  };
+
+  // Get periodic timer status information
+  public query func getPeriodicTimerStatus() : async {
+    is_running : Bool;
+    timer_id : ?Nat;
+    last_run_time : ?Nat64;
+    next_run_time : ?Nat64;
+    interval_seconds : Nat64;
+  } {
+    {
+      is_running = switch (periodicTimerId) { case (?_) { true }; case (null) { false }; };
+      timer_id = periodicTimerId;
+      last_run_time = periodicTimerLastRunTime;
+      next_run_time = periodicTimerNextRunTime;
+      interval_seconds = periodicTimerIntervalSeconds;
+    };
+  };
+
+  // Start the periodic timer (admin only)
+  public shared ({ caller }) func startPeriodicTimer() : async Bool {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("PeriodicTimer", "Unauthorized caller trying to start periodic timer: " # Principal.toText(caller), "startPeriodicTimer");
+      return false;
+    };
+
+    switch (periodicTimerId) {
+      case (?_) {
+        logger.warn("PeriodicTimer", "Periodic timer is already running, ignoring start request from " # Principal.toText(caller), "startPeriodicTimer");
+        return false;
+      };
+      case (null) {
+        logger.info("PeriodicTimer", "Starting periodic timer (interval: " # Nat64.toText(periodicTimerIntervalSeconds) # "s) by " # Principal.toText(caller), "startPeriodicTimer");
+        
+        // Schedule first execution immediately
+        let timerId = Timer.setTimer<system>(#seconds(0), func() : async () {
+          await executePeriodicTimerTick();
+        });
+        
+        periodicTimerId := ?timerId;
+        let currentTime = get_current_timestamp() / 1_000_000_000; // Convert to seconds
+        periodicTimerNextRunTime := ?currentTime;
+        
+        true;
+      };
+    };
+  };
+
+  // Stop the periodic timer (admin only)
+  public shared ({ caller }) func stopPeriodicTimer() : async Bool {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("PeriodicTimer", "Unauthorized caller trying to stop periodic timer: " # Principal.toText(caller), "stopPeriodicTimer");
+      return false;
+    };
+
+    switch (periodicTimerId) {
+      case (null) {
+        logger.info("PeriodicTimer", "Stop requested by " # Principal.toText(caller) # " but periodic timer was not running", "stopPeriodicTimer");
+        false;
+      };
+      case (?timerId) {
+        Timer.cancelTimer(timerId);
+        periodicTimerId := null;
+        periodicTimerNextRunTime := null;
+        
+        logger.info("PeriodicTimer", "Periodic timer stopped by " # Principal.toText(caller), "stopPeriodicTimer");
+        true;
+      };
+    };
+  };
+
+  // Internal function that executes on each periodic timer tick
+  private func executePeriodicTimerTick() : async () {
+    let currentTime = get_current_timestamp() / 1_000_000_000; // Convert to seconds
+    periodicTimerLastRunTime := ?currentTime;
+    
+    logger.info("PeriodicTimer", "Executing periodic timer tick", "executePeriodicTimerTick");
+
+    try {
+      // 1. Start auto-processing NNS proposals (via 0-second timer)
+      let processTimerId = Timer.setTimer<system>(#seconds(0), func() : async () {
+        let _ = await startAutoProcessNNSProposals(Blob.fromArray([])); // Empty subaccount
+      });
+      ignore processTimerId;
+      
+      // 2. Start auto-voting on urgent proposals (via 0-second timer)  
+      let voteTimerId = Timer.setTimer<system>(#seconds(0), func() : async () {
+        let _ = await startAutoVoteOnUrgentProposals();
+      });
+      ignore voteTimerId;
+      
+      logger.info("PeriodicTimer", "Scheduled NNS processing and urgent voting tasks", "executePeriodicTimerTick");
+      
+    } catch (error) {
+      logger.error("PeriodicTimer", "Error during periodic timer execution: " # Error.message(error), "executePeriodicTimerTick");
+    };
+
+    // 3. Schedule next execution
+    let nextRunTime = currentTime + periodicTimerIntervalSeconds;
+    periodicTimerNextRunTime := ?nextRunTime;
+    
+    let timerId = Timer.setTimer<system>(#seconds(Nat64.toNat(periodicTimerIntervalSeconds)), func() : async () {
+      await executePeriodicTimerTick();
+    });
+    
+    periodicTimerId := ?timerId;
+    
+    logger.info("PeriodicTimer", "Scheduled next periodic timer execution in " # Nat64.toText(periodicTimerIntervalSeconds) # "s (at timestamp " # Nat64.toText(nextRunTime) # ")", "executePeriodicTimerTick");
   };
 
   // DAO Voting System Functions
