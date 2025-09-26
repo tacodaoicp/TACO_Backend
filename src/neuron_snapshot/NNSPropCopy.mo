@@ -20,7 +20,7 @@ module {
   // Standard text template for copied NNS proposals
   public func getCopiedProposalTemplate() : Text {
     "🔗 **Copied from NNS Proposal**\n\n" #
-    "This is a motion proposal to discuss and potentially adopt the same action as NNS Proposal #{proposal_id}.\n\n" #
+    "This is a motion proposal that links to NNS Proposal #{proposal_id}. **Please vote ADOPT on this SNS motion as a formality** to confirm it, then cast your actual vote on our web app.\n\n" #
     "**Original NNS Proposal Details:**\n" #
     "- **ID:** {proposal_id}\n" #
     "- **Type:** {proposal_type}\n" #
@@ -28,7 +28,11 @@ module {
     "- **Link:** {link}\n\n" #
     "**Original Summary:**\n{summary}\n\n" #
     "---\n\n" #
-    "Please review the original proposal and vote accordingly. This motion serves to gauge community sentiment and potentially coordinate our DAO's position on this matter.";
+    "## 🗳️ How to Vote:\n\n" #
+    "1. **Vote ADOPT on this SNS motion** (to avoid rejection costs and confirm the proposal)\n" #
+    "2. **Cast your real vote** at: **https://tacodao.com/nnsprop/{proposal_id}**\n\n" #
+    "Your voting power on the web app is calculated using your staked TACO DAO neurons. The collective outcome of these \"local votes\" will determine how our DAO's NNS neuron votes on the original NNS proposal.\n\n" #
+    "This system allows you to vote REJECT on NNS proposals without rejecting the TACO SNS motion (which would cost the DAO staked TACO tokens in rejection fees).";
   };
 
   // SNS Proposal types for creating motion proposals
