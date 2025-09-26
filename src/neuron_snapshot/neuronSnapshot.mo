@@ -1490,17 +1490,27 @@ shared deployer actor class neuronSnapshot() = this {
     logger.info("PeriodicTimer", "Executing periodic timer tick", "executePeriodicTimerTick");
 
     try {
-      // 1. Start auto-processing NNS proposals (via 0-second timer)
-      let processTimerId = Timer.setTimer<system>(#seconds(0), func() : async () {
-        let _ = await startAutoProcessNNSProposals(); // Uses stable proposer subaccount
-      });
-      ignore processTimerId;
+      // 1. Start auto-processing NNS proposals (via 0-second timer) if not already running
+      if (not isAutoProcessingNNSProposals) {
+        let processTimerId = Timer.setTimer<system>(#seconds(0), func() : async () {
+          let _ = await startAutoProcessNNSProposals(); // Uses stable proposer subaccount
+        });
+        ignore processTimerId;
+        logger.info("PeriodicTimer", "Started auto-processing NNS proposals", "executePeriodicTimerTick");
+      } else {
+        logger.info("PeriodicTimer", "Auto-processing NNS proposals already running, skipping", "executePeriodicTimerTick");
+      };
       
-      // 2. Start auto-voting on urgent proposals (via 0-second timer)  
-      let voteTimerId = Timer.setTimer<system>(#seconds(0), func() : async () {
-        let _ = await startAutoVoteOnUrgentProposals();
-      });
-      ignore voteTimerId;
+      // 2. Start auto-voting on urgent proposals (via 0-second timer) if not already running
+      if (not isAutoVotingOnUrgentProposals) {
+        let voteTimerId = Timer.setTimer<system>(#seconds(0), func() : async () {
+          let _ = await startAutoVoteOnUrgentProposals();
+        });
+        ignore voteTimerId;
+        logger.info("PeriodicTimer", "Started auto-voting on urgent proposals", "executePeriodicTimerTick");
+      } else {
+        logger.info("PeriodicTimer", "Auto-voting on urgent proposals already running, skipping", "executePeriodicTimerTick");
+      };
       
       logger.info("PeriodicTimer", "Scheduled NNS processing and urgent voting tasks", "executePeriodicTimerTick");
       
