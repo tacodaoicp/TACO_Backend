@@ -2465,6 +2465,45 @@ shared deployer actor class neuronSnapshot() = this {
     countBeforeClear;
   };
 
+  // Clear all stored neuron snapshots and associated data (admin only)
+  public shared ({ caller }) func clearNeuronSnapshots() : async {
+    snapshots_cleared : Nat;
+    neuron_store_entries_cleared : Nat;
+    cumulative_values_cleared : Nat;
+  } {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
+      logger.warn("Snapshot", "Unauthorized caller trying to clear neuron snapshots: " # Principal.toText(caller), "clearNeuronSnapshots");
+      return {
+        snapshots_cleared = 0;
+        neuron_store_entries_cleared = 0;
+        cumulative_values_cleared = 0;
+      };
+    };
+
+    // Count items before clearing
+    let snapshotsCount = List.size(neuron_snapshots);
+    let neuronStoreCount = Map.size(neuronStore);
+    let cumulativeValuesCount = Map.size(snapshotCumulativeValues);
+
+    // Clear all snapshot-related data structures
+    neuron_snapshots := List.nil();
+    Map.clear(neuronStore);
+    Map.clear(snapshotCumulativeValues);
+    
+    // Reset the head ID to 0
+    neuron_snapshot_head_id := 0;
+    
+    logger.info("Snapshot", "Cleared all neuron snapshots: " # Nat.toText(snapshotsCount) # " snapshots, " # 
+      Nat.toText(neuronStoreCount) # " neuron store entries, " # Nat.toText(cumulativeValuesCount) # 
+      " cumulative values entries by " # Principal.toText(caller), "clearNeuronSnapshots");
+    
+    {
+      snapshots_cleared = snapshotsCount;
+      neuron_store_entries_cleared = neuronStoreCount;
+      cumulative_values_cleared = cumulativeValuesCount;
+    };
+  };
+
 /* NB: Turn on again after initial setup
   system func inspect({
     arg : Blob;
