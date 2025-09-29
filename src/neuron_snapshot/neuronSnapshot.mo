@@ -907,13 +907,25 @@ shared deployer actor class neuronSnapshot() = this {
     };
 
     // Call the NNSPropCopy module function using the stable proposer subaccount
-    await NNSPropCopy.copyNNSProposal(
+    let result = await NNSPropCopy.copyNNSProposal(
       nnsProposalId,
       nns_gov_canister,
       sns_gov_canister,
       proposerSubaccount,
       logger
     );
+
+    // If successful, store the NNS-SNS proposal mapping
+    switch (result) {
+      case (#ok(snsProposalId)) {
+        Map.set(copiedNNSProposals, n64hash, nnsProposalId, snsProposalId);
+        logger.info("NNSPropCopy", "Stored mapping: NNS " # Nat64.toText(nnsProposalId) # " -> SNS " # Nat64.toText(snsProposalId), "copyNNSProposal");
+        return #ok(snsProposalId);
+      };
+      case (#err(error)) {
+        return #err(error);
+      };
+    };
   };
 
   // Get full SNS proposal details
