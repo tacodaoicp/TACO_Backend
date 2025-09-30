@@ -402,6 +402,11 @@ module {
       batchTimer.adminStopAll(caller);
     };
 
+    // Emergency force reset for stuck middle loop
+    public func forceResetMiddleLoop(caller : Principal) : Result.Result<Text, Text> {
+      batchTimer.adminForceResetMiddleLoop(caller);
+    };
+
     // Legacy compatibility - single import function
     public func runManualBatchImport(caller : Principal, importFunction : () -> async ()) : async Result.Result<Text, Text> {
       await batchTimer.adminManualImport(caller, importFunction);

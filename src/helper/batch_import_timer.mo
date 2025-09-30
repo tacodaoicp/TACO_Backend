@@ -494,6 +494,35 @@ module {
       #ok("All timers stopped and cancelled")
     };
     
+    // Emergency method to force reset stuck middle loop state
+    public func adminForceResetMiddleLoop(caller: Principal) : Result.Result<Text, Text> {
+      if (not isMasterAdmin(caller)) {
+        return #err("Not authorized");
+      };
+      
+      // Force reset all middle loop state variables
+      middleLoopRunning := false;
+      middleLoopCurrentState := "Done";
+      middleLoopCancelled := false;
+      
+      // Also reset inner loop state for good measure
+      innerLoopRunning := false;
+      innerLoopCurrentType := "None";
+      innerLoopCurrentBatch := 0;
+      innerLoopCancelled := false;
+      
+      // Cancel any pending timer
+      switch (middleLoopTimerId) {
+        case (?id) {
+          Timer.cancelTimer(id);
+          middleLoopTimerId := null;
+        };
+        case null {};
+      };
+      
+      #ok("Middle loop state forcefully reset - all variables cleared")
+    };
+    
     public func adminManualImport(caller: Principal, importFunction: () -> async ()) : async Result.Result<Text, Text> {
       if (not isMasterAdmin(caller)) {
         return #err("Not authorized");

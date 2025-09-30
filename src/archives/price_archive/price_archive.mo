@@ -573,6 +573,11 @@ shared (deployer) actor class PriceArchiveV2() = this {
     base.stopAllTimers(caller);
   };
 
+  // Emergency force reset for stuck middle loop
+  public shared ({ caller }) func forceResetMiddleLoop() : async Result.Result<Text, Text> {
+    base.forceResetMiddleLoop(caller);
+  };
+
   // Advanced manual import using three-tier timer system
   public shared ({ caller }) func runManualBatchImport() : async Result.Result<Text, Text> {
     await base.runAdvancedManualBatchImport<system>(caller, null, null, ?importPriceOnly);
