@@ -23,6 +23,10 @@
     "ic": "vzs3x-taaaa-aaaan-qzzjq-cai",
     "staging": "tgqd4-eqaaa-aaaai-atifa-cai"
   },
+  "nns_neuron_controller": {
+    "ic": "tpgtx-iqaaa-aaaar-qbugq-cai",
+    "staging": "4xmtl-yiaaa-aaaan-qz7fq-cai"    
+  },
   "portfolio_archive": {
     "ic": "bl7x7-wiaaa-aaaan-qz5bq-cai",
     "staging": "lrekt-uaaaa-aaaan-qz4ya-cai"

@@ -49,6 +49,7 @@ let ledger : Ledger.Interface = actor (NNS_LEDGER_CANISTER_ID);
 type GovernanceActor = actor {
   claim_or_refresh_neuron_from_account : (NnsTypes.ClaimOrRefreshNeuronFromAccount) -> async NnsTypes.ClaimOrRefreshNeuronFromAccountResponse;
   manage_neuron : (NnsTypes.ManageNeuronRequest) -> async NnsTypes.ManageNeuronResponse;
+  get_full_neuron : (Nat64) -> async NnsTypes.Result_2;
 };
 let governance : GovernanceActor = actor (NNS_GOVERNANCE_CANISTER_ID);
 
@@ -118,6 +119,11 @@ shared (deployer) persistent actor class NnsNeuronController() = this {
       case (?#Error e) { return { ok = false; err = ?e } };
       case (_) { return { ok = true; err = null } };
     };
+  };
+
+  // Read full neuron from NNS governance and forward the result (update call)
+  public shared func get_full_neuron(neuron_id : Nat64) : async NnsTypes.Result_2 {
+    governance.get_full_neuron(neuron_id)
   };
 }
 
