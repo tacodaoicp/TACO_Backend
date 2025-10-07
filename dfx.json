@@ -45,7 +45,7 @@
       "type": "motoko"
     },
     "nns_neuron_controller": {
-      "main": "src/nns_neuron_controller/nns_neuron_controller.mo",
+      "main": "src/nns_neuron_controller/main.mo",
       "type": "motoko"
     },
     "dao_neuron_allocation_archive": {
