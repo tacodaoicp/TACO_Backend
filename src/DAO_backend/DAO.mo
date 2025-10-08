@@ -2504,6 +2504,49 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+public query ({ caller }) func getTokenDetailsWithoutPastPrices() : async [(Principal, {
+    Active : Bool;
+    isPaused : Bool;
+    epochAdded : Int;
+    tokenName : Text;
+    tokenSymbol : Text;
+    tokenDecimals : Nat;
+    tokenTransferFee : Nat;
+    balance : Nat;
+    priceInICP : Nat;
+    priceInUSD : Float;
+    tokenType : TokenType;
+    lastTimeSynced : Int;
+    pausedDueToSyncFailure : Bool;
+  })] {
+    if (isAllowedQuery(caller)) {
+      Iter.toArray(
+        Iter.map(
+          Map.entries(tokenDetailsMap),
+          func((principal, details)) {
+            (principal, {
+              Active = details.Active;
+              isPaused = details.isPaused;
+              epochAdded = details.epochAdded;
+              tokenName = details.tokenName;
+              tokenSymbol = details.tokenSymbol;
+              tokenDecimals = details.tokenDecimals;
+              tokenTransferFee = details.tokenTransferFee;
+              balance = details.balance;
+              priceInICP = details.priceInICP;
+              priceInUSD = details.priceInUSD;
+              tokenType = details.tokenType;
+              lastTimeSynced = details.lastTimeSynced;
+              pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+            })
+          }
+        )
+      );
+    } else {
+      [];
+    };
+  };  
+
   // Admin method to update spam parameters
   public shared ({ caller }) func updateSpamParameters(
     params : {
