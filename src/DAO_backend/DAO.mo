@@ -25,6 +25,7 @@ import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import CanisterIds "../helper/CanisterIds";
 import calcHelp "../neuron_snapshot/VPcalculation";
+import Cycles "mo:base/ExperimentalCycles";
 
 shared (deployer) actor class ContinuousDAO() = this {
 
@@ -3481,4 +3482,7 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
+  };  
 };

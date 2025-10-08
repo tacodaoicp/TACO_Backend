@@ -23,6 +23,7 @@ import Array "mo:base/Array";
 import Result "mo:base/Result";
 import CanisterIds "../helper/CanisterIds";
 import NNSPropCopy "./NNSPropCopy";
+import Cycles "mo:base/ExperimentalCycles";
 
 shared deployer actor class neuronSnapshot() = this {
 
@@ -2516,6 +2517,9 @@ shared deployer actor class neuronSnapshot() = this {
     };
   };
 
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
+  };
 /* NB: Turn on again after initial setup
   system func inspect({
     arg : Blob;

@@ -17,6 +17,7 @@ import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
 import Logger "../../helper/logger";
 import BatchImportTimer "../../helper/batch_import_timer";
+import Cycles "mo:base/ExperimentalCycles";
 
 shared (deployer) actor class DAOAllocationArchive() = this {
 
@@ -604,5 +605,9 @@ shared (deployer) actor class DAOAllocationArchive() = this {
       case (#Follow) { "Follow" };
       case (#Unfollow) { "Unfollow" };
     };
+  };
+
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
   };
 };

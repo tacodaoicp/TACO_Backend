@@ -13,6 +13,8 @@ import CRC32 "../helper/CRC32";
 import NnsTypes "../neuron_snapshot/nns_types";
 import Iter "mo:base/Iter";
 import Int "mo:base/Int";
+import Cycles "mo:base/ExperimentalCycles";
+
 shared (deployer) persistent actor class NnsNeuronController() = this {
   // NNS canister principals
   let NNS_GOVERNANCE_CANISTER_ID : Text = "rrkah-fqaaa-aaaaa-aaaaq-cai"; // governance
@@ -128,6 +130,10 @@ shared (deployer) persistent actor class NnsNeuronController() = this {
     assert (Principal.isController(caller));
 
     await governance.get_full_neuron(neuron_id)
+  };
+
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
   };
 }
 

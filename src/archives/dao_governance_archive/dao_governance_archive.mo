@@ -18,6 +18,7 @@ import CanisterIds "../../helper/CanisterIds";
 import ArchiveBase "../../helper/archive_base";
 import Logger "../../helper/logger";
 import BatchImportTimer "../../helper/batch_import_timer";
+import Cycles "mo:base/ExperimentalCycles";
 
 shared (deployer) actor class DAOGovernanceArchive() = this {
 
@@ -645,6 +646,10 @@ shared (deployer) actor class DAOGovernanceArchive() = this {
   private func neuronIdToText(neuronId : Blob) : Text {
     // Convert Blob to Text for indexing (simple debug representation)
     debug_show(neuronId);
+  };
+
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
   };
 };
 

@@ -20,6 +20,7 @@ import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import ICRC "../helper/icrc.types";
 import NeuronSnapshot "../neuron_snapshot/ns_types";
+import Cycles "mo:base/ExperimentalCycles";
 
 shared (deployer) persistent actor class Rewards() = this {
 
@@ -1954,5 +1955,10 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     };
   };
+
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
+  };
+
 }
 
