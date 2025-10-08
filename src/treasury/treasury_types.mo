@@ -3,6 +3,8 @@ import DAO_types "../DAO_backend/dao_types";
 import Vector "mo:vector";
 import Prim "mo:prim";
 import Principal "mo:base/Principal";
+import Cycles "mo:base/ExperimentalCycles";
+
 module {
   public type TokenDetails = DAO_types.TokenDetails;
 
@@ -548,4 +550,9 @@ module {
     getTokenDetailsSince : shared query (Int) -> async [(Principal, TokenDetails)];
     getTreasuryAdminActionsSince : shared query (Int, Nat) -> async Result.Result<TreasuryAdminActionsSinceResponse, TradingPauseError>;
   };
+
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
+  };
+
 };
