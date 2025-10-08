@@ -9,7 +9,10 @@ type TokenType =
    ICRC12;
    ICRC3;
  };
+type Subaccount = blob;
 service : {
   validate_addToken: (token: principal, tokenType: TokenType) ->
    (ValidationResult);
+  validate_sendToken: (token: principal, amount_e8s: nat, to_principal:
+   principal, to_subaccount: opt Subaccount) -> (ValidationResult) query;
 }
