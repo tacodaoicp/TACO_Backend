@@ -2504,7 +2504,7 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
-public query ({ caller }) func getTokenDetailsWithoutPastPrices() : async [(Principal, {
+  type PublicTokenDetails = {
     Active : Bool;
     isPaused : Bool;
     epochAdded : Int;
@@ -2518,12 +2518,15 @@ public query ({ caller }) func getTokenDetailsWithoutPastPrices() : async [(Prin
     tokenType : TokenType;
     lastTimeSynced : Int;
     pausedDueToSyncFailure : Bool;
-  })] {
+  };
+  type PublicTokenDetailsEntry = (Principal, PublicTokenDetails);
+
+  public query ({ caller }) func getTokenDetailsWithoutPastPrices() : async [PublicTokenDetailsEntry] {
     if (isAllowedQuery(caller)) {
       Iter.toArray(
         Iter.map(
           Map.entries(tokenDetailsMap),
-          func((principal, details)) {
+          func((principal : Principal, details : TokenDetails)) : PublicTokenDetailsEntry {
             (principal, {
               Active = details.Active;
               isPaused = details.isPaused;
