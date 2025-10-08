@@ -112,6 +112,7 @@ import SpamProtection "../helper/spam_protection";
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
+import Cycles "mo:base/ExperimentalCycles";
 
 shared (deployer) actor class treasury() = this {
 
@@ -6646,6 +6647,10 @@ shared (deployer) actor class treasury() = this {
       };
       portfolioSnapshotTimerId := 0;
     };
+  };
+
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
   };
 
 };
