@@ -3,6 +3,7 @@ import Blob "mo:base/Blob";
 import Result "mo:base/Result";
 import Principal "mo:base/Principal";
 import Debug "mo:base/Debug";
+import Cycles "mo:base/ExperimentalCycles";
 
 actor validation {
 
@@ -37,5 +38,8 @@ actor validation {
       #Ok(msg);
     };
 
+  public query func get_canister_cycles() : async { cycles : Nat } {
+    { cycles = Cycles.balance() };
+  };  
 
 }
