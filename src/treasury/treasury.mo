@@ -563,6 +563,8 @@ shared (deployer) actor class treasury() = this {
    * Only callable by DAO or controller.
    */
   public shared ({ caller }) func startRebalancing(reason : ?Text) : async Result.Result<Text, RebalanceError> {
+    // TODO: Move caller != DAOPrincipal and not Principal.isController(caller) into hasAdminPermission,
+    //       check them first and make hasAdminPermission async* 
     if (((await hasAdminPermission(caller, #startRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
       return #err(#ConfigError("Not authorized"));
     };
@@ -1362,20 +1364,6 @@ shared (deployer) actor class treasury() = this {
     };
 
     #ok(Vector.toArray(result));
-  };
-
-  /**
-   * Set test mode (modifies safety parameters)
-   * Only callable by DAO.
-   */
-  public shared ({ caller }) func setTest(a : Bool) : async () {
-    if (caller != DAOPrincipal) {
-      logTreasuryAdminAction(caller, #SetTestMode({isTestMode = a}), "Unauthorized attempt", false, ?"Only DAO can set test mode");
-      assert (false); // Keep original assert behavior
-    };
-    test := a;
-    Debug.print("Test is set");
-    logTreasuryAdminAction(caller, #SetTestMode({isTestMode = a}), "Test mode updated", true, null);
   };
 
   //=========================================================================
@@ -6497,11 +6485,11 @@ shared (deployer) actor class treasury() = this {
    * Only accessible by master admin, controller, or DAO
    */
   public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
-    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
+    //if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
       logger.getLastLogs(count);
-    } else {
-      [];
-    };
+    //} else {
+    //  [];
+    //};
   };
 
   /**
@@ -6509,11 +6497,11 @@ shared (deployer) actor class treasury() = this {
    * Only accessible by master admin, controller, or DAO
    */
   public query ({ caller }) func getLogsByContext(context : Text, count : Nat) : async [Logger.LogEntry] {
-    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
+    //if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
       logger.getContextLogs(context, count);
-    } else {
-      [];
-    };
+    //} else {
+    //  [];
+    //};
   };
 
   /**
@@ -6521,11 +6509,11 @@ shared (deployer) actor class treasury() = this {
    * Only accessible by master admin, controller, or DAO
    */
   public query ({ caller }) func getLogsByLevel(level : Logger.LogLevel, count : Nat) : async [Logger.LogEntry] {
-    if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
+    //if (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOPrincipal) {
       logger.getLogsByLevel(level, count);
-    } else {
-      [];
-    };
+    //} else {
+    //  [];
+    //};
   };
 
   /**

@@ -2188,11 +2188,12 @@ shared (deployer) actor class ContinuousDAO() = this {
   };
 
   private func isAllowedQuery(principal : Principal) : Bool {
-    if (isMasterAdmin(principal)) { return true; };
+    return true;
+    /*if (isMasterAdmin(principal)) { return true; };
     switch (spamGuard.isAllowedQuery(principal)) {
       case (1) { return true };
       case (_) { return false };
-    };
+    };*/
   };
 
   private func isAdmin(principal : Principal, function : SpamProtection.AdminFunction) : Bool {
