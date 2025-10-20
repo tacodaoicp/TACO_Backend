@@ -292,6 +292,10 @@ shared (deployer) actor class treasury() = this {
   // Timer IDs for scheduling
   var shortSyncTimerId : Nat = 0;
   var longSyncTimerId : Nat = 0;
+  
+  // Long Sync Timer tracking
+  stable var lastLongSyncTime : Int = 0;  // Last time the long sync timer executed
+  var nextLongSyncTime : Int = 0;  // Next scheduled execution time
 
   // Transfer queue and management
   stable let transferQueue = Vector.new<(TransferRecipient, Nat, Principal, Nat8)>();
@@ -1054,6 +1058,34 @@ shared (deployer) actor class treasury() = this {
  */
   public query func getSystemParameters() : async RebalanceConfig {
     rebalanceConfig;
+  };
+
+  /**
+   * Get Long Sync Timer status
+   *
+   * Returns information about the Long Sync Timer including:
+   * - lastRunTime: The last time the timer executed (0 if never run)
+   * - nextScheduledTime: The next scheduled execution time (0 if not scheduled)
+   * - isRunning: Whether the timer is currently active
+   * - timerId: The timer ID (0 if not running)
+   * - intervalNS: The configured interval in nanoseconds
+   *
+   * Accessible by any user with query access.
+   */
+  public query func getLongSyncTimerStatus() : async {
+    lastRunTime : Int;
+    nextScheduledTime : Int;
+    isRunning : Bool;
+    timerId : Nat;
+    intervalNS : Nat;
+  } {
+    {
+      lastRunTime = lastLongSyncTime;
+      nextScheduledTime = nextLongSyncTime;
+      isRunning = longSyncTimerId != 0;
+      timerId = longSyncTimerId;
+      intervalNS = rebalanceConfig.longSyncIntervalNS;
+    }
   };
 
   /**
@@ -5593,9 +5625,16 @@ shared (deployer) actor class treasury() = this {
       cancelTimer(longSyncTimerId);
     };
 
+    // Calculate next scheduled time
+    let intervalNS = if (instant) { 1_000_000 } else { rebalanceConfig.longSyncIntervalNS };
+    nextLongSyncTime := now() + intervalNS;
+
     longSyncTimerId := setTimer<system>(
-      #nanoseconds(if (instant) { 1_000_000 } else { rebalanceConfig.longSyncIntervalNS }),
+      #nanoseconds(intervalNS),
       func() : async () {
+        // Record execution time
+        lastLongSyncTime := now();
+        
         try {
           // Run less frequent maintenance tasks
           var err = false;
@@ -6430,9 +6469,16 @@ shared (deployer) actor class treasury() = this {
       if (longSyncTimerId != 0) {
         cancelTimer(longSyncTimerId);
       };
+      
+      // Set next scheduled time for retry
+      nextLongSyncTime := now() + (initialDelay * 1_000_000_000);
+      
       longSyncTimerId := setTimer<system>(
         #seconds(initialDelay),
         func() : async () {
+          // Record execution time
+          lastLongSyncTime := now();
+          
           try {
             // Run less frequent maintenance tasks
             var err = false;
