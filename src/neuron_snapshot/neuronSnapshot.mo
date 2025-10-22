@@ -1806,10 +1806,6 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Get all votes for a specific SNS proposal (admin only)
   public query ({ caller }) func getDAOVotesForProposal(snsProposalId : Nat64) : async [(Blob, T.DAOVote)] {
-    if (not (isMasterAdmin(caller) or Principal.isController(caller) or caller == DAOprincipal or (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa")))) {
-      return [];
-    };
-
     switch (Map.get(daoVotes, n64hash, snsProposalId)) {
       case (null) { [] };
       case (?proposalVotes) { Iter.toArray(Map.entries(proposalVotes)) };
