@@ -1793,6 +1793,81 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  // Public aggregate allocation statistics (no individual votes exposed)
+  public type AllocationStats = {
+    usersWithAllocations: Nat;
+    neuronsWithAllocations: Nat;
+    totalUserVotingPower: Nat;
+    totalNeuronVotingPower: Nat;
+    mostRecentUpdateTime: Int;
+    recentUpdatesCount: Nat; // Updates in last 30 days
+  };
+
+  public query ({ caller }) func getAllocationStats() : async AllocationStats {
+    if (not isAllowedQuery(caller)) {
+      return {
+        usersWithAllocations = 0;
+        neuronsWithAllocations = 0;
+        totalUserVotingPower = 0;
+        totalNeuronVotingPower = 0;
+        mostRecentUpdateTime = 0;
+        recentUpdatesCount = 0;
+      };
+    };
+
+    var usersWithAlloc = 0;
+    var totalUserVP = 0;
+    var mostRecentUser: Int = 0;
+    var recentUserUpdates = 0;
+    
+    let nowNs = Time.now();
+    let thirtyDaysNs = 30 * 24 * 60 * 60 * 1_000_000_000; // 30 days in nanoseconds
+    
+    // Count users with allocations
+    for ((principal, userState) in Map.entries(userStates)) {
+      if (userState.allocations.size() > 0) {
+        usersWithAlloc += 1;
+        totalUserVP += userState.votingPower;
+        if (userState.lastAllocationUpdate > mostRecentUser) {
+          mostRecentUser := userState.lastAllocationUpdate;
+        };
+        if (nowNs - userState.lastAllocationUpdate < thirtyDaysNs) {
+          recentUserUpdates += 1;
+        };
+      };
+    };
+    
+    var neuronsWithAlloc = 0;
+    var totalNeuronVP = 0;
+    var mostRecentNeuron: Int = 0;
+    var recentNeuronUpdates = 0;
+    
+    // Count neurons with allocations
+    for ((neuronId, neuronAlloc) in Map.entries(neuronAllocationMap)) {
+      if (neuronAlloc.allocations.size() > 0) {
+        neuronsWithAlloc += 1;
+        totalNeuronVP += neuronAlloc.votingPower;
+        if (neuronAlloc.lastUpdate > mostRecentNeuron) {
+          mostRecentNeuron := neuronAlloc.lastUpdate;
+        };
+        if (nowNs - neuronAlloc.lastUpdate < thirtyDaysNs) {
+          recentNeuronUpdates += 1;
+        };
+      };
+    };
+    
+    let mostRecent = if (mostRecentUser > mostRecentNeuron) { mostRecentUser } else { mostRecentNeuron };
+    
+    {
+      usersWithAllocations = usersWithAlloc;
+      neuronsWithAllocations = neuronsWithAlloc;
+      totalUserVotingPower = totalUserVP;
+      totalNeuronVotingPower = totalNeuronVP;
+      mostRecentUpdateTime = mostRecent;
+      recentUpdatesCount = recentUserUpdates + recentNeuronUpdates;
+    }
+  };
+
   // Refreshes voting power for the calling user by fetching their current neurons from SNS governance
   // This allows users to see their voting power immediately after adding hotkeys without waiting for the next snapshot
   public shared ({ caller }) func refreshUserVotingPower() : async Result.Result<{
