@@ -6397,14 +6397,14 @@ shared (deployer) actor class treasury() = this {
         };
         Vector.clear(transferTimerIDs);
       } else if (timerType == #shortSync) {
-        if (rebalanceState.status != #Idle) {
-          ignore setTimer<system>(
-            #seconds(0),
-            func() : async () {
-              ignore await stopRebalancing(?"Auto-stop via timer");
-            },
-          );
-        };
+        //if (rebalanceState.status != #Idle) {
+        //  ignore setTimer<system>(
+        //    #seconds(0),
+        //    func() : async () {
+        //      ignore await stopRebalancing(?"Auto-stop via timer");
+        //    },
+        //  );
+        //};
         startShortSyncTimer<system>(false);
       } else if (timerType == #longSync) {
         startLongSyncTimer<system>(false);

@@ -38,8 +38,38 @@ actor validation {
       #Ok(msg);
     };
 
-  public query func get_canister_cycles() : async { cycles : Nat } {
-    { cycles = Cycles.balance() };
-  };  
+    transient var gnsf1_cnt : Nat = 0;    
+    transient var gnsf2_cnt : Nat = 0;    
+    transient var gnsf2_principal : Principal = Principal.fromText("aaaaa-aa");    
+
+    public query func get_gnsf1_cnt() : async Nat {
+      gnsf1_cnt;
+    };
+
+    public shared ({ caller }) func test_gnsf1() : async () {
+      assert (caller == Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai"));
+      gnsf1_cnt += 1;
+      return;
+    };
+
+    public shared ({ caller }) func test_gnsf2(principal : Principal) : async () {
+      assert (caller == Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai"));
+      gnsf2_cnt += 1;
+      gnsf2_principal := principal;
+      return;
+    };
+
+    public query func validate_test_gnsf1() : async ValidationResult {
+      #Ok("validate_test_gnsf1: " # debug_show(gnsf1_cnt));
+    };
+
+    public query func validate_test_gnsf2() : async ValidationResult {
+      #Ok("validate_test_gnsf2: " # debug_show(gnsf2_cnt) # 
+        " " # debug_show(gnsf2_principal));
+    };
+
+    public query func get_canister_cycles() : async { cycles : Nat } {
+      { cycles = Cycles.balance() };
+    };
 
 }
