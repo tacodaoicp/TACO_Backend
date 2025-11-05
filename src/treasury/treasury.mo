@@ -5636,6 +5636,53 @@ shared (deployer) actor class treasury() = this {
     };
   };
 
+  public shared ({ caller }) func admin_syncWithDaoNoPull() : async Result.Result<Text, Text> {
+
+    if (((await hasAdminPermission(caller, #startRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      Debug.print("Not authorized to execute trading cycle: " # debug_show(caller));
+      return #err("Not authorized");
+    };
+
+    try {
+      Debug.print("Debug sync DAO");
+      //await syncFromDAO();
+      Debug.print("Update balances");
+      await updateBalances();
+      try {
+        Debug.print("Sync price with DEX");
+        await* syncPriceWithDEX();
+      } catch (_) {};
+      try {
+        Debug.print("Sync token details to DAO");
+        ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+      } catch (_) {};
+      for ((token, details) in Map.entries(tokenDetailsMap)) {
+        Debug.print("Check token details sync failure for " # Principal.toText(token));
+        if ((details.lastTimeSynced + rebalanceConfig.tokenSyncTimeoutNS) < now()) {
+          Map.set(tokenDetailsMap, phash, token, { details with pausedDueToSyncFailure = true });
+        };
+      };
+      return #ok("Synced with DAO");
+    } catch (e) {
+      return #err("Error syncing with DAO: " # Error.message(e));
+    };
+  };
+
+  public shared ({ caller }) func admin_syncToDao() : async Result.Result<Text, Text> {
+
+    if (((await hasAdminPermission(caller, #startRebalancing)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      Debug.print("Not authorized to execute trading cycle: " # debug_show(caller));
+      return #err("Not authorized");
+    };
+
+    try {
+      ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+      return #ok("Synced with DAO");
+    } catch (e) {
+      return #err("Error syncing with DAO: " # Error.message(e));
+    };
+  };
+
 
   private func startLongSyncTimer<system>(instant : Bool) {
     if (longSyncTimerId != 0) {

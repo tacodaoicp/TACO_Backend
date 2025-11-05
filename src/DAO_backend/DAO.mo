@@ -3604,6 +3604,39 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  public shared ({ caller }) func admin_clearAllPastPrices() : async Result.Result<Text, AuthorizationError> {
+    if (not isAdmin(caller, #getLogs)) {
+      return #err(#NotAdmin);
+    };
+
+    try {
+      var tokensUpdated = 0;
+      
+      // Iterate through all tokens and clear pastPrices
+      for ((principal, details) in Map.entries(tokenDetailsMap)) {
+        Map.set(
+          tokenDetailsMap,
+          phash,
+          principal,
+          {
+            details with
+            pastPrices = [];
+          }
+        );
+        tokensUpdated += 1;
+      };
+
+      logger.info("Admin", "Cleared past prices for " # Nat.toText(tokensUpdated) # " tokens by " # Principal.toText(caller), "clearAllPastPrices");
+      
+      #ok("Past prices cleared for " # Nat.toText(tokensUpdated) # " tokens");
+      
+    } catch (e) {
+      let errorMsg = Error.message(e);
+      logger.error("Admin", "Error clearing past prices: " # errorMsg, "clearAllPastPrices");
+      #err(#UnexpectedError(errorMsg));
+    };
+  };  
+
   public query func get_canister_cycles() : async { cycles : Nat } {
     { cycles = Cycles.balance() };
   };  
