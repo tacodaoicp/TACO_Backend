@@ -5569,10 +5569,22 @@ shared (deployer) actor class treasury() = this {
           await updateBalances();
           try {
             await* syncPriceWithDEX();
-          } catch (_) {};
+          } catch (e_dex) {
+            logger.error(
+              "SHORT_SYNC",
+              "Failed to perform syncPriceWithDEX: " # Error.message(e_dex),
+              "startShortSyncTimer"
+            );
+          };
           try {
             ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
-          } catch (_) {};
+          } catch (e_sync) {
+            logger.error(
+              "SHORT_SYNC",
+              "Failed to perform syncTokenDetailsFromTreasury: " # Error.message(e_sync),
+              "startShortSyncTimer"
+            );
+          };
           for ((token, details) in Map.entries(tokenDetailsMap)) {
             if ((details.lastTimeSynced + rebalanceConfig.tokenSyncTimeoutNS) < now()) {
               Map.set(tokenDetailsMap, phash, token, { details with pausedDueToSyncFailure = true });
@@ -5580,7 +5592,12 @@ shared (deployer) actor class treasury() = this {
           };
           // Schedule next sync
           startShortSyncTimer<system>(false);
-        } catch (_) {
+        } catch (e) {
+          logger.error(
+            "SHORT_SYNC",
+            "Failed to perform short sync: " # Error.message(e),
+            "startShortSyncTimer"
+          );
           retryFunc<system>(50, 15, #shortSync);
         };
       },

@@ -11,8 +11,14 @@ type TokenType =
  };
 type Subaccount = blob;
 service : {
+  get_canister_cycles: () -> (record {cycles: nat;}) query;
+  get_gnsf1_cnt: () -> (nat) query;
+  test_gnsf1: () -> ();
+  test_gnsf2: ("principal": principal) -> ();
   validate_addToken: (token: principal, tokenType: TokenType) ->
    (ValidationResult);
   validate_sendToken: (token: principal, amount_e8s: nat, to_principal:
    principal, to_subaccount: opt Subaccount) -> (ValidationResult) query;
+  validate_test_gnsf1: () -> (ValidationResult) query;
+  validate_test_gnsf2: () -> (ValidationResult) query;
 }
