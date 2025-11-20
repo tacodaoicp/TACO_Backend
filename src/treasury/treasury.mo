@@ -5556,6 +5556,12 @@ shared (deployer) actor class treasury() = this {
    * - Ledgers (token balances)
    */
   // Split the sync functions into short and long loops
+  public shared ({ caller }) func admin_startShortSyncTimer() : async Bool {
+    assert (isMasterAdmin(caller) or Principal.isController(caller));
+    startShortSyncTimer<system>(true);
+    return true;
+  };
+
   private func startShortSyncTimer<system>(instant : Bool) {
     if (shortSyncTimerId != 0) {
       cancelTimer(shortSyncTimerId);
@@ -5917,7 +5923,8 @@ shared (deployer) actor class treasury() = this {
         case (?tokenDetails) { tokenDetails.priceUSD };
       };
 
-      let icpPrice = Float.toInt((usdPrice * (10.0 ** Float.fromInt(details.tokenDecimals))) / ICPprice);
+      // priceInICP is always stored in e8s (10^8), regardless of token decimals
+      let icpPrice = Float.toInt((usdPrice * 100000000.0) / ICPprice);
       // testing, remove this
       //if (principal == Principal.fromText("k45jy-aiaaa-aaaaq-aadcq-cai")) {
       //  updateTokenPriceWithHistory(principal, Int.abs(icpPrice) * 2, usdPrice * 2.0);
@@ -6183,7 +6190,8 @@ shared (deployer) actor class treasury() = this {
           // Average both prices (both are > 0.0 due to filtering above)
           let avgPrice = (kong + icpSwap) / 2.0;
           if (avgPrice > 0.0) {
-            let icpPrice = Float.toInt(avgPrice * Float.fromInt(10 ** details.tokenDecimals));
+            // priceInICP is always stored in e8s (10^8), regardless of token decimals
+            let icpPrice = Float.toInt(avgPrice * 100000000.0);
             let usdPrice = avgPrice * finalICPPriceUSD;
             updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
             Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
@@ -6193,7 +6201,8 @@ shared (deployer) actor class treasury() = this {
         };
         case (?kong, null) {
           if (kong > 0.0) {
-            let icpPrice = Float.toInt(kong * Float.fromInt(10 ** details.tokenDecimals));
+            // priceInICP is always stored in e8s (10^8), regardless of token decimals
+            let icpPrice = Float.toInt(kong * 100000000.0);
             let usdPrice = kong * finalICPPriceUSD;
             updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
             Debug.print("Updated " # tokenSymbol # " with Kong DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
@@ -6203,7 +6212,8 @@ shared (deployer) actor class treasury() = this {
         };
         case (null, ?icpSwap) {
           if (icpSwap > 0.0) {
-            let icpPrice = Float.toInt(icpSwap * Float.fromInt(10 ** details.tokenDecimals));
+            // priceInICP is always stored in e8s (10^8), regardless of token decimals
+            let icpPrice = Float.toInt(icpSwap * 100000000.0);
             let usdPrice = icpSwap * finalICPPriceUSD;
             updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
             Debug.print("Updated " # tokenSymbol # " with ICPSwap DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
