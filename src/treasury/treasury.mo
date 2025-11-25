@@ -4977,28 +4977,33 @@ shared (deployer) actor class treasury() = this {
       try {
         let kongQuote = await KongSwap.getQuote(sellSymbol, buySymbol, amountIn);
         switch (kongQuote) {
-          case (#ok(quote)) {
-            if (quote.slippage <= Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
-              bestExchange := ? #KongSwap;
-              bestAmountOut := quote.receive_amount;
-              bestPriceSlippage := quote.slippage;
-              Debug.print("KongSwap quote seems good: " # debug_show (quote));
-              
-              // VERBOSE LOGGING: KongSwap quote success
-              logger.info("EXCHANGE_COMPARISON", 
-                "KongSwap quote received - Amount_out=" # Nat.toText(quote.receive_amount) #
-                " Slippage=" # Float.toText(quote.slippage) # "%" #
-                " Price=" # Float.toText(quote.price) #
-                " Status=ACCEPTED",
-                "findBestExecution"
-              );
-            } else {
-              logger.info("EXCHANGE_COMPARISON", 
-                "KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage),
-                "findBestExecution"
-              );
-              Debug.print("KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
-            };
+        case (#ok(quote)) {
+          if (quote.receive_amount == 0) {
+            logger.warn("EXCHANGE_COMPARISON",
+              "KongSwap quote rejected - zero receive amount for pair " # sellSymbol # "/" # buySymbol,
+              "findBestExecution"
+            );
+          } else if (quote.slippage <= Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
+            bestExchange := ? #KongSwap;
+            bestAmountOut := quote.receive_amount;
+            bestPriceSlippage := quote.slippage;
+            Debug.print("KongSwap quote seems good: " # debug_show (quote));
+            
+            // VERBOSE LOGGING: KongSwap quote success
+            logger.info("EXCHANGE_COMPARISON", 
+              "KongSwap quote received - Amount_out=" # Nat.toText(quote.receive_amount) #
+              " Slippage=" # Float.toText(quote.slippage) # "%" #
+              " Price=" # Float.toText(quote.price) #
+              " Status=ACCEPTED",
+              "findBestExecution"
+            );
+          } else {
+            logger.info("EXCHANGE_COMPARISON", 
+              "KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage),
+              "findBestExecution"
+            );
+            Debug.print("KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
+          };
           };
           case (#err(e)) {
             Debug.print("KongSwap quote error: " # e);
@@ -5058,7 +5063,13 @@ shared (deployer) actor class treasury() = this {
             let quoteResult = await ICPSwap.getQuote(quoteArgs);
             switch (quoteResult) {
               case (#ok(quote)) {
-                if (quote.slippage < Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
+                if (quote.amountOut == 0) {
+                  logger.warn("EXCHANGE_COMPARISON",
+                    "ICPSwap quote rejected - zero amount out for pair " # sellSymbol # "/" # buySymbol #
+                    " Pool=" # Principal.toText(poolData.canisterId),
+                    "findBestExecution"
+                  );
+                } else if (quote.slippage < Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
                   // If no quote yet or better than KongSwap
                   if (bestExchange == null or (quote.amountOut > bestAmountOut or test)) {
                     bestExchange := ? #ICPSwap;
