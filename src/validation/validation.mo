@@ -38,7 +38,7 @@ actor validation {
       #Ok(msg);
     };
 
-// GNSF Admin functions
+// treasury.mo GNSF Admin functions
 
     public query func validate_stopRebalancing(reason : ?Text) : async ValidationResult {
       #Ok("stopRebalancing called with reason: " # debug_show(reason));
@@ -54,6 +54,14 @@ actor validation {
 
     public query func validate_takeManualPortfolioSnapshot(reason : ?Text) : async ValidationResult {
       #Ok("takeManualPortfolioSnapshot called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_pauseTokenFromTradingManual(token : Principal, reason : Text) : async ValidationResult {
+      #Ok("pauseTokenFromTradingManual called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
+    };
+
+    public query func validate_unpauseTokenFromTrading(token : Principal, reason : ?Text) : async ValidationResult {
+      #Ok("unpauseTokenFromTrading called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
