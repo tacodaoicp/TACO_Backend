@@ -38,6 +38,25 @@ actor validation {
       #Ok(msg);
     };
 
+// GNSF Admin functions
+
+    public query func validate_stopRebalancing(reason : ?Text) : async ValidationResult {
+      #Ok("stopRebalancing called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_startRebalancing(reason : ?Text) : async ValidationResult {
+      #Ok("startRebalancing called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_executeTradingCycle(reason : ?Text) : async ValidationResult {
+      #Ok("executeTradingCycle called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_takeManualPortfolioSnapshot(reason : ?Text) : async ValidationResult {
+      #Ok("takeManualPortfolioSnapshot called with reason: " # debug_show(reason));
+    };
+
+//admin_executeTradingCycle, takeManualPortfolioSnapshot
     transient var gnsf1_cnt : Nat = 0;    
     transient var gnsf2_cnt : Nat = 0;    
     transient var gnsf2_principal : Principal = Principal.fromText("aaaaa-aa");    
