@@ -38,6 +38,16 @@ actor validation {
       #Ok(msg);
     };
 
+// DAO.mo GNSF Admin functions    
+
+    public query func validate_pauseToken(token : Principal, reason : Text) : async ValidationResult {
+      #Ok("pauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
+    };
+
+    public query func validate_unpauseToken(token : Principal, reason : Text) : async ValidationResult {
+      #Ok("unpauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
+    };
+
 // treasury.mo GNSF Admin functions
 
     public query func validate_stopRebalancing(reason : ?Text) : async ValidationResult {
