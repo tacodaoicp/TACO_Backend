@@ -181,7 +181,8 @@ shared deployer actor class neuronSnapshot() = this {
   private func isMasterAdmin(caller : Principal) : Bool {
     // Check single master admin (legacy)
     if (caller == masterAdmin) { return true; };
-    
+    if (caller == DAOprincipal) { return true; };
+    if (Principal.isController(caller)) { return true; };
     // Use shared admin authorization
     AdminAuth.isMasterAdmin(caller, canister_ids.isKnownCanister)
   };
@@ -337,11 +338,7 @@ shared deployer actor class neuronSnapshot() = this {
   public shared ({ caller }) func take_neuron_snapshot() : async T.TakeNeuronSnapshotResult {
     logger.info("Snapshot", "Snapshot requested by " # Principal.toText(caller), "take_neuron_snapshot");
 
-    //assert (caller == DAOprincipal);
-    if (sns_governance_canister_id == Principal.fromText("aaaaa-aa") and not test) {
-      logger.warn("Snapshot", "SNS governance canister ID not set", "take_neuron_snapshot");
-      return #Err(#SnsGovernanceCanisterIdNotSet);
-    };
+    assert (isMasterAdmin(caller));
 
     ignore check_neuron_snapshot_timeout();
 
@@ -363,7 +360,7 @@ shared deployer actor class neuronSnapshot() = this {
   public shared ({ caller }) func cancel_neuron_snapshot() : async T.CancelNeuronSnapshotResult {
     logger.info("Snapshot", "Snapshot cancellation requested by " # Principal.toText(caller), "cancel_neuron_snapshot");
 
-    //assert (caller == DAOprincipal);
+    assert (isMasterAdmin(caller));
 
     switch (neuron_snapshot_status) {
       case (#Ready) {

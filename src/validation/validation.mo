@@ -120,6 +120,16 @@ actor validation {
       #Ok("unpauseTokenFromTrading called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
+
+// treasury.mo GNSF Admin functions
+
+// /admin page functions
+    // 3015
+    public query func validate_take_neuron_snapshot() : async ValidationResult {
+      #Ok("take_neuron_snapshot called.");
+    };
+
+
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
     transient var gnsf1_cnt : Nat = 0;    
     transient var gnsf2_cnt : Nat = 0;    
