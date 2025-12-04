@@ -4,6 +4,11 @@ import Result "mo:base/Result";
 import Principal "mo:base/Principal";
 import Debug "mo:base/Debug";
 import Cycles "mo:base/ExperimentalCycles";
+import Treasury_types "../treasury/treasury_types";
+import DAO_types "../DAO_backend/dao_types";
+
+type UpdateConfig = Treasury_types.UpdateConfig;
+type SystemParameter = DAO_types.SystemParameter;
 
 actor validation {
 
@@ -40,30 +45,52 @@ actor validation {
 
 // DAO.mo GNSF Admin functions    
 
+    // 3007
     public query func validate_pauseToken(token : Principal, reason : Text) : async ValidationResult {
       #Ok("pauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
+    // 3008
     public query func validate_unpauseToken(token : Principal, reason : Text) : async ValidationResult {
       #Ok("unpauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
+    // 3011
+    public query func validate_updateSystemParameter(param : SystemParameter, reason : ?Text) : async ValidationResult {
+      #Ok("updateSystemParameter called with param " # debug_show(param) # " with reason: " # debug_show(reason));
+    };
+
+
 // treasury.mo GNSF Admin functions
 
+    // 3003
     public query func validate_stopRebalancing(reason : ?Text) : async ValidationResult {
       #Ok("stopRebalancing called with reason: " # debug_show(reason));
     };
 
+    // 3004
     public query func validate_startRebalancing(reason : ?Text) : async ValidationResult {
       #Ok("startRebalancing called with reason: " # debug_show(reason));
     };
 
+    // 3005
     public query func validate_executeTradingCycle(reason : ?Text) : async ValidationResult {
       #Ok("executeTradingCycle called with reason: " # debug_show(reason));
     };
 
+    // 3006
     public query func validate_takeManualPortfolioSnapshot(reason : ?Text) : async ValidationResult {
       #Ok("takeManualPortfolioSnapshot called with reason: " # debug_show(reason));
+    };
+
+    // 3009
+    public query func validate_updateRebalanceConfig(updates : UpdateConfig, rebalanceStateNew : ?Bool, reason : ?Text) : async ValidationResult {
+      #Ok("updateRebalanceConfig called with updates " # debug_show(updates) # " with reason: " # debug_show(reason));
+    };
+
+    // 3010
+    public query func validate_updateMaxPortfolioSnapshots(newLimit : Nat, reason : ?Text) : async ValidationResult {
+      #Ok("updateMaxPortfolioSnapshots called with newLimit " # debug_show(newLimit) # " with reason: " # debug_show(reason));
     };
 
     public query func validate_pauseTokenFromTradingManual(token : Principal, reason : Text) : async ValidationResult {
