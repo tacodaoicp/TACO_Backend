@@ -1,4 +1,3 @@
-import DAO_types "../DAO_backend/dao_types";
 import Blob "mo:base/Blob";
 import Result "mo:base/Result";
 import Principal "mo:base/Principal";
@@ -7,10 +6,10 @@ import Cycles "mo:base/ExperimentalCycles";
 import Treasury_types "../treasury/treasury_types";
 import DAO_types "../DAO_backend/dao_types";
 
-type UpdateConfig = Treasury_types.UpdateConfig;
-type SystemParameter = DAO_types.SystemParameter;
-
 actor validation {
+
+    type UpdateConfig = Treasury_types.UpdateConfig;
+    type SystemParameter = DAO_types.SystemParameter;
 
     type Subaccount = Blob;
     type TokenType = DAO_types.TokenType;
@@ -45,6 +44,7 @@ actor validation {
 
 // DAO.mo GNSF Admin functions    
 
+// /admin page functions
     // 3007
     public query func validate_pauseToken(token : Principal, reason : Text) : async ValidationResult {
       #Ok("pauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
@@ -63,6 +63,7 @@ actor validation {
 
 // treasury.mo GNSF Admin functions
 
+// /admin page functions
     // 3003
     public query func validate_stopRebalancing(reason : ?Text) : async ValidationResult {
       #Ok("stopRebalancing called with reason: " # debug_show(reason));
@@ -92,6 +93,24 @@ actor validation {
     public query func validate_updateMaxPortfolioSnapshots(newLimit : Nat, reason : ?Text) : async ValidationResult {
       #Ok("updateMaxPortfolioSnapshots called with newLimit " # debug_show(newLimit) # " with reason: " # debug_show(reason));
     };
+
+    // 3012
+    public query func validate_startPortfolioSnapshots(reason : ?Text) : async ValidationResult {
+      #Ok("startPortfolioSnapshots called with reason: " # debug_show(reason));
+    };
+
+    // 3013
+    public query func validate_stopPortfolioSnapshots(reason : ?Text) : async ValidationResult {
+      #Ok("stopPortfolioSnapshots called with reason: " # debug_show(reason));
+    };
+
+    // 3014
+    public query func validate_updatePortfolioSnapshotInterval(intervalMinutes: Nat, reason: ?Text) : async ValidationResult {
+      #Ok("updatePortfolioSnapshotInterval called newLimit with intervalMinutes " # debug_show(intervalMinutes) # " with reason: " # debug_show(reason));
+    };
+
+
+// /admin/price page functions
 
     public query func validate_pauseTokenFromTradingManual(token : Principal, reason : Text) : async ValidationResult {
       #Ok("pauseTokenFromTradingManual called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
