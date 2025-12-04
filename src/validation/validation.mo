@@ -109,6 +109,16 @@ actor validation {
       #Ok("updatePortfolioSnapshotInterval called newLimit with intervalMinutes " # debug_show(intervalMinutes) # " with reason: " # debug_show(reason));
     };
 
+    // 3015
+    public query func validate_syncWithDao() : async ValidationResult {
+      #Ok("syncWithDao called.");
+    };
+
+    // 3016
+    public query func validate_recoverPoolBalances() : async ValidationResult {
+      #Ok("recoverPoolBalances called.");
+    };
+
 
 // /admin/price page functions
 
@@ -120,11 +130,10 @@ actor validation {
       #Ok("unpauseTokenFromTrading called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
-
-// treasury.mo GNSF Admin functions
+// neuronSnapshot.mo GNSF Admin functions
 
 // /admin page functions
-    // 3015
+    // 3017
     public query func validate_take_neuron_snapshot() : async ValidationResult {
       #Ok("take_neuron_snapshot called.");
     };
