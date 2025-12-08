@@ -45,17 +45,17 @@ actor validation {
 // DAO.mo GNSF Admin functions    
 
 // /admin page functions
-    // 3007
+    // 3009
     public query func validate_pauseToken(token : Principal, reason : Text) : async ValidationResult {
       #Ok("pauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
-    // 3008
+    // 3010
     public query func validate_unpauseToken(token : Principal, reason : Text) : async ValidationResult {
       #Ok("unpauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
-    // 3011
+    // 3013
     public query func validate_updateSystemParameter(param : SystemParameter, reason : ?Text) : async ValidationResult {
       #Ok("updateSystemParameter called with param " # debug_show(param) # " with reason: " # debug_show(reason));
     };
@@ -84,37 +84,37 @@ actor validation {
       #Ok("takeManualPortfolioSnapshot called with reason: " # debug_show(reason));
     };
 
-    // 3009
+    // 3011
     public query func validate_updateRebalanceConfig(updates : UpdateConfig, rebalanceStateNew : ?Bool, reason : ?Text) : async ValidationResult {
       #Ok("updateRebalanceConfig called with updates " # debug_show(updates) # " with reason: " # debug_show(reason));
     };
 
-    // 3010
+    // 3012
     public query func validate_updateMaxPortfolioSnapshots(newLimit : Nat, reason : ?Text) : async ValidationResult {
       #Ok("updateMaxPortfolioSnapshots called with newLimit " # debug_show(newLimit) # " with reason: " # debug_show(reason));
     };
 
-    // 3012
+    // 3014
     public query func validate_startPortfolioSnapshots(reason : ?Text) : async ValidationResult {
       #Ok("startPortfolioSnapshots called with reason: " # debug_show(reason));
     };
 
-    // 3013
+    // 3015
     public query func validate_stopPortfolioSnapshots(reason : ?Text) : async ValidationResult {
       #Ok("stopPortfolioSnapshots called with reason: " # debug_show(reason));
     };
 
-    // 3014
+    // 3016
     public query func validate_updatePortfolioSnapshotInterval(intervalMinutes: Nat, reason: ?Text) : async ValidationResult {
       #Ok("updatePortfolioSnapshotInterval called newLimit with intervalMinutes " # debug_show(intervalMinutes) # " with reason: " # debug_show(reason));
     };
 
-    // 3015
+    // 3017
     public query func validate_syncWithDao() : async ValidationResult {
       #Ok("syncWithDao called.");
     };
 
-    // 3016
+    // 3018
     public query func validate_recoverPoolBalances() : async ValidationResult {
       #Ok("recoverPoolBalances called.");
     };
@@ -133,7 +133,7 @@ actor validation {
 // neuronSnapshot.mo GNSF Admin functions
 
 // /admin page functions
-    // 3017
+    // 3019
     public query func validate_take_neuron_snapshot() : async ValidationResult {
       #Ok("take_neuron_snapshot called.");
     };
