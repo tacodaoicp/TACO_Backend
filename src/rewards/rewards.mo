@@ -1287,10 +1287,8 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // Get all neuron reward balances (admin only) - returns TACO satoshis
-  public shared query ({ caller }) func getAllNeuronRewardBalances() : async [(Blob, Nat)] {
-    if (not isAdmin(caller)) {
-      return [];
-    };
+  // Public query - allows anyone to view neuron reward balances (read-only transparency)
+  public shared query func getAllNeuronRewardBalances() : async [(Blob, Nat)] {
     Iter.toArray(Map.entries(neuronRewardBalances));
   };
 
