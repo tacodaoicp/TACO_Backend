@@ -1477,10 +1477,8 @@ shared (deployer) persistent actor class Rewards() = this {
   //=========================================================================
 
   // Get the current reward skip list
-  public shared query ({ caller }) func getRewardSkipList() : async Result.Result<[Blob], RewardsError> {
-    if (not isAdmin(caller)) {
-      return #err(#NotAuthorized);
-    };
+  // Public query - allows anyone to view the reward skip list (read-only transparency)
+  public shared query func getRewardSkipList() : async Result.Result<[Blob], RewardsError> {
     #ok(rewardSkipList);
   };
 
