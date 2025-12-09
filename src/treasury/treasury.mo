@@ -1311,13 +1311,9 @@ shared (deployer) actor class treasury() = this {
   /**
    * Get portfolio history filtered by timestamp (for archive efficiency)
    * Returns only snapshots newer than the specified timestamp
+   * Public query - allows anyone to view portfolio history (read-only transparency).
    */
-  public shared query ({ caller }) func getPortfolioHistorySince(sinceTimestamp: Int, limit: Nat) : async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError> {
-    // Allow any authenticated caller (not anonymous)
-    if (Principal.isAnonymous(caller)) {
-      return #err(#NotAuthorized);
-    };
-
+  public shared query func getPortfolioHistorySince(sinceTimestamp: Int, limit: Nat) : async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError> {
     if (limit == 0 or limit > 2000) {
       return #err(#InvalidLimit);
     };
@@ -2401,14 +2397,9 @@ shared (deployer) actor class treasury() = this {
    * Get portfolio history
    * 
    * Returns recent portfolio snapshots for analysis and charting.
-   * Accessible by authenticated users.
+   * Public query - allows anyone to view portfolio history (read-only transparency).
    */
-  public shared query ({ caller }) func getPortfolioHistory(limit : Nat) : async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError> {
-    // Allow any authenticated caller (not anonymous)
-    if (Principal.isAnonymous(caller)) {
-      return #err(#NotAuthorized);
-    };
-
+  public shared query func getPortfolioHistory(limit : Nat) : async Result.Result<PortfolioHistoryResponse, PortfolioSnapshotError> {
     if (limit == 0 or limit > 2000) {
       return #err(#InvalidLimit);
     };
