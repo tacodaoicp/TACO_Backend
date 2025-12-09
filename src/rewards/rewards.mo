@@ -1629,11 +1629,8 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // Get all withdrawal history (admin only)
-  public shared ({ caller }) func getAllWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
-    if (not isAdmin(caller)) {
-      return #err(#NotAuthorized);
-    };
-    
+  // Public query - allows anyone to view withdrawal history (read-only transparency)
+  public shared func getAllWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
     let maxLimit = switch (limit) {
       case (?l) { if (l > 100) { 100 } else { l } }; // Cap at 100 records
       case null { 50 }; // Default to 50 records
@@ -1691,15 +1688,12 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // Get withdrawal statistics (admin only)
-  public shared ({ caller }) func getWithdrawalStats() : async Result.Result<{
+  // Public query - allows anyone to view withdrawal stats (read-only transparency)
+  public shared func getWithdrawalStats() : async Result.Result<{
     totalWithdrawn: Nat;
     totalWithdrawals: Nat;
     totalRecordsInHistory: Nat;
   }, RewardsError> {
-    if (not isAdmin(caller)) {
-      return #err(#NotAuthorized);
-    };
-    
     #ok({
       totalWithdrawn = totalWithdrawn;
       totalWithdrawals = totalWithdrawals;
