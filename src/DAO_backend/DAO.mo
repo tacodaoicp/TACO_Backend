@@ -1769,20 +1769,22 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  // If user allocations should not be public, please uncomment
   public query ({ caller }) func admin_getUserAllocations() : async [(Principal, UserState)] {
-    if (isAdmin(caller, #getLogs)) {
-      Iter.toArray(Map.entries(userStates));
-    } else {
-      [];
-    };
+    //if (isAdmin(caller, #getLogs)) {
+    Iter.toArray(Map.entries(userStates));
+    //} else {
+    //  [];
+    //};
   };
 
+  // If user allocations should not be public, please uncomment
   public query ({ caller }) func admin_getNeuronAllocations() : async [(Blob, NeuronAllocation)] {
-    if (isAdmin(caller, #getLogs)) {
-      Iter.toArray(Map.entries(neuronAllocationMap));
-    } else {
-      [];
-    };
+    //if (isAdmin(caller, #getLogs)) {
+    Iter.toArray(Map.entries(neuronAllocationMap));
+    //} else {
+    //  [];
+    //};
   };
 
   public query ({ caller }) func getUserAllocation() : async ?UserState {
@@ -2775,25 +2777,19 @@ shared (deployer) actor class ContinuousDAO() = this {
   };
 
   // Function to get logs - restricted to controllers only
-  public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
-    //if (caller == logAdmin or Principal.isController(caller) or sns_governance_canister_id == ?caller) {
-    if (isAdmin(caller, #getLogs) or Principal.isController(caller) or sns_governance_canister_id == ?caller) {
-      logger.getLastLogs(count);
-    } else { [] };
+  // Public query - allows anyone to view logs (read-only transparency)
+  public query func getLogs(count : Nat) : async [Logger.LogEntry] {
+    logger.getLastLogs(count);
   };
 
-  // Function to get logs by context - restricted to controllers only
-  public query ({ caller }) func getLogsByContext(context : Text, count : Nat) : async [Logger.LogEntry] {
-    if (isAdmin(caller, #getLogs) or Principal.isController(caller) or sns_governance_canister_id == ?caller) {
-      logger.getContextLogs(context, count);
-    } else { [] };
+  // Public query - allows anyone to view logs by context (read-only transparency)
+  public query func getLogsByContext(context : Text, count : Nat) : async [Logger.LogEntry] {
+    logger.getContextLogs(context, count);
   };
 
-  // Function to get logs by level - restricted to controllers only
-  public query ({ caller }) func getLogsByLevel(level : Logger.LogLevel, count : Nat) : async [Logger.LogEntry] {
-    if (isAdmin(caller, #getLogs) or Principal.isController(caller) or sns_governance_canister_id == ?caller) {
-      logger.getLogsByLevel(level, count);
-    } else { [] };
+  // Public query - allows anyone to view logs by level (read-only transparency)
+  public query func getLogsByLevel(level : Logger.LogLevel, count : Nat) : async [Logger.LogEntry] {
+    logger.getLogsByLevel(level, count);
   };
 
   // Function to clear logs - restricted to controllers
