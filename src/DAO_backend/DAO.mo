@@ -1761,12 +1761,13 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  // If user allocations should not be public, please uncomment
   public query ({ caller }) func admin_getUserAllocation(principal : Principal) : async ?UserState {
-    if (isAdmin(caller, #getLogs)) {
-      Map.get(userStates, phash, principal);
-    } else {
-      null;
-    };
+    //if (isAdmin(caller, #getLogs)) {
+    Map.get(userStates, phash, principal);
+    //} else {
+    //  null;
+    //};
   };
 
   // If user allocations should not be public, please uncomment
