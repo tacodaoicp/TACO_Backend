@@ -14,6 +14,7 @@ actor validation {
     type Subaccount = Blob;
     type TokenType = DAO_types.TokenType;
     type AuthorizationError = DAO_types.AuthorizationError;
+    type PriceDirection = Treasury_types.PriceDirection;
 
     type ValidationResult = {
         #Ok: Text;
@@ -138,6 +139,24 @@ actor validation {
       #Ok("take_neuron_snapshot called.");
     };
 
+// rewards.mo GNSF Admin functions
+
+// /admin/distributions page functions
+    // 3020
+    public query func validate_addTriggerCondition(
+      name : Text,
+      direction : PriceDirection,
+      percentage : Float,
+      timeWindowNS : Nat,
+      applicableTokens : [Principal]
+    ) : async ValidationResult {
+      #Ok("addTriggerCondition called with name: " # 
+          debug_show(name) # " with direction: " # 
+          debug_show(direction) # " with percentage: " # 
+          debug_show(percentage) # " with timeWindowNS: " # 
+          debug_show(timeWindowNS) # " with applicableTokens: " # 
+          debug_show(applicableTokens));
+    };
 
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
     transient var gnsf1_cnt : Nat = 0;    
