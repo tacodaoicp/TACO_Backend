@@ -26,6 +26,11 @@ actor validation {
         #Err :Text;
     };
 
+    public type PriceType = {
+      #ICP;
+      #USD;
+    };
+
     public shared func validate_addToken(token : Principal, tokenType : TokenType) : async ValidationResult {
 
       let msg : Text = 
@@ -221,12 +226,66 @@ actor validation {
       #Ok("take_neuron_snapshot called.");
     };
 
+// /admin/neuron page functions
+
+    // 3029
+    public query func validate_setMaxNeuronSnapshots(maxSnapshots : Nat)  : async ValidationResult {
+      #Ok("setMaxNeuronSnapshots called with maxSnapshots: " # debug_show(maxSnapshots) # " with reason: " # debug_show(reason));
+    };
+
 // rewards.mo GNSF Admin functions
 
 // /admin/distributions page functions
 
+    // 3030
+    public query func validate_triggerDistribution() : async ValidationResult {
+      #Ok("triggerDistribution called.");
+    };
 
+    // 3031
+    public query func validate_startDistributionTimer() : async ValidationResult {
+      #Ok("startDistributionTimer called.");
+    };
 
+    // 3032
+    public query func validate_stopDistributionTimer() : async ValidationResult {
+      #Ok("stopDistributionTimer called.");
+    };
+
+    // 3033
+    public query func validate_triggerDistributionCustom(startTime : Int, endTime : Int, priceType : PriceType) : async ValidationResult {
+      #Ok("triggerDistributionCustom called with startTime: " # debug_show(startTime) # " with endTime: " # debug_show(endTime) # " with priceType: " # debug_show(priceType));
+    };
+
+    // 3034
+    public query func validate_setPeriodicRewardPot(amount : Nat) : async ValidationResult {
+      #Ok("setPeriodicRewardPot called with amount: " # debug_show(amount));
+    };
+
+    // 3035
+    public query func validate_setDistributionPeriod(periodNS : Nat) : async ValidationResult {
+      #Ok("setDistributionPeriod called with periodNS: " # debug_show(periodNS));
+    };
+
+    // 3036
+    public query func validate_setPerformanceScorePower(power : Float) : async ValidationResult {
+      #Ok("setPerformanceScorePower called with power: " # debug_show(power));
+    };
+
+    // 3037
+    public query func validate_setVotingPowerPower(power : Float) : async ValidationResult {
+      #Ok("setVotingPowerPower called with power: " # debug_show(power));
+    };
+
+    // 3038
+    public query func validate_addToRewardSkipList(neuronId : Blob) : async ValidationResult {
+      #Ok("addToRewardSkipList called with neuronId: " # debug_show(neuronId));
+    };
+
+    // 3039
+    public query func validate_removeFromRewardSkipList(neuronId : Blob) : async ValidationResult {
+      #Ok("removeFromRewardSkipList called with neuronId: " # debug_show(neuronId));
+    };
 
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
     transient var gnsf1_cnt : Nat = 0;    

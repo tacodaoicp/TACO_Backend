@@ -33,4 +33,3 @@
 3037	rewards		setVotingPowerPower
 3038	rewards		addToRewardSkipList
 3039	rewards		removeFromRewardSkipList
-3040	rewards		clearRewardSkipList
