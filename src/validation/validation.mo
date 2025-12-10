@@ -128,25 +128,6 @@ actor validation {
 
 // /admin/price page functions
 
-    public query func validate_pauseTokenFromTradingManual(token : Principal, reason : Text) : async ValidationResult {
-      #Ok("pauseTokenFromTradingManual called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
-    };
-
-    public query func validate_unpauseTokenFromTrading(token : Principal, reason : ?Text) : async ValidationResult {
-      #Ok("unpauseTokenFromTrading called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
-    };
-
-// neuronSnapshot.mo GNSF Admin functions
-
-// /admin page functions
-    // 3019
-    public query func validate_take_neuron_snapshot() : async ValidationResult {
-      #Ok("take_neuron_snapshot called.");
-    };
-
-// rewards.mo GNSF Admin functions
-
-// /admin/distributions page functions
     // 3020
     public query func validate_addTriggerCondition(
       name : Text,
@@ -182,23 +163,19 @@ actor validation {
     };
 
     // 3023
-    public query func validate_updateTriggerCondition(
-      conditionId : Nat,
-      updates : TriggerConditionUpdate
-    ) : async ValidationResult {
-      #Ok("updateTriggerCondition called with conditionId: " # 
-          debug_show(conditionId) # " with updates: " # 
-          debug_show(updates)); 
+    public query func validate_unpauseTokenFromTrading(token : Principal, reason : ?Text) : async ValidationResult {
+      #Ok("unpauseTokenFromTrading called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
     // 3024
-    public query func validate_clearPriceAlerts() : async ValidationResult {
-      #Ok("clearPriceAlerts called.");
+    public query func validate_pauseTokenFromTradingManual(token : Principal, reason : Text) : async ValidationResult {
+      #Ok("pauseTokenFromTradingManual called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
+    
 
     // 3025
-    public query func validate_clearSystemLogs() : async ValidationResult {
-      #Ok("clearSystemLogs called.");
+    public query func validate_clearAllTradingPauses(reason : ?Text) : async ValidationResult {
+      #Ok("clearAllTradingPauses called with reason: " # debug_show(reason));
     };
 
     // 3026
@@ -235,15 +212,22 @@ actor validation {
           debug_show(conditionId));
     };
 
-    // 3029
-    public query func validate_updatePortfolioCircuitBreakerCondition(
-      conditionId : Nat,
-      updates : PortfolioCircuitBreakerUpdate
-    ) : async ValidationResult {
-      #Ok("updatePortfolioCircuitBreakerCondition called with conditionId: " # 
-          debug_show(conditionId) # " with updates: " # 
-          debug_show(updates));
+
+// neuronSnapshot.mo GNSF Admin functions
+
+// /admin page functions
+    // 3019
+    public query func validate_take_neuron_snapshot() : async ValidationResult {
+      #Ok("take_neuron_snapshot called.");
     };
+
+// rewards.mo GNSF Admin functions
+
+// /admin/distributions page functions
+
+
+
+
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
     transient var gnsf1_cnt : Nat = 0;    
     transient var gnsf2_cnt : Nat = 0;    
