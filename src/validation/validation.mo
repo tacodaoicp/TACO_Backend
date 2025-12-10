@@ -15,6 +15,11 @@ actor validation {
     type TokenType = DAO_types.TokenType;
     type AuthorizationError = DAO_types.AuthorizationError;
     type PriceDirection = Treasury_types.PriceDirection;
+    type PortfolioCircuitBreakerUpdate = Treasury_types.PortfolioCircuitBreakerUpdate;
+    type TriggerConditionUpdate = Treasury_types.TriggerConditionUpdate;
+    type PortfolioDirection = Treasury_types.PortfolioDirection;
+    type PortfolioValueType = Treasury_types.PortfolioValueType;
+    type PortfolioCircuitBreakerCondition = Treasury_types.PortfolioCircuitBreakerCondition;
 
     type ValidationResult = {
         #Ok: Text;
@@ -158,6 +163,87 @@ actor validation {
           debug_show(applicableTokens));
     };
 
+    // 3021
+    public query func validate_setTriggerConditionActive(
+      conditionId : Nat,
+      isActive : Bool
+    ) : async ValidationResult {
+      #Ok("setTriggerConditionActive called with conditionId: " # 
+          debug_show(conditionId) # " with isActive: " # 
+          debug_show(isActive));
+    };
+
+    // 3022
+    public query func validate_removeTriggerCondition(
+      conditionId : Nat
+    ) : async ValidationResult {
+      #Ok("removeTriggerCondition called with conditionId: " # 
+          debug_show(conditionId));
+    };
+
+    // 3023
+    public query func validate_updateTriggerCondition(
+      conditionId : Nat,
+      updates : TriggerConditionUpdate
+    ) : async ValidationResult {
+      #Ok("updateTriggerCondition called with conditionId: " # 
+          debug_show(conditionId) # " with updates: " # 
+          debug_show(updates)); 
+    };
+
+    // 3024
+    public query func validate_clearPriceAlerts() : async ValidationResult {
+      #Ok("clearPriceAlerts called.");
+    };
+
+    // 3025
+    public query func validate_clearSystemLogs() : async ValidationResult {
+      #Ok("clearSystemLogs called.");
+    };
+
+    // 3026
+    public query func validate_addPortfolioCircuitBreakerCondition(
+      name : Text,
+      direction : PortfolioDirection,
+      percentage : Float,
+      timeWindowNS : Nat,
+      valueType : PortfolioValueType
+    ) : async ValidationResult {
+      #Ok("addPortfolioCircuitBreakerCondition called with name: " # 
+        debug_show(name) # " with direction: " # 
+        debug_show(direction) # " with percentage: " # 
+        debug_show(percentage) # " with timeWindowNS: " # 
+        debug_show(timeWindowNS) # " with valueType: " # 
+        debug_show(valueType));
+    };
+
+    // 3027
+    public query func validate_setPortfolioCircuitBreakerConditionActive(
+      conditionId : Nat,
+      isActive : Bool
+    ) : async ValidationResult {
+      #Ok("setPortfolioCircuitBreakerConditionActive called with conditionId: " # 
+          debug_show(conditionId) # " with isActive: " # 
+          debug_show(isActive));
+    };
+
+    // 3028
+    public query func validate_removePortfolioCircuitBreakerCondition(
+      conditionId : Nat
+    ) : async ValidationResult {
+      #Ok("removePortfolioCircuitBreakerCondition called with conditionId: " # 
+          debug_show(conditionId));
+    };
+
+    // 3029
+    public query func validate_updatePortfolioCircuitBreakerCondition(
+      conditionId : Nat,
+      updates : PortfolioCircuitBreakerUpdate
+    ) : async ValidationResult {
+      #Ok("updatePortfolioCircuitBreakerCondition called with conditionId: " # 
+          debug_show(conditionId) # " with updates: " # 
+          debug_show(updates));
+    };
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
     transient var gnsf1_cnt : Nat = 0;    
     transient var gnsf2_cnt : Nat = 0;    
