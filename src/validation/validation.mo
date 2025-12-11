@@ -230,7 +230,7 @@ actor validation {
 
     // 3029
     public query func validate_setMaxNeuronSnapshots(maxSnapshots : Nat)  : async ValidationResult {
-      #Ok("setMaxNeuronSnapshots called with maxSnapshots: " # debug_show(maxSnapshots) # " with reason: " # debug_show(reason));
+      #Ok("setMaxNeuronSnapshots called with maxSnapshots: " # debug_show(maxSnapshots));
     };
 
 // rewards.mo GNSF Admin functions
