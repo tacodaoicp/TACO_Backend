@@ -1299,21 +1299,50 @@ shared (deployer) persistent actor class Rewards() = this {
   // Distribution History and Status
   //=========================================================================
 
-  // Get distribution history
-  public query func getDistributionHistory(limit: ?Nat) : async [DistributionRecord] {
-    let actualLimit = switch (limit) {
-      case (?l) { Nat.min(l, Vector.size(distributionHistory)) };
-      case null { Vector.size(distributionHistory) };
+  // Get distribution history with pagination (returns most recent first)
+  // offset: number of records to skip from the most recent
+  // limit: maximum number of records to return
+  public query func getDistributionHistory(offset: Nat, limit: Nat) : async {
+    records: [DistributionRecord];
+    total: Nat;
+    hasMore: Bool;
+  } {
+    let totalSize = Vector.size(distributionHistory);
+    
+    // Cap limit to prevent overly large responses
+    let actualLimit = Nat.min(limit, 10);
+    
+    // If offset exceeds total, return empty
+    if (offset >= totalSize) {
+      return {
+        records = [];
+        total = totalSize;
+        hasMore = false;
+      };
     };
     
-    let historyArray = Vector.toArray(distributionHistory);
-    let startIndex = if (historyArray.size() > actualLimit) {
-      historyArray.size() - actualLimit
-    } else {
-      0
+    // Calculate the actual range (most recent first)
+    // Records are stored oldest first, so we need to reverse the access
+    let availableFromOffset = totalSize - offset;
+    let recordsToTake = Nat.min(actualLimit, availableFromOffset);
+    
+    // Build result array (most recent first)
+    let resultBuffer = Buffer.Buffer<DistributionRecord>(recordsToTake);
+    var i = 0;
+    while (i < recordsToTake) {
+      let index = totalSize - 1 - offset - i;
+      switch (Vector.getOpt(distributionHistory, index)) {
+        case (?record) { resultBuffer.add(record); };
+        case null { };
+      };
+      i += 1;
     };
     
-    Array.subArray(historyArray, startIndex, actualLimit);
+    {
+      records = Buffer.toArray(resultBuffer);
+      total = totalSize;
+      hasMore = offset + recordsToTake < totalSize;
+    };
   };
 
   // Get current distribution status
