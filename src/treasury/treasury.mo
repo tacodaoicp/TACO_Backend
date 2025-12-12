@@ -273,7 +273,7 @@ shared (deployer) actor class treasury() = this {
   };
 
   // Track if rebalancing was active before upgrade (for auto-restart)
-  stable var wasRebalancingActiveBeforeUpgrade : Bool = false;
+  stable var wasRebalancingActiveBeforeUpgrade : Bool = false; // NOT USED
 
   stable var MAX_PRICE_HISTORY_ENTRIES = 2000;
 
@@ -6598,26 +6598,23 @@ shared (deployer) actor class treasury() = this {
 
   // Auto-restart trading bot after upgrade if it was running before
   private func autoRestartTradingAfterUpgrade<system>() {
-    if (wasRebalancingActiveBeforeUpgrade) {
-      // Small delay to allow system to stabilize after upgrade
-      ignore setTimer<system>(
-        #nanoseconds(5_000_000_000), // 5 second delay
-        func() : async () {
-          logger.info("UPGRADE", "Auto-restarting trading bot after upgrade", "autoRestartTradingAfterUpgrade");
-          rebalanceState := {
-            rebalanceState with
-            status = #Trading;
-            metrics = {
-              rebalanceState.metrics with
-              lastRebalanceAttempt = now();
-            };
+    // Small delay to allow system to stabilize after upgrade
+    ignore setTimer<system>(
+      #nanoseconds(5_000_000_000), // 5 second delay
+      func() : async () {
+        logger.info("UPGRADE", "Auto-restarting trading bot after canister upgrade", "autoRestartTradingAfterUpgrade");
+        rebalanceState := {
+          rebalanceState with
+          status = #Trading;
+          metrics = {
+            rebalanceState.metrics with
+            lastRebalanceAttempt = now();
           };
-          startTradingTimer<system>();
-          logTreasuryAdminAction(this_canister_id(), #StartRebalancing, "Auto-restart after canister upgrade", true, null);
-          wasRebalancingActiveBeforeUpgrade := false;
-        },
-      );
-    };
+        };
+        startTradingTimer<system>();
+        logTreasuryAdminAction(this_canister_id(), #StartRebalancing, "Auto-restart after canister upgrade", true, null);
+      },
+    );
   };
 
   autoRestartTradingAfterUpgrade<system>();
@@ -6625,8 +6622,6 @@ shared (deployer) actor class treasury() = this {
   system func preupgrade() {
     // Log lifecycle: canister stop
     logTreasuryAdminAction(this_canister_id(), #CanisterStop, "Canister stopping (preupgrade)", true, null);
-    // Track if rebalancing was active for auto-restart after upgrade
-    wasRebalancingActiveBeforeUpgrade := rebalanceState.status != #Idle;
   };
 
   //=========================================================================
@@ -6768,20 +6763,10 @@ shared (deployer) actor class treasury() = this {
     // After canister upgrade, all timers are invalidated
     // Reset trading status to Idle to prevent inconsistent state
     // where status shows Trading but no timer is actually running
-    // The trading bot will be auto-restarted by autoRestartTradingAfterUpgrade if it was running before
-    // (wasRebalancingActiveBeforeUpgrade is set in preupgrade before this runs)
+    // The trading bot will be auto-restarted by autoRestartTradingAfterUpgrade
     // Log lifecycle: canister start
     logTreasuryAdminAction(this_canister_id(), #CanisterStart, "Canister started (postupgrade)", true, null);
-    if (rebalanceState.status != #Idle) {
-      logger.info("UPGRADE", "Resetting trading status from " # debug_show(rebalanceState.status) # " to Idle after upgrade (will auto-restart if was active)", "postupgrade");
-      
-      rebalanceState := {
-        rebalanceState with
-        status = #Idle;
-        rebalanceTimerId = null;
-        priceUpdateTimerId = null;
-      };
-      
+
       // Reset portfolio snapshot timer ID but preserve status
       // If it was running before upgrade, admin will need to restart it manually
       if (portfolioSnapshotStatus == #Running) {
@@ -6789,7 +6774,6 @@ shared (deployer) actor class treasury() = this {
         portfolioSnapshotStatus := #Stopped;
       };
       portfolioSnapshotTimerId := 0;
-    };
   };
 
   public query func get_canister_cycles() : async { cycles : Nat } {
