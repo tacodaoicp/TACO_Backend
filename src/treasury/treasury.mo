@@ -272,6 +272,9 @@ shared (deployer) actor class treasury() = this {
     rebalanceTimerId = null;
   };
 
+  // Track if rebalancing was active before upgrade (for auto-restart)
+  stable var wasRebalancingActiveBeforeUpgrade : Bool = false;
+
   stable var MAX_PRICE_HISTORY_ENTRIES = 2000;
 
   //=========================================================================
@@ -6593,9 +6596,37 @@ shared (deployer) actor class treasury() = this {
   // Initialize sync timer at system startup
   startAllSyncTimers<system>(true);
 
+  // Auto-restart trading bot after upgrade if it was running before
+  private func autoRestartTradingAfterUpgrade<system>() {
+    if (wasRebalancingActiveBeforeUpgrade) {
+      // Small delay to allow system to stabilize after upgrade
+      ignore setTimer<system>(
+        #nanoseconds(5_000_000_000), // 5 second delay
+        func() : async () {
+          logger.info("UPGRADE", "Auto-restarting trading bot after upgrade", "autoRestartTradingAfterUpgrade");
+          rebalanceState := {
+            rebalanceState with
+            status = #Trading;
+            metrics = {
+              rebalanceState.metrics with
+              lastRebalanceAttempt = now();
+            };
+          };
+          startTradingTimer<system>();
+          logTreasuryAdminAction(this_canister_id(), #StartRebalancing, "Auto-restart after canister upgrade", true, null);
+          wasRebalancingActiveBeforeUpgrade := false;
+        },
+      );
+    };
+  };
+
+  autoRestartTradingAfterUpgrade<system>();
+
   system func preupgrade() {
     // Log lifecycle: canister stop
     logTreasuryAdminAction(this_canister_id(), #CanisterStop, "Canister stopping (preupgrade)", true, null);
+    // Track if rebalancing was active for auto-restart after upgrade
+    wasRebalancingActiveBeforeUpgrade := rebalanceState.status != #Idle;
   };
 
   //=========================================================================
@@ -6737,10 +6768,12 @@ shared (deployer) actor class treasury() = this {
     // After canister upgrade, all timers are invalidated
     // Reset trading status to Idle to prevent inconsistent state
     // where status shows Trading but no timer is actually running
+    // The trading bot will be auto-restarted by autoRestartTradingAfterUpgrade if it was running before
+    // (wasRebalancingActiveBeforeUpgrade is set in preupgrade before this runs)
     // Log lifecycle: canister start
     logTreasuryAdminAction(this_canister_id(), #CanisterStart, "Canister started (postupgrade)", true, null);
     if (rebalanceState.status != #Idle) {
-      logger.info("UPGRADE", "Resetting trading status from " # debug_show(rebalanceState.status) # " to Idle after upgrade", "postupgrade");
+      logger.info("UPGRADE", "Resetting trading status from " # debug_show(rebalanceState.status) # " to Idle after upgrade (will auto-restart if was active)", "postupgrade");
       
       rebalanceState := {
         rebalanceState with
