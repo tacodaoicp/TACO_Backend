@@ -33,3 +33,9 @@
 3037	rewards		setVotingPowerPower
 3038	rewards		addToRewardSkipList
 3039	rewards		removeFromRewardSkipList
+3040	neuronSnap	startBatchImportSystem
+3041	neuronSnap	stopBatchImportSystem
+3042	neuronSnap	stopAllTimers
+3043	neuronSnap	runManualBatchImport
+3044	neuronSnap	setMaxInnerLoopIterations
+3045	neuronSnap	resetImportTimestamps

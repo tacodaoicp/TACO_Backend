@@ -53,7 +53,9 @@ actor validation {
       #Ok(msg);
     };
 
+// ==============================
 // DAO.mo GNSF Admin functions    
+// ==============================
 
 // /admin page functions
     // 3009
@@ -71,8 +73,9 @@ actor validation {
       #Ok("updateSystemParameter called with param " # debug_show(param) # " with reason: " # debug_show(reason));
     };
 
-
+// ==============================
 // treasury.mo GNSF Admin functions
+// ==============================
 
 // /admin page functions
     // 3003
@@ -217,8 +220,9 @@ actor validation {
           debug_show(conditionId));
     };
 
-
+// ==============================
 // neuronSnapshot.mo GNSF Admin functions
+// ==============================
 
 // /admin page functions
     // 3019
@@ -233,7 +237,41 @@ actor validation {
       #Ok("setMaxNeuronSnapshots called with maxSnapshots: " # debug_show(maxSnapshots));
     };
 
+// /admin/archive page (proxy) functions
+
+    // 3040
+    public query func validate_startBatchImportSystem(archivePrincipal : Principal) : async ValidationResult {
+      #Ok("startBatchImportSystem called with archivePrincipal: . # Principal.toText(archivePrincipal)");
+    };
+
+    // 3041
+    public query func validate_stopBatchImportSystem(archivePrincipal : Principal) : async ValidationResult {
+      #Ok("stopBatchImportSystem called with archivePrincipal: " # Principal.toText(archivePrincipal));
+    };
+
+    // 3042
+    public query func validate_stopAllTimers(archivePrincipal : Principal) : async ValidationResult {
+      #Ok("stopAllTimers called with archivePrincipal: " # Principal.toText(archivePrincipal));
+    };
+
+    // 3043
+    public query func validate_runManualBatchImport(archivePrincipal : Principal) : async ValidationResult {
+      #Ok("runManualBatchImport called with archivePrincipal: " # Principal.toText(archivePrincipal));
+    };
+
+    // 3044
+    public query func validate_setMaxInnerLoopIterations(archivePrincipal : Principal, iterations : Nat) : async ValidationResult {
+      #Ok("setMaxInnerLoopIterations called with archivePrincipal: " # Principal.toText(archivePrincipal) # " with iterations: " # debug_show(iterations));
+    };
+
+    // 3045
+    public query func validate_resetImportTimestamps(archivePrincipal : Principal) : async ValidationResult {
+      #Ok("resetImportTimestamps called with archivePrincipal: " # Principal.toText(archivePrincipal));
+    };
+
+// ==============================
 // rewards.mo GNSF Admin functions
+// ==============================
 
 // /admin/distributions page functions
 
@@ -286,6 +324,8 @@ actor validation {
     public query func validate_removeFromRewardSkipList(neuronId : Blob) : async ValidationResult {
       #Ok("removeFromRewardSkipList called with neuronId: " # debug_show(neuronId));
     };
+
+
 
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
     transient var gnsf1_cnt : Nat = 0;    
