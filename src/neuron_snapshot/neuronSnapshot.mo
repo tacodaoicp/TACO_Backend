@@ -24,6 +24,8 @@ import Result "mo:base/Result";
 import CanisterIds "../helper/CanisterIds";
 import NNSPropCopy "./NNSPropCopy";
 import Cycles "mo:base/ExperimentalCycles";
+import ArchiveTypes "../archives/archive_types";
+import BatchImportTimer "../helper/batch_import_timer";
 
 shared deployer actor class neuronSnapshot() = this {
 
@@ -2512,6 +2514,267 @@ shared deployer actor class neuronSnapshot() = this {
 
   public query func get_canister_cycles() : async { cycles : Nat } {
     { cycles = Cycles.balance() };
+  };
+
+  //=========================================================================
+  // ARCHIVE CANISTER PROXY API
+  // Allows SNS DAO to call archive canister methods through a single proxy
+  //=========================================================================
+
+  // Archive canister actor interface (common API)
+  type ArchiveActor = actor {
+    // Query methods
+    getArchiveStatus : shared query () -> async Result.Result<ArchiveTypes.ArchiveStatus, ArchiveTypes.ArchiveError>;
+    getArchiveStats : shared query () -> async ArchiveTypes.ArchiveStatus;
+    getLogs : shared query (Nat) -> async [Logger.LogEntry];
+    getBatchImportStatus : shared query () -> async { isRunning : Bool; intervalSeconds : Nat };
+    getTimerStatus : shared query () -> async BatchImportTimer.TimerStatus;
+    get_canister_cycles : shared query () -> async { cycles : Nat };
+    
+    // Update methods
+    startBatchImportSystem : shared () -> async Result.Result<Text, Text>;
+    stopBatchImportSystem : shared () -> async Result.Result<Text, Text>;
+    stopAllTimers : shared () -> async Result.Result<Text, Text>;
+    runManualBatchImport : shared () -> async Result.Result<Text, Text>;
+    setMaxInnerLoopIterations : shared (Nat) -> async Result.Result<Text, Text>;
+    resetImportTimestamps : shared () -> async Result.Result<Text, Text>;
+    updateConfig : shared (ArchiveTypes.ArchiveConfig) -> async Result.Result<Text, ArchiveTypes.ArchiveError>;
+  };
+
+  // Helper function to get archive actor from principal
+  private func getArchiveActor(archivePrincipal : Principal) : ArchiveActor {
+    actor (Principal.toText(archivePrincipal)) : ArchiveActor;
+  };
+
+  // Validate that the caller is authorized to use the proxy
+  private func isProxyAuthorized(caller : Principal) : Bool {
+    isMasterAdmin(caller) or 
+    Principal.isController(caller) or 
+    caller == DAOprincipal or 
+    (sns_governance_canister_id == caller and sns_governance_canister_id != Principal.fromText("aaaaa-aa"));
+  };
+
+  // Validate that the target archive is a known archive canister
+  private func isValidArchiveCanister(archivePrincipal : Principal) : Bool {
+    // Check against all known archive canister types
+    let archiveTypes : [CanisterIds.CanisterType] = [
+      #trading_archive,
+      #portfolio_archive,
+      #price_archive,
+      #dao_admin_archive,
+      #dao_governance_archive,
+      #dao_allocation_archive,
+      #dao_neuron_allocation_archive,
+      #reward_distribution_archive,
+      #reward_withdrawal_archive
+    ];
+    
+    for (archiveType in archiveTypes.vals()) {
+      if (canister_ids.getCanisterId(archiveType) == archivePrincipal) {
+        return true;
+      };
+    };
+    false;
+  };
+
+  //=========================================================================
+  // Archive Proxy - Update Methods
+  //=========================================================================
+
+  // Proxy for startBatchImportSystem
+  public shared ({ caller }) func archiveProxy_startBatchImportSystem(archivePrincipal : Principal) : async Result.Result<Text, Text> {
+    if (not isProxyAuthorized(caller)) {
+      logger.warn("ArchiveProxy", "Unauthorized caller: " # Principal.toText(caller), "archiveProxy_startBatchImportSystem");
+      return #err("Unauthorized caller");
+    };
+
+    if (not isValidArchiveCanister(archivePrincipal)) {
+      logger.warn("ArchiveProxy", "Invalid archive canister: " # Principal.toText(archivePrincipal), "archiveProxy_startBatchImportSystem");
+      return #err("Invalid archive canister principal");
+    };
+
+    logger.info("ArchiveProxy", "Starting batch import on archive " # Principal.toText(archivePrincipal) # " by " # Principal.toText(caller), "archiveProxy_startBatchImportSystem");
+
+    try {
+      let archive = getArchiveActor(archivePrincipal);
+      await archive.startBatchImportSystem();
+    } catch (error) {
+      let errorMsg = "Failed to call archive: " # Error.message(error);
+      logger.error("ArchiveProxy", errorMsg, "archiveProxy_startBatchImportSystem");
+      #err(errorMsg);
+    };
+  };
+
+  // Proxy for stopBatchImportSystem
+  public shared ({ caller }) func archiveProxy_stopBatchImportSystem(archivePrincipal : Principal) : async Result.Result<Text, Text> {
+    if (not isProxyAuthorized(caller)) {
+      logger.warn("ArchiveProxy", "Unauthorized caller: " # Principal.toText(caller), "archiveProxy_stopBatchImportSystem");
+      return #err("Unauthorized caller");
+    };
+
+    if (not isValidArchiveCanister(archivePrincipal)) {
+      logger.warn("ArchiveProxy", "Invalid archive canister: " # Principal.toText(archivePrincipal), "archiveProxy_stopBatchImportSystem");
+      return #err("Invalid archive canister principal");
+    };
+
+    logger.info("ArchiveProxy", "Stopping batch import on archive " # Principal.toText(archivePrincipal) # " by " # Principal.toText(caller), "archiveProxy_stopBatchImportSystem");
+
+    try {
+      let archive = getArchiveActor(archivePrincipal);
+      await archive.stopBatchImportSystem();
+    } catch (error) {
+      let errorMsg = "Failed to call archive: " # Error.message(error);
+      logger.error("ArchiveProxy", errorMsg, "archiveProxy_stopBatchImportSystem");
+      #err(errorMsg);
+    };
+  };
+
+  // Proxy for stopAllTimers
+  public shared ({ caller }) func archiveProxy_stopAllTimers(archivePrincipal : Principal) : async Result.Result<Text, Text> {
+    if (not isProxyAuthorized(caller)) {
+      logger.warn("ArchiveProxy", "Unauthorized caller: " # Principal.toText(caller), "archiveProxy_stopAllTimers");
+      return #err("Unauthorized caller");
+    };
+
+    if (not isValidArchiveCanister(archivePrincipal)) {
+      logger.warn("ArchiveProxy", "Invalid archive canister: " # Principal.toText(archivePrincipal), "archiveProxy_stopAllTimers");
+      return #err("Invalid archive canister principal");
+    };
+
+    logger.info("ArchiveProxy", "Stopping all timers on archive " # Principal.toText(archivePrincipal) # " by " # Principal.toText(caller), "archiveProxy_stopAllTimers");
+
+    try {
+      let archive = getArchiveActor(archivePrincipal);
+      await archive.stopAllTimers();
+    } catch (error) {
+      let errorMsg = "Failed to call archive: " # Error.message(error);
+      logger.error("ArchiveProxy", errorMsg, "archiveProxy_stopAllTimers");
+      #err(errorMsg);
+    };
+  };
+
+  // Proxy for runManualBatchImport
+  public shared ({ caller }) func archiveProxy_runManualBatchImport(archivePrincipal : Principal) : async Result.Result<Text, Text> {
+    if (not isProxyAuthorized(caller)) {
+      logger.warn("ArchiveProxy", "Unauthorized caller: " # Principal.toText(caller), "archiveProxy_runManualBatchImport");
+      return #err("Unauthorized caller");
+    };
+
+    if (not isValidArchiveCanister(archivePrincipal)) {
+      logger.warn("ArchiveProxy", "Invalid archive canister: " # Principal.toText(archivePrincipal), "archiveProxy_runManualBatchImport");
+      return #err("Invalid archive canister principal");
+    };
+
+    logger.info("ArchiveProxy", "Running manual batch import on archive " # Principal.toText(archivePrincipal) # " by " # Principal.toText(caller), "archiveProxy_runManualBatchImport");
+
+    try {
+      let archive = getArchiveActor(archivePrincipal);
+      await archive.runManualBatchImport();
+    } catch (error) {
+      let errorMsg = "Failed to call archive: " # Error.message(error);
+      logger.error("ArchiveProxy", errorMsg, "archiveProxy_runManualBatchImport");
+      #err(errorMsg);
+    };
+  };
+
+  // Proxy for setMaxInnerLoopIterations
+  public shared ({ caller }) func archiveProxy_setMaxInnerLoopIterations(archivePrincipal : Principal, iterations : Nat) : async Result.Result<Text, Text> {
+    if (not isProxyAuthorized(caller)) {
+      logger.warn("ArchiveProxy", "Unauthorized caller: " # Principal.toText(caller), "archiveProxy_setMaxInnerLoopIterations");
+      return #err("Unauthorized caller");
+    };
+
+    if (not isValidArchiveCanister(archivePrincipal)) {
+      logger.warn("ArchiveProxy", "Invalid archive canister: " # Principal.toText(archivePrincipal), "archiveProxy_setMaxInnerLoopIterations");
+      return #err("Invalid archive canister principal");
+    };
+
+    logger.info("ArchiveProxy", "Setting max inner loop iterations to " # Nat.toText(iterations) # " on archive " # Principal.toText(archivePrincipal) # " by " # Principal.toText(caller), "archiveProxy_setMaxInnerLoopIterations");
+
+    try {
+      let archive = getArchiveActor(archivePrincipal);
+      await archive.setMaxInnerLoopIterations(iterations);
+    } catch (error) {
+      let errorMsg = "Failed to call archive: " # Error.message(error);
+      logger.error("ArchiveProxy", errorMsg, "archiveProxy_setMaxInnerLoopIterations");
+      #err(errorMsg);
+    };
+  };
+
+  // Proxy for resetImportTimestamps
+  public shared ({ caller }) func archiveProxy_resetImportTimestamps(archivePrincipal : Principal) : async Result.Result<Text, Text> {
+    if (not isProxyAuthorized(caller)) {
+      logger.warn("ArchiveProxy", "Unauthorized caller: " # Principal.toText(caller), "archiveProxy_resetImportTimestamps");
+      return #err("Unauthorized caller");
+    };
+
+    if (not isValidArchiveCanister(archivePrincipal)) {
+      logger.warn("ArchiveProxy", "Invalid archive canister: " # Principal.toText(archivePrincipal), "archiveProxy_resetImportTimestamps");
+      return #err("Invalid archive canister principal");
+    };
+
+    logger.info("ArchiveProxy", "Resetting import timestamps on archive " # Principal.toText(archivePrincipal) # " by " # Principal.toText(caller), "archiveProxy_resetImportTimestamps");
+
+    try {
+      let archive = getArchiveActor(archivePrincipal);
+      await archive.resetImportTimestamps();
+    } catch (error) {
+      let errorMsg = "Failed to call archive: " # Error.message(error);
+      logger.error("ArchiveProxy", errorMsg, "archiveProxy_resetImportTimestamps");
+      #err(errorMsg);
+    };
+  };
+
+  // Proxy for updateConfig
+  public shared ({ caller }) func archiveProxy_updateConfig(archivePrincipal : Principal, newConfig : ArchiveTypes.ArchiveConfig) : async Result.Result<Text, Text> {
+    if (not isProxyAuthorized(caller)) {
+      logger.warn("ArchiveProxy", "Unauthorized caller: " # Principal.toText(caller), "archiveProxy_updateConfig");
+      return #err("Unauthorized caller");
+    };
+
+    if (not isValidArchiveCanister(archivePrincipal)) {
+      logger.warn("ArchiveProxy", "Invalid archive canister: " # Principal.toText(archivePrincipal), "archiveProxy_updateConfig");
+      return #err("Invalid archive canister principal");
+    };
+
+    logger.info("ArchiveProxy", "Updating config on archive " # Principal.toText(archivePrincipal) # " by " # Principal.toText(caller), "archiveProxy_updateConfig");
+
+    try {
+      let archive = getArchiveActor(archivePrincipal);
+      let result = await archive.updateConfig(newConfig);
+      switch (result) {
+        case (#ok(msg)) { #ok(msg) };
+        case (#err(error)) { #err(debug_show(error)) };
+      };
+    } catch (error) {
+      let errorMsg = "Failed to call archive: " # Error.message(error);
+      logger.error("ArchiveProxy", errorMsg, "archiveProxy_updateConfig");
+      #err(errorMsg);
+    };
+  };
+
+  //=========================================================================
+  // Archive Proxy - Utility Methods
+  //=========================================================================
+
+  // Get list of all known archive canister principals
+  public query func archiveProxy_getKnownArchives() : async [(Text, Principal)] {
+    [
+      ("trading_archive", canister_ids.getCanisterId(#trading_archive)),
+      ("portfolio_archive", canister_ids.getCanisterId(#portfolio_archive)),
+      ("price_archive", canister_ids.getCanisterId(#price_archive)),
+      ("dao_admin_archive", canister_ids.getCanisterId(#dao_admin_archive)),
+      ("dao_governance_archive", canister_ids.getCanisterId(#dao_governance_archive)),
+      ("dao_allocation_archive", canister_ids.getCanisterId(#dao_allocation_archive)),
+      ("dao_neuron_allocation_archive", canister_ids.getCanisterId(#dao_neuron_allocation_archive)),
+      ("reward_distribution_archive", canister_ids.getCanisterId(#reward_distribution_archive)),
+      ("reward_withdrawal_archive", canister_ids.getCanisterId(#reward_withdrawal_archive))
+    ];
+  };
+
+  // Check if a principal is a valid archive canister
+  public query func archiveProxy_isValidArchive(archivePrincipal : Principal) : async Bool {
+    isValidArchiveCanister(archivePrincipal);
   };
 /* NB: Turn on again after initial setup
   system func inspect({
