@@ -3,6 +3,7 @@ import Principal "mo:base/Principal";
 module {
   // Master admin principal text IDs - centralized list for all TACO canisters
   public let masterAdminTexts = [
+    "lhdfz-wqaaa-aaaaq-aae3q-cai", // TACO DAO Governance canister
     "d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae",
     "uuyso-zydjd-tsb4o-lgpgj-dfsvq-awald-j2zfp-e6h72-d2je3-whmjr-xae", // lx7ws-diaaa-aaaag-aubda-cai.icp0.io identities
     "5uvsz-em754-ulbgb-vxihq-wqyzd-brdgs-snzlu-mhlqw-k74uu-4l5h3-2qe",
