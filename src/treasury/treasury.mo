@@ -114,7 +114,7 @@ import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 
-shared (deployer) actor class treasury() = this {
+shared (deployer) persistent actor class treasury() = this {
 
   private func this_canister_id() : Principal {
       Principal.fromActor(this);

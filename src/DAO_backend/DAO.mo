@@ -1,5 +1,6 @@
 import Principal "mo:base/Principal";
 import Map "mo:map/Map";
+import Bool "mo:base/Bool";
 import Nat "mo:base/Nat";
 import Int "mo:base/Int";
 import Text "mo:base/Text";
@@ -27,7 +28,7 @@ import CanisterIds "../helper/CanisterIds";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
 
-shared (deployer) actor class ContinuousDAO() = this {
+shared (deployer) persistent actor class ContinuousDAO() = this {
 
   private func this_canister_id() : Principal {
       Principal.fromActor(this);
@@ -100,7 +101,7 @@ shared (deployer) actor class ContinuousDAO() = this {
   stable var sns_governance_canister_id : ?Principal = ?Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
   // Spam protection
-  let spamGuard = SpamProtection.SpamGuard(this_canister_id());
+  transient let spamGuard = SpamProtection.SpamGuard(this_canister_id());
 
   //spamGuard.setTest(true); // delete this in production
   //MAX_ALLOCATIONS_PER_DAY := 500; // delete this in production
@@ -112,13 +113,13 @@ shared (deployer) actor class ContinuousDAO() = this {
   //SNAPSHOT_INTERVAL := 900_000_000_000; // delete this in production
 
   // Logger
-  let logger = Logger.Logger();
+  transient let logger = Logger.Logger();
 
-  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+  transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  transient let TREASURY_ID = canister_ids.getCanisterId(#treasury);
   //let NACHOS_ID = canister_ids.getCanisterId(#nachos);
 
-  let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
+  transient let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
 
   //spamGuard.setAllowedCanisters([Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai")]);
   //spamGuard.setSelf(Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai"));
@@ -135,9 +136,9 @@ shared (deployer) actor class ContinuousDAO() = this {
 
 //
   // State variables
-  let { phash; bhash } = Map;
+  transient let { phash; bhash } = Map;
 
-  var tacoAddress = Principal.fromText("kknbx-zyaaa-aaaaq-aae4a-cai");
+  transient var tacoAddress = Principal.fromText("kknbx-zyaaa-aaaaq-aae4a-cai");
 
   // Token info storage
   stable let tokenDetailsMap = Map.new<Principal, TokenDetails>();
@@ -195,6 +196,10 @@ shared (deployer) actor class ContinuousDAO() = this {
   stable var allocatedVotingPower : Nat = 0;
   stable var totalVotingPowerByHotkeySetters : Nat = 0;
 
+  // Penalized neurons - neuronId (Blob) -> multiplier (e.g., 23 means 23% of VP, i.e., 77% reduction)
+  // Used to reduce voting power for specific neurons within the DAO only (not affecting SNS VP)
+  stable var penalizedNeurons = Map.new<Blob, Nat>();
+
   // System state
 
   stable var systemState : SystemState = #Paused;
@@ -205,15 +210,15 @@ shared (deployer) actor class ContinuousDAO() = this {
   stable var maxAdminActionsStored: Nat = 10000; // Keep last 10k actions before archiving
 
   // Neuron snapshot interface
-  let neuronSnapshot = actor (Principal.toText(NEURON_SNAPSHOT_ID)) : NeuronSnapshot.Self;
+  transient let neuronSnapshot = actor (Principal.toText(NEURON_SNAPSHOT_ID)) : NeuronSnapshot.Self;
 
   //let treasury = actor ("z4is7-giaaa-aaaad-qg6uq-cai") : Treasury.Self;
-  let treasury = actor (Principal.toText(TREASURY_ID)) : Treasury.Self;
+  transient let treasury = actor (Principal.toText(TREASURY_ID)) : Treasury.Self;
   //let nachos = actor (Principal.toText(NACHOS_ID)) : Treasury.Self;
   //let mintingVault = actor ("ywhqf-eyaaa-aaaad-qg6tq-cai") : MintingVault.Self;
-  let mintingVault = actor (Principal.toText(this_canister_id())) : MintingVault.Self;
+  transient let mintingVault = actor (Principal.toText(this_canister_id())) : MintingVault.Self;
   //let treasuryPrincipal = Principal.fromText("z4is7-giaaa-aaaad-qg6uq-cai");
-  let treasuryPrincipal = TREASURY_ID;
+  transient let treasuryPrincipal = TREASURY_ID;
   // Timer IDs
   private stable var snapshotTimerId : Nat = 0;
 
@@ -1441,6 +1446,78 @@ shared (deployer) actor class ContinuousDAO() = this {
     };
   };
 
+  // ============================================
+  // Penalized Neurons Management (DAO-only VP reduction)
+  // ============================================
+
+  // Sets penalized neurons with their multipliers (replaces entire list)
+  // multiplier is percentage of VP to keep (e.g., 23 means keep 23%, reduce by 77%)
+  public shared ({ caller }) func admin_setPenalizedNeurons(neurons : [(Blob, Nat)]) : async Result.Result<Nat, AuthorizationError> {
+    if (not isAdmin(caller, #updateSystemParameter)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Clear existing penalties
+    penalizedNeurons := Map.new<Blob, Nat>();
+
+    // Add new penalties
+    var count : Nat = 0;
+    for ((neuronId, multiplier) in neurons.vals()) {
+      if (multiplier <= 100) {
+        Map.set(penalizedNeurons, bhash, neuronId, multiplier);
+        count += 1;
+      };
+    };
+
+    logger.info("VPPenalties", "Set " # Nat.toText(count) # " penalized neurons", "admin_setPenalizedNeurons");
+    #ok(count);
+  };
+
+  // Adds or updates a single penalized neuron
+  public shared ({ caller }) func admin_addPenalizedNeuron(neuronId : Blob, multiplier : Nat) : async Result.Result<(), AuthorizationError> {
+    if (not isAdmin(caller, #updateSystemParameter)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (multiplier > 100) {
+      return #err(#NotAuthorized); // Invalid multiplier
+    };
+
+    Map.set(penalizedNeurons, bhash, neuronId, multiplier);
+    logger.info("VPPenalties", "Added penalized neuron with multiplier " # Nat.toText(multiplier), "admin_addPenalizedNeuron");
+    #ok();
+  };
+
+  // Removes a neuron from the penalized list
+  public shared ({ caller }) func admin_removePenalizedNeuron(neuronId : Blob) : async Result.Result<Bool, AuthorizationError> {
+    if (not isAdmin(caller, #updateSystemParameter)) {
+      return #err(#NotAuthorized);
+    };
+
+    let existed = Map.has(penalizedNeurons, bhash, neuronId);
+    Map.delete(penalizedNeurons, bhash, neuronId);
+    logger.info("VPPenalties", "Removed penalized neuron (existed: " # Bool.toText(existed) # ")", "admin_removePenalizedNeuron");
+    #ok(existed);
+  };
+
+  // Query to get all penalized neurons - called by neuronSnapshot at start of snapshot
+  public query func getPenalizedNeurons() : async [(Blob, Nat)] {
+    Iter.toArray(Map.entries(penalizedNeurons));
+  };
+
+  // Query to get count of penalized neurons
+  public query func getPenalizedNeuronsCount() : async Nat {
+    Map.size(penalizedNeurons);
+  };
+
+  // Helper function to apply penalty to a voting power value
+  private func applyVPPenalty(neuronId : Blob, baseVP : Nat) : Nat {
+    switch (Map.get(penalizedNeurons, bhash, neuronId)) {
+      case (?multiplier) { (baseVP * multiplier) / 100 };
+      case (null) { baseVP };
+    };
+  };
+
   // Fetches latest neuron voting power data and updates all user states.
   // Gets entries from snapshot canister in chunks to manage 2MB query limit. Updates totalVotingPower and cachedVotingPowers.
   private func recalculateAllVotingPower() : async () {
@@ -1967,7 +2044,9 @@ shared (deployer) actor class ContinuousDAO() = this {
                 voting_power_percentage_multiplier = neuron.voting_power_percentage_multiplier;
               };
 
-              let votingPower = vpCalc.getVotingPower(neuronDetails);
+              let baseVotingPower = vpCalc.getVotingPower(neuronDetails);
+              // Apply DAO-specific VP penalty (if neuron is in the penalized list)
+              let votingPower = applyVPPenalty(neuronId.id, baseVotingPower);
               if (votingPower > 0) {
                 Vector.add(newNeurons, {
                   neuronId = neuronId.id;

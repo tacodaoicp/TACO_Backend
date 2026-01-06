@@ -350,5 +350,12 @@ module {
     getVotingPowerChangesSince : shared query (Int, Nat) -> async Result.Result<VotingPowerChangesSinceResponse, AuthorizationError>;
     getNeuronUpdatesSince : shared query (Int, Nat) -> async Result.Result<NeuronUpdatesSinceResponse, AuthorizationError>;
     getNeuronAllocationChangesSince : shared query (Int, Nat) -> async Result.Result<NeuronAllocationChangesSinceResponse, AuthorizationError>;
+
+    // Penalized neurons management (DAO-only VP reduction)
+    admin_setPenalizedNeurons : shared ([(Blob, Nat)]) -> async Result.Result<Nat, AuthorizationError>;
+    admin_addPenalizedNeuron : shared (Blob, Nat) -> async Result.Result<(), AuthorizationError>;
+    admin_removePenalizedNeuron : shared (Blob) -> async Result.Result<Bool, AuthorizationError>;
+    getPenalizedNeurons : shared query () -> async [(Blob, Nat)];
+    getPenalizedNeuronsCount : shared query () -> async Nat;
   };
 };
