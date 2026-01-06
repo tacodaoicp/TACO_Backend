@@ -2523,13 +2523,6 @@ shared deployer actor class neuronSnapshot() = this {
 
   // Archive canister actor interface (common API)
   type ArchiveActor = actor {
-    // Query methods
-    getArchiveStatus : shared query () -> async Result.Result<ArchiveTypes.ArchiveStatus, ArchiveTypes.ArchiveError>;
-    getArchiveStats : shared query () -> async ArchiveTypes.ArchiveStatus;
-    getLogs : shared query (Nat) -> async [Logger.LogEntry];
-    getBatchImportStatus : shared query () -> async { isRunning : Bool; intervalSeconds : Nat };
-    getTimerStatus : shared query () -> async BatchImportTimer.TimerStatus;
-    get_canister_cycles : shared query () -> async { cycles : Nat };
     
     // Update methods
     startBatchImportSystem : shared () -> async Result.Result<Text, Text>;
