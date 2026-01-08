@@ -3,22 +3,143 @@ type ValidationResult =
    Err: text;
    Ok: text;
  };
+type UpdateConfig = 
+ record {
+   longSyncIntervalNS: opt nat;
+   maxKongswapAttempts: opt nat;
+   maxPriceHistoryEntries: opt nat;
+   maxSlippageBasisPoints: opt nat;
+   maxTradeAttemptsPerInterval: opt nat;
+   maxTradeValueICP: opt nat;
+   maxTradesStored: opt nat;
+   minTradeValueICP: opt nat;
+   portfolioRebalancePeriodNS: opt nat;
+   priceUpdateIntervalNS: opt nat;
+   rebalanceIntervalNS: opt nat;
+   shortSyncIntervalNS: opt nat;
+   tokenSyncTimeoutNS: opt nat;
+ };
 type TokenType = 
  variant {
    ICP;
    ICRC12;
    ICRC3;
  };
+type SystemParameter = 
+ variant {
+   AllocationWindow: nat;
+   FollowDepth: nat;
+   LogAdmin: principal;
+   MaxAllocationsPerDay: int;
+   MaxFollowUnfollowActionsPerDay: nat;
+   MaxFollowed: nat;
+   MaxFollowers: nat;
+   MaxPastAllocations: nat;
+   MaxTotalUpdates: nat;
+   SnapshotInterval: nat;
+ };
 type Subaccount = blob;
+type PriceType = 
+ variant {
+   ICP;
+   USD;
+ };
+type PriceDirection = 
+ variant {
+   Down;
+   Up;
+ };
+type PortfolioValueType = 
+ variant {
+   ICP;
+   USD;
+ };
+type PortfolioDirection = 
+ variant {
+   Down;
+   Up;
+ };
 service : {
   get_canister_cycles: () -> (record {cycles: nat;}) query;
   get_gnsf1_cnt: () -> (nat) query;
   test_gnsf1: () -> ();
   test_gnsf2: ("principal": principal) -> ();
+  validate_addPortfolioCircuitBreakerCondition: (name: text, direction:
+   PortfolioDirection, percentage: float64, timeWindowNS: nat, valueType:
+   PortfolioValueType) -> (ValidationResult) query;
+  validate_addToRewardSkipList: (neuronId: blob) -> (ValidationResult) query;
   validate_addToken: (token: principal, tokenType: TokenType) ->
    (ValidationResult);
+  validate_addTriggerCondition: (name: text, direction: PriceDirection,
+   percentage: float64, timeWindowNS: nat, applicableTokens:
+   vec principal) -> (ValidationResult) query;
+  validate_clearAllTradingPauses: (reason: opt text) ->
+   (ValidationResult) query;
+  validate_executeTradingCycle: (reason: opt text) ->
+   (ValidationResult) query;
+  validate_pauseToken: (token: principal, reason: text) ->
+   (ValidationResult) query;
+  validate_pauseTokenFromTradingManual: (token: principal, reason: text) ->
+   (ValidationResult) query;
+  validate_recoverPoolBalances: () -> (ValidationResult) query;
+  validate_removeFromRewardSkipList: (neuronId: blob) ->
+   (ValidationResult) query;
+  validate_removePortfolioCircuitBreakerCondition: (conditionId: nat) ->
+   (ValidationResult) query;
+  validate_removeTriggerCondition: (conditionId: nat) ->
+   (ValidationResult) query;
+  validate_resetImportTimestamps: (archivePrincipal: principal) ->
+   (ValidationResult) query;
+  validate_runManualBatchImport: (archivePrincipal: principal) ->
+   (ValidationResult) query;
   validate_sendToken: (token: principal, amount_e8s: nat, to_principal:
    principal, to_subaccount: opt Subaccount) -> (ValidationResult) query;
+  validate_setDistributionPeriod: (periodNS: nat) -> (ValidationResult) query;
+  validate_setMaxInnerLoopIterations: (archivePrincipal: principal,
+   iterations: nat) -> (ValidationResult) query;
+  validate_setMaxNeuronSnapshots: (maxSnapshots: nat) ->
+   (ValidationResult) query;
+  validate_setPerformanceScorePower: (power: float64) ->
+   (ValidationResult) query;
+  validate_setPeriodicRewardPot: (amount: nat) -> (ValidationResult) query;
+  validate_setPortfolioCircuitBreakerConditionActive: (conditionId: nat,
+   isActive: bool) -> (ValidationResult) query;
+  validate_setTriggerConditionActive: (conditionId: nat, isActive: bool) ->
+   (ValidationResult) query;
+  validate_setVotingPowerPower: (power: float64) -> (ValidationResult) query;
+  validate_startBatchImportSystem: (archivePrincipal: principal) ->
+   (ValidationResult) query;
+  validate_startDistributionTimer: () -> (ValidationResult) query;
+  validate_startPortfolioSnapshots: (reason: opt text) ->
+   (ValidationResult) query;
+  validate_startRebalancing: (reason: opt text) -> (ValidationResult) query;
+  validate_stopAllTimers: (archivePrincipal: principal) ->
+   (ValidationResult) query;
+  validate_stopBatchImportSystem: (archivePrincipal: principal) ->
+   (ValidationResult) query;
+  validate_stopDistributionTimer: () -> (ValidationResult) query;
+  validate_stopPortfolioSnapshots: (reason: opt text) ->
+   (ValidationResult) query;
+  validate_stopRebalancing: (reason: opt text) -> (ValidationResult) query;
+  validate_syncWithDao: () -> (ValidationResult) query;
+  validate_takeManualPortfolioSnapshot: (reason: opt text) ->
+   (ValidationResult) query;
+  validate_take_neuron_snapshot: () -> (ValidationResult) query;
   validate_test_gnsf1: () -> (ValidationResult) query;
   validate_test_gnsf2: () -> (ValidationResult) query;
+  validate_triggerDistribution: () -> (ValidationResult) query;
+  validate_triggerDistributionCustom: (startTime: int, endTime: int,
+   priceType: PriceType) -> (ValidationResult) query;
+  validate_unpauseToken: (token: principal, reason: text) ->
+   (ValidationResult) query;
+  validate_unpauseTokenFromTrading: (token: principal, reason: opt text) ->
+   (ValidationResult) query;
+  validate_updateMaxPortfolioSnapshots: (newLimit: nat, reason: opt text) ->
+   (ValidationResult) query;
+  validate_updatePortfolioSnapshotInterval: (intervalMinutes: nat, reason:
+   opt text) -> (ValidationResult) query;
+  validate_updateRebalanceConfig: (updates: UpdateConfig, rebalanceStateNew:
+   opt bool, reason: opt text) -> (ValidationResult) query;
+  validate_updateSystemParameter: (param: SystemParameter, reason:
+   opt text) -> (ValidationResult) query;
 }

@@ -197,6 +197,9 @@ module {
   public type CumulativeVP = {
     total_staked_vp : Nat;
     total_staked_vp_by_hotkey_setters : Nat;
+    // Raw VP values without penalty applied (for transparency)
+    total_staked_vp_raw : ?Nat;
+    total_staked_vp_by_hotkey_setters_raw : ?Nat;
   };
 
   // DAO Voting System Types  

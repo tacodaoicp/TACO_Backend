@@ -26,7 +26,9 @@ import NNSPropCopy "./NNSPropCopy";
 import Cycles "mo:base/ExperimentalCycles";
 import ArchiveTypes "../archives/archive_types";
 import BatchImportTimer "../helper/batch_import_timer";
+import Migration "./migration";
 
+(with migration = Migration.migrate)
 shared deployer persistent actor class neuronSnapshot() = this {
 
   private func this_canister_id() : Principal {
@@ -573,6 +575,8 @@ shared deployer persistent actor class neuronSnapshot() = this {
 
     var total_vp : Nat = 0;
     var total_vp_by_hotkey_setters : Nat = 0;
+    var total_vp_raw : Nat = 0;
+    var total_vp_by_hotkey_setters_raw : Nat = 0;
     var neuronsProcessed = 0;
 
     // Process neurons and calculate VPs during snapshot creation
@@ -631,8 +635,10 @@ shared deployer persistent actor class neuronSnapshot() = this {
           };
 
           total_vp += votingPower;
+          total_vp_raw += baseVotingPower;
           if (Vector.size(tacoPrincipal) > 0) {
             total_vp_by_hotkey_setters += votingPower;
+            total_vp_by_hotkey_setters_raw += baseVotingPower;
           };
         };
       };
@@ -658,6 +664,8 @@ shared deployer persistent actor class neuronSnapshot() = this {
     let cumulativeVP : T.CumulativeVP = {
       total_staked_vp = total_vp;
       total_staked_vp_by_hotkey_setters = total_vp_by_hotkey_setters;
+      total_staked_vp_raw = ?total_vp_raw;
+      total_staked_vp_by_hotkey_setters_raw = ?total_vp_by_hotkey_setters_raw;
     };
     Map.set(snapshotCumulativeValues, nhash, neuron_snapshot_head_id, cumulativeVP);
 
