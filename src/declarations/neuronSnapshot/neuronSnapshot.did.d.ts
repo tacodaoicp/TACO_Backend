@@ -24,6 +24,8 @@ export type CopyNNSProposalError = { 'NetworkError' : string } |
 export type CopyNNSProposalResult = { 'ok' : bigint } |
   { 'err' : CopyNNSProposalError };
 export interface CumulativeVP {
+  'total_staked_vp_raw' : [] | [bigint],
+  'total_staked_vp_by_hotkey_setters_raw' : [] | [bigint],
   'total_staked_vp_by_hotkey_setters' : bigint,
   'total_staked_vp' : bigint,
 }

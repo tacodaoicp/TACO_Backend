@@ -21,9 +21,7 @@ import AdminAuth "../helper/admin_authorization";
 import ICRC "../helper/icrc.types";
 import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
-import Migration "./migration";
 
-(with migration = Migration.migrate)
 
 shared (deployer) persistent actor class Rewards() = this {
 
@@ -35,12 +33,12 @@ shared (deployer) persistent actor class Rewards() = this {
   private transient var logger = Logger.Logger();
 
   // TACO token constants
-  private transient let TACO_DECIMALS : Nat = 8;
-  private transient let TACO_SATOSHIS_PER_TOKEN : Nat = 100_000_000; // 10^8
-  private transient let TACO_LEDGER_CANISTER_ID : Text = "kknbx-zyaaa-aaaaq-aae4a-cai";
-  private transient let TACO_WITHDRAWAL_FEE : Nat = 10_000; // 0.0001 TACO in satoshis
+  private  let TACO_DECIMALS : Nat = 8;
+  private  let TACO_SATOSHIS_PER_TOKEN : Nat = 100_000_000; // 10^8
+  private  let TACO_LEDGER_CANISTER_ID : Text = "kknbx-zyaaa-aaaaq-aae4a-cai";
+  private  let TACO_WITHDRAWAL_FEE : Nat = 10_000; // 0.0001 TACO in satoshis
 
-  private transient let SNS_GOVERNANCE_CANISTER_ID : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
+  private  let SNS_GOVERNANCE_CANISTER_ID : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
   // Helper functions for TACO amount conversions
   private func tacoTokensToSatoshis(tokens: Nat) : Nat {

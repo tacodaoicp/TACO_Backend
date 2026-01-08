@@ -24,6 +24,7 @@ module CanisterId {
     
     // Define the environments
     public type Environment = {
+        #Local;
         #Staging;
         #Production;
     };
@@ -31,6 +32,22 @@ module CanisterId {
     public class CanisterIds(thisPrincipal: Principal) {
         
         private let canisterMappings = [
+            // Local environment (uses staging dependencies for inter-canister calls)
+            (#Local, #DAO_backend, Principal.fromText("tisou-7aaaa-aaaai-atiea-cai")),
+            (#Local, #neuronSnapshot, Principal.fromText("tgqd4-eqaaa-aaaai-atifa-cai")),
+            (#Local, #treasury, Principal.fromText("tptia-syaaa-aaaai-atieq-cai")),
+            (#Local, #validation, Principal.fromText("tbrfi-jiaaa-aaaai-atifq-cai")),
+            (#Local, #trading_archive, Principal.fromText("jlycp-kqaaa-aaaan-qz4xa-cai")),
+            (#Local, #portfolio_archive, Principal.fromText("lrekt-uaaaa-aaaan-qz4ya-cai")),
+            (#Local, #price_archive, Principal.fromText("l7gh3-pqaaa-aaaan-qz4za-cai")),
+            (#Local, #dao_admin_archive, Principal.fromText("b6ygs-xaaaa-aaaan-qz5ca-cai")),
+            (#Local, #dao_governance_archive, Principal.fromText("bzzag-2yaaa-aaaan-qz5cq-cai")),
+            (#Local, #dao_allocation_archive, Principal.fromText("bq2l2-mqaaa-aaaan-qz5da-cai")),
+            (#Local, #rewards, Principal.fromText("uxrrr-q7777-77774-qaaaq-cai")),
+            (#Local, #dao_neuron_allocation_archive, Principal.fromText("cajb4-qqaaa-aaaan-qz5la-cai")),
+            (#Local, #reward_distribution_archive, Principal.fromText("ddfi2-eiaaa-aaaan-qz5nq-cai")),
+            (#Local, #reward_withdrawal_archive, Principal.fromText("dwczx-faaaa-aaaan-qz5oa-cai")),
+
             // Staging environment
             (#Staging, #DAO_backend, Principal.fromText("tisou-7aaaa-aaaai-atiea-cai")),
             (#Staging, #neuronSnapshot, Principal.fromText("tgqd4-eqaaa-aaaai-atifa-cai")),

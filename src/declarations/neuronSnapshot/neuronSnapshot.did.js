@@ -61,6 +61,8 @@ export const idlFactory = ({ IDL }) => {
     'err' : CopyNNSProposalError,
   });
   const CumulativeVP = IDL.Record({
+    'total_staked_vp_raw' : IDL.Opt(IDL.Nat),
+    'total_staked_vp_by_hotkey_setters_raw' : IDL.Opt(IDL.Nat),
     'total_staked_vp_by_hotkey_setters' : IDL.Nat,
     'total_staked_vp' : IDL.Nat,
   });

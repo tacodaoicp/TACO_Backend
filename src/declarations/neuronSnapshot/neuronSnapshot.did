@@ -479,6 +479,8 @@ type CumulativeVP =
  record {
    total_staked_vp: nat;
    total_staked_vp_by_hotkey_setters: nat;
+   total_staked_vp_by_hotkey_setters_raw: opt nat;
+   total_staked_vp_raw: opt nat;
  };
 type CopyNNSProposalResult = 
  variant {
