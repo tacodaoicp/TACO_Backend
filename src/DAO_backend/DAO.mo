@@ -27,6 +27,9 @@ import AdminAuth "../helper/admin_authorization";
 import CanisterIds "../helper/CanisterIds";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
+import Migration "./migration";
+
+(with migration = Migration.migrate)
 
 shared (deployer) persistent actor class ContinuousDAO() = this {
 
@@ -86,7 +89,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   type NeuronAllocationChangesSinceResponse = DAO_types.NeuronAllocationChangesSinceResponse;
   
   // Constants
-  let BASIS_POINTS_TOTAL = 10000;
+  transient let BASIS_POINTS_TOTAL = 10000;
   stable var SNAPSHOT_INTERVAL = 900_000_000_000; // 15 minutes in nanoseconds
   stable var MAX_PAST_ALLOCATIONS = 100;
   stable var MAX_FOLLOWERS = 500;
@@ -172,7 +175,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   stable var neuronAllocationChangesHead : Nat = 0;
   stable var neuronAllocationChangesSize : Nat = 0;
 
-  let emptyUserState : UserState = {
+  transient let emptyUserState : UserState = {
     allocations = [];
     votingPower = 0;
     lastVotingPowerUpdate = 0;
@@ -887,6 +890,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
             votingPower = neuron.votingPower;
             maker = caller;
             reason = null; // No reason for regular user updates
+            penaltyMultiplier = getPenaltyMultiplier(neuron.neuronId);
           };
           addNeuronAllocationChange(neuronAllocationChange);
         };
@@ -1454,7 +1458,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   // multiplier is percentage of VP to keep (e.g., 23 means keep 23%, reduce by 77%)
   public shared ({ caller }) func admin_setPenalizedNeurons(neurons : [(Blob, Nat)]) : async Result.Result<Nat, AuthorizationError> {
     if (not isAdmin(caller, #updateSystemParameter)) {
-      return #err(#NotAuthorized);
+      return #err(#NotAdmin);
     };
 
     // Clear existing penalties
@@ -1476,11 +1480,11 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   // Adds or updates a single penalized neuron
   public shared ({ caller }) func admin_addPenalizedNeuron(neuronId : Blob, multiplier : Nat) : async Result.Result<(), AuthorizationError> {
     if (not isAdmin(caller, #updateSystemParameter)) {
-      return #err(#NotAuthorized);
+      return #err(#NotAdmin);
     };
 
     if (multiplier > 100) {
-      return #err(#NotAuthorized); // Invalid multiplier
+      return #err(#NotAdmin); // Invalid multiplier
     };
 
     Map.set(penalizedNeurons, bhash, neuronId, multiplier);
@@ -1491,7 +1495,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   // Removes a neuron from the penalized list
   public shared ({ caller }) func admin_removePenalizedNeuron(neuronId : Blob) : async Result.Result<Bool, AuthorizationError> {
     if (not isAdmin(caller, #updateSystemParameter)) {
-      return #err(#NotAuthorized);
+      return #err(#NotAdmin);
     };
 
     let existed = Map.has(penalizedNeurons, bhash, neuronId);
@@ -1516,6 +1520,11 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       case (?multiplier) { (baseVP * multiplier) / 100 };
       case (null) { baseVP };
     };
+  };
+
+  // Helper function to get penalty multiplier for a neuron (null = no penalty, ?23 = 77% penalty)
+  private func getPenaltyMultiplier(neuronId : Blob) : ?Nat {
+    Map.get(penalizedNeurons, bhash, neuronId);
   };
 
   // Fetches latest neuron voting power data and updates all user states.

@@ -291,6 +291,8 @@ module {
     #VotingPowerChange;
   };
 
+  // NeuronAllocationChangeRecord with optional penaltyMultiplier for backward compatibility
+  // null = no penalty (equivalent to 100), ?23 = 77% penalty
   public type NeuronAllocationChangeRecord = {
     timestamp: Int;
     neuronId: Blob;
@@ -300,6 +302,7 @@ module {
     votingPower: Nat;
     maker: Principal;
     reason: ?Text;
+    penaltyMultiplier: ?Nat; // null or ?100 = no penalty, ?23 = 77% penalty
   };
 
   public type NeuronAllocationChangesSinceResponse = {
