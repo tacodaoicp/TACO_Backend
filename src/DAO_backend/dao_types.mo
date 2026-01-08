@@ -291,6 +291,8 @@ module {
     #VotingPowerChange;
   };
 
+  // NeuronAllocationChangeRecord with optional penaltyMultiplier for backward compatibility
+  // null = no penalty (equivalent to 100), ?23 = 77% penalty
   public type NeuronAllocationChangeRecord = {
     timestamp: Int;
     neuronId: Blob;
@@ -300,6 +302,7 @@ module {
     votingPower: Nat;
     maker: Principal;
     reason: ?Text;
+    penaltyMultiplier: ?Nat; // null or ?100 = no penalty, ?23 = 77% penalty
   };
 
   public type NeuronAllocationChangesSinceResponse = {
@@ -350,5 +353,12 @@ module {
     getVotingPowerChangesSince : shared query (Int, Nat) -> async Result.Result<VotingPowerChangesSinceResponse, AuthorizationError>;
     getNeuronUpdatesSince : shared query (Int, Nat) -> async Result.Result<NeuronUpdatesSinceResponse, AuthorizationError>;
     getNeuronAllocationChangesSince : shared query (Int, Nat) -> async Result.Result<NeuronAllocationChangesSinceResponse, AuthorizationError>;
+
+    // Penalized neurons management (DAO-only VP reduction)
+    admin_setPenalizedNeurons : shared ([(Blob, Nat)]) -> async Result.Result<Nat, AuthorizationError>;
+    admin_addPenalizedNeuron : shared (Blob, Nat) -> async Result.Result<(), AuthorizationError>;
+    admin_removePenalizedNeuron : shared (Blob) -> async Result.Result<Bool, AuthorizationError>;
+    getPenalizedNeurons : shared query () -> async [(Blob, Nat)];
+    getPenalizedNeuronsCount : shared query () -> async Nat;
   };
 };

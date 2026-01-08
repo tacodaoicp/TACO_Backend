@@ -1,4 +1,6 @@
 {
+  "version": 1,
+  "dfx": "0.30.1",
   "canisters": {
     "DAO_backend": {
       "main": "src/DAO_backend/DAO.mo",

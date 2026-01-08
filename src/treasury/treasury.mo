@@ -114,7 +114,7 @@ import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 
-shared (deployer) actor class treasury() = this {
+shared (deployer) persistent actor class treasury() = this {
 
   private func this_canister_id() : Principal {
       Principal.fromActor(this);
@@ -124,29 +124,29 @@ shared (deployer) actor class treasury() = this {
   // 1. SYSTEM CONFIGURATION & STATE
   //=========================================================================
 
-  var test = false;
+  transient var test = false;
 
-  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
-  let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
+  transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  transient let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+  transient let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
 
   // Logger
-  let logger = Logger.Logger();
+  transient let logger = Logger.Logger();
 
   // Canister principals and references
   //let self = "z4is7-giaaa-aaaad-qg6uq-cai";
-  let self = Principal.toText(this_canister_id());
-  let ICPprincipalText = "ryjl3-tyaaa-aaaaa-aaaba-cai";
-  let ICPprincipal = Principal.fromText(ICPprincipalText);
+  transient let self = Principal.toText(this_canister_id());
+  transient let ICPprincipalText = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+  transient let ICPprincipal = Principal.fromText(ICPprincipalText);
   //stable var DAOText = "ywhqf-eyaaa-aaaad-qg6tq-cai";
   //stable var DAOText = "vxqw7-iqaaa-aaaan-qzziq-cai";
-  let DAOText = Principal.toText(DAO_BACKEND_ID);
+  transient let DAOText = Principal.toText(DAO_BACKEND_ID);
   //stable var DAOPrincipal = Principal.fromText(DAOText);
-  let DAOPrincipal = DAO_BACKEND_ID;
+  transient let DAOPrincipal = DAO_BACKEND_ID;
   //stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
   stable var MintVaultPrincipal = DAO_BACKEND_ID;
 
-  let taco_dao_sns_governance_canister_id : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
+  transient let taco_dao_sns_governance_canister_id : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
 
 
@@ -209,22 +209,22 @@ shared (deployer) actor class treasury() = this {
   type TreasuryAdminActionsSinceResponse = TreasuryTypes.TreasuryAdminActionsSinceResponse;
 
   // Actor references
-  let dao = actor (DAOText) : actor {
+  transient let dao = actor (DAOText) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
     getAggregateAllocation : shared () -> async [(Principal, Nat)];
     syncTokenDetailsFromTreasury : shared ([(Principal, TokenDetails)]) -> async Result.Result<Text, SyncError>;
     hasAdminPermission : query (principal : Principal, function : SpamProtection.AdminFunction) -> async Bool;
   };
 
-  let priceCheckNTN = actor ("moe7a-tiaaa-aaaag-qclfq-cai") : NTN.Self;
+  transient let priceCheckNTN = actor ("moe7a-tiaaa-aaaag-qclfq-cai") : NTN.Self;
 
   // Map utilities
-  let { phash; thash } = Map;
-  let hashpp = TreasuryTypes.hashpp;
-  let { natToNat64 } = Prim;
+  transient let { phash; thash } = Map;
+  transient let hashpp = TreasuryTypes.hashpp;
+  transient let { natToNat64 } = Prim;
 
   // Randomization
-  let fuzz = Fuzz.fromSeed(Fuzz.fromSeed(Int.abs(now()) * Fuzz.Fuzz().nat.randomRange(0, 2 ** 70)).nat.randomRange(45978345345987, 2 ** 256) -45978345345987);
+  transient let fuzz = Fuzz.fromSeed(Fuzz.fromSeed(Int.abs(now()) * Fuzz.Fuzz().nat.randomRange(0, 2 ** 70)).nat.randomRange(45978345345987, 2 ** 256) -45978345345987);
 
   // Rebalancing configuration
   stable var rebalanceConfig : RebalanceConfig = {

@@ -6,7 +6,7 @@ import Cycles "mo:base/ExperimentalCycles";
 import Treasury_types "../treasury/treasury_types";
 import DAO_types "../DAO_backend/dao_types";
 
-actor validation {
+persistent actor validation {
 
     type UpdateConfig = Treasury_types.UpdateConfig;
     type SystemParameter = DAO_types.SystemParameter;

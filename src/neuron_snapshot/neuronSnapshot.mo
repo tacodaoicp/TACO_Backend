@@ -27,15 +27,15 @@ import Cycles "mo:base/ExperimentalCycles";
 import ArchiveTypes "../archives/archive_types";
 import BatchImportTimer "../helper/batch_import_timer";
 
-shared deployer actor class neuronSnapshot() = this {
+shared deployer persistent actor class neuronSnapshot() = this {
 
   private func this_canister_id() : Principal {
       Principal.fromActor(this);
   };
 
-  let logger = Logger.Logger();
+  transient let logger = Logger.Logger();
 
-  var vp_calc = calcHelp.vp_calc();
+  transient var vp_calc = calcHelp.vp_calc();
 
   // Map of principal-snapshot combinations to their associated neuron IDs
   stable let neuronStore : T.NeuronStore = Map.new<T.SnapshotId, [(Principal, Vector.Vector<T.NeuronVP>)]>();
@@ -43,37 +43,37 @@ shared deployer actor class neuronSnapshot() = this {
   // Cumulative values per snapshot (total staked maturity and cached stake)
   stable let snapshotCumulativeValues : Map.Map<T.SnapshotId, T.CumulativeVP> = Map.new<T.SnapshotId, T.CumulativeVP>();
 
-  let { nhash; n64hash; phash; bhash } = Map;
+  transient let { nhash; n64hash; phash; bhash } = Map;
 
-  let second_ns : Nat64 = 1_000_000_000; // 1 second in nanoseconds
-  let minute_ns : Nat64 = 60 * second_ns; // 1 minute in nanoseconds
+  transient let second_ns : Nat64 = 1_000_000_000; // 1 second in nanoseconds
+  transient let minute_ns : Nat64 = 60 * second_ns; // 1 minute in nanoseconds
 
-  let NEURON_SNAPSHOT_TIMEOUT_NS : Nat64 = 10 * minute_ns;
-  let NEURON_SNAPSHOT_NEURONS_PER_CALL : Nat32 = 50;
-  let NEURON_SNAPSHOT_NEURONS_PER_TICK : Nat32 = NEURON_SNAPSHOT_NEURONS_PER_CALL * 5;
+  transient let NEURON_SNAPSHOT_TIMEOUT_NS : Nat64 = 10 * minute_ns;
+  transient let NEURON_SNAPSHOT_NEURONS_PER_CALL : Nat32 = 50;
+  transient let NEURON_SNAPSHOT_NEURONS_PER_TICK : Nat32 = NEURON_SNAPSHOT_NEURONS_PER_CALL * 5;
 
   stable var sns_governance_canister_id = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai"); // TACO DAO SNS Governance Canister ID
   //var sns_governance_canister_id = Principal.fromText("aaaaa-aa"); // NB: SNEED GOV! change in production when known!
 
   // NNS Governance Canister ID (mainnet)
-  let nns_governance_canister_id = Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai");
+  transient let nns_governance_canister_id = Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai");
   
 
-  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+  transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  transient let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
 
   //let DAOprincipal = Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai");
-  let DAOprincipal = DAO_BACKEND_ID;
+  transient let DAOprincipal = DAO_BACKEND_ID;
 
   stable var masterAdmin : Principal = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
 
 
 
 
-  var snapshotTimerId : Nat = 0;
+  transient var snapshotTimerId : Nat = 0;
 
   // Non-stable periodic timer ID (reset after upgrades)
-  var periodicTimerId : ?Nat = null;
+  transient var periodicTimerId : ?Nat = null;
 
   
   // Proposer subaccount for NNS proposal copying (hex: b294fae22d75d32a793a1cf131acb649c3943f585c52d413b412680fe2db26c1)
@@ -122,7 +122,7 @@ shared deployer actor class neuronSnapshot() = this {
   stable var autoVotingRoundCounter : Nat64 = 0;
 
   // Track which NNS proposals we've attempted in the current round (non-stable, resets on upgrade)
-  var attemptedProposalsThisRound : Map.Map<Nat64, Nat64> = Map.new<Nat64, Nat64>(); // NNS Proposal ID -> Round ID
+  transient var attemptedProposalsThisRound : Map.Map<Nat64, Nat64> = Map.new<Nat64, Nat64>(); // NNS Proposal ID -> Round ID
 
   // Auto-voting threshold in seconds (default: 2 hours = 7200 seconds)
   stable var autoVotingThresholdSeconds : Nat64 = 7200;
@@ -158,19 +158,27 @@ shared deployer actor class neuronSnapshot() = this {
   stable var test = false;
   stable let mockNeurons = Map.new<Principal, T.Neuron>();
 
-  var sns_gov_canister = actor (Principal.toText(sns_governance_canister_id)) : actor {
+  transient var sns_gov_canister = actor (Principal.toText(sns_governance_canister_id)) : actor {
     list_neurons : shared query T.ListNeurons -> async T.ListNeuronsResponse;
     get_nervous_system_parameters : shared () -> async T.NervousSystemParameters;
     manage_neuron : shared NNSPropCopy.ManageNeuron -> async NNSPropCopy.ManageNeuronResponse;
     get_proposal : shared query NNSPropCopy.GetSNSProposal -> async NNSPropCopy.GetSNSProposalResponse;
   };
 
-  let nns_gov_canister = actor (Principal.toText(nns_governance_canister_id)) : NNSPropCopy.NNSGovernanceActor;
+  transient let nns_gov_canister = actor (Principal.toText(nns_governance_canister_id)) : NNSPropCopy.NNSGovernanceActor;
+
+  // DAO Backend actor for fetching penalized neurons
+  transient let dao_backend = actor (Principal.toText(DAO_BACKEND_ID)) : actor {
+    getPenalizedNeurons : shared query () -> async [(Blob, Nat)];
+  };
+
+  // Transient map to store penalized neurons during snapshot processing (fetched once per snapshot)
+  transient var penalizedNeuronsCache = Map.new<Blob, Nat>();
 
   // Mock principals for testing
-  let testActorA = Principal.fromText("hhaaz-2aaaa-aaaaq-aacla-cai");
-  let testActorB = Principal.fromText("qtooy-2yaaa-aaaaq-aabvq-cai");
-  let testActorC = Principal.fromText("aanaa-xaaaa-aaaah-aaeiq-cai");
+  transient let testActorA = Principal.fromText("hhaaz-2aaaa-aaaaq-aacla-cai");
+  transient let testActorB = Principal.fromText("qtooy-2yaaa-aaaaq-aabvq-cai");
+  transient let testActorC = Principal.fromText("aanaa-xaaaa-aaaah-aaeiq-cai");
 
   public query func get_neuron_snapshot_curr_neuron_id() : async ?T.NeuronId {
     neuron_snapshot_curr_neuron_id;
@@ -519,12 +527,30 @@ shared deployer actor class neuronSnapshot() = this {
       };
 
       try {
-        logger.info("Snapshot", "Fetching nervous system parameters", "import_neuron_batch");
-        let params = await sns_gov_canister.get_nervous_system_parameters();
+        logger.info("Snapshot", "Fetching nervous system parameters and penalized neurons", "import_neuron_batch");
+
+        // Fetch both in parallel
+        let paramsAsync = sns_gov_canister.get_nervous_system_parameters();
+        let penaltiesAsync = dao_backend.getPenalizedNeurons();
+
+        // Await both
+        let params = await paramsAsync;
+        let penalties = await penaltiesAsync;
+
+        // Apply params
         vp_calc.setParams(params);
         logger.info("Snapshot", "Updated voting power calculation parameters", "import_neuron_batch");
+
+        // Cache penalized neurons
+        penalizedNeuronsCache := Map.new<Blob, Nat>();
+        for ((neuronId, multiplier) in penalties.vals()) {
+          Map.set(penalizedNeuronsCache, bhash, neuronId, multiplier);
+        };
+        logger.info("Snapshot", "Cached " # Nat.toText(penalties.size()) # " penalized neurons", "import_neuron_batch");
       } catch (e) {
-        logger.error("Snapshot", "Failed to get nervous system parameters: " # debug_show (Error.message(e)), "import_neuron_batch");
+        logger.error("Snapshot", "Failed to get nervous system parameters or penalized neurons: " # debug_show (Error.message(e)), "import_neuron_batch");
+        // Continue with empty cache if failed
+        penalizedNeuronsCache := Map.new<Blob, Nat>();
       };
 
       // Return the neuron id of the last imported neuron.
@@ -577,13 +603,18 @@ shared deployer actor class neuronSnapshot() = this {
             voting_power_percentage_multiplier = neuron.voting_power_percentage_multiplier;
           };
 
-          let votingPower = vp_calc.getVotingPower(neuronDetails);
+          let baseVotingPower = vp_calc.getVotingPower(neuronDetails);
+          // Apply DAO-specific VP penalty if neuron is penalized (O(1) lookup)
+          let votingPower = switch (Map.get(penalizedNeuronsCache, bhash, neuronId.id)) {
+            case (?multiplier) { (baseVotingPower * multiplier) / 100 };
+            case (null) { baseVotingPower };
+          };
           // NB: Snassy: this may not be a good idea - do we ever clear the neuron from the snapshot if it has 0 VP?
           if (votingPower == 0) {
             continue a;
           };
 
-          // Store neuron with its voting power
+          // Store neuron with its voting power (penalty already applied)
           let neuronVP : T.NeuronVP = {
             neuronId = neuronId.id;
             votingPower = votingPower;
@@ -607,10 +638,12 @@ shared deployer actor class neuronSnapshot() = this {
       };
     };
 
+    let penalizedCount = Map.size(penalizedNeuronsCache);
     logger.info(
       "Snapshot",
       "Processed " # Nat.toText(neuronsProcessed) # " neurons with total VP: " #
-      Nat.toText(total_vp) # " (hotkey setters: " # Nat.toText(total_vp_by_hotkey_setters) # ")",
+      Nat.toText(total_vp) # " (hotkey setters: " # Nat.toText(total_vp_by_hotkey_setters) #
+      ", penalized neurons: " # Nat.toText(penalizedCount) # ")",
       "add_neuron_snapshot",
     );
 

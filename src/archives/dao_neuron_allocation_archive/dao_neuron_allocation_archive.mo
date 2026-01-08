@@ -21,7 +21,7 @@ import Logger "../../helper/logger";
 import BatchImportTimer "../../helper/batch_import_timer";
 import Cycles "mo:base/ExperimentalCycles";
 
-shared (deployer) actor class DAONeuronAllocationArchive() = this {
+shared (deployer) persistent actor class DAONeuronAllocationArchive() = this {
 
   private func this_canister_id() : Principal {
     Principal.fromActor(this);
@@ -34,17 +34,18 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
     neuronId: Blob;
     changeType: ArchiveTypes.AllocationChangeType;
     oldAllocations: [ArchiveTypes.Allocation];
-    newAllocations: [ArchiveTypes.Allocation]; 
+    newAllocations: [ArchiveTypes.Allocation];
     votingPower: Nat;
     maker: Principal;
     reason: ?Text;
+    penaltyMultiplier: ?Nat; // null or ?100 = no penalty, ?23 = 77% penalty
   };
   type ArchiveError = ArchiveTypes.ArchiveError;
   type AllocationChangeType = ArchiveTypes.AllocationChangeType;
   type Allocation = ArchiveTypes.Allocation;
 
   // Initialize the generic base class with neuron allocation-specific configuration
-  private let initialConfig : ArchiveTypes.ArchiveConfig = {
+  private transient let initialConfig : ArchiveTypes.ArchiveConfig = {
     maxBlocksPerCanister = 2000000; // 2M blocks per canister (neuron allocation changes are frequent)
     blockRetentionPeriodNS = 94608000000000000; // 3 years in nanoseconds (allocation history is valuable)
     enableCompression = false;
@@ -53,9 +54,9 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
 
   // ICRC3 State for scalable storage
   private stable var icrc3State : ?ICRC3.State = null;
-  private var icrc3StateRef = { var value = icrc3State };
+  private transient var icrc3StateRef = { var value = icrc3State };
 
-  private let base = ArchiveBase.ArchiveBase<NeuronAllocationChangeBlockData>(
+  private transient let base = ArchiveBase.ArchiveBase<NeuronAllocationChangeBlockData>(
     this_canister_id(),
     ["3neuron_allocation_change"],
     initialConfig,
@@ -78,9 +79,9 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
   private stable var lastImportedNeuronAllocationTimestamp : Int = 0;
 
   // DAO_backend interface for batch imports
-  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  private let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
-  private let daoCanister : DAOTypes.Self = actor (Principal.toText(DAO_BACKEND_ID));
+  private transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  private transient let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+  private transient let daoCanister : DAOTypes.Self = actor (Principal.toText(DAO_BACKEND_ID));
 
   //=========================================================================
   // ICRC-3 Standard endpoints (delegated to base class)
@@ -146,7 +147,8 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
       ("newAllocations", #Array(Array.map(change.newAllocations, allocationToValueHelper))),
       ("votingPower", #Nat(change.votingPower)),
       ("maker", ArchiveTypes.principalToValue(change.maker)),
-      ("reason", switch (change.reason) { case (?r) { #Text(r) }; case null { #Text("") }; })
+      ("reason", switch (change.reason) { case (?r) { #Text(r) }; case null { #Text("") }; }),
+      ("penaltyMultiplier", switch (change.penaltyMultiplier) { case (?pm) { #Nat(pm) }; case null { #Nat(100) }; })
     ]);
   };
 
@@ -501,31 +503,33 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
     var votingPower : ?Nat = null;
     var maker : ?Principal = null;
     var reason : ?Text = null;
-    
+    var penaltyMultiplier : ?Nat = null; // null = no penalty (for legacy records)
+
     // Extract all fields
     for ((key, value) in dataEntries.vals()) {
       switch (key, value) {
         case ("id", #Nat(n)) { id := ?n; };
         case ("timestamp", #Int(t)) { timestamp := ?t; };
         case ("neuronId", #Blob(nId)) { neuronId := ?nId; };
-        case ("changeType", changeTypeValue) { 
-          changeType := parseAllocationChangeType(changeTypeValue); 
+        case ("changeType", changeTypeValue) {
+          changeType := parseAllocationChangeType(changeTypeValue);
         };
-        case ("oldAllocations", #Array(allocArray)) { 
-          oldAllocations := parseAllocationArray(allocArray); 
+        case ("oldAllocations", #Array(allocArray)) {
+          oldAllocations := parseAllocationArray(allocArray);
         };
-        case ("newAllocations", #Array(allocArray)) { 
-          newAllocations := parseAllocationArray(allocArray); 
+        case ("newAllocations", #Array(allocArray)) {
+          newAllocations := parseAllocationArray(allocArray);
         };
         case ("votingPower", #Nat(vp)) { votingPower := ?vp; };
-        case ("maker", #Blob(makerBlob)) { 
-          maker := ?Principal.fromBlob(makerBlob); 
+        case ("maker", #Blob(makerBlob)) {
+          maker := ?Principal.fromBlob(makerBlob);
         };
         case ("reason", #Text(r)) { reason := ?r; };
+        case ("penaltyMultiplier", #Nat(pm)) { penaltyMultiplier := ?pm; };
         case (_) {};
       };
     };
-    
+
     // Construct the result if all required fields are present
     switch (id, timestamp, neuronId, changeType, oldAllocations, newAllocations, votingPower, maker, reason) {
       case (?i, ?t, ?nId, ?ct, ?old, ?new, ?vp, ?m, ?r) {
@@ -539,6 +543,7 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
           votingPower = vp;
           maker = m;
           reason = ?r;
+          penaltyMultiplier = penaltyMultiplier;
         };
       };
       case (_) {
@@ -825,6 +830,7 @@ shared (deployer) actor class DAONeuronAllocationArchive() = this {
                 votingPower = change.votingPower;
                 maker = change.maker;
                 reason = change.reason;
+                penaltyMultiplier = change.penaltyMultiplier;
               };
               
               // Archive the data
