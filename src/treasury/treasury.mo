@@ -113,7 +113,9 @@ import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
+import Migration "./migration";
 
+(with migration = Migration.migrate)
 shared (deployer) persistent actor class treasury() = this {
 
   private func this_canister_id() : Principal {
@@ -241,6 +243,7 @@ shared (deployer) persistent actor class treasury() = this {
     shortSyncIntervalNS = 900_000_000_000; // 15 minutes (for prices, balances)
     longSyncIntervalNS = 5 * 3600_000_000_000; // 5 hours (for metadata, pools)
     tokenSyncTimeoutNS = 21_600_000_000_000; // 6 hours
+    minAllocationDiffBasisPoints = 15; // 0.15% minimum allocation difference to trade
   };
 
   // Separate stable variable for circuit breaker configuration
@@ -757,7 +760,8 @@ shared (deployer) persistent actor class treasury() = this {
     "|maxKongswapAttempts=" # debug_show(config.maxKongswapAttempts) #
     "|shortSyncIntervalNS=" # debug_show(config.shortSyncIntervalNS) #
     "|longSyncIntervalNS=" # debug_show(config.longSyncIntervalNS) #
-    "|tokenSyncTimeoutNS=" # debug_show(config.tokenSyncTimeoutNS)
+    "|tokenSyncTimeoutNS=" # debug_show(config.tokenSyncTimeoutNS) #
+    "|minAllocationDiffBasisPoints=" # debug_show(config.minAllocationDiffBasisPoints)
   };
 
   /**
@@ -1013,6 +1017,27 @@ shared (deployer) persistent actor class treasury() = this {
           updatedConfig := {
             updatedConfig with
             longSyncIntervalNS = value
+          };
+          hasChanges := true;
+        };
+      };
+      case null {}; // Keep existing value
+    };
+
+    // Validate min allocation diff basis points
+    switch (updates.minAllocationDiffBasisPoints) {
+      case (?value) {
+        let minAllowed = 1; // 0.01% minimum
+        let maxAllowed = 500; // 5% maximum
+
+        if (value < minAllowed) {
+          validationErrors #= "Minimum allocation diff cannot be less than 1 basis point (0.01%); ";
+        } else if (value > maxAllowed) {
+          validationErrors #= "Minimum allocation diff cannot be more than 500 basis points (5%); ";
+        } else {
+          updatedConfig := {
+            updatedConfig with
+            minAllocationDiffBasisPoints = value
           };
           hasChanges := true;
         };
@@ -4465,30 +4490,28 @@ shared (deployer) persistent actor class treasury() = this {
     );
 
     // Create weighted list of tokens to trade based on differences
-    // Exclude tokens where the difference is smaller than min trade size
-    let minTradeValueBasisPoints = if (totalValueICP > 0) {
-        (rebalanceConfig.minTradeValueICP * 10000) / totalValueICP
-    } else { 0 };
-    
+    // Exclude tokens where the allocation difference is smaller than minAllocationDiffBasisPoints (e.g., 15bp = 0.15%)
+    let minDiffBasisPoints = rebalanceConfig.minAllocationDiffBasisPoints;
+
     let tradePairs = Vector.new<(Principal, Int, Nat)>();
-    var excludedDueToMinTradeSize = 0;
-    
+    var excludedDueToMinDiff = 0;
+
     for (alloc in Vector.vals(allocations)) {
         let details = Map.get(tokenDetailsMap, phash, alloc.token);
         switch details {
             case (?d) {
                 if (not isTokenPausedFromTrading(alloc.token) and alloc.diffBasisPoints != 0) {
                     // Check if the allocation difference is significant enough to warrant a trade
-                    if (Int.abs(alloc.diffBasisPoints) > minTradeValueBasisPoints) {
+                    if (Int.abs(alloc.diffBasisPoints) > minDiffBasisPoints) {
                         Vector.add(tradePairs, (alloc.token, alloc.diffBasisPoints, alloc.valueInICP));
                     } else {
-                        excludedDueToMinTradeSize += 1;
-                        // VERBOSE LOGGING: Token excluded due to small difference
-                        logger.info("ALLOCATION_ANALYSIS", 
-                          "Token EXCLUDED (too close to target) - " # d.tokenSymbol # 
+                        excludedDueToMinDiff += 1;
+                        // VERBOSE LOGGING: Token excluded due to small allocation difference
+                        logger.info("ALLOCATION_ANALYSIS",
+                          "Token EXCLUDED (too close to target) - " # d.tokenSymbol #
                           ": Diff=" # Int.toText(Int.abs(alloc.diffBasisPoints)) # "bp" #
-                          " Min_trade_threshold=" # Nat.toText(minTradeValueBasisPoints) # "bp" #
-                          " Reason=Below_min_trade_size",
+                          " Min_diff_threshold=" # Nat.toText(minDiffBasisPoints) # "bp" #
+                          " Reason=Below_min_allocation_diff",
                           "calculateTradeRequirements"
                         );
                     };
@@ -4550,14 +4573,14 @@ shared (deployer) persistent actor class treasury() = this {
     };
     
     // Summary of allocation analysis
-    logger.info("ALLOCATION_ANALYSIS", 
-      "Allocation summary - Overweight=" # Nat.toText(overweightCount) # 
+    logger.info("ALLOCATION_ANALYSIS",
+      "Allocation summary - Overweight=" # Nat.toText(overweightCount) #
       " Underweight=" # Nat.toText(underweightCount) #
       " Balanced=" # Nat.toText(balancedCount) #
       " Max_overweight=" # Int.toText(Int.abs(maxOverweight)) # "bp" #
       " Max_underweight=" # Int.toText(maxUnderweight) # "bp" #
-      " Excluded_too_close=" # Nat.toText(excludedDueToMinTradeSize) #
-      " Min_trade_threshold=" # Nat.toText(minTradeValueBasisPoints) # "bp" #
+      " Excluded_too_close=" # Nat.toText(excludedDueToMinDiff) #
+      " Min_diff_threshold=" # Nat.toText(minDiffBasisPoints) # "bp" #
       " Tradeable_pairs=" # Nat.toText(Vector.size(tradePairs)),
       "calculateTradeRequirements"
     );

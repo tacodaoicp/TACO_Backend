@@ -333,6 +333,7 @@ type UpdateConfig =
    maxTradeAttemptsPerInterval: opt nat;
    maxTradeValueICP: opt nat;
    maxTradesStored: opt nat;
+   minAllocationDiffBasisPoints: opt nat;
    minTradeValueICP: opt nat;
    portfolioRebalancePeriodNS: opt nat;
    priceUpdateIntervalNS: opt nat;
@@ -726,6 +727,7 @@ type RebalanceConfig =
    maxTradeAttemptsPerInterval: nat;
    maxTradeValueICP: nat;
    maxTradesStored: nat;
+   minAllocationDiffBasisPoints: nat;
    minTradeValueICP: nat;
    portfolioRebalancePeriodNS: nat;
    rebalanceIntervalNS: nat;

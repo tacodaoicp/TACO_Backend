@@ -76,6 +76,7 @@ module {
     shortSyncIntervalNS : Nat; // frequent sync for prices and balances
     longSyncIntervalNS : Nat; // less frequent sync for metadata updates
     tokenSyncTimeoutNS : Nat; // maximum time without sync before pausing
+    minAllocationDiffBasisPoints : Nat; // Minimum allocation difference to trigger trade (e.g., 15 = 0.15%)
   };
 
   public type UpdateConfig = {
@@ -92,6 +93,7 @@ module {
     longSyncIntervalNS : ?Nat;
     maxPriceHistoryEntries : ?Nat;
     tokenSyncTimeoutNS : ?Nat;
+    minAllocationDiffBasisPoints : ?Nat;
   };
 
   type hash<K> = (
