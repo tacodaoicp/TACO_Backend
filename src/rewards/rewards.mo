@@ -14,6 +14,7 @@ import Nat "mo:base/Nat";
 import Nat64 "mo:base/Nat64";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
+import Bool "mo:base/Bool";
 
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
@@ -161,8 +162,15 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var nextScheduledDistributionTime : ?Int = null; // When the next distribution is scheduled to run
   private transient var distributionTimerId : ?Nat = null;
 
-  // Skip list for reward distribution - neurons to skip during distribution
+  // DEPRECATED: Legacy skiplist - kept for migration compatibility, no longer used
+  // Use rewardPenalties instead (with multiplier=0 for skip behavior)
   stable var rewardSkipList : [Blob] = [];
+
+  // Reward penalties for distribution - neurons with reduced reward scores
+  // multiplier = 0 means skip entirely (same as old skiplist)
+  // multiplier = 23 means keep 23% of reward score
+  // multiplier = 100 or not in map means no penalty
+  stable var rewardPenalties = Map.new<Blob, Nat>(); // neuronId -> multiplier (0-100)
   
   // Reward tracking
   private transient let { phash; bhash } = Map;
@@ -880,37 +888,40 @@ shared (deployer) persistent actor class Rewards() = this {
       
       logger.info("Distribution", "Found " # Nat.toText(allNeurons.size()) # " total neurons", "runPeriodicDistribution");
       
-      // Separate neurons into processable and skipped
+      // Separate neurons into processable and skipped (multiplier=0 means skip)
       let neuronsBuffer = Buffer.Buffer<(Blob, NeuronAllocation)>(allNeurons.size());
       let skippedNeuronsBuffer = Buffer.Buffer<FailedNeuron>(allNeurons.size());
-      
+
       for ((neuronId, neuronAllocation) in allNeurons.vals()) {
-        let isSkipped = Array.find<Blob>(rewardSkipList, func(skipId) { skipId == neuronId });
-        if (isSkipped == null) {
-          // Not in skip list, include for processing
-          neuronsBuffer.add((neuronId, neuronAllocation));
-        } else {
-          // In skip list, add to failed neurons with skip message
-          let skippedNeuron : FailedNeuron = {
-            neuronId = neuronId;
-            errorMessage = "Neuron skipped by admin (in skip list)";
+        let penalty = Map.get(rewardPenalties, bhash, neuronId);
+        switch (penalty) {
+          case (?0) {
+            // Multiplier is 0 - skip entirely (same as old skiplist behavior)
+            let skippedNeuron : FailedNeuron = {
+              neuronId = neuronId;
+              errorMessage = "Neuron skipped by admin (penalty multiplier = 0)";
+            };
+            skippedNeuronsBuffer.add(skippedNeuron);
           };
-          skippedNeuronsBuffer.add(skippedNeuron);
+          case (_) {
+            // No penalty or partial penalty - include for processing
+            neuronsBuffer.add((neuronId, neuronAllocation));
+          };
         };
       };
-      
+
       let neurons = Buffer.toArray(neuronsBuffer);
       let initialSkippedNeurons = Buffer.toArray(skippedNeuronsBuffer);
-      
+
       if (initialSkippedNeurons.size() > 0) {
-        logger.info("Distribution", "Skipped " # Nat.toText(initialSkippedNeurons.size()) # " neurons from skip list", "runPeriodicDistribution");
+        logger.info("Distribution", "Skipped " # Nat.toText(initialSkippedNeurons.size()) # " neurons with penalty=0", "runPeriodicDistribution");
       };
-      
-      logger.info("Distribution", "Processing " # Nat.toText(neurons.size()) # " neurons (after skip list filtering)", "runPeriodicDistribution");
-      
+
+      logger.info("Distribution", "Processing " # Nat.toText(neurons.size()) # " neurons (after penalty filtering)", "runPeriodicDistribution");
+
       if (neurons.size() == 0) {
         let message = if (allNeurons.size() > 0) {
-          "All " # Nat.toText(allNeurons.size()) # " neurons are in skip list"
+          "All " # Nat.toText(allNeurons.size()) # " neurons have penalty=0"
         } else {
           "No neurons found"
         };
@@ -999,8 +1010,17 @@ shared (deployer) persistent actor class Rewards() = this {
           // Apply power factors to performance score and voting power
           let adjustedPerformanceScore = Float.pow(performance.performanceScore, performanceScorePower);
           let adjustedVotingPower = Float.pow(Float.fromInt(votingPower), votingPowerPower);
-          let rewardScore = adjustedPerformanceScore * adjustedVotingPower;
-          
+          let baseRewardScore = adjustedPerformanceScore * adjustedVotingPower;
+
+          // Apply reward penalty if neuron has one (multiplier < 100)
+          let rewardScore = switch (Map.get(rewardPenalties, bhash, neuronId)) {
+            case (?multiplier) {
+              if (multiplier >= 100) { baseRewardScore }
+              else { (baseRewardScore * Float.fromInt(multiplier)) / 100.0 }
+            };
+            case (null) { baseRewardScore }; // No penalty
+          };
+
           let neuronReward : NeuronReward = {
             neuronId = neuronId;
             performanceScore = performance.performanceScore;
@@ -1504,41 +1524,124 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   //=========================================================================
-  // Skip List Management Functions
+  // Reward Penalty Management Functions
   //=========================================================================
 
-  // Get the current reward skip list
-  // Public query - allows anyone to view the reward skip list (read-only transparency)
-  public shared query func getRewardSkipList() : async Result.Result<[Blob], RewardsError> {
-    #ok(rewardSkipList);
+  // Get all reward penalties
+  // Public query - allows anyone to view the reward penalties (read-only transparency)
+  public shared query func getRewardPenalties() : async Result.Result<[(Blob, Nat)], RewardsError> {
+    #ok(Iter.toArray(Map.entries(rewardPenalties)));
   };
 
-  // Set the reward skip list (replaces entire list)
+  // Get penalty for a specific neuron (null = no penalty)
+  public shared query func getRewardPenalty(neuronId: Blob) : async Result.Result<?Nat, RewardsError> {
+    #ok(Map.get(rewardPenalties, bhash, neuronId));
+  };
+
+  // Set reward penalty for a neuron
+  // multiplier: 0 = skip entirely, 1-99 = reduce reward score by that %, 100+ = no penalty
+  public shared ({ caller }) func setRewardPenalty(neuronId: Blob, multiplier: Nat) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (multiplier > 100) {
+      return #err(#SystemError("Multiplier must be 0-100 (percentage of reward score to keep)"));
+    };
+
+    Map.set(rewardPenalties, bhash, neuronId, multiplier);
+    logger.info("Config", "Set reward penalty multiplier=" # Nat.toText(multiplier) # " for neuron", "setRewardPenalty");
+    #ok("Reward penalty set");
+  };
+
+  // Set multiple reward penalties at once (replaces all penalties)
+  public shared ({ caller }) func setRewardPenalties(penalties: [(Blob, Nat)]) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Clear existing penalties
+    rewardPenalties := Map.new<Blob, Nat>();
+
+    // Add new penalties (validate each)
+    var count : Nat = 0;
+    for ((neuronId, multiplier) in penalties.vals()) {
+      if (multiplier <= 100) {
+        Map.set(rewardPenalties, bhash, neuronId, multiplier);
+        count += 1;
+      };
+    };
+
+    logger.info("Config", "Set " # Nat.toText(count) # " reward penalties", "setRewardPenalties");
+    #ok("Reward penalties updated");
+  };
+
+  // Remove reward penalty for a neuron (neuron will get full rewards)
+  public shared ({ caller }) func removeRewardPenalty(neuronId: Blob) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let existed = Map.has(rewardPenalties, bhash, neuronId);
+    Map.delete(rewardPenalties, bhash, neuronId);
+    logger.info("Config", "Removed reward penalty (existed: " # Bool.toText(existed) # ")", "removeRewardPenalty");
+    #ok(if (existed) { "Reward penalty removed" } else { "Neuron had no penalty" });
+  };
+
+  // DEPRECATED: Legacy skiplist functions for backwards compatibility
+  // These now map to the penalty system with multiplier=0
+
+  // Get the current reward skip list (returns neurons with multiplier=0)
+  public shared query func getRewardSkipList() : async Result.Result<[Blob], RewardsError> {
+    let skipped = Buffer.Buffer<Blob>(Map.size(rewardPenalties));
+    for ((neuronId, multiplier) in Map.entries(rewardPenalties)) {
+      if (multiplier == 0) {
+        skipped.add(neuronId);
+      };
+    };
+    #ok(Buffer.toArray(skipped));
+  };
+
+  // Set the reward skip list (sets all to multiplier=0)
   public shared ({ caller }) func setRewardSkipList(neuronIds: [Blob]) : async Result.Result<Text, RewardsError> {
     if (not isAdmin(caller)) {
       return #err(#NotAuthorized);
     };
-    
-    rewardSkipList := neuronIds;
-    logger.info("Config", "Reward skip list updated with " # Nat.toText(neuronIds.size()) # " neurons", "setRewardSkipList");
+
+    // Clear existing penalties that were skips (multiplier=0)
+    let toRemove = Buffer.Buffer<Blob>(Map.size(rewardPenalties));
+    for ((neuronId, multiplier) in Map.entries(rewardPenalties)) {
+      if (multiplier == 0) {
+        toRemove.add(neuronId);
+      };
+    };
+    for (neuronId in toRemove.vals()) {
+      Map.delete(rewardPenalties, bhash, neuronId);
+    };
+
+    // Add new skips
+    for (neuronId in neuronIds.vals()) {
+      Map.set(rewardPenalties, bhash, neuronId, 0);
+    };
+
+    logger.info("Config", "Reward skip list updated with " # Nat.toText(neuronIds.size()) # " neurons (via penalty system)", "setRewardSkipList");
     #ok("Reward skip list updated");
   };
 
-  // Add a neuron to the reward skip list
+  // Add a neuron to the reward skip list (sets multiplier=0)
   public shared ({ caller }) func addToRewardSkipList(neuronId: Blob) : async Result.Result<Text, RewardsError> {
     if (not isAdmin(caller)) {
       return #err(#NotAuthorized);
     };
-    
-    // Check if neuron is already in the skip list
-    let isAlreadySkipped = Array.find<Blob>(rewardSkipList, func(id) { id == neuronId });
-    if (isAlreadySkipped != null) {
-      return #err(#SystemError("Neuron is already in the skip list"));
+
+    // Check if already skipped
+    switch (Map.get(rewardPenalties, bhash, neuronId)) {
+      case (?0) { return #err(#SystemError("Neuron is already in the skip list")); };
+      case (_) {};
     };
-    
-    // Add to skip list
-    rewardSkipList := Array.flatten([rewardSkipList, [neuronId]]);
-    logger.info("Config", "Added neuron to reward skip list", "addToRewardSkipList");
+
+    Map.set(rewardPenalties, bhash, neuronId, 0);
+    logger.info("Config", "Added neuron to reward skip list (via penalty system)", "addToRewardSkipList");
     #ok("Neuron added to skip list");
   };
 
@@ -1547,17 +1650,17 @@ shared (deployer) persistent actor class Rewards() = this {
     if (not isAdmin(caller)) {
       return #err(#NotAuthorized);
     };
-    
-    // Check if neuron is in the skip list
-    let isInSkipList = Array.find<Blob>(rewardSkipList, func(id) { id == neuronId });
-    if (isInSkipList == null) {
-      return #err(#SystemError("Neuron is not in the skip list"));
+
+    // Check if in skip list (multiplier=0)
+    switch (Map.get(rewardPenalties, bhash, neuronId)) {
+      case (?0) {
+        Map.delete(rewardPenalties, bhash, neuronId);
+        logger.info("Config", "Removed neuron from reward skip list (via penalty system)", "removeFromRewardSkipList");
+        #ok("Neuron removed from skip list");
+      };
+      case (?_) { #err(#SystemError("Neuron has a penalty but is not fully skipped")); };
+      case (null) { #err(#SystemError("Neuron is not in the skip list")); };
     };
-    
-    // Remove from skip list
-    rewardSkipList := Array.filter<Blob>(rewardSkipList, func(id) { id != neuronId });
-    logger.info("Config", "Removed neuron from reward skip list", "removeFromRewardSkipList");
-    #ok("Neuron removed from skip list");
   };
 
   // Get configuration
@@ -1572,8 +1675,14 @@ shared (deployer) persistent actor class Rewards() = this {
     nextScheduledDistribution: ?Int;
     lastDistributionTime: Int;
     totalDistributions: Nat;
-    rewardSkipListSize: Nat;
+    rewardPenaltiesCount: Nat;
+    rewardSkipListSize: Nat; // DEPRECATED: now counts neurons with penalty=0
   } {
+    // Count neurons with multiplier=0 (skipped) for backwards compatibility
+    var skipCount : Nat = 0;
+    for ((_, multiplier) in Map.entries(rewardPenalties)) {
+      if (multiplier == 0) { skipCount += 1; };
+    };
     {
       distributionPeriodNS = distributionPeriodNS;
       periodicRewardPot = periodicRewardPot;
@@ -1585,7 +1694,8 @@ shared (deployer) persistent actor class Rewards() = this {
       nextScheduledDistribution = nextScheduledDistributionTime;
       lastDistributionTime = lastDistributionTime;
       totalDistributions = distributionCounter;
-      rewardSkipListSize = rewardSkipList.size();
+      rewardPenaltiesCount = Map.size(rewardPenalties);
+      rewardSkipListSize = skipCount;
     };
   };
 

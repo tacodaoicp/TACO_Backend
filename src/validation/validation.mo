@@ -325,6 +325,20 @@ persistent actor validation {
       #Ok("removeFromRewardSkipList called with neuronId: " # debug_show(neuronId));
     };
 
+    // 3050 - New penalty functions
+    public query func validate_setRewardPenalty(neuronId : Blob, multiplier : Nat) : async ValidationResult {
+      #Ok("setRewardPenalty called with neuronId: " # debug_show(neuronId) # " with multiplier: " # debug_show(multiplier));
+    };
+
+    // 3051
+    public query func validate_setRewardPenalties(penalties : [(Blob, Nat)]) : async ValidationResult {
+      #Ok("setRewardPenalties called with " # debug_show(penalties.size()) # " penalties");
+    };
+
+    // 3052
+    public query func validate_removeRewardPenalty(neuronId : Blob) : async ValidationResult {
+      #Ok("removeRewardPenalty called with neuronId: " # debug_show(neuronId));
+    };
 
 
 //admin_executeTradingCycle, takeManualPortfolioSnapshot
