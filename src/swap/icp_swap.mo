@@ -861,7 +861,8 @@ module {
                 switch (withdrawResult) {
                   case (#ok(_tx_id)) {
                     #ok({
-                      swapAmount = withdrawAmount - metadata.tokenTransferFee;
+                      swapAmount = withdrawAmount;  // Pre-fee amount for price calculation
+                      receivedAmount = withdrawAmount - metadata.tokenTransferFee;  // Post-fee for balance
                     });
                   };
                   case (#err(e)) {

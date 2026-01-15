@@ -113,9 +113,9 @@ import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
-import Migration "./migration";
+//import Migration "./migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 shared (deployer) persistent actor class treasury() = this {
 
   private func this_canister_id() : Principal {
@@ -189,6 +189,27 @@ shared (deployer) persistent actor class treasury() = this {
   type TradingPausesResponse = TreasuryTypes.TradingPausesResponse;
   type TradingPauseError = TreasuryTypes.TradingPauseError;
 
+  // Execution plan type for split trades (Phase 2 anti-arb)
+  // slippageBP is slippage in basis points (100bp = 1%)
+  // percentBP is the percentage of trade going to this exchange in basis points (10000bp = 100%)
+  type ExecutionPlan = {
+    #Single : { exchange : ExchangeType; expectedOut : Nat; slippageBP : Nat };
+    #Split : {
+      kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+      icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+    };
+  };
+
+  // Quote data from exchange (used for reduced amount estimation)
+  type QuoteData = { out : Nat; slipBP : Nat; valid : Bool };
+
+  // Extended error with quote data for reduced amount fallback
+  type FindExecutionError = {
+    reason : Text;
+    kongQuotes : [QuoteData];
+    icpQuotes : [QuoteData];
+  };
+
   // Portfolio snapshot system type aliases
   type TokenSnapshot = TreasuryTypes.TokenSnapshot;
   type PortfolioSnapshot = TreasuryTypes.PortfolioSnapshot;
@@ -225,8 +246,16 @@ shared (deployer) persistent actor class treasury() = this {
   transient let hashpp = TreasuryTypes.hashpp;
   transient let { natToNat64 } = Prim;
 
+  // Helper: Check if a Float is finite (not NaN and not Inf)
+  // Float.toInt traps on NaN and Inf, so we must guard before calling it
+  // Max safe Int value is ~9.2e18 (2^63 - 1), we use a conservative bound
+  private func isFiniteFloat(x : Float) : Bool {
+    not Float.isNaN(x) and x < 9.0e18 and x > -9.0e18
+  };
+
   // Randomization
-  transient let fuzz = Fuzz.fromSeed(Fuzz.fromSeed(Int.abs(now()) * Fuzz.Fuzz().nat.randomRange(0, 2 ** 70)).nat.randomRange(45978345345987, 2 ** 256) -45978345345987);
+  // NOTE: Fuzz.fromSeed internally uses Nat64.fromNat, so seed must be < 2^64
+  transient let fuzz = Fuzz.fromSeed((Fuzz.fromSeed(Int.abs(now()) % (2 ** 63)).nat.randomRange(45978345345987, 2 ** 63)) % (2 ** 63));
 
   // Rebalancing configuration
   stable var rebalanceConfig : RebalanceConfig = {
@@ -1140,13 +1169,15 @@ shared (deployer) persistent actor class treasury() = this {
         totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
     };
 
-    // Second pass - calculate allocations
-    for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-        if (valueInICP > 0) {
-            let basisPoints = (valueInICP * 10000) / totalValueICP;
-            Vector.add(currentAllocs, (principal, basisPoints));
-        };
+    // Second pass - calculate allocations (only if totalValueICP > 0 to avoid division by zero)
+    if (totalValueICP > 0) {
+      for ((principal, details) in Map.entries(tokenDetailsMap)) {
+          let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+          if (valueInICP > 0) {
+              let basisPoints = (valueInICP * 10000) / totalValueICP;
+              Vector.add(currentAllocs, (principal, basisPoints));
+          };
+      };
     };
 
 
@@ -1275,13 +1306,15 @@ shared (deployer) persistent actor class treasury() = this {
         totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
     };
 
-    // Second pass - calculate allocations
-    for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-        if (valueInICP > 0) {
-            let basisPoints = (valueInICP * 10000) / totalValueICP;
-            Vector.add(currentAllocs, (principal, basisPoints));
-        };
+    // Second pass - calculate allocations (only if totalValueICP > 0 to avoid division by zero)
+    if (totalValueICP > 0) {
+      for ((principal, details) in Map.entries(tokenDetailsMap)) {
+          let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+          if (valueInICP > 0) {
+              let basisPoints = (valueInICP * 10000) / totalValueICP;
+              Vector.add(currentAllocs, (principal, basisPoints));
+          };
+      };
     };
 
     // Calculate metrics from filtered trade history only
@@ -2331,7 +2364,7 @@ shared (deployer) persistent actor class treasury() = this {
     };
 
     try {
-      ignore await* startPortfolioSnapshotTimer<system>();
+      await* startPortfolioSnapshotTimer<system>();
       let reasonText = switch (reason) { case (?r) r; case null "Portfolio snapshots started" };
       logTreasuryAdminAction(caller, #StartPortfolioSnapshots, reasonText, true, null);
       #ok("Portfolio snapshots started successfully")
@@ -2396,7 +2429,7 @@ shared (deployer) persistent actor class treasury() = this {
     let wasRunning = portfolioSnapshotStatus == #Running;
     if (wasRunning) {
       stopPortfolioSnapshotTimer();
-      ignore await* startPortfolioSnapshotTimer<system>();
+      await* startPortfolioSnapshotTimer<system>();
     };
 
     let reasonText = switch (reason) { case (?r) r; case null "Portfolio snapshot interval updated to " # Nat.toText(intervalMinutes) # " minutes" };
@@ -3851,13 +3884,15 @@ shared (deployer) persistent actor class treasury() = this {
             // Determine trade size using hybrid approach
             let useExactTargeting = shouldUseExactTargeting(sellTokenDiff, buyTokenDiff, totalValueICP);
             let maxTradeValueBP = if (totalValueICP > 0) { (rebalanceConfig.maxTradeValueICP * 10000) / totalValueICP } else { 0 };
-            
-            let tradeSize = if (useExactTargeting) {
+
+            // Get trade size and exact targeting flag
+            // isExactTargeting = true means slippage adjustment will be applied after quote
+            let (tradeSize, isExactTargeting) : (Nat, Bool) = if (useExactTargeting) {
               // VERBOSE LOGGING: Using exact targeting
-              logger.info("TRADE_SIZING", 
+              logger.info("TRADE_SIZING",
                 "Using EXACT targeting - Sell_diff=" # Int.toText(sellTokenDiff) # "bp" #
                 " Buy_diff=" # Int.toText(buyTokenDiff) # "bp" #
-                " Portfolio_value=" # Nat.toText(totalValueICP / 100000000) # "." # 
+                " Portfolio_value=" # Nat.toText(totalValueICP / 100000000) # "." #
                 Nat.toText((totalValueICP % 100000000) / 1000000) # "ICP" #
                 " Max_trade_threshold=" # Nat.toText(maxTradeValueBP) # "bp" #
                 " Reason=Close_to_target",
@@ -3865,17 +3900,17 @@ shared (deployer) persistent actor class treasury() = this {
               );
               calculateExactTargetTradeSize(sellToken, buyToken, totalValueICP, sellTokenDiff, buyTokenDiff);
             } else {
-              // VERBOSE LOGGING: Using random sizing  
-              logger.info("TRADE_SIZING", 
+              // VERBOSE LOGGING: Using random sizing
+              logger.info("TRADE_SIZING",
                 "Using RANDOM sizing - Sell_diff=" # Int.toText(sellTokenDiff) # "bp" #
                 " Buy_diff=" # Int.toText(buyTokenDiff) # "bp" #
-                " Portfolio_value=" # Nat.toText(totalValueICP / 100000000) # "." # 
+                " Portfolio_value=" # Nat.toText(totalValueICP / 100000000) # "." #
                 Nat.toText((totalValueICP % 100000000) / 1000000) # "ICP" #
                 " Max_trade_threshold=" # Nat.toText(maxTradeValueBP) # "bp" #
                 " Reason=Large_imbalance",
                 "do_executeTradingStep"
               );
-              ((calculateTradeSizeMinMax() * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP);
+              (((calculateTradeSizeMinMax() * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP), false);
             };
             
             // VERBOSE LOGGING: Final trade size decision
@@ -3896,153 +3931,300 @@ shared (deployer) persistent actor class treasury() = this {
             let bestExecution = await* findBestExecution(sellToken, buyToken, tradeSize);
 
             switch (bestExecution) {
-              case (#ok(execution)) {
-                // Calculate minimum amount out considering the actual slippage already in expectedOut
-                // execution.expectedOut already includes the exchange's price impact (execution.slippage)
-                // We need to calculate what the ideal output would be, then apply our slippage tolerance
-                
-                let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
-                let ourSlippageToleranceFloat = Float.fromInt(ourSlippageToleranceBasisPoints) / 100.0; // Convert basis points to percentage
-                
-                // Calculate ideal output (what we'd get with zero slippage)
-                let idealOut : Nat = if (execution.slippage < 99.0) { // Avoid division by values too close to 1
-                  let actualSlippageDecimal = execution.slippage / 100.0; // Convert percentage to decimal
-                  Int.abs(Float.toInt(Float.fromInt(execution.expectedOut) / (1.0 - actualSlippageDecimal)))
-                } else {
-                  execution.expectedOut // Fallback if slippage is too high
-                };
-                
-                // Apply our slippage tolerance to the ideal output
-                let minAmountOutFloat = Float.fromInt(idealOut) * (1.0 - ourSlippageToleranceFloat / 100.0);
-                let minAmountOut = Int.abs(Float.toInt(minAmountOutFloat));
-                
-                let tradeResult = await* executeTrade(
-                  sellToken,
-                  buyToken,
-                  tradeSize,
-                  execution.exchange,
-                  minAmountOut,
-                  idealOut, // Pass the spot price amount for correct slippage calculation
-                );
+              case (#ok(plan)) {
+                // Handle both #Single and #Split execution plans
+                switch (plan) {
+                  case (#Single(execution)) {
+                    // SINGLE EXCHANGE EXECUTION (existing Phase 1 logic with slippageBP)
+                    let slippageBasisPoints : Nat = execution.slippageBP;
 
-                switch (tradeResult) {
-                  case (#ok(record)) {
-                    // Update trade history
-                    let lastTrades = Vector.clone(rebalanceState.lastTrades);
-                    Vector.add(lastTrades, record);
-                    if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
-                      Vector.reverse(lastTrades);
-                      while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
-                        ignore Vector.removeLast(lastTrades);
-                      };
-                      Vector.reverse(lastTrades);
-                    };
+                    // SLIPPAGE ADJUSTMENT: Reduce trade size to compensate for price impact
+                    // This prevents overshoot when using exact targeting
+                    // Formula: adjusted = size * 10000 / (10000 + slippageBP)
+                    let finalTradeSize : Nat = if (isExactTargeting and slippageBasisPoints > 0) {
+                      let denominator = 10000 + slippageBasisPoints;
+                      let adjusted = (tradeSize * 10000) / denominator;
 
-                    // Update token prices based on trade
-                    let token0Details = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
-                      case (?details) { details };
-                      case (null) {
-                        Debug.print("Error: Sell token not found in details");
-                        return;
-                      };
-                    };
-                    let token1Details = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
-                      case (?details) { details };
-                      case (null) {
-                        Debug.print("Error: Buy token not found in details");
-                        return;
-                      };
-                    };
-
-                    // Calculate prices based on trade
-                    if (sellToken == ICPprincipal or buyToken == ICPprincipal) {
-                      if (sellToken == ICPprincipal) {
-                        // Selling ICP for token
-                        let actualTokens = Float.fromInt(record.amountBought) / Float.fromInt(10 ** token1Details.tokenDecimals);
-                        let actualICP = Float.fromInt(record.amountSold) / Float.fromInt(100000000);
-                        let newPriceInICP = Int.abs(Float.toInt((actualICP / actualTokens) * 100000000));
-                        let newPriceInUSD = token0Details.priceInUSD * actualICP / actualTokens;
-
-                        updateTokenPriceWithHistory(buyToken, newPriceInICP, newPriceInUSD);
+                      // Safety check: if adjusted size exceeds max, fall back to random
+                      let adjustedICP = (adjusted * tokenDetailsSell.priceInICP) / (10 ** tokenDetailsSell.tokenDecimals);
+                      if (adjustedICP > rebalanceConfig.maxTradeValueICP) {
+                        Debug.print("Adjusted trade exceeds max, falling back to random size");
+                        ((calculateTradeSizeMinMax() * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP)
                       } else {
-                        // Buying ICP for token
-                        let actualTokens = Float.fromInt(record.amountSold) / Float.fromInt(10 ** token0Details.tokenDecimals);
-                        let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
-                        let newPriceInICP = Int.abs(Float.toInt((actualICP / actualTokens) * 100000000));
-                        let newPriceInUSD = token1Details.priceInUSD * actualICP / actualTokens;
-
-                        updateTokenPriceWithHistory(sellToken, newPriceInICP, newPriceInUSD);
-                      };
+                        logger.info("SLIPPAGE_ADJUSTMENT",
+                          "Adjusting single trade for slippage - Original=" # Nat.toText(tradeSize) #
+                          " Adjusted=" # Nat.toText(adjusted) #
+                          " SlippageBP=" # Nat.toText(slippageBasisPoints),
+                          "do_executeTradingStep"
+                        );
+                        adjusted
+                      }
                     } else {
-                      // Non-ICP pair
-                      let maintainFirst = fuzz.nat.randomRange(0, 1) == 0;
-
-                      if (maintainFirst) {
-                        // Keep sell token price stable, calculate real amounts
-                        let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** token0Details.tokenDecimals);
-                        let actualTokensBought = Float.fromInt(record.amountBought) / Float.fromInt(10 ** token1Details.tokenDecimals);
-                        let priceRatio = actualTokensSold / actualTokensBought;
-
-                        let newPriceInICP = Int.abs(Float.toInt(Float.fromInt(token0Details.priceInICP) * priceRatio));
-                        let newPriceInUSD = token0Details.priceInUSD * priceRatio;
-
-                        updateTokenPriceWithHistory(buyToken, newPriceInICP, newPriceInUSD);
-                      } else {
-                        // Keep buy token price stable, calculate real amounts
-                        let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** token0Details.tokenDecimals);
-                        let actualTokensBought = Float.fromInt(record.amountBought) / Float.fromInt(10 ** token1Details.tokenDecimals);
-                        let priceRatio = actualTokensBought / actualTokensSold;
-
-                        let newPriceInICP = Int.abs(Float.toInt(Float.fromInt(token1Details.priceInICP) * priceRatio));
-                        let newPriceInUSD = token1Details.priceInUSD * priceRatio;
-
-                        updateTokenPriceWithHistory(sellToken, newPriceInICP, newPriceInUSD);
-                      };
+                      tradeSize
                     };
 
-                    // Update rebalance state
-                    rebalanceState := {
-                      rebalanceState with
-                      metrics = {
-                        rebalanceState.metrics with
-                        totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
-                      };
-                      lastTrades = lastTrades;
+                    // Adjust expected output proportionally if we reduced trade size
+                    let adjustedExpectedOut : Nat = if (finalTradeSize < tradeSize and tradeSize > 0) {
+                      (execution.expectedOut * finalTradeSize) / tradeSize
+                    } else {
+                      execution.expectedOut
                     };
-                    success := true;
-                    Debug.print("Trade executed successfully and prices updated");
-                    
-                    // Refresh balances to get accurate post-trade data
-                    await updateBalances();
-                    
-                    // Take portfolio snapshot after successful trade
-                    await takePortfolioSnapshot(#PostTrade);
 
-                    // Check circuit breaker conditions after post-trade snapshot
-                    checkPortfolioCircuitBreakerConditions();
-                              
-                    // VERBOSE LOGGING: Portfolio state after successful trade
-                    await* logPortfolioState("Post-trade completed");
+                    let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                    // Calculate ideal output
+                    let idealOut : Nat = if (slippageBasisPoints < 9900) {
+                      (adjustedExpectedOut * 10000) / (10000 - slippageBasisPoints)
+                    } else {
+                      adjustedExpectedOut
+                    };
+
+                    // Apply our slippage tolerance
+                    let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                    let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
+
+                    let tradeResult = await* executeTrade(
+                      sellToken,
+                      buyToken,
+                      finalTradeSize,
+                      execution.exchange,
+                      minAmountOut,
+                      idealOut,
+                    );
+
+                    switch (tradeResult) {
+                      case (#ok(record)) {
+                        // Update trade history
+                        let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                        Vector.add(lastTrades, record);
+                        if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                          Vector.reverse(lastTrades);
+                          while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                            ignore Vector.removeLast(lastTrades);
+                          };
+                          Vector.reverse(lastTrades);
+                        };
+
+                        // Update token prices based on trade
+                        let token0Details = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                          case (?details) { details };
+                          case (null) { Debug.print("Error: Sell token not found in details"); return; };
+                        };
+                        let token1Details = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                          case (?details) { details };
+                          case (null) { Debug.print("Error: Buy token not found in details"); return; };
+                        };
+
+                        // Calculate prices based on trade
+                        // Guard: Only update price if we have valid amounts to avoid division by zero / Inf
+                        if (sellToken == ICPprincipal or buyToken == ICPprincipal) {
+                          if (sellToken == ICPprincipal) {
+                            let actualTokens = Float.fromInt(record.amountBought) / Float.fromInt(10 ** token1Details.tokenDecimals);
+                            let actualICP = Float.fromInt(record.amountSold) / Float.fromInt(100000000);
+                            // Guard against division by zero (actualTokens = 0 would produce Inf)
+                            if (actualTokens > 0.0) {
+                              let ratio = actualICP / actualTokens;
+                              let scaledPrice = ratio * 100000000;
+                              if (isFiniteFloat(scaledPrice)) {
+                                let newPriceInICP = Int.abs(Float.toInt(scaledPrice));
+                                let newPriceInUSD = token0Details.priceInUSD * ratio;
+                                updateTokenPriceWithHistory(buyToken, newPriceInICP, newPriceInUSD);
+                              };
+                            };
+                          } else {
+                            let actualTokens = Float.fromInt(record.amountSold) / Float.fromInt(10 ** token0Details.tokenDecimals);
+                            let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
+                            // Guard against division by zero (actualTokens = 0 would produce Inf)
+                            if (actualTokens > 0.0) {
+                              let ratio = actualICP / actualTokens;
+                              let scaledPrice = ratio * 100000000;
+                              if (isFiniteFloat(scaledPrice)) {
+                                let newPriceInICP = Int.abs(Float.toInt(scaledPrice));
+                                let newPriceInUSD = token1Details.priceInUSD * ratio;
+                                updateTokenPriceWithHistory(sellToken, newPriceInICP, newPriceInUSD);
+                              };
+                            };
+                          };
+                        } else {
+                          let maintainFirst = fuzz.nat.randomRange(0, 1) == 0;
+                          if (maintainFirst) {
+                            let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** token0Details.tokenDecimals);
+                            let actualTokensBought = Float.fromInt(record.amountBought) / Float.fromInt(10 ** token1Details.tokenDecimals);
+                            // Guard against division by zero
+                            if (actualTokensBought > 0.0) {
+                              let priceRatio = actualTokensSold / actualTokensBought;
+                              let scaledPrice = Float.fromInt(token0Details.priceInICP) * priceRatio;
+                              if (isFiniteFloat(scaledPrice)) {
+                                let newPriceInICP = Int.abs(Float.toInt(scaledPrice));
+                                let newPriceInUSD = token0Details.priceInUSD * priceRatio;
+                                updateTokenPriceWithHistory(buyToken, newPriceInICP, newPriceInUSD);
+                              };
+                            };
+                          } else {
+                            let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** token0Details.tokenDecimals);
+                            let actualTokensBought = Float.fromInt(record.amountBought) / Float.fromInt(10 ** token1Details.tokenDecimals);
+                            // Guard against division by zero
+                            if (actualTokensSold > 0.0) {
+                              let priceRatio = actualTokensBought / actualTokensSold;
+                              let scaledPrice = Float.fromInt(token1Details.priceInICP) * priceRatio;
+                              if (isFiniteFloat(scaledPrice)) {
+                                let newPriceInICP = Int.abs(Float.toInt(scaledPrice));
+                                let newPriceInUSD = token1Details.priceInUSD * priceRatio;
+                                updateTokenPriceWithHistory(sellToken, newPriceInICP, newPriceInUSD);
+                              };
+                            };
+                          };
+                        };
+
+                        rebalanceState := {
+                          rebalanceState with
+                          metrics = { rebalanceState.metrics with totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1 };
+                          lastTrades = lastTrades;
+                        };
+                        success := true;
+                        Debug.print("Single trade executed successfully");
+                        await updateBalances();
+                        await takePortfolioSnapshot(#PostTrade);
+                        checkPortfolioCircuitBreakerConditions();
+                        await* logPortfolioState("Post-trade completed (single)");
+                      };
+                      case (#err(errorMsg)) {
+                        let failedRecord : TradeRecord = {
+                          tokenSold = sellToken;
+                          tokenBought = buyToken;
+                          amountSold = finalTradeSize;
+                          amountBought = 0;
+                          exchange = execution.exchange;
+                          timestamp = now();
+                          success = false;
+                          error = ?errorMsg;
+                          slippage = 0.0;
+                        };
+                        let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                        Vector.add(lastTrades, failedRecord);
+                        if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                          Vector.reverse(lastTrades);
+                          while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                            ignore Vector.removeLast(lastTrades);
+                          };
+                          Vector.reverse(lastTrades);
+                        };
+                        rebalanceState := {
+                          rebalanceState with
+                          metrics = { rebalanceState.metrics with totalTradesFailed = rebalanceState.metrics.totalTradesFailed + 1 };
+                          lastTrades = lastTrades;
+                        };
+                      };
+                    };
                   };
-                  case (#err(errorMsg)) {
-                    // Create a failed trade record using the correct structure
-                    let failedRecord : TradeRecord = {
-                      tokenSold = sellToken;
-                      tokenBought = buyToken;
-                      amountSold = tradeSize;
-                      amountBought = 0; // No tokens received
-                      exchange = execution.exchange;
-                      timestamp = now();
-                      success = false;
-                      error = ?errorMsg;
-                      slippage = 0.0; // No slippage on failed trade
+
+                  case (#Split(split)) {
+                    // SPLIT TRADE EXECUTION (Phase 2: Anti-arb)
+                    logger.info("TRADE_SPLIT",
+                      "Executing split trade - Kong=" # Nat.toText(split.kongswap.percentBP / 100) # "%" #
+                      " (" # Nat.toText(split.kongswap.amount) # " tokens)" #
+                      " ICP=" # Nat.toText(split.icpswap.percentBP / 100) # "%" #
+                      " (" # Nat.toText(split.icpswap.amount) # " tokens)",
+                      "do_executeTradingStep"
+                    );
+
+                    let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                    // Apply slippage adjustment to BOTH legs (Phase 1 logic for each)
+                    // KongSwap leg
+                    let kongFinalAmount : Nat = if (isExactTargeting and split.kongswap.slippageBP > 0) {
+                      let denominator = 10000 + split.kongswap.slippageBP;
+                      (split.kongswap.amount * 10000) / denominator
+                    } else { split.kongswap.amount };
+
+                    let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < split.kongswap.amount and split.kongswap.amount > 0) {
+                      (split.kongswap.expectedOut * kongFinalAmount) / split.kongswap.amount
+                    } else { split.kongswap.expectedOut };
+
+                    let kongIdealOut : Nat = if (split.kongswap.slippageBP < 9900) {
+                      (kongAdjustedExpectedOut * 10000) / (10000 - split.kongswap.slippageBP)
+                    } else { kongAdjustedExpectedOut };
+
+                    let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                    let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                    // ICPSwap leg
+                    let icpFinalAmount : Nat = if (isExactTargeting and split.icpswap.slippageBP > 0) {
+                      let denominator = 10000 + split.icpswap.slippageBP;
+                      (split.icpswap.amount * 10000) / denominator
+                    } else { split.icpswap.amount };
+
+                    let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < split.icpswap.amount and split.icpswap.amount > 0) {
+                      (split.icpswap.expectedOut * icpFinalAmount) / split.icpswap.amount
+                    } else { split.icpswap.expectedOut };
+
+                    let icpIdealOut : Nat = if (split.icpswap.slippageBP < 9900) {
+                      (icpAdjustedExpectedOut * 10000) / (10000 - split.icpswap.slippageBP)
+                    } else { icpAdjustedExpectedOut };
+
+                    let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                    let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                    // Execute both trades IN PARALLEL (no race conditions - uses executeTransferAndSwapNoTracking)
+                    let splitResult = await* executeSplitTrade(
+                      sellToken, buyToken,
+                      kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                      icpFinalAmount, icpMinAmountOut, icpIdealOut
+                    );
+
+                    // Handle pendingTx AFTER parallel execution completes (safe - sequential now)
+                    switch (splitResult.pendingTx) {
+                      case (?pendingRecord) {
+                        Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
+                        logger.warn("TRADE_SPLIT", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
+                      };
+                      case null {};
                     };
 
-                    // Update trade history with the failed trade
+                    // Track results
+                    var kongSuccess = false;
+                    var icpSuccess = false;
                     let lastTrades = Vector.clone(rebalanceState.lastTrades);
-                    Vector.add(lastTrades, failedRecord);
 
-                    // Maintain maximum size for trade history
+                    // Handle KongSwap result
+                    switch (splitResult.kongResult) {
+                      case (#ok(record)) {
+                        Vector.add(lastTrades, record);
+                        kongSuccess := true;
+                        logger.info("TRADE_SPLIT", "KongSwap leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                      };
+                      case (#err(e)) {
+                        let failedRecord : TradeRecord = {
+                          tokenSold = sellToken; tokenBought = buyToken;
+                          amountSold = kongFinalAmount; amountBought = 0;
+                          exchange = #KongSwap; timestamp = now();
+                          success = false; error = ?e; slippage = 0.0;
+                        };
+                        Vector.add(lastTrades, failedRecord);
+                        logger.error("TRADE_SPLIT", "KongSwap leg failed: " # e, "do_executeTradingStep");
+                      };
+                    };
+
+                    // Handle ICPSwap result
+                    switch (splitResult.icpResult) {
+                      case (#ok(record)) {
+                        Vector.add(lastTrades, record);
+                        icpSuccess := true;
+                        logger.info("TRADE_SPLIT", "ICPSwap leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                      };
+                      case (#err(e)) {
+                        let failedRecord : TradeRecord = {
+                          tokenSold = sellToken; tokenBought = buyToken;
+                          amountSold = icpFinalAmount; amountBought = 0;
+                          exchange = #ICPSwap; timestamp = now();
+                          success = false; error = ?e; slippage = 0.0;
+                        };
+                        Vector.add(lastTrades, failedRecord);
+                        logger.error("TRADE_SPLIT", "ICPSwap leg failed: " # e, "do_executeTradingStep");
+                      };
+                    };
+
+                    // Trim trade history if needed
                     if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
                       Vector.reverse(lastTrades);
                       while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -4050,20 +4232,186 @@ shared (deployer) persistent actor class treasury() = this {
                       };
                       Vector.reverse(lastTrades);
                     };
+
+                    // Update metrics
+                    let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                    let failCount : Nat = 2 - successCount;
+
                     rebalanceState := {
                       rebalanceState with
                       metrics = {
                         rebalanceState.metrics with
-                        totalTradesFailed = rebalanceState.metrics.totalTradesFailed + 1;
+                        totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                        totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
                       };
                       lastTrades = lastTrades;
+                    };
+
+                    // At least one leg succeeded
+                    if (kongSuccess or icpSuccess) {
+                      success := true;
+                      Debug.print("Split trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                      await updateBalances();
+                      await takePortfolioSnapshot(#PostTrade);
+                      checkPortfolioCircuitBreakerConditions();
+                      await* logPortfolioState("Post-trade completed (split)");
                     };
                   };
                 };
               };
               case (#err(e)) {
-                Debug.print("Could not find execution path: " # e);
-                
+                Debug.print("Could not find execution path: " # e.reason);
+
+                // NEW: Try REDUCED amount before ICP fallback
+                label reducedDirect switch (estimateMaxTradeableAmount(e.kongQuotes, e.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, buyToken)) {
+                  case (?reduced) {
+                    // Get symbols for quotes
+                    let reducedSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                      case (?details) { details.tokenSymbol };
+                      case null { break reducedDirect };
+                    };
+                    let reducedBuySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                      case (?details) { details.tokenSymbol };
+                      case null { break reducedDirect };
+                    };
+
+                    logger.info("REDUCED_TRADE",
+                      "Attempting reduced trade - Original=" # Nat.toText(tradeSize) #
+                      " Reduced=" # Nat.toText(reduced.amount) #
+                      " Exchange=" # debug_show(reduced.exchange) #
+                      " Pair=" # reducedSellSymbol # "/" # reducedBuySymbol,
+                      "do_executeTradingStep"
+                    );
+
+                    // Get verification quote at reduced amount - use mutable vars to avoid async type union issues
+                    var slippageBP : Nat = 99999;
+                    var expectedOut : Nat = 0;
+                    var idealOut : Nat = 0;
+                    var quoteSuccess : Bool = false;
+
+                    switch (reduced.exchange) {
+                      case (#KongSwap) {
+                        let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, reducedBuySymbol, reduced.amount) } catch (err) { #err("Kong exception: " # Error.message(err)) };
+                        switch (kongResult) {
+                          case (#ok(q)) {
+                            slippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                            expectedOut := q.receive_amount;
+                            idealOut := Int.abs(Float.toInt(Float.fromInt(reduced.amount) * q.mid_price));
+                            quoteSuccess := true;
+                          };
+                          case (#err(quoteErr)) { logger.warn("REDUCED_TRADE", "Kong quote failed: " # quoteErr, "do_executeTradingStep") };
+                        };
+                      };
+                      case (#ICPSwap) {
+                        let icpPoolData = Map.get(ICPswapPools, hashpp, (sellToken, buyToken));
+                        switch (icpPoolData) {
+                          case (?poolData) {
+                            let zeroForOne = sellToken == Principal.fromText(poolData.token0.address);
+                            let icpResult = try { await ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = reduced.amount; amountOutMinimum = 0; zeroForOne = zeroForOne }) } catch (err) { #err("ICP exception: " # Error.message(err)) };
+                            switch (icpResult) {
+                              case (#ok(q)) {
+                                // ICPSwap returns slippage as Float percentage, convert to basis points
+                                slippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                                expectedOut := q.amountOut;
+                                // Calculate ideal (spot) amount: amountOut / (1 - slippage/100)
+                                let slipFactor = if (q.slippage >= 100.0) { 0.01 } else { 1.0 - (q.slippage / 100.0) };
+                                idealOut := Int.abs(Float.toInt(Float.fromInt(q.amountOut) / slipFactor));
+                                quoteSuccess := true;
+                              };
+                              case (#err(quoteErr)) { logger.warn("REDUCED_TRADE", "ICPSwap quote failed: " # quoteErr, "do_executeTradingStep") };
+                            };
+                          };
+                          case null { logger.warn("REDUCED_TRADE", "No ICPSwap pool for reduced trade verification", "do_executeTradingStep") };
+                        };
+                      };
+                    };
+
+                    // Check if quote succeeded and slippage is acceptable
+                    if (quoteSuccess and slippageBP <= rebalanceConfig.maxSlippageBasisPoints) {
+                      logger.info("REDUCED_TRADE",
+                        "Executing reduced trade - Verified_slippage=" # Nat.toText(slippageBP) # "bp" #
+                        " Expected_out=" # Nat.toText(expectedOut),
+                        "do_executeTradingStep"
+                      );
+
+                      // Calculate min amount out with our tolerance
+                      let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+                      let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                      let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
+
+                      let reducedTradeResult = await* executeTrade(
+                        sellToken,
+                        buyToken,
+                        reduced.amount,
+                        switch (reduced.exchange) { case (#KongSwap) { #KongSwap }; case (#ICPSwap) { #ICPSwap } },
+                        minAmountOut,
+                        idealOut,
+                      );
+
+                      switch (reducedTradeResult) {
+                        case (#ok(record)) {
+                          // Update trade history
+                          let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                          let reducedRecord : TradeRecord = {
+                            record with
+                            error = ?("REDUCED_TRADE: Original amount was " # Nat.toText(tradeSize) # ", traded " # Nat.toText(reduced.amount) # " due to slippage");
+                          };
+                          Vector.add(lastTrades, reducedRecord);
+                          if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                            Vector.reverse(lastTrades);
+                            while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                              ignore Vector.removeLast(lastTrades);
+                            };
+                            Vector.reverse(lastTrades);
+                          };
+
+                          rebalanceState := {
+                            rebalanceState with
+                            metrics = {
+                              rebalanceState.metrics with
+                              totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                            };
+                            lastTrades = lastTrades;
+                          };
+
+                          success := true;
+                          logger.info("REDUCED_TRADE",
+                            "REDUCED trade SUCCESS - Sold=" # Nat.toText(record.amountSold) #
+                            " Bought=" # Nat.toText(record.amountBought) #
+                            " Exchange=" # debug_show(record.exchange),
+                            "do_executeTradingStep"
+                          );
+
+                          await updateBalances();
+                          await takePortfolioSnapshot(#PostTrade);
+                          checkPortfolioCircuitBreakerConditions();
+                          await* logPortfolioState("Post-REDUCED-trade completed");
+                        };
+                        case (#err(reducedError)) {
+                          logger.warn("REDUCED_TRADE",
+                            "REDUCED trade execution failed - Error=" # reducedError,
+                            "do_executeTradingStep"
+                          );
+                          // Continue to ICP fallback
+                        };
+                      };
+                    } else if (quoteSuccess) {
+                      // Quote succeeded but slippage too high
+                      logger.info("REDUCED_TRADE",
+                        "Verification slippage too high - Slippage=" # Nat.toText(slippageBP) # "bp" #
+                        " Max=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
+                        "do_executeTradingStep"
+                      );
+                    };
+                  };
+                  case null {
+                    Debug.print("No viable reduced amount estimated");
+                  };
+                };
+
+                // Guard: if reduced trade succeeded, skip ICP fallback
+                if (success) { return };
+
                 // ICP FALLBACK STRATEGY: If we can't find a direct route, try selling for ICP instead
                 // This creates an ICP overweight that will be corrected in the next cycle
                 // Only attempt fallback if ICP itself is not paused
@@ -4083,31 +4431,30 @@ shared (deployer) persistent actor class treasury() = this {
                   logger.info("ICP_FALLBACK", 
                     "Direct route failed, attempting ICP fallback - Original_pair=" # sellSymbol # "/" # buySymbol #
                     " Fallback_pair=" # sellSymbol # "/ICP" #
-                    " Original_error=" # e #
+                    " Original_error=" # e.reason #
                     " Strategy=Two_step_rebalancing",
                     "do_executeTradingStep"
                   );
                   
                   let icpFallbackExecution = await* findBestExecution(sellToken, ICPprincipal, tradeSize);
-                  
+
                   switch (icpFallbackExecution) {
-                    case (#ok(icpExecution)) {
+                    case (#ok(#Single(icpExecution))) {
+                      // ICP fallback typically uses single exchange
                       Debug.print("ICP fallback route found, executing trade");
-                      
-                      // Calculate minimum amount out for ICP trade
+
                       let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
-                      let ourSlippageToleranceFloat = Float.fromInt(ourSlippageToleranceBasisPoints) / 100.0;
-                      
-                      let idealOut : Nat = if (icpExecution.slippage < 99.0) {
-                        let actualSlippageDecimal = icpExecution.slippage / 100.0;
-                        Int.abs(Float.toInt(Float.fromInt(icpExecution.expectedOut) / (1.0 - actualSlippageDecimal)))
+
+                      // Calculate ideal output using integer arithmetic
+                      let idealOut : Nat = if (icpExecution.slippageBP < 9900) {
+                        (icpExecution.expectedOut * 10000) / (10000 - icpExecution.slippageBP)
                       } else {
                         icpExecution.expectedOut
                       };
-                      
-                      let minAmountOutFloat = Float.fromInt(idealOut) * (1.0 - ourSlippageToleranceFloat / 100.0);
-                      let minAmountOut = Int.abs(Float.toInt(minAmountOutFloat));
-                      
+
+                      let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                      let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
+
                       let icpTradeResult = await* executeTrade(
                         sellToken,
                         ICPprincipal,
@@ -4150,10 +4497,15 @@ shared (deployer) persistent actor class treasury() = this {
                           // Calculate new ICP price from the trade
                           let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** sellTokenDetails.tokenDecimals);
                           let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
-                          let newICPPrice = Int.abs(Float.toInt((actualTokensSold / actualICP) * Float.fromInt(sellTokenDetails.priceInICP)));
-                          let newICPPriceUSD = sellTokenDetails.priceInUSD * actualTokensSold / actualICP;
-                          
-                          updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+                          // Guard against division by zero (actualICP = 0 would produce Inf)
+                          if (actualICP > 0.0) {
+                            let priceRatio = (actualTokensSold / actualICP) * Float.fromInt(sellTokenDetails.priceInICP);
+                            if (isFiniteFloat(priceRatio)) {
+                              let newICPPrice = Int.abs(Float.toInt(priceRatio));
+                              let newICPPriceUSD = sellTokenDetails.priceInUSD * actualTokensSold / actualICP;
+                              updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+                            };
+                          };
 
                           // Update rebalance state
                           rebalanceState := {
@@ -4195,7 +4547,7 @@ shared (deployer) persistent actor class treasury() = this {
                           
                           // VERBOSE LOGGING: ICP fallback failed
                           logger.error("ICP_FALLBACK", 
-                            "ICP fallback trade FAILED - Original_error=" # e #
+                            "ICP fallback trade FAILED - Original_error=" # e.reason #
                             " ICP_fallback_error=" # icpErrorMsg #
                             " Status=Both_routes_failed",
                             "do_executeTradingStep"
@@ -4207,7 +4559,7 @@ shared (deployer) persistent actor class treasury() = this {
                             rebalanceState with
                             metrics = {
                               rebalanceState.metrics with
-                              currentStatus = #Failed("Both direct and ICP fallback routes failed: " # e # " | " # icpErrorMsg);
+                              currentStatus = #Failed("Both direct and ICP fallback routes failed: " # e.reason # " | " # icpErrorMsg);
                             };
                           };
                           
@@ -4216,27 +4568,325 @@ shared (deployer) persistent actor class treasury() = this {
                         };
                       };
                     };
+                    case (#ok(#Split(split))) {
+                      // SPLIT ICP FALLBACK EXECUTION (Phase 2: Anti-arb)
+                      Debug.print("ICP fallback split route found, executing both legs");
+                      logger.info("ICP_FALLBACK_SPLIT",
+                        "Executing split ICP fallback - Kong=" # Nat.toText(split.kongswap.percentBP / 100) # "%" #
+                        " ICP=" # Nat.toText(split.icpswap.percentBP / 100) # "%",
+                        "do_executeTradingStep"
+                      );
+
+                      let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                      // Apply slippage adjustment to BOTH legs (Phase 1 logic for each)
+                      // KongSwap leg
+                      let kongFinalAmount : Nat = if (isExactTargeting and split.kongswap.slippageBP > 0) {
+                        let denominator = 10000 + split.kongswap.slippageBP;
+                        (split.kongswap.amount * 10000) / denominator
+                      } else { split.kongswap.amount };
+
+                      let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < split.kongswap.amount and split.kongswap.amount > 0) {
+                        (split.kongswap.expectedOut * kongFinalAmount) / split.kongswap.amount
+                      } else { split.kongswap.expectedOut };
+
+                      let kongIdealOut : Nat = if (split.kongswap.slippageBP < 9900) {
+                        (kongAdjustedExpectedOut * 10000) / (10000 - split.kongswap.slippageBP)
+                      } else { kongAdjustedExpectedOut };
+
+                      let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                      let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                      // ICPSwap leg
+                      let icpFinalAmount : Nat = if (isExactTargeting and split.icpswap.slippageBP > 0) {
+                        let denominator = 10000 + split.icpswap.slippageBP;
+                        (split.icpswap.amount * 10000) / denominator
+                      } else { split.icpswap.amount };
+
+                      let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < split.icpswap.amount and split.icpswap.amount > 0) {
+                        (split.icpswap.expectedOut * icpFinalAmount) / split.icpswap.amount
+                      } else { split.icpswap.expectedOut };
+
+                      let icpIdealOut : Nat = if (split.icpswap.slippageBP < 9900) {
+                        (icpAdjustedExpectedOut * 10000) / (10000 - split.icpswap.slippageBP)
+                      } else { icpAdjustedExpectedOut };
+
+                      let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                      let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                      // Execute both trades IN PARALLEL (to ICP) - no race conditions
+                      let splitResult = await* executeSplitTrade(
+                        sellToken, ICPprincipal,
+                        kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                        icpFinalAmount, icpMinAmountOut, icpIdealOut
+                      );
+
+                      // Handle pendingTx AFTER parallel execution completes (safe - sequential now)
+                      switch (splitResult.pendingTx) {
+                        case (?pendingRecord) {
+                          Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
+                          logger.warn("ICP_FALLBACK_SPLIT", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
+                        };
+                        case null {};
+                      };
+
+                      // Track results
+                      var kongSuccess = false;
+                      var icpSuccess = false;
+                      let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                      // Handle KongSwap result
+                      switch (splitResult.kongResult) {
+                        case (#ok(record)) {
+                          let fallbackRecord : TradeRecord = {
+                            record with
+                            error = ?("ICP_FALLBACK_SPLIT: Original target was " # buySymbol # ", traded for ICP (KongSwap leg)");
+                          };
+                          Vector.add(lastTrades, fallbackRecord);
+                          kongSuccess := true;
+                          logger.info("ICP_FALLBACK_SPLIT", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                        };
+                        case (#err(errKong)) {
+                          let failedRecord : TradeRecord = {
+                            tokenSold = sellToken; tokenBought = ICPprincipal;
+                            amountSold = kongFinalAmount; amountBought = 0;
+                            exchange = #KongSwap; timestamp = now();
+                            success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errKong); slippage = 0.0;
+                          };
+                          Vector.add(lastTrades, failedRecord);
+                          logger.error("ICP_FALLBACK_SPLIT", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                        };
+                      };
+
+                      // Handle ICPSwap result
+                      switch (splitResult.icpResult) {
+                        case (#ok(record)) {
+                          let fallbackRecord : TradeRecord = {
+                            record with
+                            error = ?("ICP_FALLBACK_SPLIT: Original target was " # buySymbol # ", traded for ICP (ICPSwap leg)");
+                          };
+                          Vector.add(lastTrades, fallbackRecord);
+                          icpSuccess := true;
+                          logger.info("ICP_FALLBACK_SPLIT", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                        };
+                        case (#err(errIcp)) {
+                          let failedRecord : TradeRecord = {
+                            tokenSold = sellToken; tokenBought = ICPprincipal;
+                            amountSold = icpFinalAmount; amountBought = 0;
+                            exchange = #ICPSwap; timestamp = now();
+                            success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errIcp); slippage = 0.0;
+                          };
+                          Vector.add(lastTrades, failedRecord);
+                          logger.error("ICP_FALLBACK_SPLIT", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                        };
+                      };
+
+                      // Trim trade history if needed
+                      if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                        Vector.reverse(lastTrades);
+                        while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                          ignore Vector.removeLast(lastTrades);
+                        };
+                        Vector.reverse(lastTrades);
+                      };
+
+                      // Update metrics
+                      let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                      let failCount : Nat = 2 - successCount;
+
+                      rebalanceState := {
+                        rebalanceState with
+                        metrics = {
+                          rebalanceState.metrics with
+                          totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                          totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                        };
+                        lastTrades = lastTrades;
+                      };
+
+                      // At least one leg succeeded
+                      if (kongSuccess or icpSuccess) {
+                        success := true;
+                        Debug.print("ICP fallback split trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                        await updateBalances();
+                        await takePortfolioSnapshot(#PostTrade);
+                        checkPortfolioCircuitBreakerConditions();
+                        await* logPortfolioState("Post-ICP-fallback-split completed");
+                      } else {
+                        // Both legs failed
+                        incrementSkipCounter(#noExecutionPath);
+                        rebalanceState := {
+                          rebalanceState with
+                          metrics = {
+                            rebalanceState.metrics with
+                            currentStatus = #Failed("ICP fallback split: both legs failed");
+                          };
+                        };
+                        await* recoverFromFailure();
+                      };
+                    };
                     case (#err(icpRouteError)) {
-                      Debug.print("ICP fallback route also not available: " # icpRouteError);
-                      
+                      Debug.print("ICP fallback route also not available: " # icpRouteError.reason);
+
+                      // NEW: Try REDUCED amount for ICP fallback (ICP is always valuable - no min check)
+                      label reducedIcpFallback switch (estimateMaxTradeableAmount(icpRouteError.kongQuotes, icpRouteError.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal)) {
+                        case (?reduced) {
+                          let reducedSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                            case (?details) { details.tokenSymbol };
+                            case null { break reducedIcpFallback };
+                          };
+
+                          logger.info("REDUCED_ICP_FALLBACK",
+                            "Attempting reduced ICP fallback - Original=" # Nat.toText(tradeSize) #
+                            " Reduced=" # Nat.toText(reduced.amount) #
+                            " Exchange=" # debug_show(reduced.exchange),
+                            "do_executeTradingStep"
+                          );
+
+                          // Get verification quote for sellToken -> ICP - use mutable vars to avoid async type union issues
+                          var icpSlippageBP : Nat = 99999;
+                          var icpExpectedOut : Nat = 0;
+                          var icpIdealOut : Nat = 0;
+                          var icpQuoteSuccess : Bool = false;
+
+                          switch (reduced.exchange) {
+                            case (#KongSwap) {
+                              let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, "ICP", reduced.amount) } catch (err) { #err("Kong exception: " # Error.message(err)) };
+                              switch (kongResult) {
+                                case (#ok(q)) {
+                                  icpSlippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                                  icpExpectedOut := q.receive_amount;
+                                  icpIdealOut := Int.abs(Float.toInt(Float.fromInt(reduced.amount) * q.mid_price));
+                                  icpQuoteSuccess := true;
+                                };
+                                case (#err(quoteErr)) { logger.warn("REDUCED_ICP_FALLBACK", "Kong quote failed: " # quoteErr, "do_executeTradingStep") };
+                              };
+                            };
+                            case (#ICPSwap) {
+                              let icpPoolData = Map.get(ICPswapPools, hashpp, (sellToken, ICPprincipal));
+                              switch (icpPoolData) {
+                                case (?poolData) {
+                                  let zeroForOne = sellToken == Principal.fromText(poolData.token0.address);
+                                  let icpResult = try { await ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = reduced.amount; amountOutMinimum = 0; zeroForOne = zeroForOne }) } catch (err) { #err("ICP exception: " # Error.message(err)) };
+                                  switch (icpResult) {
+                                    case (#ok(q)) {
+                                      // ICPSwap returns slippage as Float percentage, convert to basis points
+                                      icpSlippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                                      icpExpectedOut := q.amountOut;
+                                      // Calculate ideal (spot) amount: amountOut / (1 - slippage/100)
+                                      let slipFactor = if (q.slippage >= 100.0) { 0.01 } else { 1.0 - (q.slippage / 100.0) };
+                                      icpIdealOut := Int.abs(Float.toInt(Float.fromInt(q.amountOut) / slipFactor));
+                                      icpQuoteSuccess := true;
+                                    };
+                                    case (#err(quoteErr)) { logger.warn("REDUCED_ICP_FALLBACK", "ICPSwap quote failed: " # quoteErr, "do_executeTradingStep") };
+                                  };
+                                };
+                                case null { logger.warn("REDUCED_ICP_FALLBACK", "No ICPSwap pool for ICP fallback verification", "do_executeTradingStep") };
+                              };
+                            };
+                          };
+
+                          // Check if quote succeeded and slippage is acceptable
+                          if (icpQuoteSuccess and icpSlippageBP <= rebalanceConfig.maxSlippageBasisPoints) {
+                            let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+                            let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let minAmountOut : Nat = (icpIdealOut * toleranceMultiplier) / 10000;
+
+                            logger.info("REDUCED_ICP_FALLBACK",
+                              "Executing reduced ICP fallback - Verified_slippage=" # Nat.toText(icpSlippageBP) # "bp" #
+                              " Expected_out=" # Nat.toText(icpExpectedOut),
+                              "do_executeTradingStep"
+                            );
+
+                            let reducedIcpTradeResult = await* executeTrade(
+                              sellToken,
+                              ICPprincipal,
+                              reduced.amount,
+                              switch (reduced.exchange) { case (#KongSwap) { #KongSwap }; case (#ICPSwap) { #ICPSwap } },
+                              minAmountOut,
+                              icpIdealOut,
+                            );
+
+                            switch (reducedIcpTradeResult) {
+                              case (#ok(record)) {
+                                let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                                let reducedIcpRecord : TradeRecord = {
+                                  record with
+                                  error = ?("REDUCED_ICP_FALLBACK: Original target was " # buySymbol # ", traded reduced amount " # Nat.toText(reduced.amount) # " for ICP");
+                                };
+                                Vector.add(lastTrades, reducedIcpRecord);
+                                if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                                  Vector.reverse(lastTrades);
+                                  while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                    ignore Vector.removeLast(lastTrades);
+                                  };
+                                  Vector.reverse(lastTrades);
+                                };
+
+                                rebalanceState := {
+                                  rebalanceState with
+                                  metrics = {
+                                    rebalanceState.metrics with
+                                    totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                                  };
+                                  lastTrades = lastTrades;
+                                };
+
+                                success := true;
+                                logger.info("REDUCED_ICP_FALLBACK",
+                                  "REDUCED ICP fallback SUCCESS - Sold=" # Nat.toText(record.amountSold) #
+                                  " ICP_received=" # Nat.toText(record.amountBought),
+                                  "do_executeTradingStep"
+                                );
+
+                                await updateBalances();
+                                await takePortfolioSnapshot(#PostTrade);
+                                checkPortfolioCircuitBreakerConditions();
+                                await* logPortfolioState("Post-REDUCED-ICP-fallback completed");
+                              };
+                              case (#err(reducedIcpError)) {
+                                logger.warn("REDUCED_ICP_FALLBACK",
+                                  "REDUCED ICP fallback execution failed - Error=" # reducedIcpError,
+                                  "do_executeTradingStep"
+                                );
+                                // Continue to failure path
+                              };
+                            };
+                          } else if (icpQuoteSuccess) {
+                            // Quote succeeded but slippage too high
+                            logger.info("REDUCED_ICP_FALLBACK",
+                              "Verification slippage too high - Slippage=" # Nat.toText(icpSlippageBP) # "bp" #
+                              " Max=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
+                              "do_executeTradingStep"
+                            );
+                          };
+                        };
+                        case null {
+                          Debug.print("No viable reduced ICP fallback amount estimated");
+                        };
+                      };
+
+                      // If reduced ICP fallback succeeded, return early
+                      if (success) { return };
+
                       // VERBOSE LOGGING: ICP fallback route not found
-                      logger.error("ICP_FALLBACK", 
-                        "ICP fallback route NOT FOUND - Original_error=" # e #
-                        " ICP_route_error=" # icpRouteError #
+                      logger.error("ICP_FALLBACK",
+                        "ICP fallback route NOT FOUND - Original_error=" # e.reason #
+                        " ICP_route_error=" # icpRouteError.reason #
                         " Status=No_routes_available",
                         "do_executeTradingStep"
                       );
-                      
+
                       // No routes available at all - count as skip
                       incrementSkipCounter(#noExecutionPath);
                       rebalanceState := {
                         rebalanceState with
                         metrics = {
                           rebalanceState.metrics with
-                          currentStatus = #Failed("No routes available: " # e # " | ICP fallback: " # icpRouteError);
+                          currentStatus = #Failed("No routes available: " # e.reason # " | ICP fallback: " # icpRouteError.reason);
                         };
                       };
-                      
+
                       // Attempt system recovery
                       await* recoverFromFailure();
                     };
@@ -4244,23 +4894,23 @@ shared (deployer) persistent actor class treasury() = this {
                 } else if (buyToken == ICPprincipal or sellToken == ICPprincipal) {
                   // We were already trying to buy ICP and that failed - no fallback possible
                   Debug.print("No ICP fallback possible - was already trying to buy ICP");
-                  
-                  logger.warn("ICP_FALLBACK", 
+
+                  logger.warn("ICP_FALLBACK",
                     "No ICP fallback possible - Original trade was already targeting ICP" #
-                    " Error=" # e #
+                    " Error=" # e.reason #
                     " Status=ICP_route_failed",
                     "do_executeTradingStep"
                   );
-                  
+
                   incrementSkipCounter(#noExecutionPath);
                   rebalanceState := {
                     rebalanceState with
                     metrics = {
                       rebalanceState.metrics with
-                      currentStatus = #Failed(e);
+                      currentStatus = #Failed(e.reason);
                     };
                   };
-                  
+
                   // Attempt system recovery
                   await* recoverFromFailure();
                 } else {
@@ -4269,7 +4919,7 @@ shared (deployer) persistent actor class treasury() = this {
                   
                   logger.warn("ICP_FALLBACK", 
                     "ICP fallback skipped - ICP is paused from trading" #
-                    " Original_error=" # e #
+                    " Original_error=" # e.reason #
                     " Status=ICP_paused_fallback_skipped",
                     "do_executeTradingStep"
                   );
@@ -4279,7 +4929,7 @@ shared (deployer) persistent actor class treasury() = this {
                     rebalanceState with
                     metrics = {
                       rebalanceState.metrics with
-                      currentStatus = #Failed("No execution path and ICP fallback unavailable (ICP paused): " # e);
+                      currentStatus = #Failed("No execution path and ICP fallback unavailable (ICP paused): " # e.reason);
                     };
                   };
                   
@@ -4431,7 +5081,10 @@ shared (deployer) persistent actor class treasury() = this {
                 switch (Map.get(currentAllocations, phash, principal)) {
                     case (?target) {
                         // Adjust target proportionally based on total active target points
-                        (target * 10000) / totalTargetBasisPoints
+                        // Guard against division by zero
+                        if (totalTargetBasisPoints > 0) {
+                            (target * 10000) / totalTargetBasisPoints
+                        } else { 0 }
                     };
                     case null { 0 };
                 };
@@ -4766,69 +5419,82 @@ shared (deployer) persistent actor class treasury() = this {
    * Chooses which token to target exactly (prefers the one closer to target)
    * and calculates the precise trade size needed.
    */
+  // Returns (tradeSize, isExactTargeting)
+  // isExactTargeting = true means we should apply slippage adjustment after getting quote
+  // isExactTargeting = false means we're using random sizing (don't adjust)
   private func calculateExactTargetTradeSize(
     sellToken: Principal,
-    buyToken: Principal, 
+    buyToken: Principal,
     totalPortfolioValueICP: Nat,
     sellTokenDiffBasisPoints: Nat,
     buyTokenDiffBasisPoints: Nat
-  ) : Nat {
-    
+  ) : (Nat, Bool) {
+
     // Choose which token to target exactly (prefer the one closer to target)
     let targetSellToken = Int.abs(sellTokenDiffBasisPoints) <= Int.abs(buyTokenDiffBasisPoints);
-    
+
     if (targetSellToken) {
       // Calculate exact amount to sell to reach sell token's target
       // sellTokenDiffBasisPoints is negative (overweight), so we need Int.abs
       let excessValueICP = (Int.abs(sellTokenDiffBasisPoints) * totalPortfolioValueICP) / 10000;
-      
+
       let sellTokenDetails = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details };
-        case null { 
+        case null {
           Debug.print("Warning: Sell token details not found for exact targeting, using random size");
-          return calculateTradeSizeMinMax();
+          return (calculateTradeSizeMinMax(), false);
         };
       };
-      
+
+      // Guard against division by zero for priceInICP
+      if (sellTokenDetails.priceInICP == 0) {
+        Debug.print("Warning: Sell token priceInICP is 0, using random size");
+        return (calculateTradeSizeMinMax(), false);
+      };
+
       let exactTradeSize = (excessValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP;
-      
-      // Ensure trade size is within reasonable bounds
+
+      // Only check max bound - 15bp filter handles trivial trades
+      // If trade exceeds max, use random sizing to confuse arb bots
       let tradeSizeICP = (exactTradeSize * sellTokenDetails.priceInICP) / (10 ** sellTokenDetails.tokenDecimals);
-      if (tradeSizeICP < rebalanceConfig.minTradeValueICP) {
-        Debug.print("Exact trade size too small, using minimum trade size");
-        ((rebalanceConfig.minTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
-      } else if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
-        Debug.print("Exact trade size too large, using maximum trade size");  
-        ((rebalanceConfig.maxTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
+      if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
+        Debug.print("Exact trade size too large, using random trade size");
+        (calculateTradeSizeMinMax(), false)  // Random, not exact targeting
       } else {
-        exactTradeSize
+        Debug.print("Using exact targeting with slippage adjustment");
+        (exactTradeSize, true)  // Exact targeting, will apply slippage adjustment
       }
-      
+
     } else {
       // Calculate exact amount to buy to reach buy token's target
       // buyTokenDiffBasisPoints is positive (underweight)
       let deficitValueICP : Nat = (buyTokenDiffBasisPoints * totalPortfolioValueICP) / 10000;
-      
+
       let sellTokenDetails = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details };
-        case null { 
+        case null {
           Debug.print("Warning: Sell token details not found for exact targeting, using random size");
-          return calculateTradeSizeMinMax();
+          return (calculateTradeSizeMinMax(), false);
         };
       };
-      
+
+      // Guard against division by zero for priceInICP
+      if (sellTokenDetails.priceInICP == 0) {
+        Debug.print("Warning: Sell token priceInICP is 0, using random size");
+        return (calculateTradeSizeMinMax(), false);
+      };
+
       let exactTradeSize : Nat = (deficitValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP;
-      
-      // Ensure trade size is within reasonable bounds
+
+      // Only check max bound - 15bp filter handles trivial trades
+      // If trade exceeds max, use random sizing to confuse arb bots
       let tradeSizeICP = (exactTradeSize * sellTokenDetails.priceInICP) / (10 ** sellTokenDetails.tokenDecimals);
-      if (tradeSizeICP < rebalanceConfig.minTradeValueICP) {
-        Debug.print("Exact trade size too small, using minimum trade size");
-        ((rebalanceConfig.minTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
-      } else if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
-        Debug.print("Exact trade size too large, using maximum trade size");
-        ((rebalanceConfig.maxTradeValueICP * (10 ** sellTokenDetails.tokenDecimals)) / sellTokenDetails.priceInICP)
+      if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
+        Debug.print("Exact trade size too large, using random trade size");
+        (calculateTradeSizeMinMax(), false)  // Random, not exact targeting
       } else {
-        exactTradeSize
+        Debug.print("Using exact targeting with slippage adjustment");
+        (exactTradeSize, true)  // Exact targeting, will apply slippage adjustment
       }
     }
   };
@@ -4951,242 +5617,572 @@ shared (deployer) persistent actor class treasury() = this {
     sellToken : Principal,
     buyToken : Principal,
     amountIn : Nat,
-  ) : async* Result.Result<{ exchange : ExchangeType; expectedOut : Nat; slippage : Float }, Text> {
+  ) : async* Result.Result<ExecutionPlan, FindExecutionError> {
     try {
-      var bestExchange : ?ExchangeType = null;
-      var bestAmountOut : Nat = 0;
-      var bestPriceSlippage : Float = 100.0; // Start with 100% as worse case
-
-      // Check KongSwap
-      // VERBOSE LOGGING: Exchange comparison start
+      // Get token symbols for exchange APIs
       let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details.tokenSymbol };
-        case null { return #err("Token details not found for sell token") };
+        case null { return #err({ reason = "Token details not found for sell token"; kongQuotes = []; icpQuotes = [] }) };
       };
       let buySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
         case (?details) { details.tokenSymbol };
-        case null { return #err("Token details not found for buy token") };
+        case null { return #err({ reason = "Token details not found for buy token"; kongQuotes = []; icpQuotes = [] }) };
       };
       let sellDecimals = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details.tokenDecimals };
         case null { 8 };
       };
-      
-      logger.info("EXCHANGE_COMPARISON", 
-        "Starting exchange comparison - Pair=" # sellSymbol # "/" # buySymbol #
+
+      logger.info("EXCHANGE_COMPARISON",
+        "Starting exchange comparison with 10 quotes (20% increments) - Pair=" # sellSymbol # "/" # buySymbol #
         " Amount_in=" # Nat.toText(amountIn) # " (raw)" #
         " Amount_formatted=" # Float.toText(Float.fromInt(amountIn) / Float.fromInt(10 ** sellDecimals)) #
         " Max_slippage=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
         "findBestExecution"
       );
 
-      // Check KongSwap
-
-      Debug.print("Checking KongSwap for " # sellSymbol # " -> " # buySymbol);
-      
-      // VERBOSE LOGGING: KongSwap quote attempt
-      logger.info("EXCHANGE_COMPARISON", 
-        "Requesting KongSwap quote - Pair=" # sellSymbol # "/" # buySymbol #
-        " Amount=" # Nat.toText(amountIn),
-        "findBestExecution"
-      );
-      
-      try {
-        let kongQuote = await KongSwap.getQuote(sellSymbol, buySymbol, amountIn);
-        switch (kongQuote) {
-        case (#ok(quote)) {
-          if (quote.receive_amount == 0) {
-            logger.warn("EXCHANGE_COMPARISON",
-              "KongSwap quote rejected - zero receive amount for pair " # sellSymbol # "/" # buySymbol,
-              "findBestExecution"
-            );
-          } else if (quote.slippage <= Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
-            bestExchange := ? #KongSwap;
-            bestAmountOut := quote.receive_amount;
-            bestPriceSlippage := quote.slippage;
-            Debug.print("KongSwap quote seems good: " # debug_show (quote));
-            
-            // VERBOSE LOGGING: KongSwap quote success
-            logger.info("EXCHANGE_COMPARISON", 
-              "KongSwap quote received - Amount_out=" # Nat.toText(quote.receive_amount) #
-              " Slippage=" # Float.toText(quote.slippage) # "%" #
-              " Price=" # Float.toText(quote.price) #
-              " Status=ACCEPTED",
-              "findBestExecution"
-            );
-          } else {
-            logger.info("EXCHANGE_COMPARISON", 
-              "KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage),
-              "findBestExecution"
-            );
-            Debug.print("KongSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
-          };
-          };
-          case (#err(e)) {
-            Debug.print("KongSwap quote error: " # e);
-            
-            // VERBOSE LOGGING: KongSwap quote error
-            logger.warn("EXCHANGE_COMPARISON", 
-              "KongSwap quote failed - Error=" # e #
-              " Status=REJECTED",
-              "findBestExecution"
-            );
-          };
-        };
-      } catch (e) {
-        Debug.print("KongSwap error: " # Error.message(e));
-        
-        // VERBOSE LOGGING: KongSwap exception
-        logger.error("EXCHANGE_COMPARISON", 
-          "KongSwap threw exception - Error=" # Error.message(e) #
-          " Status=EXCEPTION",
-          "findBestExecution"
-        );
+      // Get ICPSwap pool data first (needed for quote args)
+      let icpPoolData = Map.get(ICPswapPools, hashpp, (sellToken, buyToken));
+      let zeroForOne = switch (icpPoolData) {
+        case (?poolData) { sellToken == Principal.fromText(poolData.token0.address) };
+        case null { true };
       };
 
-      // Check ICPSwap
-      Debug.print("Checking ICPSwap for pair");
-      
-      // VERBOSE LOGGING: ICPSwap pool check
-      logger.info("EXCHANGE_COMPARISON", 
-        "Checking ICPSwap pool - Pair=" # sellSymbol # "/" # buySymbol #
-        " Pool_count=" # Nat.toText(Map.size(ICPswapPools)),
-        "findBestExecution"
-      );
-      
-      try {
-        let poolResult = Map.get(ICPswapPools, hashpp, (sellToken, buyToken));
+      // ========================================
+      // PARALLEL QUOTE CALLS (20 quotes total)
+      // Get 10%, 20%, 30%, ..., 100% quotes from both exchanges
+      // Query calls are FREE and run in parallel
+      // ========================================
 
-        switch (poolResult) {
-          case (?poolData) {
-            
-            // VERBOSE LOGGING: ICPSwap pool found
-            logger.info("EXCHANGE_COMPARISON", 
-              "ICPSwap pool found - Pool_ID=" # Principal.toText(poolData.canisterId) #
-              " Token0=" # poolData.token0.address # " Token1=" # poolData.token1.address #
-              " Requesting_quote=true",
-              "findBestExecution"
-            );
+      // Calculate amounts for 20% increments (indices 0-4 = 20%, 40%, 60%, 80%, 100%)
+      let amounts : [Nat] = [
+        amountIn * 2 / 10,    // 20%
+        amountIn * 4 / 10,    // 40%
+        amountIn * 6 / 10,    // 60%
+        amountIn * 8 / 10,    // 80%
+        amountIn,             // 100%
+      ];
 
-            let quoteArgs = {
-              poolId = poolData.canisterId;
-              amountIn = amountIn;
-              amountOutMinimum = 0;
-              zeroForOne = if (sellToken == Principal.fromText(poolData.token0.address)) {
-                true;
-              } else { false };
-            };
+      // Start all 10 quote requests in parallel (no await yet)
+      // Kong quotes for 5 percentages
+      let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[0]);
+      let kongFuture1 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[1]);
+      let kongFuture2 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[2]);
+      let kongFuture3 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[3]);
+      let kongFuture4 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[4]);
 
-            let quoteResult = await ICPSwap.getQuote(quoteArgs);
-            switch (quoteResult) {
-              case (#ok(quote)) {
-                if (quote.amountOut == 0) {
-                  logger.warn("EXCHANGE_COMPARISON",
-                    "ICPSwap quote rejected - zero amount out for pair " # sellSymbol # "/" # buySymbol #
-                    " Pool=" # Principal.toText(poolData.canisterId),
-                    "findBestExecution"
-                  );
-                } else if (quote.slippage < Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0) {
-                  // If no quote yet or better than KongSwap
-                  if (bestExchange == null or (quote.amountOut > bestAmountOut or test)) {
-                    bestExchange := ? #ICPSwap;
-                    bestAmountOut := quote.amountOut;
-                    bestPriceSlippage := quote.slippage;
-                    
-                    // VERBOSE LOGGING: ICPSwap selected as best
-                    logger.info("EXCHANGE_COMPARISON", 
-                      "ICPSwap quote accepted as BEST - Amount_out=" # Nat.toText(quote.amountOut) #
-                      " Slippage=" # Float.toText(quote.slippage) # "%" #
-                      " Previous_best=" # (switch bestExchange { case null "NONE"; case _ "KONGSWAP" }) #
-                      " Status=BEST_EXECUTION",
-                      "findBestExecution"
-                    );
-                  } else {
-                    // VERBOSE LOGGING: ICPSwap quote but not selected
-                    logger.info("EXCHANGE_COMPARISON", 
-                      "ICPSwap quote received but NOT selected - Amount_out=" # Nat.toText(quote.amountOut) #
-                      " Slippage=" # Float.toText(quote.slippage) # "%" #
-                      " Best_amount=" # Nat.toText(bestAmountOut) #
-                      " Status=NOT_SELECTED",
-                      "findBestExecution"
-                    );
-                  };
-                } else {
-                  logger.info("EXCHANGE_COMPARISON", 
-                    "ICPSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage),
-                    "findBestExecution"
-                  );
-                  Debug.print("ICPSwap quote seems bad: " # debug_show (quote) # " as slippage: " # debug_show (quote.slippage));
-                };
-                Debug.print("ICPSwap quote: " # debug_show (quote));
-              };
-              case (#err(e)) {
-                Debug.print("ICPSwap quote error: " # e);
-                
-                // VERBOSE LOGGING: ICPSwap quote error
-                logger.warn("EXCHANGE_COMPARISON", 
-                  "ICPSwap quote failed - Error=" # e #
-                  " Status=QUOTE_ERROR",
-                  "findBestExecution"
-                );
-              };
-            };
-          };
-          case (_) {
-            // VERBOSE LOGGING: ICPSwap pool not found
-            logger.warn("EXCHANGE_COMPARISON", 
-              "ICPSwap pool NOT found - Pair=" # sellSymbol # "/" # buySymbol #
-              " Available_pools=" # Nat.toText(Map.size(ICPswapPools)) #
-              " Status=NO_POOL",
-              "findBestExecution"
-            );
-          };
-        };
-      } catch (e) {
-        Debug.print("ICPSwap error: " # Error.message(e));
-        
-        // VERBOSE LOGGING: ICPSwap exception
-        logger.error("EXCHANGE_COMPARISON", 
-          "ICPSwap threw exception - Error=" # Error.message(e) #
-          " Status=EXCEPTION",
-          "findBestExecution"
-        );
-      };
-
-      switch (bestExchange) {
-        case (?exchange) {
-          
-          // VERBOSE LOGGING: Final exchange selection
-          logger.info("EXCHANGE_COMPARISON", 
-            "Exchange selection FINAL - Selected=" # debug_show(exchange) #
-            " Amount_out=" # Nat.toText(bestAmountOut) #
-            " Best_slippage=" # Float.toText(bestPriceSlippage) # "%" #
-            " Status=SELECTED",
-            "findBestExecution"
-          );
-          
-          #ok({
-            exchange = exchange;
-            expectedOut = bestAmountOut;
-            slippage = bestPriceSlippage;
-          });
+      // ICP quotes for 5 percentages (or error if no pool)
+      let (icpFuture0, icpFuture1, icpFuture2, icpFuture3, icpFuture4) = switch (icpPoolData) {
+        case (?poolData) {
+          (
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[0]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[1]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[2]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[3]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[4]; amountOutMinimum = 0; zeroForOne = zeroForOne })
+          )
         };
         case null {
-          
-          // VERBOSE LOGGING: No exchange found
-          logger.warn("EXCHANGE_COMPARISON", 
-            "No viable exchange found - KongSwap_available=" # debug_show(Map.size(tokenDetailsMap) > 0) #
-            " ICPSwap_pools=" # Nat.toText(Map.size(ICPswapPools)) #
-            " Status=NO_EXECUTION_PATH",
+          // No ICPSwap pool - will use error handling when awaiting
+          let errFuture = ICPSwap.getQuote({ poolId = Principal.fromText("aaaaa-aa"); amountIn = 0; amountOutMinimum = 0; zeroForOne = true });
+          (errFuture, errFuture, errFuture, errFuture, errFuture)
+        };
+      };
+
+      // Await all 10 quotes (must await each individually in Motoko)
+      let kongResult0 = try { await kongFuture0 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult1 = try { await kongFuture1 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult2 = try { await kongFuture2 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult3 = try { await kongFuture3 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult4 = try { await kongFuture4 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+
+      let icpResult0 = try { await icpFuture0 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult1 = try { await icpFuture1 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult2 = try { await icpFuture2 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult3 = try { await icpFuture3 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult4 = try { await icpFuture4 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+
+      let kongResults = [kongResult0, kongResult1, kongResult2, kongResult3, kongResult4];
+      let icpResults = [icpResult0, icpResult1, icpResult2, icpResult3, icpResult4];
+
+      // ========================================
+      // PROCESS QUOTE RESULTS
+      // Extract output and slippage, validate against threshold
+      // ========================================
+
+      let maxSlippagePct = Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0;
+
+      // Get token prices and decimals for dust output validation
+      let sellTokenDetails = Map.get(tokenDetailsMap, phash, sellToken);
+      let buyTokenDetails = Map.get(tokenDetailsMap, phash, buyToken);
+      let sellPriceICP : Nat = switch (sellTokenDetails) { case (?d) { d.priceInICP }; case null { 0 } };
+      let buyPriceICP : Nat = switch (buyTokenDetails) { case (?d) { d.priceInICP }; case null { 0 } };
+      let buyDecimals : Nat = switch (buyTokenDetails) { case (?d) { d.tokenDecimals }; case null { 8 } };
+
+      // Helper to check for dust output: output < 1% of expected at spot price
+      func isDustOutput(amountIn : Nat, amountOut : Nat) : Bool {
+        if (sellPriceICP == 0 or buyPriceICP == 0 or amountOut == 0) { return false };
+        // Calculate expected output at spot price
+        let sellValueE8s = (amountIn * sellPriceICP) / (10 ** sellDecimals);
+        let expectedOut = (sellValueE8s * (10 ** buyDecimals)) / buyPriceICP;
+        let minExpected = if (expectedOut / 100 > 100) { expectedOut / 100 } else { 100 };
+        amountOut < minExpected
+      };
+
+      // Helper to extract KongSwap quote (returns lowercase #ok/#err from Result.Result)
+      func extractKong(result : Result.Result<swaptypes.SwapAmountsReply, Text>, amountIn : Nat) : QuoteData {
+        switch (result) {
+          case (#ok(r)) {
+            let slipBP = Int.abs(Float.toInt(r.slippage * 100.0));
+            // Dust output validation: reject if output < 1% of expected
+            let isDust = isDustOutput(amountIn, r.receive_amount);
+            let valid = r.slippage <= maxSlippagePct and r.receive_amount > 0 and not isDust;
+            { out = r.receive_amount; slipBP = slipBP; valid = valid }
+          };
+          case (#err(_)) { { out = 0; slipBP = 10000; valid = false } };
+        }
+      };
+
+      // Helper to extract ICPSwap quote (returns lowercase #ok/#err from Result.Result)
+      func extractIcp(result : Result.Result<swaptypes.ICPSwapQuoteResult, Text>, amountIn : Nat) : QuoteData {
+        switch (result) {
+          case (#ok(r)) {
+            let slipBP = Int.abs(Float.toInt(r.slippage * 100.0));
+            // Dust output validation: reject if output < 1% of expected
+            let isDust = isDustOutput(amountIn, r.amountOut);
+            let valid = r.slippage <= maxSlippagePct and r.amountOut > 0 and not isDust;
+            { out = r.amountOut; slipBP = slipBP; valid = valid }
+          };
+          case (#err(_)) { { out = 0; slipBP = 10000; valid = false } };
+        }
+      };
+
+      // Extract KongSwap quotes (indices 0-4 = 20%, 40%, 60%, 80%, 100%)
+      let kong = Array.tabulate<QuoteData>(5, func(i) : QuoteData {
+        extractKong(kongResults[i], amounts[i])
+      });
+
+      // Extract ICPSwap quotes (indices 0-4 = 20%, 40%, 60%, 80%, 100%)
+      let icp = Array.tabulate<QuoteData>(5, func(i) : QuoteData {
+        extractIcp(icpResults[i], amounts[i])
+      });
+
+      // Log quote results summary
+      logger.info("EXCHANGE_COMPARISON",
+        "Quotes received - Kong_100%=" # Nat.toText(kong[4].out) # " (valid=" # debug_show(kong[4].valid) # ")" #
+        " ICP_100%=" # Nat.toText(icp[4].out) # " (valid=" # debug_show(icp[4].valid) # ")",
+        "findBestExecution"
+      );
+
+      // ========================================
+      // CALCULATE ALL 5 SCENARIOS
+      // 2 single + 3 splits (80/20, 60/40, 40/60, 20/80)
+      // Pick scenario with maximum total output
+      // Then interpolate between best and second-best using slippage
+      // ========================================
+
+      type Scenario = { name : Text; kongPct : Nat; icpPct : Nat; totalOut : Nat; kongSlipBP : Nat; icpSlipBP : Nat; kongIdx : Nat; icpIdx : Nat };
+
+      var bestScenario : ?Scenario = null;
+      var secondBestScenario : ?Scenario = null;
+
+      // Helper to update best/second-best
+      func updateBest(scenario : Scenario) {
+        switch (bestScenario) {
+          case (null) { bestScenario := ?scenario };
+          case (?best) {
+            if (scenario.totalOut > best.totalOut) {
+              secondBestScenario := ?best;
+              bestScenario := ?scenario;
+            } else {
+              switch (secondBestScenario) {
+                case (null) { secondBestScenario := ?scenario };
+                case (?second) { if (scenario.totalOut > second.totalOut) { secondBestScenario := ?scenario } };
+              };
+            };
+          };
+        };
+      };
+
+      // Scenario 1: Single KongSwap (100%)
+      if (kong[4].valid) {
+        updateBest({
+          name = "SINGLE_KONG";
+          kongPct = 10000;
+          icpPct = 0;
+          totalOut = kong[4].out;
+          kongSlipBP = kong[4].slipBP;
+          icpSlipBP = 0;
+          kongIdx = 4;
+          icpIdx = 4;
+        });
+      };
+
+      // Scenario 2: Single ICPSwap (100%)
+      if (icp[4].valid) {
+        updateBest({
+          name = "SINGLE_ICP";
+          kongPct = 0;
+          icpPct = 10000;
+          totalOut = icp[4].out;
+          kongSlipBP = 0;
+          icpSlipBP = icp[4].slipBP;
+          kongIdx = 4;
+          icpIdx = 4;
+        });
+      };
+
+      // Scenarios 3-6: Splits (80/20, 60/40, 40/60, 20/80)
+      // kongIdx 3=80%, 2=60%, 1=40%, 0=20%
+      // icpIdx must complement to 100%: kongIdx + icpIdx indices that sum to 100%
+      // Kong 80% (idx 3) + ICP 20% (idx 0), Kong 60% (idx 2) + ICP 40% (idx 1), etc.
+      for (kongIdx in Array.vals([3, 2, 1, 0])) {
+        let icpIdx = 3 - kongIdx; // 3-3=0 (20%), 3-0=3 (80%)
+        if (kong[kongIdx].valid and icp[icpIdx].valid) {
+          let kongPct = (kongIdx + 1) * 2000; // idx 0 = 20% = 2000bp, idx 3 = 80% = 8000bp
+          let icpPct = 10000 - kongPct;
+          let totalOut = kong[kongIdx].out + icp[icpIdx].out;
+
+          updateBest({
+            name = "SPLIT_" # Nat.toText(kongPct / 100) # "_" # Nat.toText(icpPct / 100);
+            kongPct = kongPct;
+            icpPct = icpPct;
+            totalOut = totalOut;
+            kongSlipBP = kong[kongIdx].slipBP;
+            icpSlipBP = icp[icpIdx].slipBP;
+            kongIdx = kongIdx;
+            icpIdx = icpIdx;
+          });
+        };
+      };
+
+      // ========================================
+      // BUILD EXECUTION PLAN FROM BEST SCENARIO
+      // With slippage interpolation between adjacent scenarios
+      // ========================================
+
+      switch (bestScenario) {
+        case (null) {
+          logger.warn("EXCHANGE_COMPARISON",
+            "No viable execution path - all quotes invalid or exceed slippage threshold",
             "findBestExecution"
           );
-          
-          #err("No viable execution path found");
+          #err({ reason = "No viable execution path found"; kongQuotes = kong; icpQuotes = icp })
+        };
+        case (?best) {
+          // Check if we can interpolate between best and second-best
+          // Only interpolate if both are splits and adjacent (differ by 20%)
+          let (finalKongPct, finalIcpPct, finalKongSlipBP, finalIcpSlipBP, interpolated) : (Nat, Nat, Nat, Nat, Bool) = switch (secondBestScenario) {
+            case (?second) {
+              // Check if both are splits (not single exchange)
+              let bothAreSplits = best.kongPct > 0 and best.kongPct < 10000 and second.kongPct > 0 and second.kongPct < 10000;
+
+              // Check if they're adjacent (differ by exactly 20% = 2000bp)
+              let diff = if (best.kongPct > second.kongPct) { best.kongPct - second.kongPct } else { second.kongPct - best.kongPct };
+              let areAdjacent = diff == 2000;
+
+              if (bothAreSplits and areAdjacent) {
+                // Use inverse slippage weighting to find optimal split within the 20% range
+                //
+                // Given two adjacent scenarios (e.g., 60/40 and 80/20), find the optimal point.
+                // Average the slippages from both edges to get representative values for the range.
+                //
+                // Inverse weighting: kongRatio = avgIcpSlip / (avgKongSlip + avgIcpSlip)
+                // - Higher ICP slippage -> shift more toward Kong (higher ratio)
+                // - Higher Kong slippage -> shift more toward ICP (lower ratio)
+
+                let avgKongSlip = (Float.fromInt(best.kongSlipBP) + Float.fromInt(second.kongSlipBP)) / 2.0;
+                let avgIcpSlip = (Float.fromInt(best.icpSlipBP) + Float.fromInt(second.icpSlipBP)) / 2.0;
+                let totalSlip = avgKongSlip + avgIcpSlip;
+
+                if (totalSlip > 0.0) {
+                  // kongRatio tells us where in the 20% range the optimal split is
+                  let kongRatio = avgIcpSlip / totalSlip;
+
+                  // Scale to the range between scenarios
+                  let lowKongPct = if (best.kongPct < second.kongPct) { best.kongPct } else { second.kongPct };
+                  let highKongPct = if (best.kongPct > second.kongPct) { best.kongPct } else { second.kongPct };
+
+                  // Calculate interpolated percentage within the 20% range
+                  let rangeSize = Float.fromInt(highKongPct - lowKongPct);
+                  let interpolatedKongPct = lowKongPct + Int.abs(Float.toInt(kongRatio * rangeSize));
+                  let interpolatedIcpPct = 10000 - interpolatedKongPct;
+
+                  // Interpolate slippage values linearly based on position in range
+                  let t = kongRatio;
+                  let lowKongSlip = if (best.kongPct < second.kongPct) { best.kongSlipBP } else { second.kongSlipBP };
+                  let highKongSlip = if (best.kongPct > second.kongPct) { best.kongSlipBP } else { second.kongSlipBP };
+                  let lowIcpSlip = if (best.icpPct < second.icpPct) { best.icpSlipBP } else { second.icpSlipBP };
+                  let highIcpSlip = if (best.icpPct > second.icpPct) { best.icpSlipBP } else { second.icpSlipBP };
+
+                  let interpKongSlip = lowKongSlip + Int.abs(Float.toInt(t * Float.fromInt(highKongSlip - lowKongSlip)));
+                  let interpIcpSlip = lowIcpSlip + Int.abs(Float.toInt(t * Float.fromInt(highIcpSlip - lowIcpSlip)));
+
+                  logger.info("EXCHANGE_COMPARISON",
+                    "Interpolating between " # best.name # " and " # second.name #
+                    " - avgKongSlip=" # Float.toText(avgKongSlip) # "bp avgIcpSlip=" # Float.toText(avgIcpSlip) # "bp" #
+                    " kongRatio=" # Float.toText(kongRatio) #
+                    " Result: Kong=" # Nat.toText(interpolatedKongPct / 100) # "% ICP=" # Nat.toText(interpolatedIcpPct / 100) # "%",
+                    "findBestExecution"
+                  );
+
+                  (interpolatedKongPct, interpolatedIcpPct, interpKongSlip, interpIcpSlip, true)
+                } else {
+                  // Zero slippage - use best scenario as-is
+                  (best.kongPct, best.icpPct, best.kongSlipBP, best.icpSlipBP, false)
+                }
+              } else {
+                // Not both splits or not adjacent - use best scenario as-is
+                (best.kongPct, best.icpPct, best.kongSlipBP, best.icpSlipBP, false)
+              }
+            };
+            case (null) {
+              // No second-best scenario - use best as-is
+              (best.kongPct, best.icpPct, best.kongSlipBP, best.icpSlipBP, false)
+            };
+          };
+
+          logger.info("EXCHANGE_COMPARISON",
+            "Final execution plan - " # (if (interpolated) { "INTERPOLATED" } else { best.name }) #
+            " Kong=" # Nat.toText(finalKongPct / 100) # "% (slip=" # Nat.toText(finalKongSlipBP) # "bp)" #
+            " ICP=" # Nat.toText(finalIcpPct / 100) # "% (slip=" # Nat.toText(finalIcpSlipBP) # "bp)",
+            "findBestExecution"
+          );
+
+          if (finalKongPct == 10000) {
+            // Single KongSwap
+            #ok(#Single({ exchange = #KongSwap; expectedOut = best.totalOut; slippageBP = finalKongSlipBP }))
+          } else if (finalIcpPct == 10000) {
+            // Single ICPSwap
+            #ok(#Single({ exchange = #ICPSwap; expectedOut = best.totalOut; slippageBP = finalIcpSlipBP }))
+          } else {
+            // Split trade
+            let kongAmount = (amountIn * finalKongPct) / 10000;
+            let icpAmount = amountIn - kongAmount;
+
+            // Estimate expected output by interpolating from quotes
+            // Use the scenario indices to get base outputs, then scale
+            let kongExpectedOut = (kong[best.kongIdx].out * finalKongPct) / best.kongPct;
+            let icpExpectedOut = (icp[best.icpIdx].out * finalIcpPct) / best.icpPct;
+
+            #ok(#Split({
+              kongswap = {
+                amount = kongAmount;
+                expectedOut = kongExpectedOut;
+                slippageBP = finalKongSlipBP;
+                percentBP = finalKongPct;
+              };
+              icpswap = {
+                amount = icpAmount;
+                expectedOut = icpExpectedOut;
+                slippageBP = finalIcpSlipBP;
+                percentBP = finalIcpPct;
+              };
+            }))
+          }
         };
       };
     } catch (e) {
-      #err("Error finding best execution: " # Error.message(e));
+      #err({ reason = "Error finding best execution: " # Error.message(e); kongQuotes = []; icpQuotes = [] });
     };
+  };
+
+  /**
+   * Estimate max tradeable amount when slippage is too high
+   *
+   * Uses the 20% quote's slippage to estimate the maximum amount that can be traded
+   * at half the max allowed slippage (for safety margin).
+   *
+   * Formula: maxAmount = (amountIn/5) * (maxSlippageBP/2) / bestSlippage
+   *
+   * Returns null if:
+   * - No valid quotes (both exchanges returned errors)
+   * - Zero slippage (would divide by zero)
+   * - For non-ICP pairs: calculated amount is 0
+   */
+  private func estimateMaxTradeableAmount(
+    kongQuotes : [QuoteData],
+    icpQuotes : [QuoteData],
+    amountIn : Nat,
+    maxSlippageBP : Nat,
+    sellToken : Principal,
+    buyToken : Principal
+  ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap } } {
+    // Need at least one quote at 20% (index 0)
+    if (kongQuotes.size() == 0 or icpQuotes.size() == 0) { return null };
+
+    // Get 20% quote slippage (index 0) - use 99999 as sentinel for invalid
+    let kong20Slip : Nat = if (kongQuotes[0].out > 0) { kongQuotes[0].slipBP } else { 99999 };
+    let icp20Slip : Nat = if (icpQuotes[0].out > 0) { icpQuotes[0].slipBP } else { 99999 };
+
+    // Find best (lowest slippage) exchange
+    let (bestSlip, bestExchange) : (Nat, { #KongSwap; #ICPSwap }) =
+      if (kong20Slip <= icp20Slip) { (kong20Slip, #KongSwap) }
+      else { (icp20Slip, #ICPSwap) };
+
+    // Guard: no valid quotes OR zero slippage (would divide by zero)
+    if (bestSlip >= 99999 or bestSlip == 0) { return null };
+
+    // amountAt20Pct = amountIn / 5 (the 20% quote corresponds to 20% of amountIn)
+    let amountAt20Pct = amountIn / 5;
+
+    // targetSlip = maxSlippageBP * 7 / 10 (70% of max for safety margin)
+    let targetSlip = (maxSlippageBP * 7) / 10;
+
+    // maxAmount = amountAt20Pct * (targetSlip / bestSlip)
+    // Reorder to avoid precision loss: (amountAt20Pct * targetSlip) / bestSlip
+    let maxAmount = (amountAt20Pct * targetSlip) / bestSlip;
+
+    // Skip minimum check if ICP is involved (ICP trades always valuable)
+    let icpInvolved = sellToken == ICPprincipal or buyToken == ICPprincipal;
+
+    // For non-ICP pairs, ensure amount > 0
+    if (not icpInvolved and maxAmount == 0) { return null };
+
+    ?{ amount = maxAmount; exchange = bestExchange }
+  };
+
+  /**
+   * Execute a split trade on BOTH exchanges IN PARALLEL
+   *
+   * This is safe because:
+   * - Uses KongSwap.executeTransferAndSwapNoTracking (doesn't modify pendingTxs)
+   * - ICPSwap doesn't use pendingTxs
+   * - State updates (pendingTxs, logs) happen AFTER both trades complete
+   */
+  private func executeSplitTrade(
+    sellToken : Principal,
+    buyToken : Principal,
+    kongAmount : Nat,
+    kongMinOut : Nat,
+    kongIdealOut : Nat,
+    icpAmount : Nat,
+    icpMinOut : Nat,
+    icpIdealOut : Nat,
+  ) : async* { kongResult : Result.Result<TradeRecord, Text>; icpResult : Result.Result<TradeRecord, Text>; pendingTx : ?swaptypes.SwapTxRecord } {
+    let startTime = now();
+
+    // Get symbols for KongSwap
+    let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+      case (?details) { details.tokenSymbol };
+      case null { "UNKNOWN" };
+    };
+    let buySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+      case (?details) { details.tokenSymbol };
+      case null { "UNKNOWN" };
+    };
+
+    // Prepare KongSwap params
+    let kongParams : swaptypes.KongSwapParams = {
+      token0_ledger = sellToken;
+      token0_symbol = sellSymbol;
+      token1_ledger = buyToken;
+      token1_symbol = buySymbol;
+      amountIn = kongAmount;
+      minAmountOut = kongMinOut;
+      deadline = ?(startTime + 300_000_000_000);
+      recipient = null;
+      txId = null;
+      slippageTolerance = Float.fromInt(rebalanceConfig.maxSlippageBasisPoints) / 100.0;
+    };
+
+    // Prepare ICPSwap params
+    let icpPoolResult = Map.get(ICPswapPools, hashpp, (sellToken, buyToken));
+
+    // START BOTH TRADES IN PARALLEL (no await yet!)
+    let kongFuture = KongSwap.executeTransferAndSwapNoTracking(kongParams);
+
+    let icpFuture : async Result.Result<swaptypes.TransferDepositSwapWithdrawResult, Text> = switch (icpPoolResult) {
+      case (?poolData) {
+        let tx_fee = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+          case (?details) { details.tokenTransferFee };
+          case null { 0 };
+        };
+
+        let depositParams : swaptypes.ICPSwapDepositParams = {
+          poolId = poolData.canisterId;
+          token = sellToken;
+          amount = icpAmount;
+          fee = tx_fee;
+        };
+
+        let swapParams : swaptypes.ICPSwapParams = {
+          poolId = poolData.canisterId;
+          amountIn = if (icpAmount > tx_fee) { icpAmount - tx_fee } else { 0 };
+          minAmountOut = icpMinOut;
+          zeroForOne = sellToken == Principal.fromText(poolData.token0.address);
+        };
+
+        let withdrawParams : swaptypes.OptionalWithdrawParams = {
+          token = buyToken;
+          amount = null;
+        };
+
+        ICPSwap.executeTransferDepositSwapAndWithdraw(
+          Principal.fromText(self),
+          depositParams,
+          swapParams,
+          withdrawParams,
+          tokenDetailsMap,
+        );
+      };
+      case null {
+        async { #err("ICPSwap pool not found") };
+      };
+    };
+
+    // NOW AWAIT BOTH RESULTS (they were running in parallel!)
+    let kongRawResult = await kongFuture;
+    let icpRawResult = await icpFuture;
+
+    // Process KongSwap result (no state writes during parallel execution)
+    var pendingTxRecord : ?swaptypes.SwapTxRecord = null;
+
+    let kongResult : Result.Result<TradeRecord, Text> = switch (kongRawResult) {
+      case (#ok(reply)) {
+        #ok({
+          tokenSold = sellToken;
+          tokenBought = buyToken;
+          amountSold = kongAmount;
+          amountBought = reply.receive_amount;
+          exchange = #KongSwap;
+          timestamp = startTime;
+          success = true;
+          error = null;
+          slippage = reply.slippage;
+        });
+      };
+      case (#err(e)) {
+        #err(e);
+      };
+      case (#pendingRetry(info)) {
+        // Save for caller to add to pendingTxs AFTER this function returns
+        pendingTxRecord := ?info.record;
+        #err("KongSwap swap failed (transfer succeeded, needs retry): " # info.error);
+      };
+    };
+
+    // Process ICPSwap result
+    let icpResult : Result.Result<TradeRecord, Text> = switch (icpRawResult) {
+      case (#ok(result)) {
+        #ok({
+          tokenSold = sellToken;
+          tokenBought = buyToken;
+          amountSold = icpAmount;
+          amountBought = result.swapAmount;
+          exchange = #ICPSwap;
+          timestamp = startTime;
+          success = true;
+          error = null;
+          slippage = 0.0;
+        });
+      };
+      case (#err(e)) {
+        #err(e);
+      };
+    };
+
+    { kongResult = kongResult; icpResult = icpResult; pendingTx = pendingTxRecord };
   };
 
   /**
@@ -5415,19 +6411,23 @@ shared (deployer) persistent actor class treasury() = this {
 
               switch (swapResult) {
                 case (#ok(result)) {
-                  
+
                   // VERBOSE LOGGING: ICPSwap trade success
                   let executionTime = now() - startTime;
-                  let actualAmountOut = result.swapAmount;
+                  // Use swapAmount (pre-withdraw-fee) for price calculation to avoid fee affecting exchange rate
+                  let amountForPrice = result.swapAmount;
+                  // Use receivedAmount (post-withdraw-fee) for actual balance tracking
+                  let actualAmountReceived = result.receivedAmount;
                   let effectiveSlippage = if (idealAmountOut > 0) {
-                    // Calculate how much worse we did compared to the original quote
-                    if (actualAmountOut < idealAmountOut) {
-                      Float.fromInt(idealAmountOut - actualAmountOut) / Float.fromInt(idealAmountOut) * 100.0;
+                    // Calculate slippage based on swap output (not affected by withdraw fee)
+                    if (amountForPrice < idealAmountOut) {
+                      Float.fromInt(idealAmountOut - amountForPrice) / Float.fromInt(idealAmountOut) * 100.0;
                     } else { 0.0 }; // We got more than expected, so no negative slippage
                   } else { 0.0 };
-                  
-                  logger.info("TRADE_EXECUTION", 
-                    "ICPSwap trade SUCCESS - Amount_received=" # Nat.toText(actualAmountOut) #
+
+                  logger.info("TRADE_EXECUTION",
+                    "ICPSwap trade SUCCESS - Swap_output=" # Nat.toText(amountForPrice) #
+                    " After_withdraw_fee=" # Nat.toText(actualAmountReceived) #
                     " Expected_min=" # Nat.toText(minAmountOut) #
                     " Effective_slippage=" # Float.toText(effectiveSlippage) # "%" #
                     " Execution_time=" # Int.toText(executionTime / 1_000_000) # "ms" #
@@ -5439,7 +6439,7 @@ shared (deployer) persistent actor class treasury() = this {
                     tokenSold = sellToken;
                     tokenBought = buyToken;
                     amountSold = amountIn;
-                    amountBought = result.swapAmount;
+                    amountBought = amountForPrice; // Use pre-fee amount for price calculation
                     exchange = #ICPSwap;
                     timestamp = startTime;
                     success = true;
@@ -5952,13 +6952,14 @@ shared (deployer) persistent actor class treasury() = this {
       };
 
       // priceInICP is always stored in e8s (10^8), regardless of token decimals
-      let icpPrice = Float.toInt((usdPrice * 100000000.0) / ICPprice);
-      // testing, remove this
-      //if (principal == Principal.fromText("k45jy-aiaaa-aaaaq-aadcq-cai")) {
-      //  updateTokenPriceWithHistory(principal, Int.abs(icpPrice) * 2, usdPrice * 2.0);
-      //} else {
-        updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
-      //};
+      // Guard against division by zero (ICPprice = 0) and ensure result is finite
+      if (ICPprice > 0.0) {
+        let priceRatio = (usdPrice * 100000000.0) / ICPprice;
+        if (isFiniteFloat(priceRatio)) {
+          let icpPrice = Float.toInt(priceRatio);
+          updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
+        };
+      };
     };
 
     rebalanceState := {
@@ -6217,9 +7218,11 @@ shared (deployer) persistent actor class treasury() = this {
         case (?kong, ?icpSwap) {
           // Average both prices (both are > 0.0 due to filtering above)
           let avgPrice = (kong + icpSwap) / 2.0;
-          if (avgPrice > 0.0) {
+          let scaledPrice = avgPrice * 100000000.0;
+          // Guard: ensure price is finite before Float.toInt to avoid trap
+          if (avgPrice > 0.0 and isFiniteFloat(scaledPrice)) {
             // priceInICP is always stored in e8s (10^8), regardless of token decimals
-            let icpPrice = Float.toInt(avgPrice * 100000000.0);
+            let icpPrice = Float.toInt(scaledPrice);
             let usdPrice = avgPrice * finalICPPriceUSD;
             updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
             Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
@@ -6228,9 +7231,11 @@ shared (deployer) persistent actor class treasury() = this {
           };
         };
         case (?kong, null) {
-          if (kong > 0.0) {
+          let scaledPrice = kong * 100000000.0;
+          // Guard: ensure price is finite before Float.toInt to avoid trap
+          if (kong > 0.0 and isFiniteFloat(scaledPrice)) {
             // priceInICP is always stored in e8s (10^8), regardless of token decimals
-            let icpPrice = Float.toInt(kong * 100000000.0);
+            let icpPrice = Float.toInt(scaledPrice);
             let usdPrice = kong * finalICPPriceUSD;
             updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
             Debug.print("Updated " # tokenSymbol # " with Kong DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
@@ -6239,9 +7244,11 @@ shared (deployer) persistent actor class treasury() = this {
           };
         };
         case (null, ?icpSwap) {
-          if (icpSwap > 0.0) {
+          let scaledPrice = icpSwap * 100000000.0;
+          // Guard: ensure price is finite before Float.toInt to avoid trap
+          if (icpSwap > 0.0 and isFiniteFloat(scaledPrice)) {
             // priceInICP is always stored in e8s (10^8), regardless of token decimals
-            let icpPrice = Float.toInt(icpSwap * 100000000.0);
+            let icpPrice = Float.toInt(scaledPrice);
             let usdPrice = icpSwap * finalICPPriceUSD;
             updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
             Debug.print("Updated " # tokenSymbol # " with ICPSwap DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));

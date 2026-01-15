@@ -27,9 +27,9 @@ import AdminAuth "../helper/admin_authorization";
 import CanisterIds "../helper/CanisterIds";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
-import Migration "./migration";
+//import Migration "./migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 
 shared (deployer) persistent actor class ContinuousDAO() = this {
 

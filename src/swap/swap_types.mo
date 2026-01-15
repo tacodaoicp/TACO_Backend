@@ -436,7 +436,8 @@ module {
 
   // Combined operation result
   public type TransferDepositSwapWithdrawResult = {
-    swapAmount : Nat; // Amount received from swap
+    swapAmount : Nat;     // Amount from swap (use for price calculation)
+    receivedAmount : Nat; // Amount after withdraw fee (actual tokens received)
   };
 
   // Kong Swap Transaction Types

@@ -27,3 +27,7 @@ dist/
 *.pem
 dfx_output.txt
 
+# test scripts
+test_exchange_selection copy.py
+*.csv
+

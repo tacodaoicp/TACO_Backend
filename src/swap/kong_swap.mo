@@ -318,6 +318,59 @@ module {
     };
   };
 
+  // Execute transfer and swap WITHOUT pendingTxs tracking
+  // Used for parallel split trades where we can't safely modify shared state
+  // Returns the swap result AND any pending tx info for the caller to handle
+  public type SplitTradeResult = {
+    #ok : Types.SwapReply;
+    #err : Text;
+    #pendingRetry : { txId : Nat; record : Types.SwapTxRecord; error : Text };
+  };
+
+  public func executeTransferAndSwapNoTracking(
+    params : Types.KongSwapParams,
+  ) : async SplitTradeResult {
+    Debug.print("KongSwap.executeTransferAndSwapNoTracking: Starting");
+    try {
+      // Step 1: Execute transfer
+      let transferResult = await executeICRC1Transfer(params.token0_ledger, params.amountIn);
+
+      switch (transferResult) {
+        case (#ok(blockIndex)) {
+          // Step 2: Execute swap
+          let swapParams = { params with txId = ?blockIndex };
+          let swapResult = await executeSwap(swapParams);
+
+          switch (swapResult) {
+            case (#ok(reply)) { #ok(reply) };
+            case (#err(e)) {
+              // Swap failed - return info for caller to add to pendingTxs
+              #pendingRetry({
+                txId = blockIndex;
+                record = {
+                  txId = blockIndex;
+                  token0_ledger = params.token0_ledger;
+                  token0_symbol = params.token0_symbol;
+                  token1_ledger = params.token1_ledger;
+                  token1_symbol = params.token1_symbol;
+                  amount = params.amountIn;
+                  minAmountOut = params.minAmountOut;
+                  lastAttempt = Time.now();
+                  attempts = 1;
+                  status = #SwapFailed(e);
+                };
+                error = e;
+              });
+            };
+          };
+        };
+        case (#err(e)) { #err("Transfer failed: " # e) };
+      };
+    } catch (e) {
+      #err("Error: " # Error.message(e));
+    };
+  };
+
   // Helper function to execute ICRC1 transfer
   private func executeICRC1Transfer(tokenId : Principal, amount : Nat) : async Result.Result<Nat, Text> {
     Debug.print("KongSwap.executeICRC1Transfer: Starting transfer of " # debug_show (amount) # " tokens from " # Principal.toText(tokenId));
