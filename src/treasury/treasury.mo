@@ -4108,6 +4108,21 @@ shared (deployer) persistent actor class treasury() = this {
                         await* logPortfolioState("Post-trade completed (single)");
                       };
                       case (#err(errorMsg)) {
+                        // Log the initial failure
+                        let sellSymbol = tokenDetailsSell.tokenSymbol;
+                        let buySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                          case (?details) { details.tokenSymbol };
+                          case null { "UNKNOWN" };
+                        };
+
+                        logger.warn("TRADE_FAILED",
+                          "Single trade execution failed - Pair=" # sellSymbol # "/" # buySymbol #
+                          " Exchange=" # debug_show(execution.exchange) #
+                          " Error=" # errorMsg,
+                          "do_executeTradingStep"
+                        );
+
+                        // Record the failed attempt
                         let failedRecord : TradeRecord = {
                           tokenSold = sellToken;
                           tokenBought = buyToken;
@@ -4128,10 +4143,135 @@ shared (deployer) persistent actor class treasury() = this {
                           };
                           Vector.reverse(lastTrades);
                         };
-                        rebalanceState := {
-                          rebalanceState with
-                          metrics = { rebalanceState.metrics with totalTradesFailed = rebalanceState.metrics.totalTradesFailed + 1 };
-                          lastTrades = lastTrades;
+
+                        // === ICP FALLBACK: Try selling for ICP instead if eligible ===
+                        // Only for ICPSwap failures (tokens recovered immediately via recoverBalanceFromSpecificPool)
+                        // KongSwap failures use pendingTxs retry mechanism instead - tokens not available
+                        var fallbackSucceeded = false;
+
+                        if (execution.exchange == #ICPSwap and
+                            buyToken != ICPprincipal and
+                            sellToken != ICPprincipal and
+                            not isTokenPausedFromTrading(ICPprincipal)) {
+                          logger.info("ICP_FALLBACK",
+                            "Execution failed, attempting ICP fallback - Original_pair=" # sellSymbol # "/" # buySymbol #
+                            " Fallback_pair=" # sellSymbol # "/ICP" #
+                            " Original_error=" # errorMsg,
+                            "do_executeTradingStep"
+                          );
+
+                          let icpFallbackExecution = await* findBestExecution(sellToken, ICPprincipal, finalTradeSize);
+
+                          switch (icpFallbackExecution) {
+                            case (#ok(#Single(icpExecution))) {
+                              let ourSlippageToleranceBP = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                              let idealOut : Nat = if (icpExecution.slippageBP < 9900) {
+                                (icpExecution.expectedOut * 10000) / (10000 - icpExecution.slippageBP)
+                              } else {
+                                icpExecution.expectedOut
+                              };
+
+                              let toleranceMultiplier : Nat = if (ourSlippageToleranceBP >= 10000) { 0 } else { 10000 - ourSlippageToleranceBP };
+                              let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
+
+                              let icpTradeResult = await* executeTrade(
+                                sellToken,
+                                ICPprincipal,
+                                finalTradeSize,
+                                icpExecution.exchange,
+                                minAmountOut,
+                                idealOut,
+                              );
+
+                              switch (icpTradeResult) {
+                                case (#ok(record)) {
+                                  // ICP fallback succeeded!
+                                  let fallbackRecord : TradeRecord = {
+                                    record with
+                                    error = ?("ICP_FALLBACK: Original " # buySymbol # " trade failed (" # errorMsg # "), sold for ICP instead");
+                                  };
+
+                                  Vector.add(lastTrades, fallbackRecord);
+                                  if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                    Vector.reverse(lastTrades);
+                                    while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                      ignore Vector.removeLast(lastTrades);
+                                    };
+                                    Vector.reverse(lastTrades);
+                                  };
+
+                                  // Update price if deviation acceptable
+                                  let deviationFromQuote : Float = if (icpExecution.expectedOut > 0) {
+                                    Float.abs(Float.fromInt(record.amountBought) - Float.fromInt(icpExecution.expectedOut)) / Float.fromInt(icpExecution.expectedOut)
+                                  } else { 1.0 };
+                                  let shouldUpdatePrice = isFiniteFloat(deviationFromQuote) and deviationFromQuote <= 0.05;
+
+                                  if (shouldUpdatePrice) {
+                                    let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** tokenDetailsSell.tokenDecimals);
+                                    let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
+                                    if (actualICP > 0.0) {
+                                      let priceRatio = (actualTokensSold / actualICP) * Float.fromInt(tokenDetailsSell.priceInICP);
+                                      if (isFiniteFloat(priceRatio)) {
+                                        let newICPPrice = Int.abs(Float.toInt(priceRatio));
+                                        let newICPPriceUSD = tokenDetailsSell.priceInUSD * actualTokensSold / actualICP;
+                                        updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+                                      };
+                                    };
+                                  };
+
+                                  rebalanceState := {
+                                    rebalanceState with
+                                    metrics = { rebalanceState.metrics with totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1 };
+                                    lastTrades = lastTrades;
+                                  };
+
+                                  success := true;
+                                  fallbackSucceeded := true;
+
+                                  logger.info("ICP_FALLBACK",
+                                    "ICP fallback SUCCESS after execution failure - Sold=" # sellSymbol #
+                                    " Amount_sold=" # Nat.toText(record.amountSold) #
+                                    " ICP_received=" # Nat.toText(record.amountBought) #
+                                    " Exchange=" # debug_show(record.exchange),
+                                    "do_executeTradingStep"
+                                  );
+
+                                  await updateBalances();
+                                  await takePortfolioSnapshot(#PostTrade);
+                                  checkPortfolioCircuitBreakerConditions();
+                                  await* logPortfolioState("Post-ICP-fallback (after exec failure)");
+                                };
+                                case (#err(icpError)) {
+                                  logger.warn("ICP_FALLBACK",
+                                    "ICP fallback also failed - Error=" # icpError,
+                                    "do_executeTradingStep"
+                                  );
+                                };
+                              };
+                            };
+                            case (#ok(#Split(_))) {
+                              logger.info("ICP_FALLBACK", "Split ICP fallback route found but not implemented for exec failure path", "do_executeTradingStep");
+                            };
+                            case (#ok(#Partial(_))) {
+                              logger.info("ICP_FALLBACK", "Partial ICP fallback route found but not implemented for exec failure path", "do_executeTradingStep");
+                            };
+                            case (#err(icpRouteError)) {
+                              logger.warn("ICP_FALLBACK",
+                                "No ICP fallback route available - Error=" # icpRouteError.reason,
+                                "do_executeTradingStep"
+                              );
+                            };
+                          };
+                        };
+
+                        // If fallback didn't succeed, record the failure
+                        if (not fallbackSucceeded) {
+                          rebalanceState := {
+                            rebalanceState with
+                            metrics = { rebalanceState.metrics with totalTradesFailed = rebalanceState.metrics.totalTradesFailed + 1 };
+                            lastTrades = lastTrades;
+                          };
                         };
                       };
                     };

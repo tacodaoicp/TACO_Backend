@@ -3,6 +3,17 @@
 Test script to verify the exchange selection algorithm against real quotes.
 Tests ALL token pair combinations with ICPSwap fallback logic.
 Matches treasury's findBestExecution exactly.
+
+ICP Fallback Logic (matching treasury.mo):
+1. Quote-level fallback (line 4584): When findBestExecution returns #err, try sell->ICP route
+2. Execution-level fallback (line 4110): When executeTrade returns #err (e.g. "slippage over range"),
+   try ICP fallback - but ONLY for ICPSwap failures (tokens recovered immediately via
+   recoverBalanceFromSpecificPool). KongSwap failures use pendingTxs retry mechanism instead.
+
+Result types:
+- ICP_FALLBACK: Direct quote failed, routed via ICP (single exchange)
+- ICP_FB_SPLIT: Direct quote failed, routed via ICP (split between Kong/ICPSwap)
+- ICP_FB_EXEC: Execution failed after quote succeeded, ICP fallback used (ICPSwap only)
 """
 
 import subprocess
@@ -128,7 +139,9 @@ class Scenario:
 class TestResult:
     pair: str
     amount: int
-    result_type: str  # 'SINGLE_KONG', 'SINGLE_ICP', 'SPLIT', 'SPLIT_INTERP', 'ICP_FALLBACK', 'ICP_FB_SPLIT', 'REDUCED', 'FAILURE'
+    result_type: str  # 'SINGLE_KONG', 'SINGLE_ICP', 'SPLIT', 'SPLIT_INTERP', 'ICP_FALLBACK', 'ICP_FB_SPLIT', 'ICP_FB_EXEC', 'REDUCED', 'FAILURE'
+    # Note: ICP_FB_EXEC = ICP fallback after execution failure (quote succeeded but swap failed with "slippage over range")
+    # This is handled in treasury.mo at line 4110 - only for ICPSwap failures where tokens are recovered immediately
     algorithm_output: int = 0
     actual_output: int = 0
     error_pct: float = 0.0
@@ -2327,6 +2340,49 @@ def estimate_max_tradeable_icp(kong_quotes: List[Quote], icp_quotes: List[Quote]
     return (0, "")
 
 
+def simulate_execution_failure_with_icp_fallback(
+    sell_symbol: str,
+    buy_symbol: str,
+    amount_icp: int,
+    base_amount: int,
+    original_exchange: str,  # 'ICPSwap' or 'KongSwap'
+    error_msg: str = "Slippage is over range"
+) -> Optional[TestResult]:
+    """
+    Simulate what happens when executeTrade fails after findBestExecution succeeded.
+
+    This matches treasury.mo line 4110-4276:
+    - Only ICPSwap failures trigger ICP fallback (tokens recovered immediately)
+    - KongSwap failures use pendingTxs retry mechanism instead
+    - Fallback only if: buyToken != ICP and sellToken != ICP
+
+    Returns: TestResult with type 'ICP_FB_EXEC' if fallback works, None otherwise
+    """
+    # Only ICPSwap failures trigger ICP fallback
+    if original_exchange != 'ICPSwap':
+        return None  # KongSwap uses pendingTxs retry
+
+    # Can't fallback if already trading ICP
+    if sell_symbol == "ICP" or buy_symbol == "ICP":
+        return None
+
+    # Try the ICP fallback route (sell -> ICP)
+    fallback_result, fb_kong, fb_icp = test_pair_internal(sell_symbol, "ICP", amount_icp, base_amount)
+
+    if fallback_result and fallback_result.result_type not in ['FAILURE', 'SKIP']:
+        return TestResult(
+            f"{sell_symbol}/{buy_symbol}", amount_icp, 'ICP_FB_EXEC',
+            algorithm_output=fallback_result.algorithm_output,
+            actual_output=fallback_result.actual_output,
+            error_pct=fallback_result.error_pct,
+            split_pct=fallback_result.split_pct,
+            interpolated=fallback_result.interpolated,
+            details=f"Exec failed ({error_msg}), ICP fallback: {sell_symbol}->ICP via {fallback_result.result_type}"
+        )
+
+    return None  # Fallback also failed
+
+
 def test_pair_internal(sell_symbol: str, buy_symbol: str, amount_icp: int, base_amount: int) -> Tuple[Optional[TestResult], List[Quote], List[Quote]]:
     """
     Internal test function that runs the algorithm on a pair.
@@ -2548,10 +2604,11 @@ def print_status():
         splits = sum(1 for r in all_results if r.result_type in ['SPLIT', 'SPLIT_INTERP'])
         icp_fb_single = sum(1 for r in all_results if r.result_type == 'ICP_FALLBACK')
         icp_fb_split = sum(1 for r in all_results if r.result_type == 'ICP_FB_SPLIT')
+        icp_fb_exec = sum(1 for r in all_results if r.result_type == 'ICP_FB_EXEC')
         reduced = sum(1 for r in all_results if r.result_type == 'REDUCED')
         failures = sum(1 for r in all_results if r.result_type == 'FAILURE')
 
-        status = f"\r[{completed_count}/{total_tests}] Kong:{singles_kong} ICP:{singles_icp} Split:{splits} ICP_FB:{icp_fb_single}({icp_fb_split}) Red:{reduced} Fail:{failures}"
+        status = f"\r[{completed_count}/{total_tests}] Kong:{singles_kong} ICP:{singles_icp} Split:{splits} ICP_FB:{icp_fb_single}({icp_fb_split}) ExecFB:{icp_fb_exec} Red:{reduced} Fail:{failures}"
         print(status, end="", flush=True)
 
 
@@ -2588,6 +2645,7 @@ def print_final_summary():
     splits_interp = [r for r in all_results if r.result_type == 'SPLIT_INTERP']
     icp_fb_single = [r for r in all_results if r.result_type == 'ICP_FALLBACK']
     icp_fb_split = [r for r in all_results if r.result_type == 'ICP_FB_SPLIT']
+    icp_fb_exec = [r for r in all_results if r.result_type == 'ICP_FB_EXEC']
     reduced = [r for r in all_results if r.result_type == 'REDUCED']
     failures = [r for r in all_results if r.result_type == 'FAILURE']
     skipped = [r for r in all_results if r.result_type == 'SKIP']
@@ -2606,6 +2664,7 @@ def print_final_summary():
 
     print(f"  ICP_FALLBACK (single): {len(icp_fb_single)} (direct failed, routed via ICP)")
     print(f"  ICP_FALLBACK (split):  {len(icp_fb_split)} (direct failed, split via ICP route)")
+    print(f"  ICP_FB_EXEC: {len(icp_fb_exec)} (execution failed, ICP fallback succeeded)")
     print(f"  REDUCED: {len(reduced)} (slippage too high, estimated max tradeable)")
     print(f"  FAILURES: {len(failures)} (no viable route)")
     if skipped:
@@ -2630,6 +2689,15 @@ def print_final_summary():
         print("\n" + "-" * 80)
         print(f"ICP Fallbacks - Split ({len(icp_fb_split)}):")
         for r in icp_fb_split[:10]:
+            print(f"  {r.pair:15} @{r.amount:2}ICP: {r.details}")
+
+    # Show ICP fallbacks after execution failure (ICPSwap "slippage over range" etc)
+    if icp_fb_exec:
+        print("\n" + "-" * 80)
+        print(f"ICP Fallbacks - After Execution Failure ({len(icp_fb_exec)}):")
+        print("  (These are trades where findBestExecution succeeded but executeTrade failed)")
+        print("  (Only ICPSwap failures trigger this - tokens recovered immediately)")
+        for r in icp_fb_exec[:10]:
             print(f"  {r.pair:15} @{r.amount:2}ICP: {r.details}")
 
     # Show reduced amount suggestions
@@ -2670,6 +2738,51 @@ def main():
             num_cycles = int(args[1]) if len(args) > 1 else 5
             run_full_trading_cycle_with_real_quotes(num_cycles, use_production_data=use_production)
             return
+        elif args[0] == "--exec-fallback" or args[0] == "-e":
+            # Test execution failure with ICP fallback
+            print("=" * 80)
+            print("Execution Failure ICP Fallback Simulation")
+            print("=" * 80)
+            print("Simulating: ICPSwap trade succeeds in findBestExecution but fails in executeTrade")
+            print("Treasury.mo line 4110-4276 handles this by attempting ICP fallback")
+            print()
+
+            # Discover ICPSwap pools first
+            print("Discovering ICPSwap pools...")
+            discover_icpswap_pools()
+            print(f"Found {len(ICPSWAP_POOLS)} ICPSwap pools")
+            print()
+
+            # Test all non-ICP pairs that could fail on ICPSwap
+            exec_fallback_results = []
+            for sell in TOKENS:
+                if sell == "ICP":
+                    continue
+                for buy in TOKENS:
+                    if buy == "ICP" or buy == sell:
+                        continue
+
+                    # Calculate base amount for 5 ICP equivalent
+                    decimals = TOKENS[sell][1]
+                    if sell == "ckETH":
+                        base_amount = 5 * (10 ** 18) // 770
+                    elif sell == "ckBTC":
+                        base_amount = 5 * (10 ** 8) // 22800
+                    else:
+                        base_amount = 5 * (10 ** decimals)
+
+                    result = simulate_execution_failure_with_icp_fallback(
+                        sell, buy, 5, base_amount, "ICPSwap", "Slippage is over range"
+                    )
+                    if result:
+                        exec_fallback_results.append(result)
+                        print(f"  {result.pair:15} -> ICP fallback available: {result.details}")
+                    else:
+                        print(f"  {sell}/{buy}:15 -> No ICP fallback route")
+
+            print()
+            print(f"Total pairs with ICP execution fallback: {len(exec_fallback_results)}")
+            return
         elif args[0] == "--help" or args[0] == "-h":
             print("Usage:")
             print("  python test_exchange_selection.py              # Run exchange selection tests with real quotes")
@@ -2679,6 +2792,7 @@ def main():
             print("  python test_exchange_selection.py -f 10        # Run 10 trading cycles with REAL DEX quotes")
             print("  python test_exchange_selection.py --full --prod # Use REAL prices/config from production canisters")
             print("  python test_exchange_selection.py -f -p 10      # Production data with 10 cycles")
+            print("  python test_exchange_selection.py --exec-fallback  # Test execution failure ICP fallback")
             print("\nFlags:")
             print("  --prod, -p   Use REAL prices/decimals/config from production DAO/Treasury canisters")
             print("               (Target allocations remain random for test diversity)")
