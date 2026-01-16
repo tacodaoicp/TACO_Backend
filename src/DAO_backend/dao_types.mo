@@ -26,6 +26,24 @@ module {
     pausedDueToSyncFailure : Bool;
   };
 
+  public type PublicTokenDetails = {
+    Active : Bool;
+    isPaused : Bool;
+    epochAdded : Int;
+    tokenName : Text;
+    tokenSymbol : Text;
+    tokenDecimals : Nat;
+    tokenTransferFee : Nat;
+    balance : Nat;
+    priceInICP : Nat;
+    priceInUSD : Float;
+    tokenType : TokenType;
+    lastTimeSynced : Int;
+    pausedDueToSyncFailure : Bool;
+  };
+
+  public type TokenDetailsWithoutPastPrices = (Principal, PublicTokenDetails);
+
   public type LogLevel = {
     #INFO;
     #WARN;

@@ -150,153 +150,231 @@ stop_requested = False
 # DFX Helpers
 # ============================================
 
-def get_kong_quote(sell_symbol: str, buy_symbol: str, amount: int) -> Quote:
-    """Get a KongSwap quote. Uses IC. prefix for all tokens."""
+def get_kong_quote(sell_symbol: str, buy_symbol: str, amount: int, max_retries: int = 2) -> Quote:
+    """Get a KongSwap quote. Uses IC. prefix for all tokens.
+
+    Retries on transient failures (timeout, dfx_error) with exponential backoff.
+    """
     kong_sell = f"IC.{sell_symbol}"
     kong_buy = f"IC.{buy_symbol}"
     args = f'("{kong_sell}", {amount}, "{kong_buy}")'
     cmd = f'dfx canister call {KONGSWAP_CANISTER} swap_amounts \'{args}\' --network {NETWORK} --identity anonymous'
 
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CALL_TIMEOUT)
-        if result.returncode != 0:
-            return Quote(amount, 0, 10000, False, "dfx_error")
+    last_error = "unknown"
+    for attempt in range(max_retries + 1):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CALL_TIMEOUT)
+            if result.returncode != 0:
+                last_error = "dfx_error"
+                if attempt < max_retries:
+                    time.sleep(0.5 * (2 ** attempt))  # Exponential backoff: 0.5s, 1s, 2s
+                    continue
+                return Quote(amount, 0, 10000, False, "dfx_error")
 
-        output = result.stdout
-        receive_matches = re.findall(r'receive_amount\s*=\s*(\d[_\d]*)', output)
-        slippage_match = re.search(r'slippage\s*=\s*([\d.]+)', output)
+            output = result.stdout
+            receive_matches = re.findall(r'receive_amount\s*=\s*(\d[_\d]*)', output)
+            slippage_match = re.search(r'slippage\s*=\s*([\d.]+)', output)
 
-        if receive_matches and slippage_match:
-            receive_amount = int(receive_matches[-1].replace('_', ''))  # Use LAST match (top-level)
-            slippage_pct = float(slippage_match.group(1))
-            slippage_bp = int(slippage_pct * 100)
-            valid = slippage_bp <= MAX_SLIPPAGE_BP and receive_amount > 0
-            return Quote(amount, receive_amount, slippage_bp, valid)
-        else:
-            if "Err" in output:
-                return Quote(amount, 0, 10000, False, "no_pool")
-            return Quote(amount, 0, 10000, False, "parse_error")
-    except subprocess.TimeoutExpired:
-        return Quote(amount, 0, 10000, False, "timeout")
-    except Exception as e:
-        return Quote(amount, 0, 10000, False, str(e)[:20])
+            if receive_matches and slippage_match:
+                receive_amount = int(receive_matches[-1].replace('_', ''))  # Use LAST match (top-level)
+                slippage_pct = float(slippage_match.group(1))
+                slippage_bp = int(slippage_pct * 100)
+                valid = slippage_bp <= MAX_SLIPPAGE_BP and receive_amount > 0
+                return Quote(amount, receive_amount, slippage_bp, valid)
+            else:
+                if "Err" in output:
+                    return Quote(amount, 0, 10000, False, "no_pool")  # Don't retry - no pool is permanent
+                last_error = "parse_error"
+                if attempt < max_retries:
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
+                return Quote(amount, 0, 10000, False, "parse_error")
+        except subprocess.TimeoutExpired:
+            last_error = "timeout"
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return Quote(amount, 0, 10000, False, "timeout")
+        except Exception as e:
+            last_error = str(e)[:20]
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return Quote(amount, 0, 10000, False, str(e)[:20])
+
+    return Quote(amount, 0, 10000, False, last_error)
 
 
 # Cache for pool metadata (sqrtPriceX96)
 pool_metadata_cache: Dict[str, int] = {}
 
 
-def get_pool_metadata(pool_id: str) -> Optional[int]:
-    """Get sqrtPriceX96 from pool metadata. Returns None on error."""
+def get_pool_metadata(pool_id: str, max_retries: int = 2) -> Optional[int]:
+    """Get sqrtPriceX96 from pool metadata. Returns None on error.
+
+    Retries on transient failures with exponential backoff.
+    """
     if pool_id in pool_metadata_cache:
         return pool_metadata_cache[pool_id]
 
     cmd = f'dfx canister call {pool_id} metadata \'()\' --network {NETWORK} --identity anonymous'
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CALL_TIMEOUT)
-        if result.returncode != 0:
+    for attempt in range(max_retries + 1):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CALL_TIMEOUT)
+            if result.returncode != 0:
+                if attempt < max_retries:
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
+                return None
+
+            output = result.stdout
+            # Parse sqrtPriceX96 from metadata
+            sqrt_match = re.search(r'sqrtPriceX96\s*=\s*(\d[_\d]*)', output)
+            if sqrt_match:
+                sqrt_price = int(sqrt_match.group(1).replace('_', ''))
+                pool_metadata_cache[pool_id] = sqrt_price
+                return sqrt_price
+            return None  # Parse succeeded but no sqrtPriceX96 - don't retry
+        except subprocess.TimeoutExpired:
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
             return None
-
-        output = result.stdout
-        # Parse sqrtPriceX96 from metadata
-        sqrt_match = re.search(r'sqrtPriceX96\s*=\s*(\d[_\d]*)', output)
-        if sqrt_match:
-            sqrt_price = int(sqrt_match.group(1).replace('_', ''))
-            pool_metadata_cache[pool_id] = sqrt_price
-            return sqrt_price
-        return None
-    except:
-        return None
+        except:
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+    return None
 
 
-def get_icpswap_quote(pool_id: str, amount: int, zero_for_one: bool, sqrt_price_x96: Optional[int] = None) -> Quote:
-    """Get an ICPSwap quote with slippage calculated exactly like treasury.mo."""
+def get_icpswap_quote(pool_id: str, amount: int, zero_for_one: bool, sqrt_price_x96: Optional[int] = None, max_retries: int = 2) -> Quote:
+    """Get an ICPSwap quote with slippage calculated exactly like treasury.mo.
+
+    Retries on transient failures (timeout, dfx_error) with exponential backoff.
+    """
     zfo = "true" if zero_for_one else "false"
     args = f'(record {{ amountIn = "{amount}"; zeroForOne = {zfo}; amountOutMinimum = "0" }})'
     cmd = f'dfx canister call {pool_id} quote \'{args}\' --network {NETWORK} --identity anonymous'
 
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CALL_TIMEOUT)
-        if result.returncode != 0:
-            return Quote(amount, 0, 10000, False, "dfx_error")
+    last_error = "unknown"
+    for attempt in range(max_retries + 1):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CALL_TIMEOUT)
+            if result.returncode != 0:
+                last_error = "dfx_error"
+                if attempt < max_retries:
+                    time.sleep(0.5 * (2 ** attempt))  # Exponential backoff: 0.5s, 1s, 2s
+                    continue
+                return Quote(amount, 0, 10000, False, "dfx_error")
 
-        output = result.stdout
-        amount_match = re.search(r'ok\s*=\s*(\d[_\d]*)', output)
+            output = result.stdout
+            amount_match = re.search(r'ok\s*=\s*(\d[_\d]*)', output)
 
-        if amount_match:
-            amount_out = int(amount_match.group(1).replace('_', ''))
-            if amount_out <= 0:
-                return Quote(amount, 0, 10000, False, "zero_output")
+            if amount_match:
+                amount_out = int(amount_match.group(1).replace('_', ''))
+                if amount_out <= 0:
+                    return Quote(amount, 0, 10000, False, "zero_output")  # Don't retry - valid response
 
-            # Calculate slippage exactly like treasury.mo
-            slippage_bp = 0
-            if sqrt_price_x96 and sqrt_price_x96 > 0:
-                # spotPrice = (sqrtPriceX96)^2 / 2^192
-                sqrt_squared = sqrt_price_x96 * sqrt_price_x96
-                spot_price = sqrt_squared / (2 ** 192)
+                # Calculate slippage exactly like treasury.mo
+                slippage_bp = 0
+                if sqrt_price_x96 and sqrt_price_x96 > 0:
+                    # spotPrice = (sqrtPriceX96)^2 / 2^192
+                    sqrt_squared = sqrt_price_x96 * sqrt_price_x96
+                    spot_price = sqrt_squared / (2 ** 192)
 
-                # effectivePrice = amountIn / amountOut
-                effective_price = amount / amount_out
+                    # effectivePrice = amountIn / amountOut
+                    effective_price = amount / amount_out
 
-                # Normalize based on direction
-                if zero_for_one:
-                    # Trading token0 for token1, want token0/token1 (inverse)
-                    normalized_spot = 1.0 / spot_price if spot_price > 0 else 0
-                else:
-                    # Trading token1 for token0, same as spot price
-                    normalized_spot = spot_price
+                    # Normalize based on direction
+                    if zero_for_one:
+                        # Trading token0 for token1, want token0/token1 (inverse)
+                        normalized_spot = 1.0 / spot_price if spot_price > 0 else 0
+                    else:
+                        # Trading token1 for token0, same as spot price
+                        normalized_spot = spot_price
 
-                # slippage = (effectivePrice - spotPrice) / spotPrice * 100
-                if normalized_spot > 0:
-                    slippage_pct = (effective_price - normalized_spot) / normalized_spot * 100
-                    slippage_bp = int(abs(slippage_pct) * 100)  # Convert % to basis points
+                    # slippage = (effectivePrice - spotPrice) / spotPrice * 100
+                    if normalized_spot > 0:
+                        slippage_pct = (effective_price - normalized_spot) / normalized_spot * 100
+                        slippage_bp = int(abs(slippage_pct) * 100)  # Convert % to basis points
 
-            valid = slippage_bp <= MAX_SLIPPAGE_BP and amount_out > 0
-            return Quote(amount, amount_out, slippage_bp, valid)
+                valid = slippage_bp <= MAX_SLIPPAGE_BP and amount_out > 0
+                return Quote(amount, amount_out, slippage_bp, valid)
 
-        if "err" in output.lower():
-            return Quote(amount, 0, 10000, False, "icp_error")
-        return Quote(amount, 0, 10000, False, "parse_error")
-    except subprocess.TimeoutExpired:
-        return Quote(amount, 0, 10000, False, "timeout")
-    except Exception as e:
-        return Quote(amount, 0, 10000, False, str(e)[:20])
+            if "err" in output.lower():
+                return Quote(amount, 0, 10000, False, "icp_error")  # Don't retry - valid error response
+            last_error = "parse_error"
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return Quote(amount, 0, 10000, False, "parse_error")
+        except subprocess.TimeoutExpired:
+            last_error = "timeout"
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return Quote(amount, 0, 10000, False, "timeout")
+        except Exception as e:
+            last_error = str(e)[:20]
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return Quote(amount, 0, 10000, False, str(e)[:20])
+
+    return Quote(amount, 0, 10000, False, last_error)
 
 
-def fetch_icpswap_pools():
-    """Fetch ALL ICPSwap pools and store by token pair."""
+def fetch_icpswap_pools(max_retries: int = 2):
+    """Fetch ALL ICPSwap pools and store by token pair.
+
+    Retries on transient failures with exponential backoff.
+    """
     global ICPSWAP_POOLS
     print("Fetching ICPSwap pools from factory...")
     cmd = f'dfx canister call {ICPSWAP_FACTORY} getPools \'()\' --network {NETWORK} --identity anonymous'
 
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            print(f"  Error: {result.stderr[:100]}")
-            return
+    for attempt in range(max_retries + 1):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                print(f"  Error (attempt {attempt + 1}): {result.stderr[:100]}")
+                if attempt < max_retries:
+                    time.sleep(1.0 * (2 ** attempt))  # Longer backoff for pool fetch: 1s, 2s, 4s
+                    continue
+                return
 
-        output = result.stdout
-        pool_pattern = re.compile(
-            r'token0\s*=\s*record\s*\{\s*address\s*=\s*"([^"]+)"[^}]*\}\s*;\s*'
-            r'token1\s*=\s*record\s*\{\s*address\s*=\s*"([^"]+)"[^}]*\}\s*;\s*'
-            r'canisterId\s*=\s*principal\s*"([^"]+)"'
-        )
-        pool_matches = pool_pattern.findall(output)
+            output = result.stdout
+            pool_pattern = re.compile(
+                r'token0\s*=\s*record\s*\{\s*address\s*=\s*"([^"]+)"[^}]*\}\s*;\s*'
+                r'token1\s*=\s*record\s*\{\s*address\s*=\s*"([^"]+)"[^}]*\}\s*;\s*'
+                r'canisterId\s*=\s*principal\s*"([^"]+)"'
+            )
+            pool_matches = pool_pattern.findall(output)
 
-        found = 0
-        for token0_principal, token1_principal, pool_id in pool_matches:
-            sym0 = PRINCIPAL_TO_SYMBOL.get(token0_principal)
-            sym1 = PRINCIPAL_TO_SYMBOL.get(token1_principal)
+            found = 0
+            for token0_principal, token1_principal, pool_id in pool_matches:
+                sym0 = PRINCIPAL_TO_SYMBOL.get(token0_principal)
+                sym1 = PRINCIPAL_TO_SYMBOL.get(token1_principal)
 
-            if sym0 and sym1:
-                # zeroForOne=true means selling token0 for token1
-                ICPSWAP_POOLS[(sym0, sym1)] = (pool_id, True)
-                ICPSWAP_POOLS[(sym1, sym0)] = (pool_id, False)
-                found += 1
+                if sym0 and sym1:
+                    # zeroForOne=true means selling token0 for token1
+                    ICPSWAP_POOLS[(sym0, sym1)] = (pool_id, True)
+                    ICPSWAP_POOLS[(sym1, sym0)] = (pool_id, False)
+                    found += 1
 
-        print(f"  Found {found} pools ({len(ICPSWAP_POOLS)} directions)")
-    except Exception as e:
-        print(f"  Exception: {e}")
+            print(f"  Found {found} pools ({len(ICPSWAP_POOLS)} directions)")
+            return  # Success - exit retry loop
+        except subprocess.TimeoutExpired:
+            print(f"  Timeout (attempt {attempt + 1})")
+            if attempt < max_retries:
+                time.sleep(1.0 * (2 ** attempt))
+                continue
+        except Exception as e:
+            print(f"  Exception (attempt {attempt + 1}): {e}")
+            if attempt < max_retries:
+                time.sleep(1.0 * (2 ** attempt))
+                continue
 
 
 # ============================================
@@ -450,7 +528,7 @@ TREASURY_CANISTER_ID = "v6t5d-6yaaa-aaaan-qzzja-cai"
 
 def parse_production_token_details(output: str) -> Dict[str, Dict]:
     """
-    Parse getTokenDetails output from DAO canister.
+    Parse getTokenDetailsWithoutPastPrices output from DAO canister.
     Returns: {principal -> {decimals, balance, priceInICP}}
     """
     tokens = {}
@@ -529,7 +607,7 @@ def fetch_production_data() -> Tuple[Dict[str, Dict], Dict[str, int], Dict[str, 
     import concurrent.futures
 
     def fetch_token_details():
-        cmd = f'dfx canister call {DAO_CANISTER_ID} getTokenDetails "()" --network ic --identity anonymous'
+        cmd = f'dfx canister call {DAO_CANISTER_ID} getTokenDetailsWithoutPastPrices "()" --network ic --identity anonymous'
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to fetch token details: {result.stderr}")
@@ -569,9 +647,9 @@ def initialize_portfolio_from_production(
     Initialize portfolio with REAL data from production canisters.
 
     Uses:
-    - REAL prices from DAO getTokenDetails
-    - REAL decimals from DAO getTokenDetails
-    - REAL balances from DAO getTokenDetails (if use_real_balances=True)
+    - REAL prices from DAO getTokenDetailsWithoutPastPrices
+    - REAL decimals from DAO getTokenDetailsWithoutPastPrices
+    - REAL balances from DAO getTokenDetailsWithoutPastPrices (if use_real_balances=True)
     - RANDOM target allocations (for test diversity)
 
     Returns: (portfolio, config)
@@ -1268,24 +1346,40 @@ def get_real_quote_for_trade(
         # Step 1: Try REDUCED amount estimation (no extra API call)
         trade_value_icp_amount = (trade_size * sell_token.price_in_icp) // (10 ** sell_token.decimals) // 100_000_000
         icp_involved = sell_symbol == "ICP" or buy_symbol == "ICP"
-        max_icp, best_exch = estimate_max_tradeable_icp(kong_quotes, icp_quotes, max(1, trade_value_icp_amount), icp_involved)
+        max_icp, best_exch = estimate_max_tradeable_icp(kong_quotes, icp_quotes, max(1, trade_value_icp_amount), icp_involved, num_quotes)
         if max_icp > 0 and (icp_involved or max_icp >= MIN_TRADE_ICP):
             # Calculate reduced trade size and verify
             reduced_trade_size = int(trade_size * max_icp / max(1, trade_value_icp_amount))
-            if best_exch == "Kong":
-                verify = get_kong_quote(sell_symbol, buy_symbol, reduced_trade_size)
-            else:
-                if pool_key in ICPSWAP_POOLS:
-                    pool_id, zero_for_one = ICPSWAP_POOLS[pool_key]
-                    sqrt_price = get_pool_metadata(pool_id)
-                    verify = get_icpswap_quote(pool_id, reduced_trade_size, zero_for_one, sqrt_price)
+
+            # Try both exchanges for verify - if first fails, try second
+            # This handles cases where bulk quotes failed for both but one exchange might work
+            verify = None
+            actual_exch = best_exch
+
+            for exch in ([best_exch, "ICP" if best_exch == "Kong" else "Kong"]):
+                if exch == "Kong":
+                    test_verify = get_kong_quote(sell_symbol, buy_symbol, reduced_trade_size)
                 else:
-                    verify = Quote(reduced_trade_size, 0, 10000, False, "no_pool")
-            # Check if reduced quote is valid (amount > 0 and slippage acceptable)
-            if verify.amount_out > 0 and verify.slippage_bp <= MAX_SLIPPAGE_BP:
-                # Include which exchange REDUCED used
-                reduced_route = f"REDUCED_{best_exch[0]}"  # REDUCED_K or REDUCED_I
-                return (verify.amount_out, verify.slippage_bp, reduced_route, (0, 0), buy_symbol)
+                    if pool_key in ICPSWAP_POOLS:
+                        pool_id, zero_for_one = ICPSWAP_POOLS[pool_key]
+                        sqrt_price = get_pool_metadata(pool_id)
+                        test_verify = get_icpswap_quote(pool_id, reduced_trade_size, zero_for_one, sqrt_price)
+                    else:
+                        test_verify = Quote(reduced_trade_size, 0, 10000, False, "no_pool")
+
+                # Check if this verify is valid
+                if test_verify.amount_out > 0 and test_verify.slippage_bp <= MAX_SLIPPAGE_BP:
+                    verify = test_verify
+                    actual_exch = exch
+                    break
+
+            # Return if we found a valid verify quote
+            if verify is not None:
+                reduced_route = f"REDUCED_{actual_exch[0]}"  # REDUCED_K or REDUCED_I
+                # Calculate actual percentage traded: (max_icp / trade_value_icp_amount) * 10000
+                reduced_pct_bp = (max_icp * 10000) // max(1, trade_value_icp_amount)
+                split = (reduced_pct_bp, 0) if actual_exch == "Kong" else (0, reduced_pct_bp)
+                return (verify.amount_out, verify.slippage_bp, reduced_route, split, buy_symbol)
 
         # Step 2: Try ONE-LEG ICP fallback route (sell -> ICP only)
         # Matches treasury.mo: creates ICP overweight that corrects in next cycle
@@ -1360,10 +1454,15 @@ def get_real_quote_for_trade(
         if valid_partials:
             valid_partials.sort(key=combined_slippage)
             best = valid_partials[0]
-        # Step C: If no valid partials AND ICP is in pair, allow any partial
+        # Step C: If no valid partials AND ICP is in pair, allow partials meeting min total only
         elif icp_involved and partial_candidates:
-            partial_candidates.sort(key=combined_slippage)
-            best = partial_candidates[0]
+            # Still enforce MIN_PARTIAL_TOTAL_BP even for ICP pairs (prevent tiny partials like 10/10)
+            icp_valid = [p for p in partial_candidates if partial_total_pct(p) >= MIN_PARTIAL_TOTAL_BP]
+            if icp_valid:
+                icp_valid.sort(key=combined_slippage)
+                best = icp_valid[0]
+            else:
+                best = None  # Fall through to REDUCED/NO_PATH
         else:
             # No partials meet criteria for non-ICP pair - fall through to NO_PATH
             best = None
@@ -1410,7 +1509,10 @@ def get_real_quote_for_trade(
                         was_interpolated = True
 
             # Get actual output from quotes
-            pct_to_idx = {2000: 0, 4000: 1, 6000: 2, 8000: 3, 10000: 4}
+            # Build pct_to_idx mapping dynamically based on num_quotes
+            # For 5 quotes: {2000: 0, 4000: 1, 6000: 2, 8000: 3, 10000: 4}
+            # For 10 quotes: {1000: 0, 2000: 1, 3000: 2, ..., 10000: 9}
+            pct_to_idx = {(i + 1) * step_bp: i for i in range(num_quotes)}
             kong_idx = pct_to_idx.get(best.kong_pct, -1)
             icp_idx = pct_to_idx.get(best.icp_pct, -1)
 
@@ -1455,24 +1557,40 @@ def get_real_quote_for_trade(
         # Try REDUCED amount estimation before giving up
         trade_value_icp_amount = (trade_size * sell_token.price_in_icp) // (10 ** sell_token.decimals) // 100_000_000
         icp_involved = sell_symbol == "ICP" or buy_symbol == "ICP"
-        max_icp, best_exch = estimate_max_tradeable_icp(kong_quotes, icp_quotes, max(1, trade_value_icp_amount), icp_involved)
+        max_icp, best_exch = estimate_max_tradeable_icp(kong_quotes, icp_quotes, max(1, trade_value_icp_amount), icp_involved, num_quotes)
         if max_icp > 0 and (icp_involved or max_icp >= MIN_TRADE_ICP):
             # Calculate reduced trade size and verify
             reduced_trade_size = int(trade_size * max_icp / max(1, trade_value_icp_amount))
-            if best_exch == "Kong":
-                verify = get_kong_quote(sell_symbol, buy_symbol, reduced_trade_size)
-            else:
-                if pool_key in ICPSWAP_POOLS:
-                    pool_id, zero_for_one = ICPSWAP_POOLS[pool_key]
-                    sqrt_price = get_pool_metadata(pool_id)
-                    verify = get_icpswap_quote(pool_id, reduced_trade_size, zero_for_one, sqrt_price)
+
+            # Try both exchanges for verify - if first fails, try second
+            # This handles cases where bulk quotes failed for both but one exchange might work
+            verify = None
+            actual_exch = best_exch
+
+            for exch in ([best_exch, "ICP" if best_exch == "Kong" else "Kong"]):
+                if exch == "Kong":
+                    test_verify = get_kong_quote(sell_symbol, buy_symbol, reduced_trade_size)
                 else:
-                    verify = Quote(reduced_trade_size, 0, 10000, False, "no_pool")
-            # Check if reduced quote is valid (amount > 0 and slippage acceptable)
-            if verify.amount_out > 0 and verify.slippage_bp <= MAX_SLIPPAGE_BP:
-                # Include which exchange REDUCED used
-                reduced_route = f"REDUCED_{best_exch[0]}"  # REDUCED_K or REDUCED_I
-                return (verify.amount_out, verify.slippage_bp, reduced_route, (0, 0), buy_symbol)
+                    if pool_key in ICPSWAP_POOLS:
+                        pool_id, zero_for_one = ICPSWAP_POOLS[pool_key]
+                        sqrt_price = get_pool_metadata(pool_id)
+                        test_verify = get_icpswap_quote(pool_id, reduced_trade_size, zero_for_one, sqrt_price)
+                    else:
+                        test_verify = Quote(reduced_trade_size, 0, 10000, False, "no_pool")
+
+                # Check if this verify is valid
+                if test_verify.amount_out > 0 and test_verify.slippage_bp <= MAX_SLIPPAGE_BP:
+                    verify = test_verify
+                    actual_exch = exch
+                    break
+
+            # Return if we found a valid verify quote
+            if verify is not None:
+                reduced_route = f"REDUCED_{actual_exch[0]}"  # REDUCED_K or REDUCED_I
+                # Calculate actual percentage traded: (max_icp / trade_value_icp_amount) * 10000
+                reduced_pct_bp = (max_icp * 10000) // max(1, trade_value_icp_amount)
+                split = (reduced_pct_bp, 0) if actual_exch == "Kong" else (0, reduced_pct_bp)
+                return (verify.amount_out, verify.slippage_bp, reduced_route, split, buy_symbol)
 
         # Try ONE-LEG ICP fallback (sell -> ICP only)
         # Matches treasury.mo: creates ICP overweight that corrects in next cycle
@@ -1740,7 +1858,8 @@ def run_full_trading_cycle_with_real_quotes(num_cycles: int = 5, use_production_
                     'cycle': cycle + 1, 'attempt': attempt + 1,
                     'sell': sell_symbol, 'buy': buy_symbol, 'intended_buy': buy_symbol,
                     'amount_sold': trade_size, 'amount_bought': 0,
-                    'trade_value_icp': trade_value_icp // 100_000_000,  # In ICP units
+                    'intended_icp': trade_value_icp // 100_000_000,  # Intended ICP value
+                    'actual_icp': 0,  # Failed trade - no actual ICP traded
                     'is_exact': use_exact, 'slippage_bp': 10000,
                     'sell_diff_bp': sell_diff, 'buy_diff_bp': buy_diff,
                     'route': f"FAIL_{route_type}", 'split_pct': (0, 0),
@@ -1763,7 +1882,8 @@ def run_full_trading_cycle_with_real_quotes(num_cycles: int = 5, use_production_
                     'cycle': cycle + 1, 'attempt': attempt + 1,
                     'sell': sell_symbol, 'buy': buy_symbol, 'intended_buy': buy_symbol,
                     'amount_sold': trade_size, 'amount_bought': 0,
-                    'trade_value_icp': trade_value_icp // 100_000_000,  # In ICP units
+                    'intended_icp': trade_value_icp // 100_000_000,  # Intended ICP value
+                    'actual_icp': 0,  # Failed trade - no actual ICP traded
                     'is_exact': use_exact, 'slippage_bp': slippage_bp,
                     'sell_diff_bp': sell_diff, 'buy_diff_bp': buy_diff,
                     'route': "FAIL_HIGH_SLIPPAGE", 'split_pct': (0, 0),
@@ -1803,6 +1923,22 @@ def run_full_trading_cycle_with_real_quotes(num_cycles: int = 5, use_production_
                 cur_bp = (val * 10000) // portfolio.total_value_icp if portfolio.total_value_icp > 0 else 0
                 imbalance_before += abs(det.target_allocation_bp - cur_bp)
 
+            # Calculate actual ICP traded based on route type
+            intended_icp = trade_value_icp // 100_000_000
+            if "PARTIAL" in route_type:
+                # For PARTIAL routes (including ICP_FB_PARTIAL), actual = intended * total_pct / 10000
+                kong_pct, icp_pct = split_pct
+                total_pct = kong_pct + icp_pct
+                actual_icp = (intended_icp * total_pct) // 10000
+            elif "REDUCED" in route_type or route_type == "ICP_FB:R":
+                # For REDUCED routes (REDUCED_K, REDUCED_I, ICP_FB:R), split_pct contains the reduced percentage
+                kong_pct, icp_pct = split_pct
+                reduced_pct = kong_pct if kong_pct > 0 else icp_pct
+                actual_icp = (intended_icp * reduced_pct) // 10000
+            else:
+                # For normal trades (KONG_100, ICP_100, SPLIT, ICP_FB:K, ICP_FB:I, ICP_FB_SPLIT), actual = intended
+                actual_icp = intended_icp
+
             trade_record = {
                 'cycle': cycle + 1,
                 'attempt': attempt + 1,
@@ -1811,7 +1947,8 @@ def run_full_trading_cycle_with_real_quotes(num_cycles: int = 5, use_production_
                 'intended_buy': buy_symbol,  # Original intended buy for reference
                 'amount_sold': final_size,
                 'amount_bought': amount_out,
-                'trade_value_icp': trade_value_icp // 100_000_000,  # In ICP units
+                'intended_icp': intended_icp,  # Intended ICP value
+                'actual_icp': actual_icp,  # Actual ICP traded (less for PARTIAL/REDUCED)
                 'is_exact': is_exact,
                 'slippage_bp': slippage_bp,
                 'sell_diff_bp': sell_diff,
@@ -2091,16 +2228,14 @@ def run_full_trading_cycle_with_real_quotes(num_cycles: int = 5, use_production_
 
         # Convert split_pct tuple to readable string (e.g., (6000, 4000) -> "60/40")
         for t in trades:
-            if 'split_pct' in t and t['split_pct'] != (0, 0):
+            if 'split_pct' in t and isinstance(t['split_pct'], tuple):
                 kong_bp, icp_bp = t['split_pct']
                 t['split_pct'] = f"{kong_bp // 100}/{icp_bp // 100}"
-            else:
-                t['split_pct'] = ""
 
         with open(csv_filename, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
                 'cycle', 'attempt', 'sell', 'buy', 'intended_buy',
-                'amount_sold', 'amount_bought', 'trade_value_icp', 'is_exact',
+                'amount_sold', 'amount_bought', 'intended_icp', 'actual_icp', 'is_exact',
                 'slippage_bp', 'sell_diff_bp', 'buy_diff_bp',
                 'route', 'split_pct', 'fail_reason',
                 'imbalance_before', 'imbalance_after', 'imbalance_change'
@@ -2116,7 +2251,7 @@ def run_full_trading_cycle_with_real_quotes(num_cycles: int = 5, use_production_
 # Test Function
 # ============================================
 
-def estimate_max_tradeable_icp(kong_quotes: List[Quote], icp_quotes: List[Quote], amount_icp: int, icp_involved: bool = False) -> Tuple[int, str]:
+def estimate_max_tradeable_icp(kong_quotes: List[Quote], icp_quotes: List[Quote], amount_icp: int, icp_involved: bool = False, num_quotes: int = 5) -> Tuple[int, str]:
     """
     Estimate max tradeable ICP at 70% of max slippage using existing smallest quote.
     Returns (estimated_icp, best_exchange) or (0, "") if can't estimate.
@@ -2124,6 +2259,9 @@ def estimate_max_tradeable_icp(kong_quotes: List[Quote], icp_quotes: List[Quote]
 
     If icp_involved=True (sell or buy is ICP), skip minimum trade check.
     Matches treasury.mo: ICP trades are always valuable regardless of size.
+
+    num_quotes: number of quote points (default 5). The smallest quote is at (100/num_quotes)%.
+    For 5 quotes: smallest is 20% (divide by 5). For 10 quotes: smallest is 10% (divide by 10).
     """
     # Get the smallest quote (index 0) slippage from whichever exchange has lower slippage
     kong_20_slip = kong_quotes[0].slippage_bp if kong_quotes[0].amount_out > 0 else 99999
@@ -2137,23 +2275,41 @@ def estimate_max_tradeable_icp(kong_quotes: List[Quote], icp_quotes: List[Quote]
         min_slip = icp_20_slip
         best_exchange = "ICP"
 
-    if min_slip >= 99999 or min_slip == 0:
-        return (0, "")  # No valid quotes or zero slippage (shouldn't happen)
+    if min_slip >= 99999:
+        # No valid quotes at all from either exchange
+        # Still try 1 ICP - the verify step will make a fresh API call
+        # and might succeed even if the bulk quotes failed
+        if amount_icp > 0:
+            # Prefer Kong as it has better routing, fallback to ICPSwap
+            return (1, "Kong")
+        return (0, "")
 
-    # The smallest quote is for amount_icp / num_quotes (e.g., 20% for 5 quotes)
-    # Using integer math: amount_at_smallest = amount_icp // num_quotes (but we don't have num_quotes here)
-    # For now, assume smallest quote is ~20% of amount (conservative)
-    amount_at_smallest = amount_icp // 5
+    if min_slip == 0:
+        return (0, "")  # Zero slippage shouldn't happen
 
     # Slippage scales roughly linearly with amount
     # target_slip = maxSlippageBP * 7 / 10 (70% of max for safety margin)
     # Using Nat-safe integer math
     target_slip_bp = (MAX_SLIPPAGE_BP * 7) // 10
 
-    # max_amount = amount_at_smallest * target_slip_bp / min_slip
-    # Using Nat-safe integer math to avoid float division
+    # The smallest quote is for amount_icp / num_quotes (e.g., 10% for 10 quotes, 20% for 5 quotes)
+    # max_amount = (amount_icp / num_quotes) * target_slip_bp / min_slip
+    #
+    # IMPORTANT: Multiply before dividing to avoid integer precision loss!
+    # Old buggy code: max_icp = (amount_icp // num_quotes * target_slip_bp) // min_slip
+    # For 15 ICP with 500bp slippage: (15 // 5 * 70) // 500 = (3 * 70) // 500 = 0
+    # Fixed: Do all multiplication first, then single division
+    # max_icp = (amount_icp * target_slip_bp) // (min_slip * num_quotes)
+    #
+    # For very small trades with high slippage, ensure at least 1 ICP if any trade is possible
     if min_slip > 0:
-        max_icp = (amount_at_smallest * target_slip_bp) // min_slip
+        max_icp = (amount_icp * target_slip_bp) // (min_slip * num_quotes)
+        # If calculation gives 0 but we have some input, try at least 1 ICP
+        # This allows tiny trades through fallback instead of failing outright
+        # NOTE: Don't check min_slip <= MAX_SLIPPAGE_BP here - let the verify step filter bad quotes
+        # Even high-slippage pairs might work with 1 ICP trade
+        if max_icp == 0 and amount_icp > 0:
+            max_icp = 1
     else:
         max_icp = 0
 
@@ -2297,21 +2453,32 @@ def test_pair(sell_symbol: str, buy_symbol: str, amount_icp: int) -> TestResult:
         if max_icp > 0 and (icp_involved or max_icp >= MIN_TRADE_ICP):
             # Verify with actual quote at reduced amount
             reduced_base = int(base_amount * max_icp / amount_icp)
-            if best_exch == "Kong":
-                verify_quote = get_kong_quote(sell_symbol, buy_symbol, reduced_base)
-            else:
-                pool_key = (sell_symbol, buy_symbol)
-                if pool_key in ICPSWAP_POOLS:
-                    pool_id, zfo = ICPSWAP_POOLS[pool_key]
-                    sqrt_price = get_pool_metadata(pool_id)
-                    verify_quote = get_icpswap_quote(pool_id, reduced_base, zfo, sqrt_price)
-                else:
-                    verify_quote = Quote(reduced_base, 0, 10000, False, "no_pool")
+            pool_key = (sell_symbol, buy_symbol)
 
-            if verify_quote.valid:
+            # Try both exchanges for verify - if first fails, try second
+            verify_quote = None
+            actual_exch = best_exch
+
+            for exch in ([best_exch, "ICP" if best_exch == "Kong" else "Kong"]):
+                if exch == "Kong":
+                    test_verify = get_kong_quote(sell_symbol, buy_symbol, reduced_base)
+                else:
+                    if pool_key in ICPSWAP_POOLS:
+                        pool_id, zfo = ICPSWAP_POOLS[pool_key]
+                        sqrt_price = get_pool_metadata(pool_id)
+                        test_verify = get_icpswap_quote(pool_id, reduced_base, zfo, sqrt_price)
+                    else:
+                        test_verify = Quote(reduced_base, 0, 10000, False, "no_pool")
+
+                if test_verify.valid:
+                    verify_quote = test_verify
+                    actual_exch = exch
+                    break
+
+            if verify_quote is not None:
                 return TestResult(
                     f"{sell_symbol}/{buy_symbol}", amount_icp, 'REDUCED',
-                    details=f"Direct {best_exch}: verified ~{max_icp:.1f} ICP @ {verify_quote.slippage_bp}bp",
+                    details=f"Direct {actual_exch}: verified ~{max_icp:.1f} ICP @ {verify_quote.slippage_bp}bp",
                     max_tradeable_icp=max_icp,
                     algorithm_output=verify_quote.amount_out
                 )

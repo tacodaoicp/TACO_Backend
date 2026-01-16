@@ -158,6 +158,7 @@ shared (deployer) persistent actor class treasury() = this {
   type TransferResultICRC1 = TreasuryTypes.TransferResultICRC1;
   type TransferResultICP = TreasuryTypes.TransferResultICP;
   type TokenDetails = TreasuryTypes.TokenDetails;
+  type TokenDetailsWithoutPastPrices = DAO_types.TokenDetailsWithoutPastPrices;
   type Allocation = DAO_types.Allocation;
   type SyncError = DAO_types.SyncError;
   type SyncErrorTreasury = TreasuryTypes.SyncErrorTreasury;
@@ -198,6 +199,11 @@ shared (deployer) persistent actor class treasury() = this {
       kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
     };
+    #Partial : {
+      kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+      icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+      totalPercentBP : Nat;  // Sum of percentages (e.g., 6000 = 60%)
+    };
   };
 
   // Quote data from exchange (used for reduced amount estimation)
@@ -234,6 +240,7 @@ shared (deployer) persistent actor class treasury() = this {
   // Actor references
   transient let dao = actor (DAOText) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
+    getTokenDetailsWithoutPastPrices : shared () -> async [TokenDetailsWithoutPastPrices];
     getAggregateAllocation : shared () -> async [(Principal, Nat)];
     syncTokenDetailsFromTreasury : shared ([(Principal, TokenDetails)]) -> async Result.Result<Text, SyncError>;
     hasAdminPermission : query (principal : Principal, function : SpamProtection.AdminFunction) -> async Bool;
@@ -4015,9 +4022,21 @@ shared (deployer) persistent actor class treasury() = this {
                           case (null) { Debug.print("Error: Buy token not found in details"); return; };
                         };
 
-                        // Calculate prices based on trade
+                        // Check if execution matches quote (5% tolerance) before updating price
+                        let deviationFromQuote : Float = if (adjustedExpectedOut > 0) {
+                          Float.abs(Float.fromInt(record.amountBought) - Float.fromInt(adjustedExpectedOut)) / Float.fromInt(adjustedExpectedOut)
+                        } else { 1.0 };
+                        let shouldUpdatePrice = isFiniteFloat(deviationFromQuote) and deviationFromQuote <= 0.05;
+
+                        if (not shouldUpdatePrice) {
+                          logger.warn("PRICE_SKIP",
+                            "Execution deviated " # Float.toText(deviationFromQuote * 100.0) # "% from quote - skipping price update",
+                            "do_executeTradingStep");
+                        };
+
+                        // Calculate prices based on trade - only if deviation is acceptable
                         // Guard: Only update price if we have valid amounts to avoid division by zero / Inf
-                        if (sellToken == ICPprincipal or buyToken == ICPprincipal) {
+                        if (shouldUpdatePrice and (sellToken == ICPprincipal or buyToken == ICPprincipal)) {
                           if (sellToken == ICPprincipal) {
                             let actualTokens = Float.fromInt(record.amountBought) / Float.fromInt(10 ** token1Details.tokenDecimals);
                             let actualICP = Float.fromInt(record.amountSold) / Float.fromInt(100000000);
@@ -4045,7 +4064,7 @@ shared (deployer) persistent actor class treasury() = this {
                               };
                             };
                           };
-                        } else {
+                        } else if (shouldUpdatePrice) {
                           let maintainFirst = fuzz.nat.randomRange(0, 1) == 0;
                           if (maintainFirst) {
                             let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** token0Details.tokenDecimals);
@@ -4257,6 +4276,149 @@ shared (deployer) persistent actor class treasury() = this {
                       await* logPortfolioState("Post-trade completed (split)");
                     };
                   };
+
+                  case (#Partial(partial)) {
+                    // PARTIAL SPLIT EXECUTION - same as Split but trades less than 100%
+                    logger.info("TRADE_PARTIAL",
+                      "Executing partial split - Kong=" # Nat.toText(partial.kongswap.percentBP / 100) # "%" #
+                      " (" # Nat.toText(partial.kongswap.amount) # " tokens)" #
+                      " ICP=" # Nat.toText(partial.icpswap.percentBP / 100) # "%" #
+                      " (" # Nat.toText(partial.icpswap.amount) # " tokens)" #
+                      " Total=" # Nat.toText(partial.totalPercentBP / 100) # "%",
+                      "do_executeTradingStep"
+                    );
+
+                    let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                    // Apply slippage adjustment to BOTH legs (same as Split)
+                    // KongSwap leg
+                    let kongFinalAmount : Nat = if (isExactTargeting and partial.kongswap.slippageBP > 0) {
+                      let denominator = 10000 + partial.kongswap.slippageBP;
+                      (partial.kongswap.amount * 10000) / denominator
+                    } else { partial.kongswap.amount };
+
+                    let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < partial.kongswap.amount and partial.kongswap.amount > 0) {
+                      (partial.kongswap.expectedOut * kongFinalAmount) / partial.kongswap.amount
+                    } else { partial.kongswap.expectedOut };
+
+                    let kongIdealOut : Nat = if (partial.kongswap.slippageBP < 9900) {
+                      (kongAdjustedExpectedOut * 10000) / (10000 - partial.kongswap.slippageBP)
+                    } else { kongAdjustedExpectedOut };
+
+                    let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                    let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                    // ICPSwap leg
+                    let icpFinalAmount : Nat = if (isExactTargeting and partial.icpswap.slippageBP > 0) {
+                      let denominator = 10000 + partial.icpswap.slippageBP;
+                      (partial.icpswap.amount * 10000) / denominator
+                    } else { partial.icpswap.amount };
+
+                    let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < partial.icpswap.amount and partial.icpswap.amount > 0) {
+                      (partial.icpswap.expectedOut * icpFinalAmount) / partial.icpswap.amount
+                    } else { partial.icpswap.expectedOut };
+
+                    let icpIdealOut : Nat = if (partial.icpswap.slippageBP < 9900) {
+                      (icpAdjustedExpectedOut * 10000) / (10000 - partial.icpswap.slippageBP)
+                    } else { icpAdjustedExpectedOut };
+
+                    let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                    let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                    // Execute both trades IN PARALLEL
+                    let splitResult = await* executeSplitTrade(
+                      sellToken, buyToken,
+                      kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                      icpFinalAmount, icpMinAmountOut, icpIdealOut
+                    );
+
+                    // Handle pendingTx
+                    switch (splitResult.pendingTx) {
+                      case (?pendingRecord) {
+                        Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
+                        logger.warn("TRADE_PARTIAL", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
+                      };
+                      case null {};
+                    };
+
+                    // Track results
+                    var kongSuccess = false;
+                    var icpSuccess = false;
+                    let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                    // Handle KongSwap result
+                    switch (splitResult.kongResult) {
+                      case (#ok(record)) {
+                        Vector.add(lastTrades, record);
+                        kongSuccess := true;
+                        logger.info("TRADE_PARTIAL", "KongSwap leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                      };
+                      case (#err(e)) {
+                        let failedRecord : TradeRecord = {
+                          tokenSold = sellToken; tokenBought = buyToken;
+                          amountSold = kongFinalAmount; amountBought = 0;
+                          exchange = #KongSwap; timestamp = now();
+                          success = false; error = ?e; slippage = 0.0;
+                        };
+                        Vector.add(lastTrades, failedRecord);
+                        logger.error("TRADE_PARTIAL", "KongSwap leg failed: " # e, "do_executeTradingStep");
+                      };
+                    };
+
+                    // Handle ICPSwap result
+                    switch (splitResult.icpResult) {
+                      case (#ok(record)) {
+                        Vector.add(lastTrades, record);
+                        icpSuccess := true;
+                        logger.info("TRADE_PARTIAL", "ICPSwap leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                      };
+                      case (#err(e)) {
+                        let failedRecord : TradeRecord = {
+                          tokenSold = sellToken; tokenBought = buyToken;
+                          amountSold = icpFinalAmount; amountBought = 0;
+                          exchange = #ICPSwap; timestamp = now();
+                          success = false; error = ?e; slippage = 0.0;
+                        };
+                        Vector.add(lastTrades, failedRecord);
+                        logger.error("TRADE_PARTIAL", "ICPSwap leg failed: " # e, "do_executeTradingStep");
+                      };
+                    };
+
+                    // Trim trade history if needed
+                    if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                      Vector.reverse(lastTrades);
+                      while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                        ignore Vector.removeLast(lastTrades);
+                      };
+                      Vector.reverse(lastTrades);
+                    };
+
+                    // Update metrics - count as partial trades
+                    let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                    let failCount : Nat = 2 - successCount;
+
+                    rebalanceState := {
+                      rebalanceState with
+                      metrics = {
+                        rebalanceState.metrics with
+                        totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                        totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                      };
+                      lastTrades = lastTrades;
+                    };
+
+                    // At least one leg succeeded = overall success
+                    if (kongSuccess or icpSuccess) {
+                      success := true;
+                      Debug.print("Partial trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                      await updateBalances();
+                      await takePortfolioSnapshot(#PostTrade);
+                      checkPortfolioCircuitBreakerConditions();
+                      await* logPortfolioState("Post-partial-split completed");
+                    } else {
+                      await* recoverFromFailure();
+                    };
+                  };
                 };
               };
               case (#err(e)) {
@@ -4294,9 +4456,11 @@ shared (deployer) persistent actor class treasury() = this {
                         let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, reducedBuySymbol, reduced.amount) } catch (err) { #err("Kong exception: " # Error.message(err)) };
                         switch (kongResult) {
                           case (#ok(q)) {
-                            slippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                            let slipFloat = q.slippage * 100.0;
+                            slippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
                             expectedOut := q.receive_amount;
-                            idealOut := Int.abs(Float.toInt(Float.fromInt(reduced.amount) * q.mid_price));
+                            let idealFloat = Float.fromInt(reduced.amount) * q.mid_price;
+                            idealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
                             quoteSuccess := true;
                           };
                           case (#err(quoteErr)) { logger.warn("REDUCED_TRADE", "Kong quote failed: " # quoteErr, "do_executeTradingStep") };
@@ -4311,11 +4475,13 @@ shared (deployer) persistent actor class treasury() = this {
                             switch (icpResult) {
                               case (#ok(q)) {
                                 // ICPSwap returns slippage as Float percentage, convert to basis points
-                                slippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                                let slipFloat = q.slippage * 100.0;
+                                slippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
                                 expectedOut := q.amountOut;
                                 // Calculate ideal (spot) amount: amountOut / (1 - slippage/100)
                                 let slipFactor = if (q.slippage >= 100.0) { 0.01 } else { 1.0 - (q.slippage / 100.0) };
-                                idealOut := Int.abs(Float.toInt(Float.fromInt(q.amountOut) / slipFactor));
+                                let idealFloat = Float.fromInt(q.amountOut) / slipFactor;
+                                idealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
                                 quoteSuccess := true;
                               };
                               case (#err(quoteErr)) { logger.warn("REDUCED_TRADE", "ICPSwap quote failed: " # quoteErr, "do_executeTradingStep") };
@@ -4493,17 +4659,31 @@ shared (deployer) persistent actor class treasury() = this {
                               return;
                             };
                           };
-                          
-                          // Calculate new ICP price from the trade
-                          let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** sellTokenDetails.tokenDecimals);
-                          let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
-                          // Guard against division by zero (actualICP = 0 would produce Inf)
-                          if (actualICP > 0.0) {
-                            let priceRatio = (actualTokensSold / actualICP) * Float.fromInt(sellTokenDetails.priceInICP);
-                            if (isFiniteFloat(priceRatio)) {
-                              let newICPPrice = Int.abs(Float.toInt(priceRatio));
-                              let newICPPriceUSD = sellTokenDetails.priceInUSD * actualTokensSold / actualICP;
-                              updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+
+                          // Check if execution matches quote (5% tolerance) before updating price
+                          let deviationFromQuote : Float = if (icpExecution.expectedOut > 0) {
+                            Float.abs(Float.fromInt(record.amountBought) - Float.fromInt(icpExecution.expectedOut)) / Float.fromInt(icpExecution.expectedOut)
+                          } else { 1.0 };
+                          let shouldUpdatePrice = isFiniteFloat(deviationFromQuote) and deviationFromQuote <= 0.05;
+
+                          if (not shouldUpdatePrice) {
+                            logger.warn("PRICE_SKIP",
+                              "ICP fallback execution deviated " # Float.toText(deviationFromQuote * 100.0) # "% from quote - skipping price update",
+                              "do_executeTradingStep");
+                          };
+
+                          // Calculate new ICP price from the trade - only if deviation is acceptable
+                          if (shouldUpdatePrice) {
+                            let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** sellTokenDetails.tokenDecimals);
+                            let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
+                            // Guard against division by zero (actualICP = 0 would produce Inf)
+                            if (actualICP > 0.0) {
+                              let priceRatio = (actualTokensSold / actualICP) * Float.fromInt(sellTokenDetails.priceInICP);
+                              if (isFiniteFloat(priceRatio)) {
+                                let newICPPrice = Int.abs(Float.toInt(priceRatio));
+                                let newICPPriceUSD = sellTokenDetails.priceInUSD * actualTokensSold / actualICP;
+                                updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+                              };
                             };
                           };
 
@@ -4725,6 +4905,151 @@ shared (deployer) persistent actor class treasury() = this {
                         await* recoverFromFailure();
                       };
                     };
+
+                    case (#ok(#Partial(partial))) {
+                      // PARTIAL ICP FALLBACK EXECUTION
+                      Debug.print("ICP fallback partial route found, executing both legs");
+                      logger.info("ICP_FALLBACK_PARTIAL",
+                        "Executing partial ICP fallback - Kong=" # Nat.toText(partial.kongswap.percentBP / 100) # "%" #
+                        " ICP=" # Nat.toText(partial.icpswap.percentBP / 100) # "%" #
+                        " Total=" # Nat.toText(partial.totalPercentBP / 100) # "%",
+                        "do_executeTradingStep"
+                      );
+
+                      let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                      // Slippage adjustment for both legs (same pattern as direct partial)
+                      let kongFinalAmount : Nat = if (isExactTargeting and partial.kongswap.slippageBP > 0) {
+                        let denominator = 10000 + partial.kongswap.slippageBP;
+                        (partial.kongswap.amount * 10000) / denominator
+                      } else { partial.kongswap.amount };
+
+                      let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < partial.kongswap.amount and partial.kongswap.amount > 0) {
+                        (partial.kongswap.expectedOut * kongFinalAmount) / partial.kongswap.amount
+                      } else { partial.kongswap.expectedOut };
+
+                      let kongIdealOut : Nat = if (partial.kongswap.slippageBP < 9900) {
+                        (kongAdjustedExpectedOut * 10000) / (10000 - partial.kongswap.slippageBP)
+                      } else { kongAdjustedExpectedOut };
+
+                      let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                      let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                      let icpFinalAmount : Nat = if (isExactTargeting and partial.icpswap.slippageBP > 0) {
+                        let denominator = 10000 + partial.icpswap.slippageBP;
+                        (partial.icpswap.amount * 10000) / denominator
+                      } else { partial.icpswap.amount };
+
+                      let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < partial.icpswap.amount and partial.icpswap.amount > 0) {
+                        (partial.icpswap.expectedOut * icpFinalAmount) / partial.icpswap.amount
+                      } else { partial.icpswap.expectedOut };
+
+                      let icpIdealOut : Nat = if (partial.icpswap.slippageBP < 9900) {
+                        (icpAdjustedExpectedOut * 10000) / (10000 - partial.icpswap.slippageBP)
+                      } else { icpAdjustedExpectedOut };
+
+                      let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                      let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                      // Execute both trades IN PARALLEL (to ICP)
+                      let splitResult = await* executeSplitTrade(
+                        sellToken, ICPprincipal,
+                        kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                        icpFinalAmount, icpMinAmountOut, icpIdealOut
+                      );
+
+                      // Handle pendingTx
+                      switch (splitResult.pendingTx) {
+                        case (?pendingRecord) {
+                          Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
+                          logger.warn("ICP_FALLBACK_PARTIAL", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
+                        };
+                        case null {};
+                      };
+
+                      // Track results
+                      var kongSuccess = false;
+                      var icpSuccess = false;
+                      let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                      switch (splitResult.kongResult) {
+                        case (#ok(record)) {
+                          let fallbackRecord : TradeRecord = {
+                            record with
+                            error = ?("ICP_FALLBACK_PARTIAL: Original target was " # buySymbol # ", traded for ICP (KongSwap leg)");
+                          };
+                          Vector.add(lastTrades, fallbackRecord);
+                          kongSuccess := true;
+                          logger.info("ICP_FALLBACK_PARTIAL", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                        };
+                        case (#err(errKong)) {
+                          let failedRecord : TradeRecord = {
+                            tokenSold = sellToken; tokenBought = ICPprincipal;
+                            amountSold = kongFinalAmount; amountBought = 0;
+                            exchange = #KongSwap; timestamp = now();
+                            success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errKong); slippage = 0.0;
+                          };
+                          Vector.add(lastTrades, failedRecord);
+                          logger.error("ICP_FALLBACK_PARTIAL", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                        };
+                      };
+
+                      switch (splitResult.icpResult) {
+                        case (#ok(record)) {
+                          let fallbackRecord : TradeRecord = {
+                            record with
+                            error = ?("ICP_FALLBACK_PARTIAL: Original target was " # buySymbol # ", traded for ICP (ICPSwap leg)");
+                          };
+                          Vector.add(lastTrades, fallbackRecord);
+                          icpSuccess := true;
+                          logger.info("ICP_FALLBACK_PARTIAL", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                        };
+                        case (#err(errIcp)) {
+                          let failedRecord : TradeRecord = {
+                            tokenSold = sellToken; tokenBought = ICPprincipal;
+                            amountSold = icpFinalAmount; amountBought = 0;
+                            exchange = #ICPSwap; timestamp = now();
+                            success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errIcp); slippage = 0.0;
+                          };
+                          Vector.add(lastTrades, failedRecord);
+                          logger.error("ICP_FALLBACK_PARTIAL", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                        };
+                      };
+
+                      // Update metrics
+                      let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                      let failCount : Nat = 2 - successCount;
+                      rebalanceState := {
+                        rebalanceState with
+                        metrics = {
+                          rebalanceState.metrics with
+                          totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                          totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                        };
+                        lastTrades = lastTrades;
+                      };
+
+                      // At least one leg succeeded
+                      if (kongSuccess or icpSuccess) {
+                        success := true;
+                        Debug.print("ICP fallback partial trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                        await updateBalances();
+                        await takePortfolioSnapshot(#PostTrade);
+                        checkPortfolioCircuitBreakerConditions();
+                        await* logPortfolioState("Post-ICP-fallback-partial completed");
+                      } else {
+                        incrementSkipCounter(#noExecutionPath);
+                        rebalanceState := {
+                          rebalanceState with
+                          metrics = {
+                            rebalanceState.metrics with
+                            currentStatus = #Failed("ICP fallback partial: both legs failed");
+                          };
+                        };
+                        await* recoverFromFailure();
+                      };
+                    };
+
                     case (#err(icpRouteError)) {
                       Debug.print("ICP fallback route also not available: " # icpRouteError.reason);
 
@@ -4754,9 +5079,11 @@ shared (deployer) persistent actor class treasury() = this {
                               let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, "ICP", reduced.amount) } catch (err) { #err("Kong exception: " # Error.message(err)) };
                               switch (kongResult) {
                                 case (#ok(q)) {
-                                  icpSlippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                                  let slipFloat = q.slippage * 100.0;
+                                  icpSlippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
                                   icpExpectedOut := q.receive_amount;
-                                  icpIdealOut := Int.abs(Float.toInt(Float.fromInt(reduced.amount) * q.mid_price));
+                                  let idealFloat = Float.fromInt(reduced.amount) * q.mid_price;
+                                  icpIdealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
                                   icpQuoteSuccess := true;
                                 };
                                 case (#err(quoteErr)) { logger.warn("REDUCED_ICP_FALLBACK", "Kong quote failed: " # quoteErr, "do_executeTradingStep") };
@@ -4771,11 +5098,13 @@ shared (deployer) persistent actor class treasury() = this {
                                   switch (icpResult) {
                                     case (#ok(q)) {
                                       // ICPSwap returns slippage as Float percentage, convert to basis points
-                                      icpSlippageBP := Int.abs(Float.toInt(q.slippage * 100.0));
+                                      let slipFloat = q.slippage * 100.0;
+                                      icpSlippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
                                       icpExpectedOut := q.amountOut;
                                       // Calculate ideal (spot) amount: amountOut / (1 - slippage/100)
                                       let slipFactor = if (q.slippage >= 100.0) { 0.01 } else { 1.0 - (q.slippage / 100.0) };
-                                      icpIdealOut := Int.abs(Float.toInt(Float.fromInt(q.amountOut) / slipFactor));
+                                      let idealFloat = Float.fromInt(q.amountOut) / slipFactor;
+                                      icpIdealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
                                       icpQuoteSuccess := true;
                                     };
                                     case (#err(quoteErr)) { logger.warn("REDUCED_ICP_FALLBACK", "ICPSwap quote failed: " # quoteErr, "do_executeTradingStep") };
@@ -5654,56 +5983,81 @@ shared (deployer) persistent actor class treasury() = this {
       // Query calls are FREE and run in parallel
       // ========================================
 
-      // Calculate amounts for 20% increments (indices 0-4 = 20%, 40%, 60%, 80%, 100%)
+      // Calculate amounts for 10% increments (indices 0-9 = 10%, 20%, ..., 100%)
       let amounts : [Nat] = [
-        amountIn * 2 / 10,    // 20%
-        amountIn * 4 / 10,    // 40%
-        amountIn * 6 / 10,    // 60%
-        amountIn * 8 / 10,    // 80%
-        amountIn,             // 100%
+        amountIn * 1 / 10,    // 10%  - idx 0
+        amountIn * 2 / 10,    // 20%  - idx 1
+        amountIn * 3 / 10,    // 30%  - idx 2
+        amountIn * 4 / 10,    // 40%  - idx 3
+        amountIn * 5 / 10,    // 50%  - idx 4
+        amountIn * 6 / 10,    // 60%  - idx 5
+        amountIn * 7 / 10,    // 70%  - idx 6
+        amountIn * 8 / 10,    // 80%  - idx 7
+        amountIn * 9 / 10,    // 90%  - idx 8
+        amountIn,             // 100% - idx 9
       ];
 
-      // Start all 10 quote requests in parallel (no await yet)
-      // Kong quotes for 5 percentages
+      // Start all 20 quote requests in parallel (no await yet)
+      // Kong quotes for 10 percentages
       let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[0]);
       let kongFuture1 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[1]);
       let kongFuture2 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[2]);
       let kongFuture3 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[3]);
       let kongFuture4 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[4]);
+      let kongFuture5 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[5]);
+      let kongFuture6 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[6]);
+      let kongFuture7 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[7]);
+      let kongFuture8 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[8]);
+      let kongFuture9 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[9]);
 
-      // ICP quotes for 5 percentages (or error if no pool)
-      let (icpFuture0, icpFuture1, icpFuture2, icpFuture3, icpFuture4) = switch (icpPoolData) {
+      // ICP quotes for 10 percentages (or error if no pool)
+      let (icpFuture0, icpFuture1, icpFuture2, icpFuture3, icpFuture4, icpFuture5, icpFuture6, icpFuture7, icpFuture8, icpFuture9) = switch (icpPoolData) {
         case (?poolData) {
           (
             ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[0]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
             ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[1]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
             ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[2]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
             ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[3]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[4]; amountOutMinimum = 0; zeroForOne = zeroForOne })
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[4]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[5]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[6]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[7]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[8]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[9]; amountOutMinimum = 0; zeroForOne = zeroForOne })
           )
         };
         case null {
           // No ICPSwap pool - will use error handling when awaiting
           let errFuture = ICPSwap.getQuote({ poolId = Principal.fromText("aaaaa-aa"); amountIn = 0; amountOutMinimum = 0; zeroForOne = true });
-          (errFuture, errFuture, errFuture, errFuture, errFuture)
+          (errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture)
         };
       };
 
-      // Await all 10 quotes (must await each individually in Motoko)
+      // Await all 20 quotes (must await each individually in Motoko)
       let kongResult0 = try { await kongFuture0 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult1 = try { await kongFuture1 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult2 = try { await kongFuture2 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult3 = try { await kongFuture3 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult4 = try { await kongFuture4 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult5 = try { await kongFuture5 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult6 = try { await kongFuture6 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult7 = try { await kongFuture7 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult8 = try { await kongFuture8 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
+      let kongResult9 = try { await kongFuture9 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
 
       let icpResult0 = try { await icpFuture0 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
       let icpResult1 = try { await icpFuture1 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
       let icpResult2 = try { await icpFuture2 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
       let icpResult3 = try { await icpFuture3 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
       let icpResult4 = try { await icpFuture4 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult5 = try { await icpFuture5 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult6 = try { await icpFuture6 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult7 = try { await icpFuture7 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult8 = try { await icpFuture8 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
+      let icpResult9 = try { await icpFuture9 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
 
-      let kongResults = [kongResult0, kongResult1, kongResult2, kongResult3, kongResult4];
-      let icpResults = [icpResult0, icpResult1, icpResult2, icpResult3, icpResult4];
+      let kongResults = [kongResult0, kongResult1, kongResult2, kongResult3, kongResult4, kongResult5, kongResult6, kongResult7, kongResult8, kongResult9];
+      let icpResults = [icpResult0, icpResult1, icpResult2, icpResult3, icpResult4, icpResult5, icpResult6, icpResult7, icpResult8, icpResult9];
 
       // ========================================
       // PROCESS QUOTE RESULTS
@@ -5733,7 +6087,8 @@ shared (deployer) persistent actor class treasury() = this {
       func extractKong(result : Result.Result<swaptypes.SwapAmountsReply, Text>, amountIn : Nat) : QuoteData {
         switch (result) {
           case (#ok(r)) {
-            let slipBP = Int.abs(Float.toInt(r.slippage * 100.0));
+            let slipFloat = r.slippage * 100.0;
+            let slipBP = if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
             // Dust output validation: reject if output < 1% of expected
             let isDust = isDustOutput(amountIn, r.receive_amount);
             let valid = r.slippage <= maxSlippagePct and r.receive_amount > 0 and not isDust;
@@ -5747,7 +6102,8 @@ shared (deployer) persistent actor class treasury() = this {
       func extractIcp(result : Result.Result<swaptypes.ICPSwapQuoteResult, Text>, amountIn : Nat) : QuoteData {
         switch (result) {
           case (#ok(r)) {
-            let slipBP = Int.abs(Float.toInt(r.slippage * 100.0));
+            let slipFloat = r.slippage * 100.0;
+            let slipBP = if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
             // Dust output validation: reject if output < 1% of expected
             let isDust = isDustOutput(amountIn, r.amountOut);
             let valid = r.slippage <= maxSlippagePct and r.amountOut > 0 and not isDust;
@@ -5757,34 +6113,40 @@ shared (deployer) persistent actor class treasury() = this {
         }
       };
 
-      // Extract KongSwap quotes (indices 0-4 = 20%, 40%, 60%, 80%, 100%)
-      let kong = Array.tabulate<QuoteData>(5, func(i) : QuoteData {
+      // Extract KongSwap quotes (indices 0-9 = 10%, 20%, ..., 100%)
+      let kong = Array.tabulate<QuoteData>(10, func(i) : QuoteData {
         extractKong(kongResults[i], amounts[i])
       });
 
-      // Extract ICPSwap quotes (indices 0-4 = 20%, 40%, 60%, 80%, 100%)
-      let icp = Array.tabulate<QuoteData>(5, func(i) : QuoteData {
+      // Extract ICPSwap quotes (indices 0-9 = 10%, 20%, ..., 100%)
+      let icp = Array.tabulate<QuoteData>(10, func(i) : QuoteData {
         extractIcp(icpResults[i], amounts[i])
       });
 
       // Log quote results summary
       logger.info("EXCHANGE_COMPARISON",
-        "Quotes received - Kong_100%=" # Nat.toText(kong[4].out) # " (valid=" # debug_show(kong[4].valid) # ")" #
-        " ICP_100%=" # Nat.toText(icp[4].out) # " (valid=" # debug_show(icp[4].valid) # ")",
+        "Quotes received - Kong_100%=" # Nat.toText(kong[9].out) # " (valid=" # debug_show(kong[9].valid) # ")" #
+        " ICP_100%=" # Nat.toText(icp[9].out) # " (valid=" # debug_show(icp[9].valid) # ")",
         "findBestExecution"
       );
 
       // ========================================
-      // CALCULATE ALL 5 SCENARIOS
-      // 2 single + 3 splits (80/20, 60/40, 40/60, 20/80)
-      // Pick scenario with maximum total output
-      // Then interpolate between best and second-best using slippage
+      // CALCULATE ALL SCENARIOS
+      // Singles (100%), Full splits (sum to 100%), and Partials (sum < 100%)
+      // Full splits: pick scenario with maximum total output
+      // Partials: used only when no full scenarios - pick by minimum combined slippage
       // ========================================
+
+      // Constants for 10 quotes
+      let NUM_QUOTES : Nat = 10;
+      let STEP_BP : Nat = 1000;  // 10% per step
+      let MIN_PARTIAL_TOTAL_BP : Nat = 4000;  // 40% minimum for partials
 
       type Scenario = { name : Text; kongPct : Nat; icpPct : Nat; totalOut : Nat; kongSlipBP : Nat; icpSlipBP : Nat; kongIdx : Nat; icpIdx : Nat };
 
       var bestScenario : ?Scenario = null;
       var secondBestScenario : ?Scenario = null;
+      var partialScenarios = Vector.new<Scenario>();
 
       // Helper to update best/second-best
       func updateBest(scenario : Scenario) {
@@ -5804,55 +6166,77 @@ shared (deployer) persistent actor class treasury() = this {
         };
       };
 
-      // Scenario 1: Single KongSwap (100%)
-      if (kong[4].valid) {
+      // Scenario 1: Single KongSwap (100%) - index 9
+      if (kong[9].valid) {
         updateBest({
           name = "SINGLE_KONG";
           kongPct = 10000;
           icpPct = 0;
-          totalOut = kong[4].out;
-          kongSlipBP = kong[4].slipBP;
+          totalOut = kong[9].out;
+          kongSlipBP = kong[9].slipBP;
           icpSlipBP = 0;
-          kongIdx = 4;
-          icpIdx = 4;
+          kongIdx = 9;
+          icpIdx = 9;
         });
       };
 
-      // Scenario 2: Single ICPSwap (100%)
-      if (icp[4].valid) {
+      // Scenario 2: Single ICPSwap (100%) - index 9
+      if (icp[9].valid) {
         updateBest({
           name = "SINGLE_ICP";
           kongPct = 0;
           icpPct = 10000;
-          totalOut = icp[4].out;
+          totalOut = icp[9].out;
           kongSlipBP = 0;
-          icpSlipBP = icp[4].slipBP;
-          kongIdx = 4;
-          icpIdx = 4;
+          icpSlipBP = icp[9].slipBP;
+          kongIdx = 9;
+          icpIdx = 9;
         });
       };
 
-      // Scenarios 3-6: Splits (80/20, 60/40, 40/60, 20/80)
-      // kongIdx 3=80%, 2=60%, 1=40%, 0=20%
-      // icpIdx must complement to 100%: kongIdx + icpIdx indices that sum to 100%
-      // Kong 80% (idx 3) + ICP 20% (idx 0), Kong 60% (idx 2) + ICP 40% (idx 1), etc.
-      for (kongIdx in Array.vals([3, 2, 1, 0])) {
-        let icpIdx = 3 - kongIdx; // 3-3=0 (20%), 3-0=3 (80%)
-        if (kong[kongIdx].valid and icp[icpIdx].valid) {
-          let kongPct = (kongIdx + 1) * 2000; // idx 0 = 20% = 2000bp, idx 3 = 80% = 8000bp
-          let icpPct = 10000 - kongPct;
-          let totalOut = kong[kongIdx].out + icp[icpIdx].out;
+      // All combinations - 10x10 = 100 checks
+      // Full splits (totalPct == 10000) -> updateBest for max output selection
+      // Partials (totalPct < 10000) -> partialScenarios for min slippage selection
+      label outerLoop for (kongIdxIter in Iter.range(0, 9)) {
+        label innerLoop for (icpIdxIter in Iter.range(0, 9)) {
+          let kongPctCalc = (kongIdxIter + 1) * STEP_BP;  // 1000, 2000, ..., 10000
+          let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
+          let totalPctCalc = kongPctCalc + icpPctCalc;
 
-          updateBest({
-            name = "SPLIT_" # Nat.toText(kongPct / 100) # "_" # Nat.toText(icpPct / 100);
-            kongPct = kongPct;
-            icpPct = icpPct;
-            totalOut = totalOut;
-            kongSlipBP = kong[kongIdx].slipBP;
-            icpSlipBP = icp[icpIdx].slipBP;
-            kongIdx = kongIdx;
-            icpIdx = icpIdx;
-          });
+          // Skip if over 100%
+          if (totalPctCalc > 10000) {
+            continue innerLoop;
+          };
+
+          // Skip 100% singles (already handled above)
+          if (kongPctCalc == 10000 or icpPctCalc == 10000) {
+            continue innerLoop;
+          };
+
+          // Check both quotes valid
+          if (kong[kongIdxIter].valid and icp[icpIdxIter].valid) {
+            let totalOutCalc = kong[kongIdxIter].out + icp[icpIdxIter].out;
+
+            let scenario : Scenario = {
+              name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) #
+                     Nat.toText(kongPctCalc / 100) # "_" # Nat.toText(icpPctCalc / 100);
+              kongPct = kongPctCalc;
+              icpPct = icpPctCalc;
+              totalOut = totalOutCalc;
+              kongSlipBP = kong[kongIdxIter].slipBP;
+              icpSlipBP = icp[icpIdxIter].slipBP;
+              kongIdx = kongIdxIter;
+              icpIdx = icpIdxIter;
+            };
+
+            if (totalPctCalc == 10000) {
+              // Full split - goes to best/secondBest selection by MAX output
+              updateBest(scenario);
+            } else {
+              // Partial split - separate collection for MIN slippage selection
+              Vector.add(partialScenarios, scenario);
+            };
+          };
         };
       };
 
@@ -5863,65 +6247,301 @@ shared (deployer) persistent actor class treasury() = this {
 
       switch (bestScenario) {
         case (null) {
-          logger.warn("EXCHANGE_COMPARISON",
-            "No viable execution path - all quotes invalid or exceed slippage threshold",
+          // No full scenario (single or 100% split) found - TRY PARTIALS
+          logger.info("EXCHANGE_COMPARISON",
+            "No full execution path - checking " # Nat.toText(Vector.size(partialScenarios)) # " partial scenarios",
             "findBestExecution"
           );
-          #err({ reason = "No viable execution path found"; kongQuotes = kong; icpQuotes = icp })
+
+          // GUARD: No partials at all
+          if (Vector.size(partialScenarios) == 0) {
+            logger.warn("EXCHANGE_COMPARISON",
+              "No viable execution path - all quotes invalid or exceed slippage threshold",
+              "findBestExecution"
+            );
+            #err({ reason = "No viable execution path found"; kongQuotes = kong; icpQuotes = icp })
+          } else {
+            // Calculate trade value in ICP for filtering
+            let tradeValueICP : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+              case (?d) {
+                if (d.tokenDecimals > 0) {
+                  (amountIn * d.priceInICP) / (10 ** d.tokenDecimals)
+                } else { 0 }
+              };
+              case null { 0 };
+            };
+            let icpInvolved = sellToken == ICPprincipal or buyToken == ICPprincipal;
+
+            // Helper: combined slippage (NO FLOAT)
+            func combinedSlip(p : Scenario) : Nat {
+              p.kongSlipBP + p.icpSlipBP
+            };
+
+            // Helper: partial total percentage
+            func totalPctFunc(p : Scenario) : Nat {
+              p.kongPct + p.icpPct
+            };
+
+            // Helper: partial value in ICP (safe division)
+            func partialValueICP(p : Scenario) : Nat {
+              if (tradeValueICP == 0) { return 0 };
+              (tradeValueICP * totalPctFunc(p)) / 10000
+            };
+
+            // ============================================
+            // STEP A: Filter by BOTH MIN_TRADE_VALUE_ICP AND MIN_PARTIAL_TOTAL_BP
+            // ============================================
+            let validPartials = Vector.new<Scenario>();
+            for (p in Vector.vals(partialScenarios)) {
+              let meetsTotalPct = totalPctFunc(p) >= MIN_PARTIAL_TOTAL_BP;
+              let meetsValueICP = partialValueICP(p) >= rebalanceConfig.minTradeValueICP;
+              if (meetsTotalPct and meetsValueICP) {
+                Vector.add(validPartials, p);
+              };
+            };
+
+            // ============================================
+            // STEP B/C: Select best - EXACT PYTHON if/elif/else ORDER
+            // ============================================
+            var bestPartial : ?Scenario = null;
+            var selectedPool = Vector.new<Scenario>();  // Track which pool best came from
+
+            // BRANCH 1: valid_partials has items
+            if (Vector.size(validPartials) > 0) {
+              // Sort by combined slippage (ascending - lowest first)
+              let arr = Array.sort<Scenario>(Vector.toArray(validPartials), func(a : Scenario, b : Scenario) : Order.Order {
+                Nat.compare(combinedSlip(a), combinedSlip(b))
+              });
+              bestPartial := ?arr[0];
+              // Copy to selectedPool
+              for (p in arr.vals()) { Vector.add(selectedPool, p) };
+            }
+            // BRANCH 2: ICP involved AND partial_candidates exists
+            else if (icpInvolved and Vector.size(partialScenarios) > 0) {
+              // ICP EXCEPTION: Filter by MIN_PARTIAL_TOTAL_BP only (skip MIN_TRADE_VALUE_ICP)
+              let icpValid = Vector.new<Scenario>();
+              for (p in Vector.vals(partialScenarios)) {
+                if (totalPctFunc(p) >= MIN_PARTIAL_TOTAL_BP) {
+                  Vector.add(icpValid, p);
+                };
+              };
+
+              // NESTED: if icp_valid has items
+              if (Vector.size(icpValid) > 0) {
+                let arr = Array.sort<Scenario>(Vector.toArray(icpValid), func(a : Scenario, b : Scenario) : Order.Order {
+                  Nat.compare(combinedSlip(a), combinedSlip(b))
+                });
+                bestPartial := ?arr[0];
+                for (p in arr.vals()) { Vector.add(selectedPool, p) };
+              }
+              // NESTED else: best = None (falls through)
+            };
+            // BRANCH 3: else - best stays None
+
+            // ============================================
+            // STEP D: Process best (or return error)
+            // ============================================
+            switch (bestPartial) {
+              case (null) {
+                // No valid partials - return error with quotes for REDUCED fallback
+                logger.warn("EXCHANGE_COMPARISON",
+                  "No viable partial execution path found",
+                  "findBestExecution"
+                );
+                #err({ reason = "No viable partial execution path"; kongQuotes = kong; icpQuotes = icp })
+              };
+              case (?partialBest) {
+                // ============================================
+                // INTERPOLATION CHECK FOR PARTIALS
+                // ============================================
+                var finalKongPctP = partialBest.kongPct;
+                var finalIcpPctP = partialBest.icpPct;
+                var finalKongSlipBPP = partialBest.kongSlipBP;
+                var finalIcpSlipBPP = partialBest.icpSlipBP;
+                var interpolatedP = false;
+
+                // Get "others" from selectedPool (excluding best)
+                let others = Vector.new<Scenario>();
+                for (p in Vector.vals(selectedPool)) {
+                  // Compare by identity (name is unique)
+                  if (p.name != partialBest.name) {
+                    Vector.add(others, p);
+                  };
+                };
+
+                // INTERPOLATION: if others is not empty
+                if (Vector.size(others) > 0) {
+                  // Sort others by combined slippage
+                  let othersArr = Array.sort<Scenario>(Vector.toArray(others), func(a : Scenario, b : Scenario) : Order.Order {
+                    Nat.compare(combinedSlip(a), combinedSlip(b))
+                  });
+                  let second = othersArr[0];
+
+                  // ADJACENCY CHECK: BOTH kong and icp must differ by STEP_BP
+                  let kongDiff = if (partialBest.kongPct > second.kongPct) {
+                    partialBest.kongPct - second.kongPct
+                  } else {
+                    second.kongPct - partialBest.kongPct
+                  };
+                  let icpDiff = if (partialBest.icpPct > second.icpPct) {
+                    partialBest.icpPct - second.icpPct
+                  } else {
+                    second.icpPct - partialBest.icpPct
+                  };
+
+                  // BOTH must match step size for partials
+                  if (kongDiff == STEP_BP and icpDiff == STEP_BP) {
+                    // Calculate average slippages (integer, no float)
+                    let avgKongSlipBP = (partialBest.kongSlipBP + second.kongSlipBP) / 2;
+                    let avgIcpSlipBP = (partialBest.icpSlipBP + second.icpSlipBP) / 2;
+                    let totalSlipBPP = avgKongSlipBP + avgIcpSlipBP;
+
+                    // GUARD: totalSlip > 0
+                    if (totalSlipBPP > 0) {
+                      // kongRatio = avgIcpSlip / totalSlip
+                      // Scale by 10000 for precision: kongRatioBP = (avgIcpSlipBP * 10000) / totalSlipBP
+                      let kongRatioBP = (avgIcpSlipBP * 10000) / totalSlipBPP;
+
+                      // Kong percentage interpolation
+                      let lowKong = if (partialBest.kongPct < second.kongPct) { partialBest.kongPct } else { second.kongPct };
+                      let highKong = if (partialBest.kongPct > second.kongPct) { partialBest.kongPct } else { second.kongPct };
+                      let kongRange = highKong - lowKong;  // Safe: highKong >= lowKong by definition
+                      finalKongPctP := lowKong + (kongRatioBP * kongRange) / 10000;
+
+                      // ICP percentage: INVERSE direction (highIcp - ratio * range)
+                      let lowIcp = if (partialBest.icpPct < second.icpPct) { partialBest.icpPct } else { second.icpPct };
+                      let highIcp = if (partialBest.icpPct > second.icpPct) { partialBest.icpPct } else { second.icpPct };
+                      let icpRange = highIcp - lowIcp;
+                      // SAFE subtraction: highIcp >= (kongRatioBP * icpRange) / 10000 always
+                      // because kongRatioBP <= 10000 and icpRange <= STEP_BP
+                      finalIcpPctP := highIcp - (kongRatioBP * icpRange) / 10000;
+
+                      // Slippage interpolation (integer)
+                      let lowKongSlip = if (partialBest.kongPct < second.kongPct) { partialBest.kongSlipBP } else { second.kongSlipBP };
+                      let highKongSlip = if (partialBest.kongPct > second.kongPct) { partialBest.kongSlipBP } else { second.kongSlipBP };
+                      let lowIcpSlip = if (partialBest.icpPct < second.icpPct) { partialBest.icpSlipBP } else { second.icpSlipBP };
+                      let highIcpSlip = if (partialBest.icpPct > second.icpPct) { partialBest.icpSlipBP } else { second.icpSlipBP };
+
+                      // Safe: highSlip >= lowSlip by selection
+                      let kongSlipRange = if (highKongSlip > lowKongSlip) { highKongSlip - lowKongSlip } else { 0 };
+                      let icpSlipRange = if (highIcpSlip > lowIcpSlip) { highIcpSlip - lowIcpSlip } else { 0 };
+
+                      finalKongSlipBPP := lowKongSlip + (kongRatioBP * kongSlipRange) / 10000;
+                      finalIcpSlipBPP := lowIcpSlip + (kongRatioBP * icpSlipRange) / 10000;
+
+                      interpolatedP := true;
+                    };
+                  };
+                };
+
+                // ============================================
+                // BUILD PARTIAL EXECUTION PLAN
+                // ============================================
+                let finalTotalPct = finalKongPctP + finalIcpPctP;
+                let kongAmountP = (amountIn * finalKongPctP) / 10000;
+                let icpAmountP = (amountIn * finalIcpPctP) / 10000;
+
+                // Find closest quote index for interpolated percentages
+                // closestIdx: find i where (i+1)*STEP_BP is closest to pct
+                func closestIdx(pct : Nat) : Nat {
+                  var bestIdx : Nat = 0;
+                  var bestDiff : Nat = if (pct > STEP_BP) { pct - STEP_BP } else { STEP_BP - pct };
+                  for (i in Iter.range(1, NUM_QUOTES - 1)) {
+                    let stepPct = (i + 1) * STEP_BP;
+                    let diff = if (pct > stepPct) { pct - stepPct } else { stepPct - pct };
+                    if (diff < bestDiff) {
+                      bestIdx := i;
+                      bestDiff := diff;
+                    };
+                  };
+                  bestIdx
+                };
+
+                let kongIdxP = closestIdx(finalKongPctP);
+                let icpIdxP = closestIdx(finalIcpPctP);
+
+                // SAFE array access (kongIdxP and icpIdxP are in 0..NUM_QUOTES-1)
+                let kongExpectedOutP = kong[kongIdxP].out;
+                let icpExpectedOutP = icp[icpIdxP].out;
+
+                logger.info("PARTIAL_EXECUTION",
+                  "Partial split - Kong=" # Nat.toText(finalKongPctP / 100) # "%" #
+                  " ICP=" # Nat.toText(finalIcpPctP / 100) # "%" #
+                  " Total=" # Nat.toText(finalTotalPct / 100) # "%" #
+                  (if (interpolatedP) { " INTERP" } else { "" }),
+                  "findBestExecution"
+                );
+
+                #ok(#Partial({
+                  kongswap = {
+                    amount = kongAmountP;
+                    expectedOut = kongExpectedOutP;
+                    slippageBP = finalKongSlipBPP;
+                    percentBP = finalKongPctP;
+                  };
+                  icpswap = {
+                    amount = icpAmountP;
+                    expectedOut = icpExpectedOutP;
+                    slippageBP = finalIcpSlipBPP;
+                    percentBP = finalIcpPctP;
+                  };
+                  totalPercentBP = finalTotalPct;
+                }))
+              };
+            }
+          }
         };
         case (?best) {
           // Check if we can interpolate between best and second-best
-          // Only interpolate if both are splits and adjacent (differ by 20%)
+          // Only interpolate if both are splits and adjacent (differ by 10% = STEP_BP)
           let (finalKongPct, finalIcpPct, finalKongSlipBP, finalIcpSlipBP, interpolated) : (Nat, Nat, Nat, Nat, Bool) = switch (secondBestScenario) {
             case (?second) {
               // Check if both are splits (not single exchange)
               let bothAreSplits = best.kongPct > 0 and best.kongPct < 10000 and second.kongPct > 0 and second.kongPct < 10000;
 
-              // Check if they're adjacent (differ by exactly 20% = 2000bp)
+              // Check if they're adjacent (differ by exactly 10% = STEP_BP)
               let diff = if (best.kongPct > second.kongPct) { best.kongPct - second.kongPct } else { second.kongPct - best.kongPct };
-              let areAdjacent = diff == 2000;
+              let areAdjacent = diff == STEP_BP;
 
               if (bothAreSplits and areAdjacent) {
-                // Use inverse slippage weighting to find optimal split within the 20% range
-                //
-                // Given two adjacent scenarios (e.g., 60/40 and 80/20), find the optimal point.
-                // Average the slippages from both edges to get representative values for the range.
-                //
-                // Inverse weighting: kongRatio = avgIcpSlip / (avgKongSlip + avgIcpSlip)
-                // - Higher ICP slippage -> shift more toward Kong (higher ratio)
-                // - Higher Kong slippage -> shift more toward ICP (lower ratio)
+                // Use inverse slippage weighting to find optimal split within the 10% range
+                // Using INTEGER MATH to avoid Float traps
 
-                let avgKongSlip = (Float.fromInt(best.kongSlipBP) + Float.fromInt(second.kongSlipBP)) / 2.0;
-                let avgIcpSlip = (Float.fromInt(best.icpSlipBP) + Float.fromInt(second.icpSlipBP)) / 2.0;
-                let totalSlip = avgKongSlip + avgIcpSlip;
+                // Average slippages (integer)
+                let avgKongSlipBP = (best.kongSlipBP + second.kongSlipBP) / 2;
+                let avgIcpSlipBP = (best.icpSlipBP + second.icpSlipBP) / 2;
+                let totalSlipBP = avgKongSlipBP + avgIcpSlipBP;
 
-                if (totalSlip > 0.0) {
-                  // kongRatio tells us where in the 20% range the optimal split is
-                  let kongRatio = avgIcpSlip / totalSlip;
+                if (totalSlipBP > 0) {
+                  // kongRatio = avgIcpSlip / totalSlip
+                  // Scale by 10000 for precision: kongRatioBP = (avgIcpSlipBP * 10000) / totalSlipBP
+                  let kongRatioBP = (avgIcpSlipBP * 10000) / totalSlipBP;
 
                   // Scale to the range between scenarios
                   let lowKongPct = if (best.kongPct < second.kongPct) { best.kongPct } else { second.kongPct };
                   let highKongPct = if (best.kongPct > second.kongPct) { best.kongPct } else { second.kongPct };
 
-                  // Calculate interpolated percentage within the 20% range
-                  let rangeSize = Float.fromInt(highKongPct - lowKongPct);
-                  let interpolatedKongPct = lowKongPct + Int.abs(Float.toInt(kongRatio * rangeSize));
+                  // Calculate interpolated percentage within the 10% range (integer math)
+                  let kongRange = highKongPct - lowKongPct;
+                  let interpolatedKongPct = lowKongPct + (kongRatioBP * kongRange) / 10000;
                   let interpolatedIcpPct = 10000 - interpolatedKongPct;
 
-                  // Interpolate slippage values linearly based on position in range
-                  let t = kongRatio;
+                  // Interpolate slippage values (integer)
                   let lowKongSlip = if (best.kongPct < second.kongPct) { best.kongSlipBP } else { second.kongSlipBP };
                   let highKongSlip = if (best.kongPct > second.kongPct) { best.kongSlipBP } else { second.kongSlipBP };
                   let lowIcpSlip = if (best.icpPct < second.icpPct) { best.icpSlipBP } else { second.icpSlipBP };
                   let highIcpSlip = if (best.icpPct > second.icpPct) { best.icpSlipBP } else { second.icpSlipBP };
 
-                  let interpKongSlip = lowKongSlip + Int.abs(Float.toInt(t * Float.fromInt(highKongSlip - lowKongSlip)));
-                  let interpIcpSlip = lowIcpSlip + Int.abs(Float.toInt(t * Float.fromInt(highIcpSlip - lowIcpSlip)));
+                  let kongSlipRange = if (highKongSlip > lowKongSlip) { highKongSlip - lowKongSlip } else { 0 };
+                  let icpSlipRange = if (highIcpSlip > lowIcpSlip) { highIcpSlip - lowIcpSlip } else { 0 };
+
+                  let interpKongSlip = lowKongSlip + (kongRatioBP * kongSlipRange) / 10000;
+                  let interpIcpSlip = lowIcpSlip + (kongRatioBP * icpSlipRange) / 10000;
 
                   logger.info("EXCHANGE_COMPARISON",
                     "Interpolating between " # best.name # " and " # second.name #
-                    " - avgKongSlip=" # Float.toText(avgKongSlip) # "bp avgIcpSlip=" # Float.toText(avgIcpSlip) # "bp" #
-                    " kongRatio=" # Float.toText(kongRatio) #
+                    " - avgKongSlip=" # Nat.toText(avgKongSlipBP) # "bp avgIcpSlip=" # Nat.toText(avgIcpSlipBP) # "bp" #
+                    " kongRatioBP=" # Nat.toText(kongRatioBP) #
                     " Result: Kong=" # Nat.toText(interpolatedKongPct / 100) # "% ICP=" # Nat.toText(interpolatedIcpPct / 100) # "%",
                     "findBestExecution"
                   );
@@ -5990,15 +6610,16 @@ shared (deployer) persistent actor class treasury() = this {
   /**
    * Estimate max tradeable amount when slippage is too high
    *
-   * Uses the 20% quote's slippage to estimate the maximum amount that can be traded
-   * at half the max allowed slippage (for safety margin).
+   * Uses the 10% quote's slippage to estimate the maximum amount that can be traded
+   * at 70% of max allowed slippage (for safety margin).
    *
-   * Formula: maxAmount = (amountIn/5) * (maxSlippageBP/2) / bestSlippage
+   * Formula: maxAmount = (amountIn * targetSlip) / (bestSlip * 10)
    *
-   * Returns null if:
-   * - No valid quotes (both exchanges returned errors)
-   * - Zero slippage (would divide by zero)
-   * - For non-ICP pairs: calculated amount is 0
+   * Key changes matching Python:
+   * 1. If no valid quotes (min_slip >= 99999): return 1 ICP worth, prefer Kong
+   *    - The verify step makes a fresh API call - bulk quotes might have failed
+   * 2. If calculated == 0 and amountIn > 0: return 1 ICP worth
+   *    - Don't check bestSlip <= maxSlippageBP - let verify step filter bad quotes
    */
   private func estimateMaxTradeableAmount(
     kongQuotes : [QuoteData],
@@ -6008,36 +6629,63 @@ shared (deployer) persistent actor class treasury() = this {
     sellToken : Principal,
     buyToken : Principal
   ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap } } {
-    // Need at least one quote at 20% (index 0)
+    // Need at least one quote at 10% (index 0)
     if (kongQuotes.size() == 0 or icpQuotes.size() == 0) { return null };
 
-    // Get 20% quote slippage (index 0) - use 99999 as sentinel for invalid
-    let kong20Slip : Nat = if (kongQuotes[0].out > 0) { kongQuotes[0].slipBP } else { 99999 };
-    let icp20Slip : Nat = if (icpQuotes[0].out > 0) { icpQuotes[0].slipBP } else { 99999 };
+    // Get 10% quote slippage (index 0) - use 99999 as sentinel for invalid
+    let kong10Slip : Nat = if (kongQuotes[0].out > 0) { kongQuotes[0].slipBP } else { 99999 };
+    let icp10Slip : Nat = if (icpQuotes[0].out > 0) { icpQuotes[0].slipBP } else { 99999 };
 
     // Find best (lowest slippage) exchange
     let (bestSlip, bestExchange) : (Nat, { #KongSwap; #ICPSwap }) =
-      if (kong20Slip <= icp20Slip) { (kong20Slip, #KongSwap) }
-      else { (icp20Slip, #ICPSwap) };
+      if (kong10Slip <= icp10Slip) { (kong10Slip, #KongSwap) }
+      else { (icp10Slip, #ICPSwap) };
 
-    // Guard: no valid quotes OR zero slippage (would divide by zero)
-    if (bestSlip >= 99999 or bestSlip == 0) { return null };
+    // Helper: calculate 1 ICP worth of sell token
+    func oneIcpWorth() : Nat {
+      switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?d) {
+          if (d.priceInICP > 0 and d.tokenDecimals <= 18) {
+            let decimals = 10 ** d.tokenDecimals;
+            (100_000_000 * decimals) / d.priceInICP
+          } else { 0 }
+        };
+        case null { 0 };
+      }
+    };
 
-    // amountAt20Pct = amountIn / 5 (the 20% quote corresponds to 20% of amountIn)
-    let amountAt20Pct = amountIn / 5;
+    // CHANGE 1: If no valid quotes at all, still try 1 ICP worth
+    // The verify step makes a fresh API call - bulk quotes might have failed but single quote might succeed
+    if (bestSlip >= 99999) {
+      let minAmount = oneIcpWorth();
+      if (minAmount > 0) {
+        // Prefer Kong as it has better routing
+        return ?{ amount = minAmount; exchange = #KongSwap };
+      };
+      return null;  // No price data available
+    };
+
+    // Guard: zero slippage (would divide by zero) - shouldn't happen
+    if (bestSlip == 0) { return null };
 
     // targetSlip = maxSlippageBP * 7 / 10 (70% of max for safety margin)
     let targetSlip = (maxSlippageBP * 7) / 10;
 
-    // maxAmount = amountAt20Pct * (targetSlip / bestSlip)
-    // Reorder to avoid precision loss: (amountAt20Pct * targetSlip) / bestSlip
-    let maxAmount = (amountAt20Pct * targetSlip) / bestSlip;
+    // FIXED: With 10 quotes, index 0 is 10% = amountIn/10
+    // maxAmount = (amountIn/10) * targetSlip / bestSlip
+    //           = (amountIn * targetSlip) / (bestSlip * 10)
+    let maxAmount = (amountIn * targetSlip) / (bestSlip * 10);
 
-    // Skip minimum check if ICP is involved (ICP trades always valuable)
-    let icpInvolved = sellToken == ICPprincipal or buyToken == ICPprincipal;
-
-    // For non-ICP pairs, ensure amount > 0
-    if (not icpInvolved and maxAmount == 0) { return null };
+    // CHANGE 2: If calculation gives 0 but we have input, try at least 1 ICP worth
+    // NOTE: Don't check bestSlip <= maxSlippageBP here - let verify step filter bad quotes
+    // Even high-slippage pairs might work with 1 ICP trade
+    if (maxAmount == 0 and amountIn > 0) {
+      let minAmount = oneIcpWorth();
+      if (minAmount > 0) {
+        return ?{ amount = minAmount; exchange = bestExchange };
+      };
+      return null;
+    };
 
     ?{ amount = maxAmount; exchange = bestExchange }
   };
@@ -6777,7 +7425,7 @@ shared (deployer) persistent actor class treasury() = this {
   private func syncFromDAO() : async () {
     // Run token details and allocation fetches in parallel
 
-    let tokenDetailsFuture = dao.getTokenDetails();
+    let tokenDetailsFuture = dao.getTokenDetailsWithoutPastPrices();
     let allocationFuture = dao.getAggregateAllocation();
     let tokenDetailsResult = await tokenDetailsFuture;
     let allocationResult = await allocationFuture;
@@ -6788,11 +7436,27 @@ shared (deployer) persistent actor class treasury() = this {
       let oldDetails = Map.get(tokenDetailsMap, phash, principal);
       switch (oldDetails) {
         case null {
+          // New token - create full TokenDetails with empty pastPrices
           Map.set(
             tokenDetailsMap,
             phash,
             principal,
-            details,
+            {
+              Active = details.Active;
+              isPaused = details.isPaused;
+              epochAdded = details.epochAdded;
+              tokenName = details.tokenName;
+              tokenSymbol = details.tokenSymbol;
+              tokenDecimals = details.tokenDecimals;
+              tokenTransferFee = details.tokenTransferFee;
+              balance = details.balance;
+              priceInICP = details.priceInICP;
+              priceInUSD = details.priceInUSD;
+              tokenType = details.tokenType;
+              pastPrices = []; // Initialize with empty price history
+              lastTimeSynced = details.lastTimeSynced;
+              pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+            },
           );
         };
         case (?(oldDetails)) {

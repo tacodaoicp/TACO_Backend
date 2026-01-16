@@ -107,33 +107,84 @@ executeTradingCycle() [Line 3673]
                     │           └─► range = maxTradeValueICP - minTradeValueICP
                     │           └─► RETURN: minTradeValueICP + random(0, range)
                     │
-                    ├─► findBestExecution() [Line 5558]
+                    ├─► findBestExecution() [Line 5900]
                     │   │
-                    │   ├─► GET 10 QUOTES IN PARALLEL (20%, 40%, 60%, 80%, 100%)
-                    │   │   ├─► KongSwap: 5 quotes
-                    │   │   └─► ICPSwap: 5 quotes
+                    │   ├─► GET 20 QUOTES IN PARALLEL (10%, 20%, 30%, ..., 100%)
+                    │   │   ├─► KongSwap: 10 quotes (indices 0-9)
+                    │   │   └─► ICPSwap: 10 quotes (indices 0-9)
+                    │   │
+                    │   ├─► CONSTANTS:
+                    │   │   ├─► NUM_QUOTES = 10
+                    │   │   ├─► STEP_BP = 1000 (10% per step)
+                    │   │   └─► MIN_PARTIAL_TOTAL_BP = 4000 (40% minimum)
                     │   │
                     │   ├─► EXTRACT quote data:
-                    │   │   └─► QuoteData = { out: Nat, slipBP: Nat, valid: Bool }
-                    │   │   └─► valid = (slippage <= maxSlippageBP AND out > 0)
+                    │   │   ├─► QuoteData = { out: Nat, slipBP: Nat, valid: Bool }
+                    │   │   ├─► valid = (slippage <= maxSlippageBP AND out > 0 AND NOT dustOutput)
+                    │   │   └─► dustOutput = (output < 1% of expected at spot price)
                     │   │
-                    │   ├─► EVALUATE 6 SCENARIOS:
-                    │   │   ├─► Scenario 1: Single KongSwap (100%)
-                    │   │   ├─► Scenario 2: Single ICPSwap (100%)
-                    │   │   ├─► Scenario 3: Split 80% Kong / 20% ICP
-                    │   │   ├─► Scenario 4: Split 60% Kong / 40% ICP
-                    │   │   ├─► Scenario 5: Split 40% Kong / 60% ICP
-                    │   │   └─► Scenario 6: Split 20% Kong / 80% ICP
+                    │   ├─► EVALUATE ALL SCENARIOS (10x10 = 100 combinations):
+                    │   │   │
+                    │   │   ├─► STEP 1: Single exchanges
+                    │   │   │   ├─► SINGLE_KONG (100%) - kong[9]
+                    │   │   │   └─► SINGLE_ICP (100%) - icp[9]
+                    │   │   │
+                    │   │   ├─► STEP 2: Nested loop for all combos
+                    │   │   │   for kongIdx in 0..9:
+                    │   │   │     for icpIdx in 0..9:
+                    │   │   │       kongPct = (kongIdx + 1) * STEP_BP  // 1000, 2000, ..., 10000
+                    │   │   │       icpPct = (icpIdx + 1) * STEP_BP
+                    │   │   │       totalPct = kongPct + icpPct
+                    │   │   │
+                    │   │   │       SKIP if totalPct > 10000  // Over 100%
+                    │   │   │       SKIP if kongPct == 10000 or icpPct == 10000  // Singles handled
+                    │   │   │
+                    │   │   │       if kong[kongIdx].valid AND icp[icpIdx].valid:
+                    │   │   │         if totalPct == 10000:
+                    │   │   │           updateBest(scenario)  // FULL SPLIT -> MAX output
+                    │   │   │         else:
+                    │   │   │           partialScenarios.add(scenario)  // PARTIAL -> MIN slippage
+                    │   │   │
+                    │   │   └─► RESULT: bestScenario, secondBestScenario, partialScenarios[]
                     │   │
-                    │   ├─► SELECT: Scenario with maximum totalOut
+                    │   ├─► SCENARIO SELECTION:
+                    │   │   │
+                    │   │   ├─► IF bestScenario found (single or full split):
+                    │   │   │   ├─► INTERPOLATION (if best & second are adjacent splits):
+                    │   │   │   │   ├─► diff = |best.kongPct - second.kongPct|
+                    │   │   │   │   ├─► areAdjacent = (diff == STEP_BP)  // 1000bp = 10%
+                    │   │   │   │   ├─► avgKongSlip = (best.kongSlipBP + second.kongSlipBP) / 2
+                    │   │   │   │   ├─► avgIcpSlip = (best.icpSlipBP + second.icpSlipBP) / 2
+                    │   │   │   │   ├─► kongRatioBP = (avgIcpSlipBP * 10000) / totalSlipBP  // INTEGER
+                    │   │   │   │   └─► interpolatedKongPct = lowKong + (kongRatioBP * range) / 10000
+                    │   │   │   └─► RETURN: #Single OR #Split
+                    │   │   │
+                    │   │   └─► ELSE (no full scenario - TRY PARTIALS):
+                    │   │       │
+                    │   │       ├─► STEP A: Filter partials by BOTH conditions:
+                    │   │       │   ├─► meetsTotalPct = totalPct >= MIN_PARTIAL_TOTAL_BP (40%)
+                    │   │       │   └─► meetsValueICP = partialValueICP >= minTradeValueICP
+                    │   │       │   └─► validPartials = partials meeting BOTH
+                    │   │       │
+                    │   │       ├─► STEP B: If validPartials non-empty:
+                    │   │       │   ├─► Sort by combinedSlip (MIN slippage wins)
+                    │   │       │   └─► bestPartial = validPartials[0]
+                    │   │       │
+                    │   │       ├─► STEP C (ICP EXCEPTION): Elif ICP involved AND partials exist:
+                    │   │       │   ├─► icpValid = partials where totalPct >= 40% (skip minTradeValueICP)
+                    │   │       │   ├─► Sort by combinedSlip
+                    │   │       │   └─► bestPartial = icpValid[0] or null
+                    │   │       │
+                    │   │       ├─► STEP D: If bestPartial found:
+                    │   │       │   ├─► INTERPOLATION (if adjacent partial exists):
+                    │   │       │   │   ├─► BOTH kongDiff AND icpDiff must == STEP_BP
+                    │   │       │   │   ├─► ICP uses INVERSE: highIcp - (ratio * range)
+                    │   │       │   │   └─► Integer math scaled by 10000
+                    │   │       │   └─► RETURN: #Partial({ totalPercentBP, kongswap, icpswap })
+                    │   │       │
+                    │   │       └─► ELSE: RETURN #err with quotes for REDUCED fallback
                     │   │
-                    │   ├─► SLIPPAGE INTERPOLATION (if best & 2nd-best are adjacent splits):
-                    │   │   ├─► avgKongSlip = (best.kongSlip + second.kongSlip) / 2
-                    │   │   ├─► avgIcpSlip = (best.icpSlip + second.icpSlip) / 2
-                    │   │   ├─► kongRatio = avgIcpSlip / (avgKongSlip + avgIcpSlip)
-                    │   │   └─► interpolatedKongPct = lowKongPct + (kongRatio * range)
-                    │   │
-                    │   └─► RETURN: #Single OR #Split execution plan
+                    │   └─► RETURN: #Single OR #Split OR #Partial OR #err
                     │
                     ├─► CHECK: bestExecution == #err?
                     │   └─► YES → CONTINUE to next attempt
@@ -152,17 +203,34 @@ executeTradingCycle() [Line 3673]
                         │   │
                         │   └─► executeTrade() → TradeRecord or error
                         │
-                        └─► IF #Split execution:
+                        ├─► IF #Split execution:
+                        │   │
+                        │   ├─► APPLY slippage adjustment to BOTH legs
+                        │   │   ├─► kongFinalAmount = (kongAmount * 10000) / (10000 + kongSlipBP)
+                        │   │   └─► icpFinalAmount = (icpAmount * 10000) / (10000 + icpSlipBP)
+                        │   │
+                        │   └─► executeSplitTrade() [Line 6658]
+                        │       ├─► Launch KongSwap trade (async)
+                        │       ├─► Launch ICPSwap trade (async)
+                        │       ├─► AWAIT both results in parallel
+                        │       └─► Process results, update state
+                        │
+                        └─► IF #Partial execution:
                             │
-                            ├─► APPLY slippage adjustment to BOTH legs
-                            │   ├─► kongFinalAmount = (kongAmount * 10000) / (10000 + kongSlipBP)
-                            │   └─► icpFinalAmount = (icpAmount * 10000) / (10000 + icpSlipBP)
+                            ├─► LOG: "Partial split - Kong=X% ICP=Y% Total=Z%"
                             │
-                            └─► executeSplitTrade() [Line 5974]
-                                ├─► Launch KongSwap trade (async)
-                                ├─► Launch ICPSwap trade (async)
-                                ├─► AWAIT both results in parallel
-                                └─► Process results, update state
+                            ├─► APPLY slippage adjustment to BOTH legs (same as #Split)
+                            │   ├─► kongFinalAmount = (partial.kongswap.amount * 10000) / (10000 + kongSlipBP)
+                            │   └─► icpFinalAmount = (partial.icpswap.amount * 10000) / (10000 + icpSlipBP)
+                            │
+                            ├─► executeSplitTrade() - SAME as #Split
+                            │   ├─► Launch KongSwap trade (async)
+                            │   ├─► Launch ICPSwap trade (async)
+                            │   ├─► AWAIT both results in parallel
+                            │   └─► Track: kongSuccess, icpSuccess
+                            │
+                            └─► RESULT: At least one leg succeeded = overall success
+                                (partial.totalPercentBP < 10000 means less than 100% traded)
 ```
 
 ---
@@ -234,30 +302,68 @@ idealOut = (adjustedExpectedOut * 10000) / (10000 - slippageBP)
 minAmountOut = (idealOut * (10000 - maxSlippageBP)) / 10000
 ```
 
-### 7. Exchange Selection - Scenario Comparison
+### 7. Exchange Selection - Scenario Comparison (10 Quotes)
 ```
-Scenarios evaluated:
-1. Single Kong: totalOut = kong[100%].out
-2. Single ICP: totalOut = icp[100%].out
-3-6. Splits: totalOut = kong[X%].out + icp[Y%].out (where X+Y=100%)
+CONSTANTS:
+  NUM_QUOTES = 10
+  STEP_BP = 1000  (10% per step)
+  MIN_PARTIAL_TOTAL_BP = 4000  (40% minimum for partials)
 
-Best scenario = max(totalOut) where all quotes are valid
+Scenarios evaluated (10x10 = 100 combinations):
+  1. Single Kong: totalOut = kong[9].out (index 9 = 100%)
+  2. Single ICP: totalOut = icp[9].out
+  3+. All combos: kong[i].out + icp[j].out where (i+1)*10% + (j+1)*10% <= 100%
+
+Selection criteria:
+  - FULL SPLITS (totalPct == 10000): Best = max(totalOut)
+  - PARTIALS (totalPct < 10000): Best = min(combinedSlippage)
+
+Partial filtering:
+  - Must meet totalPct >= 40% (MIN_PARTIAL_TOTAL_BP)
+  - Must meet partialValueICP >= minTradeValueICP
+  - ICP EXCEPTION: Skip minTradeValueICP for ICP pairs (but keep 40% min)
 ```
 
-### 8. Slippage Interpolation Between Adjacent Splits
+### 8. Slippage Interpolation (Integer Math)
 ```
-// Only when best and 2nd-best are both splits differing by 20%
+// For FULL SPLITS: Only when best and 2nd-best are adjacent splits differing by 10%
+// For PARTIALS: BOTH kongDiff AND icpDiff must == STEP_BP
 
-avgKongSlip = (best.kongSlipBP + second.kongSlipBP) / 2
-avgIcpSlip = (best.icpSlipBP + second.icpSlipBP) / 2
-totalSlip = avgKongSlip + avgIcpSlip
+// Check adjacency
+diff = |best.kongPct - second.kongPct|
+areAdjacent = (diff == STEP_BP)  // 1000bp = 10%
+
+// INTEGER MATH (scaled by 10000 for precision)
+avgKongSlipBP = (best.kongSlipBP + second.kongSlipBP) / 2
+avgIcpSlipBP = (best.icpSlipBP + second.icpSlipBP) / 2
+totalSlipBP = avgKongSlipBP + avgIcpSlipBP
 
 // Inverse weighting: higher ICP slippage → more Kong
-kongRatio = avgIcpSlip / totalSlip
+kongRatioBP = (avgIcpSlipBP * 10000) / totalSlipBP  // Scaled integer
 
-// Interpolate within the 20% range
-interpolatedKongPct = lowKongPct + (kongRatio * (highKongPct - lowKongPct))
-interpolatedIcpPct = 10000 - interpolatedKongPct
+// Kong interpolation
+kongRange = highKongPct - lowKongPct
+interpolatedKongPct = lowKongPct + (kongRatioBP * kongRange) / 10000
+
+// ICP interpolation (INVERSE for partials)
+// Full splits: interpolatedIcpPct = 10000 - interpolatedKongPct
+// Partials: interpolatedIcpPct = highIcpPct - (kongRatioBP * icpRange) / 10000
+```
+
+### 8b. Partial Execution Plan Type
+```motoko
+type ExecutionPlan = {
+  #Single : { exchange : ExchangeType; expectedOut : Nat; slippageBP : Nat };
+  #Split : {
+    kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+    icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+  };
+  #Partial : {
+    kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+    icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+    totalPercentBP : Nat;  // Sum < 10000 (e.g., 6000 = 60%)
+  };
+};
 ```
 
 ### 9. Weighted Random Selection for Token Pairs
@@ -337,108 +443,163 @@ newPrice = otherToken.priceInICP * priceRatio
 
 ## Executive Summary
 
-The Python test script (`test_exchange_selection.py`) **partially matches** the treasury logic. It correctly implements the **exchange selection algorithm** but is **missing several critical components** of the full trading cycle.
+**UPDATED**: Treasury now uses **10 quotes** (10%, 20%, ..., 100%) instead of 5 quotes, and supports **partial splits** (e.g., 60% total = 40% Kong + 20% ICP). The Python test script needs updating to match.
 
 ---
 
-## What MATCHES (Exchange Selection Algorithm)
+## CURRENT TREASURY IMPLEMENTATION (Updated)
 
-### 1. Quote Fetching Strategy - MATCHES
-**Treasury ([treasury.mo:5599-5645](src/treasury/treasury.mo#L5599)):**
+### 1. Quote Fetching - NOW 10 QUOTES
+**Treasury ([treasury.mo:5944-6024](src/treasury/treasury.mo#L5944)):**
 ```motoko
-// 5 amounts at 20%, 40%, 60%, 80%, 100%
-let amounts = [amountIn * 2/10, amountIn * 4/10, amountIn * 6/10, amountIn * 8/10, amountIn]
-// Fetch 10 quotes in parallel (5 Kong + 5 ICP)
+// Calculate amounts for 10% increments (indices 0-9 = 10%, 20%, ..., 100%)
+let amounts : [Nat] = [
+  amountIn * 1 / 10,    // 10%  - idx 0
+  amountIn * 2 / 10,    // 20%  - idx 1
+  amountIn * 3 / 10,    // 30%  - idx 2
+  amountIn * 4 / 10,    // 40%  - idx 3
+  amountIn * 5 / 10,    // 50%  - idx 4
+  amountIn * 6 / 10,    // 60%  - idx 5
+  amountIn * 7 / 10,    // 70%  - idx 6
+  amountIn * 8 / 10,    // 80%  - idx 7
+  amountIn * 9 / 10,    // 90%  - idx 8
+  amountIn,             // 100% - idx 9
+];
+// Fetch 20 quotes in parallel (10 Kong + 10 ICP)
 ```
 
-**Python ([test_exchange_selection.py:381-406](test_exchange_selection.py#L381)):**
-```python
-# Quote amounts: 20%, 40%, 60%, 80%, 100%
-amounts = [base_amount * p // 10 for p in [2, 4, 6, 8, 10]]
-# Fetch ALL quotes in parallel (5 Kong + up to 5 ICPSwap = 10 requests)
-```
-**IDENTICAL**
-
-### 2. Slippage Extraction - MATCHES
-**Treasury ([treasury.mo:5658-5679](src/treasury/treasury.mo#L5658)):**
+### 2. Constants
 ```motoko
-func extractKong(result): QuoteData {
+let NUM_QUOTES : Nat = 10;
+let STEP_BP : Nat = 1000;  // 10% per step (was 2000 for 5 quotes)
+let MIN_PARTIAL_TOTAL_BP : Nat = 4000;  // 40% minimum for partials
+```
+
+### 3. Slippage Extraction - WITH DUST VALIDATION
+```motoko
+func extractKong(result, amountIn): QuoteData {
   let slipBP = Int.abs(Float.toInt(r.slippage * 100.0));
-  let valid = r.slippage <= maxSlippagePct and r.receive_amount > 0;
+  let isDust = isDustOutput(amountIn, r.receive_amount);  // < 1% of expected
+  let valid = r.slippage <= maxSlippagePct and r.receive_amount > 0 and not isDust;
 }
 ```
 
-**Python ([test_exchange_selection.py:119-124](test_exchange_selection.py#L119)):**
-```python
-slippage_bp = int(slippage_pct * 100)
-valid = slippage_bp <= MAX_SLIPPAGE_BP and receive_amount > 0
-```
-**IDENTICAL**
-
-### 3. Scenario Evaluation - MATCHES
-**Treasury ([treasury.mo:5728-5778](src/treasury/treasury.mo#L5728)):**
-- Scenario 1: Single Kong (100%)
-- Scenario 2: Single ICP (100%)
-- Scenarios 3-6: Splits (80/20, 60/40, 40/60, 20/80)
-- Select scenario with max `totalOut`
-
-**Python ([test_exchange_selection.py:262-292](test_exchange_selection.py#L262)):**
-```python
-# Single Kong (100%)
-if kong_quotes[4].valid: scenarios.append(...)
-# Single ICPSwap (100%)
-if icp_quotes[4].valid: scenarios.append(...)
-# Splits: 80/20, 60/40, 40/60, 20/80
-for kong_idx in [3, 2, 1, 0]:
-    icp_idx = 3 - kong_idx
-    ...
-scenarios.sort(key=lambda s: s.total_out, reverse=True)
-```
-**IDENTICAL**
-
-### 4. Slippage Interpolation Logic - MATCHES
-**Treasury ([treasury.mo:5796-5864](src/treasury/treasury.mo#L5796)):**
+### 4. Scenario Evaluation - NOW 10x10 = 100 COMBINATIONS
+**Treasury ([treasury.mo:6162-6203](src/treasury/treasury.mo#L6162)):**
 ```motoko
-let bothAreSplits = best.kongPct > 0 and best.kongPct < 10000 and second.kongPct > 0 and second.kongPct < 10000;
-let diff = |best.kongPct - second.kongPct|;
-let areAdjacent = diff == 2000;
+// Single exchanges
+if (kong[9].valid) { updateBest(SINGLE_KONG) }  // 100% at index 9
+if (icp[9].valid) { updateBest(SINGLE_ICP) }
 
-if (bothAreSplits and areAdjacent) {
-  let avgKongSlip = (best.kongSlipBP + second.kongSlipBP) / 2;
-  let avgIcpSlip = (best.icpSlipBP + second.icpSlipBP) / 2;
-  let kongRatio = avgIcpSlip / (avgKongSlip + avgIcpSlip);
-  let interpolatedKongPct = lowKongPct + (kongRatio * range);
-}
+// All 10x10 combinations
+for (kongIdx in 0..9):
+  for (icpIdx in 0..9):
+    kongPct = (kongIdx + 1) * STEP_BP  // 1000, 2000, ..., 10000
+    icpPct = (icpIdx + 1) * STEP_BP
+    totalPct = kongPct + icpPct
+
+    if totalPct > 10000: continue  // Over 100%
+    if kongPct == 10000 or icpPct == 10000: continue  // Singles handled
+
+    if kong[kongIdx].valid and icp[icpIdx].valid:
+      if totalPct == 10000:
+        updateBest(scenario)  // FULL SPLIT -> MAX output selection
+      else:
+        partialScenarios.add(scenario)  // PARTIAL -> MIN slippage selection
 ```
 
-**Python ([test_exchange_selection.py:299-323](test_exchange_selection.py#L299)):**
-```python
-both_splits = 0 < best.kong_pct < 10000 and 0 < second.kong_pct < 10000
-diff = abs(best.kong_pct - second.kong_pct)
-
-if both_splits and diff == 2000:
-    avg_kong_slip = (best.kong_slip_bp + second.kong_slip_bp) / 2
-    avg_icp_slip = (best.icp_slip_bp + second.icp_slip_bp) / 2
-    kong_ratio = avg_icp_slip / total_slip
-    interp_kong = low_kong + int(kong_ratio * (high_kong - low_kong))
-```
-**IDENTICAL**
-
-### 5. Reduced Amount Estimation (estimateMaxTradeableAmount) - MATCHES
-**Treasury ([treasury.mo:5924-5963](src/treasury/treasury.mo#L5924)):**
+### 5. Partial Selection Logic - NEW
+**Treasury ([treasury.mo:6253-6453](src/treasury/treasury.mo#L6253)):**
 ```motoko
-let amountAt20Pct = amountIn / 5;
-let targetSlip = maxSlippageBP / 2;
-let maxAmount = (amountAt20Pct * targetSlip) / bestSlip;
+// STEP A: Filter partials by BOTH conditions
+validPartials = partials.filter(p =>
+  totalPct(p) >= MIN_PARTIAL_TOTAL_BP AND  // >= 40%
+  partialValueICP(p) >= minTradeValueICP
+)
+
+// STEP B: If validPartials non-empty
+if validPartials.size > 0:
+  sort by combinedSlip (ascending - MIN wins)
+  bestPartial = validPartials[0]
+
+// STEP C: ICP EXCEPTION - elif ICP involved AND partials exist
+elif icpInvolved and partialScenarios.size > 0:
+  icpValid = partials.filter(p => totalPct(p) >= 40%)  // Skip minTradeValueICP
+  if icpValid.size > 0:
+    sort by combinedSlip
+    bestPartial = icpValid[0]
+
+// STEP D: If bestPartial found, check for interpolation
+// For partials: BOTH kongDiff AND icpDiff must == STEP_BP
 ```
 
-**Python ([test_exchange_selection.py:338-372](test_exchange_selection.py#L338)):**
-```python
-icp_at_20pct = amount_icp * 0.2
-target_slip = MAX_SLIPPAGE_BP / 2.0
-max_icp = icp_at_20pct * (target_slip / min_slip)
+### 6. Slippage Interpolation - NOW INTEGER MATH
+**Treasury ([treasury.mo:6468-6511](src/treasury/treasury.mo#L6468)):**
+```motoko
+// Full splits: diff = |best.kongPct - second.kongPct| == STEP_BP (1000)
+// Partials: kongDiff == STEP_BP AND icpDiff == STEP_BP
+
+// INTEGER MATH (scaled by 10000)
+kongRatioBP = (avgIcpSlipBP * 10000) / totalSlipBP
+interpolatedKongPct = lowKong + (kongRatioBP * kongRange) / 10000
+
+// For partials, ICP uses INVERSE direction:
+interpolatedIcpPct = highIcp - (kongRatioBP * icpRange) / 10000
 ```
-**IDENTICAL**
+
+### 7. estimateMaxTradeableAmount - UPDATED
+**Treasury ([treasury.mo:6586-6656](src/treasury/treasury.mo#L6586)):**
+```motoko
+// Index 0 is now 10% (not 20%), divisor is 10 (not 5)
+let kong10Slip = if kongQuotes[0].out > 0 { kongQuotes[0].slipBP } else { 99999 }
+let icp10Slip = if icpQuotes[0].out > 0 { icpQuotes[0].slipBP } else { 99999 }
+
+// CHANGE 1: No valid quotes → return 1 ICP worth, prefer Kong
+if bestSlip >= 99999:
+  return ?{ amount = oneIcpWorth(); exchange = #KongSwap }
+
+// targetSlip = maxSlippageBP * 7 / 10 (70% of max)
+let maxAmount = (amountIn * targetSlip) / (bestSlip * 10)  // Divisor is 10 now
+
+// CHANGE 2: calculated == 0 and amountIn > 0 → return 1 ICP worth
+// NOTE: Don't check bestSlip <= maxSlippageBP - let verify step filter
+if maxAmount == 0 and amountIn > 0:
+  return ?{ amount = oneIcpWorth(); exchange = bestExchange }
+```
+
+---
+
+## What Python Script STILL MATCHES (Core Logic)
+
+### ✅ Slippage Extraction
+Both extract slippage in basis points: `slipBP = slippage_pct * 100`
+
+### ✅ Selection Criteria
+- Full splits: MAX total output
+- Partials: MIN combined slippage
+
+### ✅ Partial If/Elif/Else Order
+Same branch structure for partial selection
+
+### ✅ ICP Exception
+Skip minTradeValueICP for ICP pairs, keep 40% minimum
+
+### ✅ Interpolation Logic
+Same inverse weighting: `kongRatio = avgIcpSlip / totalSlip`
+
+---
+
+## What Python Script NEEDS UPDATING
+
+| Aspect | Current Python | Should Be |
+|--------|---------------|-----------|
+| Quote count | 5 (20% steps) | 10 (10% steps) |
+| STEP_BP | 2000 | 1000 |
+| Index for 100% | [4] | [9] |
+| Divisor in estimateMax | 5 | 10 |
+| Dust output check | Missing | Add |
+| oneIcpWorth() | Returns 1 | Calculate dynamically |
+| Integer math | Float | Scaled by 10000 |
 
 ### 6. ICPSwap Slippage Calculation - MATCHES
 **Treasury (via ICPSwap.getQuote):**
@@ -782,22 +943,32 @@ private func retryFailedKongswapTransactions() : async* () {
 
 ---
 
-## Summary of Differences
+## Summary of Differences (Updated for 10 Quotes + Partials)
+
+### Exchange Selection Algorithm
+
+| Component | Treasury | Python Test | Notes |
+|-----------|----------|-------------|-------|
+| Quote count | **10 per exchange** | 5 per exchange | **UPDATE NEEDED** |
+| STEP_BP | **1000 (10%)** | 2000 (20%) | **UPDATE NEEDED** |
+| Scenario count | **100 combinations** | 6 scenarios | **UPDATE NEEDED** |
+| Partial splits | **YES (#Partial type)** | YES | Logic matches |
+| MIN_PARTIAL_TOTAL_BP | **4000 (40%)** | 4000 (40%) | ✓ Matches |
+| ICP exception | YES | YES | ✓ Matches |
+| Interpolation math | **Integer (×10000)** | Float | **UPDATE NEEDED** |
+| Dust output check | **YES** | NO | **ADD** |
+| estimateMaxTradeableAmount divisor | **10** | 5 | **UPDATE NEEDED** |
+| oneIcpWorth() | **Dynamic calculation** | Returns 1 | **UPDATE NEEDED** |
+
+### Full Trading Cycle (NOT in Python Script)
 
 | Component | Treasury | Python Test |
 |-----------|----------|-------------|
-| Quote fetching (5 per exchange) | YES | YES |
-| Scenario evaluation (6 scenarios) | YES | YES |
-| Best scenario selection | YES | YES |
-| Slippage interpolation | YES | YES |
-| Reduced amount estimation | YES | YES |
-| ICP fallback route | YES | YES |
-| ICPSwap slippage calculation | YES | YES |
 | **Allocation calculation** | YES | **NO** |
 | **Weighted random pair selection** | YES | **NO** |
 | **Exact targeting logic** | YES | **NO** |
 | **Slippage adjustment for exact targeting** | YES | **NO** |
-| **Trade execution** | YES | **NO** |
+| **Trade execution (#Partial handler)** | YES | **NO** |
 | **Price updates** | YES | **NO** |
 | **Circuit breakers** | YES | **NO** |
 | **Transaction retry** | YES | **NO** |
@@ -806,15 +977,27 @@ private func retryFailedKongswapTransactions() : async* () {
 
 ## Conclusion
 
-The Python test script accurately replicates the **exchange selection algorithm** (`findBestExecution`), which is ~30% of the trading cycle logic. It is useful for testing:
-- Quote fetching and parsing
-- Scenario comparison
-- Slippage interpolation
-- ICP fallback routing
+The Python test script implements the **exchange selection algorithm** (`findBestExecution`) core logic, but needs updating to match treasury.mo:
 
-However, it is **NOT a complete replica** of the treasury trading cycle. It is missing:
-- Portfolio allocation logic (what/when to trade)
-- Trade sizing decisions (exact vs random)
+**What needs updating in Python:**
+1. Change from 5 to 10 quotes per exchange
+2. Update STEP_BP from 2000 to 1000
+3. Change 100% index from [4] to [9]
+4. Update divisor in estimateMaxTradeableAmount from 5 to 10
+5. Add dust output validation
+6. Convert Float interpolation to Integer (scaled by 10000)
+7. Update oneIcpWorth() to calculate dynamically
+
+**What already matches:**
+- Partial selection if/elif/else order
+- ICP exception (skip minTradeValueICP, keep 40% min)
+- Combined slippage selection (MIN for partials)
+- Interpolation inverse weighting logic
+- ICPSwap slippage calculation
+
+The Python script is **NOT a complete replica** of the trading cycle - it's only for testing exchange selection. Missing:
+- Portfolio allocation logic
+- Trade sizing decisions
 - Slippage adjustments
 - Trade execution
-- State management (prices, balances, pending txs)
+- State management
