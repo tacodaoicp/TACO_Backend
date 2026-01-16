@@ -7880,18 +7880,40 @@ shared (deployer) persistent actor class treasury() = this {
       // Calculate final token price
       switch (kongTokenPrice, icpSwapTokenPrice) {
         case (?kong, ?icpSwap) {
-          // Average both prices (both are > 0.0 due to filtering above)
-          let avgPrice = (kong + icpSwap) / 2.0;
-          let scaledPrice = avgPrice * 100000000.0;
+          // Both DEXes returned prices - check variance to decide averaging strategy
+          let maxPrice = Float.max(kong, icpSwap);
+          let minPrice = Float.min(kong, icpSwap);
+          let variance = if (maxPrice > 0.0) { (maxPrice - minPrice) / maxPrice } else { 1.0 };
+
+          let finalPrice : Float = if (variance <= 0.01) {
+            // Variance < 1% - safe to average
+            Debug.print(tokenSymbol # " DEX variance " # Float.toText(variance * 100.0) # "% < 1% - averaging prices");
+            (kong + icpSwap) / 2.0
+          } else {
+            // Variance >= 1% - pick the one closest to last recorded price
+            let lastPriceFloat = Float.fromInt(details.priceInICP) / 100000000.0;
+            let kongDiff = Float.abs(kong - lastPriceFloat);
+            let icpSwapDiff = Float.abs(icpSwap - lastPriceFloat);
+
+            if (kongDiff <= icpSwapDiff) {
+              Debug.print(tokenSymbol # " DEX variance " # Float.toText(variance * 100.0) # "% >= 1% - using Kong (closer to last price " # Float.toText(lastPriceFloat) # ")");
+              kong
+            } else {
+              Debug.print(tokenSymbol # " DEX variance " # Float.toText(variance * 100.0) # "% >= 1% - using ICPSwap (closer to last price " # Float.toText(lastPriceFloat) # ")");
+              icpSwap
+            }
+          };
+
+          let scaledPrice = finalPrice * 100000000.0;
           // Guard: ensure price is finite before Float.toInt to avoid trap
-          if (avgPrice > 0.0 and isFiniteFloat(scaledPrice)) {
+          if (finalPrice > 0.0 and isFiniteFloat(scaledPrice)) {
             // priceInICP is always stored in e8s (10^8), regardless of token decimals
             let icpPrice = Float.toInt(scaledPrice);
-            let usdPrice = avgPrice * finalICPPriceUSD;
+            let usdPrice = finalPrice * finalICPPriceUSD;
             updateTokenPriceWithHistory(principal, Int.abs(icpPrice), usdPrice);
-            Debug.print("Updated " # tokenSymbol # " with averaged DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
+            Debug.print("Updated " # tokenSymbol # " with DEX price - ICP: " # Int.toText(Int.abs(icpPrice)) # ", USD: " # Float.toText(usdPrice));
           } else {
-            Debug.print("Averaged price was zero/unreasonable; skipping update for " # tokenSymbol);
+            Debug.print("Final price was zero/unreasonable; skipping update for " # tokenSymbol);
           };
         };
         case (?kong, null) {
