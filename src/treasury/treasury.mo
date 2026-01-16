@@ -6102,6 +6102,33 @@ shared (deployer) persistent actor class treasury() = this {
         case null { 8 };
       };
 
+      // Get transfer fee for sell token (needed for ICPSwap quote adjustment)
+      // ICPSwap executes swaps with (amountIn - fee), so quotes must reflect this
+      let sellTokenFee = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?details) { details.tokenTransferFee };
+        case null { 0 };
+      };
+
+      // Skip trade if transfer fee > 5% of amount (would waste cycles on doomed trades)
+      // This triggers ICP fallback which may succeed via KongSwap (handles fees internally)
+      if (amountIn > 0 and sellTokenFee > 0) {
+        let feeRatioBP = (sellTokenFee * 10000) / amountIn;
+        if (feeRatioBP > 500) {  // 5%
+          logger.warn("QUOTE_SKIP",
+            "Transfer fee too high relative to trade - Pair=" # sellSymbol # "/" # buySymbol #
+            " Fee=" # Nat.toText(sellTokenFee) #
+            " Amount=" # Nat.toText(amountIn) #
+            " Ratio=" # Nat.toText(feeRatioBP) # "bp (>5%)",
+            "findBestExecution"
+          );
+          return #err({
+            reason = "Transfer fee (" # Nat.toText(feeRatioBP) # "bp) exceeds 5% of trade amount";
+            kongQuotes = [];
+            icpQuotes = [];
+          });
+        };
+      };
+
       logger.info("EXCHANGE_COMPARISON",
         "Starting exchange comparison with 10 quotes (20% increments) - Pair=" # sellSymbol # "/" # buySymbol #
         " Amount_in=" # Nat.toText(amountIn) # " (raw)" #
@@ -6124,7 +6151,8 @@ shared (deployer) persistent actor class treasury() = this {
       // ========================================
 
       // Calculate amounts for 10% increments (indices 0-9 = 10%, 20%, ..., 100%)
-      let amounts : [Nat] = [
+      // Kong uses full amounts (handles fee internally via pay_tx_id)
+      let kongAmounts : [Nat] = [
         amountIn * 1 / 10,    // 10%  - idx 0
         amountIn * 2 / 10,    // 20%  - idx 1
         amountIn * 3 / 10,    // 30%  - idx 2
@@ -6137,33 +6165,48 @@ shared (deployer) persistent actor class treasury() = this {
         amountIn,             // 100% - idx 9
       ];
 
-      // Start all 20 quote requests in parallel (no await yet)
-      // Kong quotes for 10 percentages
-      let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[0]);
-      let kongFuture1 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[1]);
-      let kongFuture2 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[2]);
-      let kongFuture3 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[3]);
-      let kongFuture4 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[4]);
-      let kongFuture5 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[5]);
-      let kongFuture6 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[6]);
-      let kongFuture7 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[7]);
-      let kongFuture8 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[8]);
-      let kongFuture9 = KongSwap.getQuote(sellSymbol, buySymbol, amounts[9]);
+      // ICPSwap uses fee-adjusted amounts (fee deducted before swap in pool)
+      // This ensures quotes match what will actually be swapped
+      let icpAmounts : [Nat] = [
+        if (amountIn * 1 / 10 > sellTokenFee) { amountIn * 1 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 2 / 10 > sellTokenFee) { amountIn * 2 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 3 / 10 > sellTokenFee) { amountIn * 3 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 4 / 10 > sellTokenFee) { amountIn * 4 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 5 / 10 > sellTokenFee) { amountIn * 5 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 6 / 10 > sellTokenFee) { amountIn * 6 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 7 / 10 > sellTokenFee) { amountIn * 7 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 8 / 10 > sellTokenFee) { amountIn * 8 / 10 - sellTokenFee } else { 0 },
+        if (amountIn * 9 / 10 > sellTokenFee) { amountIn * 9 / 10 - sellTokenFee } else { 0 },
+        if (amountIn > sellTokenFee) { amountIn - sellTokenFee } else { 0 },
+      ];
 
-      // ICP quotes for 10 percentages (or error if no pool)
+      // Start all 20 quote requests in parallel (no await yet)
+      // Kong quotes for 10 percentages (uses full amounts - Kong handles fees internally)
+      let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[0]);
+      let kongFuture1 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[1]);
+      let kongFuture2 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[2]);
+      let kongFuture3 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[3]);
+      let kongFuture4 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[4]);
+      let kongFuture5 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[5]);
+      let kongFuture6 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[6]);
+      let kongFuture7 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[7]);
+      let kongFuture8 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[8]);
+      let kongFuture9 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[9]);
+
+      // ICP quotes for 10 percentages (uses fee-adjusted amounts - ICPSwap swaps amountIn-fee)
       let (icpFuture0, icpFuture1, icpFuture2, icpFuture3, icpFuture4, icpFuture5, icpFuture6, icpFuture7, icpFuture8, icpFuture9) = switch (icpPoolData) {
         case (?poolData) {
           (
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[0]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[1]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[2]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[3]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[4]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[5]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[6]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[7]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[8]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = amounts[9]; amountOutMinimum = 0; zeroForOne = zeroForOne })
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[0]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[1]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[2]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[3]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[4]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[5]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[6]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[7]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[8]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[9]; amountOutMinimum = 0; zeroForOne = zeroForOne })
           )
         };
         case null {
@@ -6255,12 +6298,12 @@ shared (deployer) persistent actor class treasury() = this {
 
       // Extract KongSwap quotes (indices 0-9 = 10%, 20%, ..., 100%)
       let kong = Array.tabulate<QuoteData>(10, func(i) : QuoteData {
-        extractKong(kongResults[i], amounts[i])
+        extractKong(kongResults[i], kongAmounts[i])
       });
 
       // Extract ICPSwap quotes (indices 0-9 = 10%, 20%, ..., 100%)
       let icp = Array.tabulate<QuoteData>(10, func(i) : QuoteData {
-        extractIcp(icpResults[i], amounts[i])
+        extractIcp(icpResults[i], icpAmounts[i])
       });
 
       // Log quote results summary

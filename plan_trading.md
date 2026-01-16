@@ -235,6 +235,61 @@ executeTradingCycle() [Line 3673]
 
 ---
 
+## ICP Fallback Logic
+
+There are TWO ICP fallback mechanisms:
+
+### 1. Quote-Level Fallback (line ~4584)
+**Trigger:** `findBestExecution()` returns `#err` (no valid route found)
+
+```
+findBestExecution(sellToken, buyToken) → #err
+│
+├─► CHECK: buyToken != ICP AND sellToken != ICP AND ICP not paused?
+│   └─► NO → Record failure, continue
+│   └─► YES ↓
+│
+├─► TRY: findBestExecution(sellToken, ICP)
+│   └─► If succeeds → Execute sell→ICP trade
+│   └─► If fails → Record original failure
+│
+└─► RESULT: Next cycle handles ICP→buyToken imbalance
+```
+
+### 2. Execution-Level Fallback (line ~4110) - NEW
+**Trigger:** `executeTrade()` returns `#err` (e.g., "slippage over range")
+
+**CRITICAL:** Only for ICPSwap failures (tokens recovered immediately via `recoverBalanceFromSpecificPool`).
+KongSwap failures use `pendingTxs` retry mechanism instead - tokens are held by Kong.
+
+```
+executeTrade(sellToken, buyToken, ...) → #err("slippage over range")
+│
+├─► CHECK: exchange == #ICPSwap?
+│   └─► NO (KongSwap) → pendingTxs handles retry, DO NOT attempt fallback
+│   └─► YES ↓
+│
+├─► CHECK: buyToken != ICP AND sellToken != ICP AND ICP not paused?
+│   └─► NO → Record failure
+│   └─► YES ↓
+│
+├─► LOG: "Execution failed, attempting ICP fallback"
+├─► findBestExecution(sellToken, ICP) → get fresh quotes
+│
+├─► IF quote succeeds:
+│   └─► executeTrade(sellToken, ICP, ...)
+│       ├─► SUCCESS → Record ICP_FALLBACK trade, update prices
+│       └─► FAIL → Record original failure
+│
+└─► RESULT: Tokens recovered from failed ICPSwap, sold to ICP instead
+```
+
+**Why ICPSwap-only?**
+- ICPSwap: Failed swap → tokens stay in pool unused → `recoverBalanceFromSpecificPool()` withdraws them → tokens back in treasury → safe to retry
+- KongSwap: Failed swap → tokens transferred to Kong → `pendingTxs` tracks for retry → tokens NOT available for fallback
+
+---
+
 ## Key Calculations
 
 ### 1. Portfolio Value Calculation
@@ -449,24 +504,48 @@ newPrice = otherToken.priceInICP * priceRatio
 
 ## CURRENT TREASURY IMPLEMENTATION (Updated)
 
-### 1. Quote Fetching - NOW 10 QUOTES
-**Treasury ([treasury.mo:5944-6024](src/treasury/treasury.mo#L5944)):**
+### 1. Quote Fetching - 10 QUOTES WITH FEE ADJUSTMENT
+**Treasury ([treasury.mo:6100-6200](src/treasury/treasury.mo#L6100)):**
+
+**CRITICAL:** Kong and ICPSwap use DIFFERENT quote amounts due to how fees are handled:
+- **KongSwap**: Uses FULL amounts (fee handled internally via `pay_tx_id`)
+- **ICPSwap**: Uses FEE-ADJUSTED amounts (execution uses `amountIn - tx_fee`)
+
 ```motoko
-// Calculate amounts for 10% increments (indices 0-9 = 10%, 20%, ..., 100%)
-let amounts : [Nat] = [
+// Get transfer fee for sell token
+let sellTokenFee = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+  case (?details) { details.tokenTransferFee };
+  case null { 0 };
+};
+
+// Kong uses full amounts (handles fee internally via pay_tx_id)
+let kongAmounts : [Nat] = [
   amountIn * 1 / 10,    // 10%  - idx 0
   amountIn * 2 / 10,    // 20%  - idx 1
-  amountIn * 3 / 10,    // 30%  - idx 2
-  amountIn * 4 / 10,    // 40%  - idx 3
-  amountIn * 5 / 10,    // 50%  - idx 4
-  amountIn * 6 / 10,    // 60%  - idx 5
-  amountIn * 7 / 10,    // 70%  - idx 6
-  amountIn * 8 / 10,    // 80%  - idx 7
-  amountIn * 9 / 10,    // 90%  - idx 8
+  ...
   amountIn,             // 100% - idx 9
 ];
-// Fetch 20 quotes in parallel (10 Kong + 10 ICP)
+
+// ICPSwap uses fee-adjusted amounts (fee deducted before swap in pool)
+let icpAmounts : [Nat] = [
+  if (amountIn * 1 / 10 > sellTokenFee) { amountIn * 1 / 10 - sellTokenFee } else { 0 },
+  if (amountIn * 2 / 10 > sellTokenFee) { amountIn * 2 / 10 - sellTokenFee } else { 0 },
+  ...
+  if (amountIn > sellTokenFee) { amountIn - sellTokenFee } else { 0 },
+];
+
+// Kong quotes use kongAmounts
+let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[0]);
+
+// ICPSwap quotes use icpAmounts
+ICPSwap.getQuote({ poolId; amountIn = icpAmounts[0]; ... });
 ```
+
+**Why this matters:**
+- Without fee adjustment, ICPSwap quotes are for `amountIn`
+- But execution actually swaps `amountIn - tx_fee`
+- Result: `minAmountOut` set too high → "slippage over range" failures
+- For small trades (e.g., 0.000042 ckETH with 0.000002 fee = 4.76% eaten by fee)
 
 ### 2. Constants
 ```motoko
@@ -598,8 +677,30 @@ Same inverse weighting: `kongRatio = avgIcpSlip / totalSlip`
 | Index for 100% | [4] | [9] |
 | Divisor in estimateMax | 5 | 10 |
 | Dust output check | Missing | Add |
-| oneIcpWorth() | Returns 1 | Calculate dynamically |
-| Integer math | Float | Scaled by 10000 |
+| **Transfer fee adjustment** | **DONE** | **DONE** |
+| **ICP fallback types** | **DONE** | **DONE** |
+
+### ✅ RECENTLY ADDED TO PYTHON:
+
+#### Transfer Fee Quote Adjustment
+```python
+# Token data now includes transfer fees
+TOKENS = {
+    "ICP": ("ryjl3-tyaaa-aaaaa-aaaba-cai", 8, 10_000),      # (principal, decimals, fee)
+    "ckETH": ("ss2fx-dyaaa-aaaar-qacoq-cai", 18, 2_000_000_000_000),  # 0.000002 ckETH
+    ...
+}
+
+# Separate amounts for Kong vs ICPSwap
+sell_token_fee = TOKENS.get(sell_symbol, (None, None, 0))[2]
+kong_amounts = [trade_size * (i + 1) // num_quotes for i in range(num_quotes)]
+icp_amounts = [max(0, amt - sell_token_fee) for amt in kong_amounts]
+```
+
+#### ICP Fallback Result Types
+- `ICP_FALLBACK`: Quote-level fallback (findBestExecution failed)
+- `ICP_FB_SPLIT`: Quote-level fallback with split route
+- `ICP_FB_EXEC`: Execution-level fallback (executeTrade failed, ICPSwap only)
 
 ### 6. ICPSwap Slippage Calculation - MATCHES
 **Treasury (via ICPSwap.getQuote):**

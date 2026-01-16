@@ -10,6 +10,13 @@ ICP Fallback Logic (matching treasury.mo):
    try ICP fallback - but ONLY for ICPSwap failures (tokens recovered immediately via
    recoverBalanceFromSpecificPool). KongSwap failures use pendingTxs retry mechanism instead.
 
+Transfer Fee Quote Adjustment (matching treasury.mo line 6105-6161):
+- Kong quotes use full amounts (Kong handles fees internally via pay_tx_id)
+- ICPSwap quotes use fee-adjusted amounts (amount - transfer_fee)
+  This is because ICPSwap execution actually swaps (amountIn - fee), so quotes must match.
+  Without this adjustment, small trades fail with "slippage over range" because
+  minAmountOut is set too high relative to actual swap input.
+
 Result types:
 - ICP_FALLBACK: Direct quote failed, routed via ICP (single exchange)
 - ICP_FB_SPLIT: Direct quote failed, routed via ICP (split between Kong/ICPSwap)
@@ -39,21 +46,23 @@ MAX_SLIPPAGE_BP = 100  # 4.5% (450bp = 0.45%) - matches treasury production conf
 CALL_TIMEOUT = 25
 MAX_PARALLEL = 12  # More parallel tests since quotes are now fetched in parallel too
 
-# Token data: symbol -> (principal, decimals)
+# Token data: symbol -> (principal, decimals, transfer_fee)
+# Transfer fees are in the token's smallest unit
+# ICPSwap quotes need fee-adjusted amounts because execution uses (amount - fee)
 TOKENS = {
-    "ICP": ("ryjl3-tyaaa-aaaaa-aaaba-cai", 8),
-    "TACO": ("kknbx-zyaaa-aaaaq-aae4a-cai", 8),
-    "ckBTC": ("mxzaz-hqaaa-aaaar-qaada-cai", 8),
-    "DKP": ("zfcdd-tqaaa-aaaaq-aaaga-cai", 8),
-    "SNEED": ("hvgxa-wqaaa-aaaaq-aacia-cai", 8),
-    "MOTOKO": ("k45jy-aiaaa-aaaaq-aadcq-cai", 8),
-    "sGLDT": ("i2s4q-syaaa-aaaan-qz4sq-cai", 8),
-    "CHAT": ("2ouva-viaaa-aaaaq-aaamq-cai", 8),
-    "GOLDAO": ("tyyy3-4aaaa-aaaaq-aab7a-cai", 8),
-    "NTN": ("f54if-eqaaa-aaaaq-aacea-cai", 8),
-    "cICP": ("n6tkf-tqaaa-aaaal-qsneq-cai", 8),
-    "CLOWN": ("iwv6l-6iaaa-aaaal-ajjjq-cai", 8),
-    "ckETH": ("ss2fx-dyaaa-aaaar-qacoq-cai", 18),
+    "ICP": ("ryjl3-tyaaa-aaaaa-aaaba-cai", 8, 10_000),           # 0.0001 ICP
+    "TACO": ("kknbx-zyaaa-aaaaq-aae4a-cai", 8, 1_000_000),       # 0.01 TACO
+    "ckBTC": ("mxzaz-hqaaa-aaaar-qaada-cai", 8, 10),             # 0.0000001 ckBTC
+    "DKP": ("zfcdd-tqaaa-aaaaq-aaaga-cai", 8, 10_000),           # 0.0001 DKP
+    "SNEED": ("hvgxa-wqaaa-aaaaq-aacia-cai", 8, 1_000),          # 0.00001 SNEED
+    "MOTOKO": ("k45jy-aiaaa-aaaaq-aadcq-cai", 8, 100_000),       # 0.001 MOTOKO
+    "sGLDT": ("i2s4q-syaaa-aaaan-qz4sq-cai", 8, 100),            # 0.000001 sGLDT
+    "CHAT": ("2ouva-viaaa-aaaaq-aaamq-cai", 8, 100_000),         # 0.001 CHAT
+    "GOLDAO": ("tyyy3-4aaaa-aaaaq-aab7a-cai", 8, 100_000),       # 0.001 GOLDAO
+    "NTN": ("f54if-eqaaa-aaaaq-aacea-cai", 8, 10_000_000),       # 0.1 NTN
+    "cICP": ("n6tkf-tqaaa-aaaal-qsneq-cai", 8, 0),               # 0 cICP (no fee)
+    "CLOWN": ("iwv6l-6iaaa-aaaal-ajjjq-cai", 8, 100_000),        # 0.001 CLOWN
+    "ckETH": ("ss2fx-dyaaa-aaaar-qacoq-cai", 18, 2_000_000_000_000),  # 0.000002 ckETH
 }
 
 PRINCIPAL_TO_SYMBOL = {v[0]: k for k, v in TOKENS.items()}
@@ -1307,21 +1316,33 @@ def get_real_quote_for_trade(
     trade_value_icp = (trade_size * sell_token.price_in_icp) // (10 ** sell_token.decimals)
     amount_icp = max(1, trade_value_icp // 100_000_000)  # Convert e8s to ICP units
 
+    # Get transfer fee for sell token (needed for ICPSwap quote adjustment)
+    # ICPSwap executes swaps with (amountIn - fee), so quotes must reflect this
+    sell_token_fee = TOKENS.get(sell_symbol, (None, None, 0))[2]
+
     # Quote amounts based on num_quotes (e.g., 5 = 20%, 40%, 60%, 80%, 100%)
-    # Each quote is at (i+1)/num_quotes of the trade size
-    amounts = [trade_size * (i + 1) // num_quotes for i in range(num_quotes)]
+    # Kong uses full amounts (handles fee internally via pay_tx_id)
+    kong_amounts = [trade_size * (i + 1) // num_quotes for i in range(num_quotes)]
+
+    # ICPSwap uses fee-adjusted amounts (fee deducted before swap in pool)
+    # This ensures quotes match what will actually be swapped
+    icp_amounts = [
+        max(0, amt - sell_token_fee) for amt in kong_amounts
+    ]
 
     # Check for ICPSwap pool
     pool_key = (sell_symbol, buy_symbol)
     has_icpswap_pool = pool_key in ICPSWAP_POOLS
 
     # Fetch ALL quotes in parallel
-    kong_futures = [quote_executor.submit(get_kong_quote, sell_symbol, buy_symbol, amt) for amt in amounts]
+    # Kong quotes use full amounts
+    kong_futures = [quote_executor.submit(get_kong_quote, sell_symbol, buy_symbol, amt) for amt in kong_amounts]
 
+    # ICPSwap quotes use fee-adjusted amounts
     if has_icpswap_pool:
         pool_id, zero_for_one = ICPSWAP_POOLS[pool_key]
         sqrt_price = get_pool_metadata(pool_id)
-        icp_futures = [quote_executor.submit(get_icpswap_quote, pool_id, amt, zero_for_one, sqrt_price) for amt in amounts]
+        icp_futures = [quote_executor.submit(get_icpswap_quote, pool_id, amt, zero_for_one, sqrt_price) for amt in icp_amounts]
     else:
         icp_futures = None
 
@@ -1331,7 +1352,7 @@ def get_real_quote_for_trade(
     if icp_futures:
         icp_quotes = [f.result() for f in icp_futures]
     else:
-        icp_quotes = [Quote(amt, 0, 10000, False, "no_pool") for amt in amounts]
+        icp_quotes = [Quote(amt, 0, 10000, False, "no_pool") for amt in icp_amounts]
 
     # Dust output validation: mark quotes as invalid if output < 1% of expected
     # Matches treasury.mo fix for Kong returning amount=1 with slippage=0%
@@ -1349,8 +1370,9 @@ def get_real_quote_for_trade(
                 return Quote(quote.amount_in, quote.amount_out, 10000, False, "dust_output")
             return quote
 
-        kong_quotes = [validate_dust(q, amounts[i]) for i, q in enumerate(kong_quotes)]
-        icp_quotes = [validate_dust(q, amounts[i]) for i, q in enumerate(icp_quotes)]
+        # Use correct amounts for each exchange (Kong=full, ICPSwap=fee-adjusted)
+        kong_quotes = [validate_dust(q, kong_amounts[i]) for i, q in enumerate(kong_quotes)]
+        icp_quotes = [validate_dust(q, icp_amounts[i]) for i, q in enumerate(icp_quotes)]
 
     # Check if any exchange works
     kong_works = any(q.valid for q in kong_quotes)
@@ -2389,22 +2411,32 @@ def test_pair_internal(sell_symbol: str, buy_symbol: str, amount_icp: int, base_
     Does NOT attempt ICP fallback - caller handles that.
     Returns: (result, kong_quotes, icp_quotes) - quotes needed for reduced amount estimation
     """
+    # Get transfer fee for sell token (needed for ICPSwap quote adjustment)
+    # ICPSwap executes swaps with (amountIn - fee), so quotes must reflect this
+    sell_token_fee = TOKENS.get(sell_symbol, (None, None, 0))[2]
+
     # Quote amounts: 20%, 40%, 60%, 80%, 100%
-    amounts = [base_amount * p // 10 for p in [2, 4, 6, 8, 10]]
+    # Kong uses full amounts (handles fee internally via pay_tx_id)
+    kong_amounts = [base_amount * p // 10 for p in [2, 4, 6, 8, 10]]
+
+    # ICPSwap uses fee-adjusted amounts (fee deducted before swap in pool)
+    icp_amounts = [max(0, amt - sell_token_fee) for amt in kong_amounts]
 
     # Check for ICPSwap pool
     pool_key = (sell_symbol, buy_symbol)
     has_icpswap_pool = pool_key in ICPSWAP_POOLS
 
     # Fetch ALL quotes in parallel (5 Kong + up to 5 ICPSwap = 10 requests)
-    kong_futures = [quote_executor.submit(get_kong_quote, sell_symbol, buy_symbol, amt) for amt in amounts]
+    # Kong quotes use full amounts
+    kong_futures = [quote_executor.submit(get_kong_quote, sell_symbol, buy_symbol, amt) for amt in kong_amounts]
 
+    # ICPSwap quotes use fee-adjusted amounts
     if has_icpswap_pool:
         pool_id, zero_for_one = ICPSWAP_POOLS[pool_key]
         # Fetch pool metadata for slippage calculation (like treasury.mo)
         sqrt_price = get_pool_metadata(pool_id)
         # Fetch ICPSwap quotes in parallel with sqrt_price for slippage calc
-        icp_futures = [quote_executor.submit(get_icpswap_quote, pool_id, amt, zero_for_one, sqrt_price) for amt in amounts]
+        icp_futures = [quote_executor.submit(get_icpswap_quote, pool_id, amt, zero_for_one, sqrt_price) for amt in icp_amounts]
     else:
         icp_futures = None
 
@@ -2414,7 +2446,7 @@ def test_pair_internal(sell_symbol: str, buy_symbol: str, amount_icp: int, base_
     if icp_futures:
         icp_quotes = [f.result() for f in icp_futures]
     else:
-        icp_quotes = [Quote(amt, 0, 10000, False, "no_pool") for amt in amounts]
+        icp_quotes = [Quote(amt, 0, 10000, False, "no_pool") for amt in icp_amounts]
 
     # Check if any exchange works
     kong_works = any(q.valid for q in kong_quotes)
