@@ -8,7 +8,7 @@ ICP Fallback Logic (matching treasury.mo):
 1. Quote-level fallback (line 4584): When findBestExecution returns #err, try sell->ICP route
 2. Execution-level fallback (line 4110): When executeTrade returns #err (e.g. "slippage over range"),
    try ICP fallback - but ONLY for ICPSwap failures (tokens recovered immediately via
-   recoverBalanceFromSpecificPool). KongSwap failures use pendingTxs retry mechanism instead.
+   recoverBalanceFromSpecificPool). KongSwap failures use Kong's claims mechanism for token recovery.
 
 Transfer Fee Quote Adjustment (matching treasury.mo line 6105-6161):
 - Kong quotes use full amounts (Kong handles fees internally via pay_tx_id)
@@ -176,6 +176,10 @@ stop_requested = False
 def get_kong_quote(sell_symbol: str, buy_symbol: str, amount: int, max_retries: int = 2) -> Quote:
     """Get a KongSwap quote. Uses IC. prefix for all tokens.
 
+    Calculates slippage from mid_price like treasury.mo (not Kong's raw slippage).
+    Kong's mid_price is in human units but amountIn/receive_amount are in raw token units,
+    so we must normalize using decimals before calculating slippage.
+
     Retries on transient failures (timeout, dfx_error) with exponential backoff.
     """
     kong_sell = f"IC.{sell_symbol}"
@@ -196,11 +200,45 @@ def get_kong_quote(sell_symbol: str, buy_symbol: str, amount: int, max_retries: 
 
             output = result.stdout
             receive_matches = re.findall(r'receive_amount\s*=\s*(\d[_\d]*)', output)
-            slippage_match = re.search(r'slippage\s*=\s*([\d.]+)', output)
+            mid_price_match = re.search(r'mid_price\s*=\s*([\d.e+-]+)', output)
 
-            if receive_matches and slippage_match:
+            if receive_matches:
                 receive_amount = int(receive_matches[-1].replace('_', ''))  # Use LAST match (top-level)
-                slippage_pct = float(slippage_match.group(1))
+
+                # Calculate slippage from mid_price like treasury.mo
+                # Kong's mid_price is in human units (buyToken per sellToken)
+                # but amountIn and receive_amount are in raw token units (e8s, sats, etc.)
+                if mid_price_match:
+                    mid_price = float(mid_price_match.group(1))
+                    if mid_price > 0:
+                        # Get decimals for normalization
+                        sell_decimals = TOKENS[sell_symbol][1]
+                        buy_decimals = TOKENS[buy_symbol][1]
+
+                        # Normalize to human units
+                        sell_factor = 10 ** sell_decimals
+                        buy_factor = 10 ** buy_decimals
+
+                        amount_in_human = amount / sell_factor
+                        actual_out_human = receive_amount / buy_factor
+
+                        # Calculate expected output at spot price
+                        spot_amount_out = amount_in_human * mid_price
+
+                        # Slippage = (spot - actual) / spot * 100
+                        if spot_amount_out > actual_out_human:
+                            slippage_pct = (spot_amount_out - actual_out_human) / spot_amount_out * 100
+                        else:
+                            slippage_pct = 0.0
+                    else:
+                        # mid_price is 0, use Kong's raw slippage as fallback
+                        slippage_match = re.search(r'slippage\s*=\s*([\d.]+)', output)
+                        slippage_pct = float(slippage_match.group(1)) if slippage_match else 100.0
+                else:
+                    # No mid_price found, use Kong's raw slippage as fallback
+                    slippage_match = re.search(r'slippage\s*=\s*([\d.]+)', output)
+                    slippage_pct = float(slippage_match.group(1)) if slippage_match else 100.0
+
                 slippage_bp = int(slippage_pct * 100)
                 valid = slippage_bp <= MAX_SLIPPAGE_BP and receive_amount > 0
                 return Quote(amount, receive_amount, slippage_bp, valid)
@@ -2375,14 +2413,14 @@ def simulate_execution_failure_with_icp_fallback(
 
     This matches treasury.mo line 4110-4276:
     - Only ICPSwap failures trigger ICP fallback (tokens recovered immediately)
-    - KongSwap failures use pendingTxs retry mechanism instead
+    - KongSwap failures use Kong's claims mechanism for token recovery (recoverKongswapClaims)
     - Fallback only if: buyToken != ICP and sellToken != ICP
 
     Returns: TestResult with type 'ICP_FB_EXEC' if fallback works, None otherwise
     """
     # Only ICPSwap failures trigger ICP fallback
     if original_exchange != 'ICPSwap':
-        return None  # KongSwap uses pendingTxs retry
+        return None  # KongSwap uses claims mechanism for recovery
 
     # Can't fallback if already trading ICP
     if sell_symbol == "ICP" or buy_symbol == "ICP":

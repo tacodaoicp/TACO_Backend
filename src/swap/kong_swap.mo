@@ -73,7 +73,9 @@ module {
   };
 
   // Get quote for a swap
-  public func getQuote(tokenA : Text, tokenB : Text, amountIn : Nat) : async Result.Result<Types.SwapAmountsReply, Text> {
+  // sellDecimals and buyDecimals are needed to normalize slippage calculation
+  // (mid_price is in human units, but amountIn/receive_amount are in raw token units)
+  public func getQuote(tokenA : Text, tokenB : Text, amountIn : Nat, sellDecimals : Nat, buyDecimals : Nat) : async Result.Result<Types.SwapAmountsReply, Text> {
     Debug.print("KongSwap.getQuote: Getting quote for " # debug_show (amountIn) # " " # tokenA # " to " # tokenB);
     try {
       let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
@@ -83,31 +85,44 @@ module {
         case (#Ok(quote)) {
           Debug.print("KongSwap.getQuote: Quote received successfully of tokenA: " # tokenA # " to tokenB: " # tokenB);
           Debug.print("KongSwap.getQuote: Original quote: " # debug_show (quote));
-          
+
           // Calculate our own slippage using mid_price (spot price) vs actual quote
+          // IMPORTANT: mid_price is in human units (buyToken per sellToken)
+          // but amountIn and receive_amount are in raw token units (e8, e18, etc.)
+          // We must normalize to human units before calculating slippage
           let calculatedSlippage = if (quote.mid_price > 0.0) {
+            // Normalize amountIn to human units
+            let sellDecimalsFactor = Float.pow(10.0, Float.fromInt(sellDecimals));
+            let buyDecimalsFactor = Float.pow(10.0, Float.fromInt(buyDecimals));
+
+            let amountInHuman = Float.fromInt(amountIn) / sellDecimalsFactor;
+            let actualAmountOutHuman = Float.fromInt(quote.receive_amount) / buyDecimalsFactor;
+
             // Calculate what we should get at spot price (mid_price)
-            let spotAmountOut = Float.fromInt(amountIn) * quote.mid_price;
-            let actualAmountOut = Float.fromInt(quote.receive_amount);
-            
+            let spotAmountOut = amountInHuman * quote.mid_price;
+
+            Debug.print("KongSwap.getQuote: amountInHuman=" # Float.toText(amountInHuman) #
+                       ", spotAmountOut=" # Float.toText(spotAmountOut) #
+                       ", actualAmountOutHuman=" # Float.toText(actualAmountOutHuman));
+
             // Slippage = (spot_amount - actual_amount) / spot_amount * 100
-            if (spotAmountOut > actualAmountOut) {
-              (spotAmountOut - actualAmountOut) / spotAmountOut * 100.0;
+            if (spotAmountOut > actualAmountOutHuman) {
+              (spotAmountOut - actualAmountOutHuman) / spotAmountOut * 100.0;
             } else {
               0.0; // No slippage if we got more than expected
             };
           } else {
             quote.slippage; // Fallback to their calculation if mid_price is unavailable
           };
-          
+
           Debug.print("KongSwap.getQuote: Calculated slippage: " # Float.toText(calculatedSlippage) # "% vs Kong's reported: " # Float.toText(quote.slippage) # "%");
-          
+
           // Return quote with our calculated slippage
           let correctedQuote = {
             quote with
             slippage = calculatedSlippage;
           };
-          
+
           #ok(correctedQuote);
         };
         case (#Err(e)) {
@@ -117,6 +132,52 @@ module {
       };
     } catch (e) {
       Debug.print("KongSwap.getQuote: Exception");
+      #err("Error calling Kong Swap: " # Error.message(e));
+    };
+  };
+
+  // Get all pending claims for a principal (for recovering tokens from failed swaps)
+  public func getPendingClaims(treasuryPrincipal : Principal) : async Result.Result<[Types.ClaimsReply], Text> {
+    Debug.print("KongSwap.getPendingClaims: Getting claims for " # Principal.toText(treasuryPrincipal));
+    try {
+      let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
+      let result = await kong.claims(Principal.toText(treasuryPrincipal));
+
+      switch (result) {
+        case (#Ok(claims)) {
+          Debug.print("KongSwap.getPendingClaims: Found " # Nat.toText(claims.size()) # " claims");
+          #ok(claims);
+        };
+        case (#Err(e)) {
+          Debug.print("KongSwap.getPendingClaims: Error getting claims: " # e);
+          #err("Error getting claims: " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("KongSwap.getPendingClaims: Exception");
+      #err("Error calling Kong Swap: " # Error.message(e));
+    };
+  };
+
+  // Execute a claim to recover tokens from a failed swap
+  public func executeClaim(claimId : Nat64) : async Result.Result<Types.ClaimReply, Text> {
+    Debug.print("KongSwap.executeClaim: Executing claim " # Nat64.toText(claimId));
+    try {
+      let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
+      let result = await kong.claim(claimId);
+
+      switch (result) {
+        case (#Ok(reply)) {
+          Debug.print("KongSwap.executeClaim: Claim successful - " # reply.symbol # " amount=" # Nat.toText(reply.amount));
+          #ok(reply);
+        };
+        case (#Err(e)) {
+          Debug.print("KongSwap.executeClaim: Error executing claim: " # e);
+          #err("Error executing claim: " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("KongSwap.executeClaim: Exception");
       #err("Error calling Kong Swap: " # Error.message(e));
     };
   };
@@ -239,9 +300,9 @@ module {
   };
 
   // Execute transfer and swap in one operation
+  // Kong automatically creates claims for failed swaps - no local tracking needed
   public func executeTransferAndSwap(
     params : Types.KongSwapParams,
-    pendingTxs : Map.Map<Nat, Types.SwapTxRecord>,
   ) : async Result.Result<Types.SwapReply, Text> {
     Debug.print("KongSwap.executeTransferAndSwap: Starting with params: " # debug_show (params));
     try {
@@ -252,22 +313,7 @@ module {
 
       switch (transferResult) {
         case (#ok(blockIndex)) {
-          Debug.print("KongSwap.executeTransferAndSwap: Transfer successful, recording pending swap...");
-          // Record the pending swap
-          let record : Types.SwapTxRecord = {
-            txId = blockIndex;
-            token0_ledger = params.token0_ledger;
-            token0_symbol = params.token0_symbol;
-            token1_ledger = params.token1_ledger;
-            token1_symbol = params.token1_symbol;
-            amount = params.amountIn;
-            minAmountOut = params.minAmountOut;
-            lastAttempt = Time.now();
-            attempts = 1;
-            status = #SwapPending;
-          };
-          Map.set(pendingTxs, nhash, blockIndex, record);
-          Debug.print("KongSwap.executeTransferAndSwap: Recorded pending swap with txId: " # debug_show (blockIndex));
+          Debug.print("KongSwap.executeTransferAndSwap: Transfer successful with blockIndex: " # Nat.toText(blockIndex));
 
           // Step 2: Try to execute the swap
           Debug.print("KongSwap.executeTransferAndSwap: Step 2 - Executing swap...");
@@ -275,35 +321,19 @@ module {
             params with
             txId = ?blockIndex
           };
-          Debug.print("KongSwap.executeTransferAndSwap: Updated params with txId: " # debug_show (blockIndex));
           let swapResult = await executeSwap(swapParams);
           Debug.print("KongSwap.executeTransferAndSwap: Swap result: " # debug_show (swapResult));
 
           switch (swapResult) {
             case (#ok(reply)) {
-              Debug.print("KongSwap.executeTransferAndSwap: Swap successful, removing from pending...");
-              // Update record status and remove from pending
-              Map.delete(pendingTxs, nhash, blockIndex);
+              Debug.print("KongSwap.executeTransferAndSwap: Swap successful");
               #ok(reply);
             };
             case (#err(e)) {
-              Debug.print("KongSwap.executeTransferAndSwap: Swap failed: " # e);
-              // Update record status but keep in pending for retry
-              switch (Map.get(pendingTxs, nhash, blockIndex)) {
-                case (?record) {
-                  let updatedRecord = {
-                    record with
-                    status = #SwapFailed(e);
-                    lastAttempt = Time.now();
-                  };
-                  Map.set(pendingTxs, nhash, blockIndex, updatedRecord);
-                  Debug.print("KongSwap.executeTransferAndSwap: Updated pending record with failure status");
-                };
-                case null {
-                  Debug.print("KongSwap.executeTransferAndSwap: Warning - Could not find pending record to update");
-                };
-              };
-              #err(e);
+              // Swap failed after transfer - Kong automatically creates a claim
+              // Tokens will be recovered via recoverKongswapClaims()
+              Debug.print("KongSwap.executeTransferAndSwap: Swap failed - Kong will create claim for blockIndex=" # Nat.toText(blockIndex));
+              #err("Swap failed (tokens held by Kong, will be claimed): " # e);
             };
           };
         };
@@ -318,13 +348,11 @@ module {
     };
   };
 
-  // Execute transfer and swap WITHOUT pendingTxs tracking
-  // Used for parallel split trades where we can't safely modify shared state
-  // Returns the swap result AND any pending tx info for the caller to handle
+  // Execute transfer and swap - Kong automatically creates claims for failed swaps
+  // Used for parallel split trades
   public type SplitTradeResult = {
     #ok : Types.SwapReply;
     #err : Text;
-    #pendingRetry : { txId : Nat; record : Types.SwapTxRecord; error : Text };
   };
 
   public func executeTransferAndSwapNoTracking(
@@ -344,23 +372,10 @@ module {
           switch (swapResult) {
             case (#ok(reply)) { #ok(reply) };
             case (#err(e)) {
-              // Swap failed - return info for caller to add to pendingTxs
-              #pendingRetry({
-                txId = blockIndex;
-                record = {
-                  txId = blockIndex;
-                  token0_ledger = params.token0_ledger;
-                  token0_symbol = params.token0_symbol;
-                  token1_ledger = params.token1_ledger;
-                  token1_symbol = params.token1_symbol;
-                  amount = params.amountIn;
-                  minAmountOut = params.minAmountOut;
-                  lastAttempt = Time.now();
-                  attempts = 1;
-                  status = #SwapFailed(e);
-                };
-                error = e;
-              });
+              // Swap failed after transfer - Kong automatically creates a claim
+              // Tokens will be recovered via recoverKongswapClaims()
+              Debug.print("KongSwap.executeTransferAndSwapNoTracking: Swap failed after transfer - Kong will create claim for blockIndex=" # Nat.toText(blockIndex));
+              #err("Swap failed (tokens held by Kong, will be claimed): " # e);
             };
           };
         };
@@ -408,93 +423,6 @@ module {
     } catch (e) {
       Debug.print("KongSwap.executeICRC1Transfer: Exception: " # Error.message(e));
       #err("Error executing transfer: " # Error.message(e));
-    };
-  };
-
-  // Retry a failed transaction
-  public func retryTransaction(
-    txId : Nat,
-    pendingTxs : Map.Map<Nat, Types.SwapTxRecord>,
-    failedTxs : Map.Map<Nat, Types.SwapTxRecord>,
-    maxAttempts : Nat,
-  ) : async Result.Result<(), Text> {
-    try {
-      let record = switch (Map.get(pendingTxs, nhash, txId)) {
-        case (?r) { ?r };
-        case null { Map.get(failedTxs, nhash, txId) };
-      };
-
-      switch (record) {
-        case (?r) {
-          // Move back to pending if it was in failed
-          if (Map.get(failedTxs, nhash, txId) != null) {
-            Map.delete(failedTxs, nhash, txId);
-            Map.set(pendingTxs, nhash, txId, r);
-          };
-
-          // Reconstruct params from record
-          let params : Types.KongSwapParams = {
-            token0_ledger = r.token0_ledger;
-            token0_symbol = r.token0_symbol;
-            token1_ledger = r.token1_ledger;
-            token1_symbol = r.token1_symbol;
-            amountIn = r.amount;
-            minAmountOut = r.minAmountOut;
-            deadline = null;
-            recipient = null;
-            txId = ?txId;
-            slippageTolerance = 0.5; // Default value
-          };
-
-          // Try swap again
-          let swapResult = await executeSwap(params);
-
-          switch (swapResult) {
-            case (#ok(_)) {
-              Map.delete(pendingTxs, nhash, txId);
-              #ok();
-            };
-            case (#err(e)) {
-              let updatedRecord = {
-                r with
-                status = #SwapFailed(e);
-                lastAttempt = Time.now();
-                attempts = r.attempts + 1;
-              };
-              if (updatedRecord.attempts < maxAttempts) {
-                Map.set(pendingTxs, nhash, txId, updatedRecord);
-              } else {
-                Map.set(failedTxs, nhash, txId, updatedRecord);
-                Map.delete(pendingTxs, nhash, txId);
-              };
-              #err(e);
-            };
-          };
-        };
-        case null {
-          #err("Transaction not found");
-        };
-      };
-    } catch (e) {
-      #err("Error in retryTransaction: " # Error.message(e));
-    };
-  };
-
-  // Abandon a pending transaction
-  public func abandonTransaction(
-    txId : Nat,
-    pendingTxs : Map.Map<Nat, Types.SwapTxRecord>,
-    failedTxs : Map.Map<Nat, Types.SwapTxRecord>,
-  ) : Result.Result<(), Text> {
-    switch (Map.get(pendingTxs, nhash, txId)) {
-      case (?record) {
-        Map.delete(pendingTxs, nhash, txId);
-        Map.set(failedTxs, nhash, txId, record);
-        #ok();
-      };
-      case null {
-        #err("Transaction not found in pending list");
-      };
     };
   };
 };

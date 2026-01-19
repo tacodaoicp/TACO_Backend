@@ -226,7 +226,7 @@ module {
                       fee = metadata.tokenTransferFee;
                     };
 
-                    let result = await executeWithdraw(selfId, withdrawParams);
+                    let result = await executeWithdraw(selfId, withdrawParams, false);
                     switch (result) {
                       case (#ok(_tx_id)) {
                         let amountOut = balance.balance0 - metadata.tokenTransferFee;
@@ -266,7 +266,7 @@ module {
                       fee = metadata.tokenTransferFee;
                     };
 
-                    let result = await executeWithdraw(selfId, withdrawParams);
+                    let result = await executeWithdraw(selfId, withdrawParams, false);
                     switch (result) {
                       case (#ok(_tx_id)) {
                         let amountOut = balance.balance1 - metadata.tokenTransferFee;
@@ -583,6 +583,7 @@ module {
     };
   };
 
+  // DEPRECATED: Use executeDepositAndSwapNative instead - this makes 2 calls where native makes 1
   public func executeDepositAndSwap(depositParams : Types.ICPSwapDepositParams, swapParams : Types.ICPSwapParams) : async Result.Result<Nat, Text> {
     Debug.print("ICPSwap.executeDepositAndSwap: Starting deposit and swap with params: " # debug_show ({ deposit = depositParams; swap = swapParams }));
     try {
@@ -620,8 +621,53 @@ module {
     };
   };
 
-  public func executeTransferDepositAndSwap(selfId : Principal, depositParams : Types.ICPSwapDepositParams, swapParams : Types.ICPSwapParams) : async Result.Result<Nat, Text> {
-    Debug.print("ICPSwap.executeTransferDepositAndSwap: Starting transfer, deposit and swap with params: " # debug_show ({ deposit = depositParams; swap = swapParams }));
+  // Native ICPSwap depositAndSwap - combines deposit+swap into 1 inter-canister call
+  // Saves ~5-8s per trade compared to executeDepositAndSwap which makes 2 calls
+  public func executeDepositAndSwapNative(
+    poolId : Principal,
+    zeroForOne : Bool,
+    tokenInFee : Nat,
+    tokenOutFee : Nat,
+    amountIn : Nat,
+    amountOutMinimum : Nat
+  ) : async Result.Result<Nat, Text> {
+    Debug.print("ICPSwap.executeDepositAndSwapNative: Starting with poolId=" # Principal.toText(poolId) #
+      " zeroForOne=" # debug_show(zeroForOne) #
+      " amountIn=" # Nat.toText(amountIn) #
+      " amountOutMinimum=" # Nat.toText(amountOutMinimum));
+    try {
+      let pool : Types.ICPSwapPool = actor (if test { FACTORY_CANISTER_ID } else { Principal.toText(poolId) });
+      let args : Types.DepositAndSwapArgs = {
+        zeroForOne = zeroForOne;
+        tokenInFee = tokenInFee;
+        tokenOutFee = tokenOutFee;
+        amountIn = Nat.toText(amountIn);
+        amountOutMinimum = Nat.toText(amountOutMinimum);
+      };
+      Debug.print("ICPSwap.executeDepositAndSwapNative: Calling pool.depositAndSwap with args: " # debug_show(args));
+
+      let result = await pool.depositAndSwap(args);
+      Debug.print("ICPSwap.executeDepositAndSwapNative: Result: " # debug_show(result));
+
+      switch (result) {
+        case (#ok(amount)) {
+          Debug.print("ICPSwap.executeDepositAndSwapNative: Success, amount out: " # Nat.toText(amount));
+          #ok(amount);
+        };
+        case (#err(e)) {
+          Debug.print("ICPSwap.executeDepositAndSwapNative: Error: " # debug_show(e));
+          #err("depositAndSwap error: " # debug_show(e));
+        };
+      };
+    } catch (e) {
+      Debug.print("ICPSwap.executeDepositAndSwapNative: Exception: " # Error.message(e));
+      #err("Error executing depositAndSwap: " # Error.message(e));
+    };
+  };
+
+  // tokenOutFee: the transfer fee of the output token (needed for native depositAndSwap)
+  public func executeTransferDepositAndSwap(selfId : Principal, depositParams : Types.ICPSwapDepositParams, swapParams : Types.ICPSwapParams, tokenOutFee : Nat) : async Result.Result<Nat, Text> {
+    Debug.print("ICPSwap.executeTransferDepositAndSwap: Starting transfer, deposit and swap with params: " # debug_show ({ deposit = depositParams; swap = swapParams; tokenOutFee = tokenOutFee }));
     try {
       // Step 1: Transfer tokens to pool subaccount
       Debug.print("ICPSwap.executeTransferDepositAndSwap: Step 1 - Transferring tokens...");
@@ -630,9 +676,22 @@ module {
 
       switch (transferResult) {
         case (#ok(_)) {
-          // Step 2: Register deposit and execute swap
-          Debug.print("ICPSwap.executeTransferDepositAndSwap: Step 2 - Executing deposit and swap...");
-          let swapResult = await executeDepositAndSwap(depositParams, swapParams);
+          // Step 2: Combined deposit and swap using native ICPSwap function (saves ~5-8s)
+          // IMPORTANT: depositAndSwap adds tokenInFee to amountIn internally (amountInDeposit = amountIn + feeIn)
+          // So we must pass the NET amount (depositParams.amount - depositParams.fee) as amountIn
+          // Otherwise ICPSwap tries to transfer more than what's in the subaccount
+          let netAmountIn = if (depositParams.amount > depositParams.fee) {
+            depositParams.amount - depositParams.fee
+          } else { 0 };
+          Debug.print("ICPSwap.executeTransferDepositAndSwap: Step 2 - Executing native depositAndSwap with netAmountIn=" # Nat.toText(netAmountIn));
+          let swapResult = await executeDepositAndSwapNative(
+            depositParams.poolId,
+            swapParams.zeroForOne,
+            depositParams.fee,      // tokenInFee
+            tokenOutFee,            // tokenOutFee
+            netAmountIn,            // amountIn (NET, depositAndSwap will add fee)
+            swapParams.minAmountOut
+          );
           Debug.print("ICPSwap.executeTransferDepositAndSwap: Deposit and swap result: " # debug_show (swapResult));
 
           switch (swapResult) {
@@ -657,22 +716,26 @@ module {
     };
   };
 
-  public func executeWithdraw(selfId : Principal, params : Types.ICPSwapWithdrawParams) : async Result.Result<Nat, Text> {
-    Debug.print("ICPSwap.executeWithdraw: Starting withdrawal with params: " # debug_show (params));
+  // skipBalanceCheck: set to true when called right after a swap (we know the balance exists)
+  // This saves ~2-3s per trade by avoiding an extra inter-canister call
+  public func executeWithdraw(selfId : Principal, params : Types.ICPSwapWithdrawParams, skipBalanceCheck : Bool) : async Result.Result<Nat, Text> {
+    Debug.print("ICPSwap.executeWithdraw: Starting withdrawal with params: " # debug_show (params) # " skipBalanceCheck: " # debug_show(skipBalanceCheck));
     try {
       let pool : Types.ICPSwapPool = actor (if test { FACTORY_CANISTER_ID } else { Principal.toText(params.poolId) });
 
-      let balance = await getBalance(selfId, params.poolId);
-      switch (balance) {
-        case (#ok(balance)) {
-          if (balance.balance0 < params.amount and balance.balance1 < params.amount) {
-            Debug.print("ICPSwap.executeWithdraw: Insufficient balance in pool! Balance: " # debug_show (balance) # " Amount: " # debug_show (params.amount));
-            //#err("Insufficient balance in pool");
+      // Only check balance when needed (recovery operations)
+      // Skip for post-swap withdrawals to save ~2-3s
+      if (not skipBalanceCheck) {
+        let balance = await getBalance(selfId, params.poolId);
+        switch (balance) {
+          case (#ok(balance)) {
+            if (balance.balance0 < params.amount and balance.balance1 < params.amount) {
+              Debug.print("ICPSwap.executeWithdraw: Insufficient balance in pool! Balance: " # debug_show (balance) # " Amount: " # debug_show (params.amount));
+            };
           };
-        };
-        case (#err(e)) {
-          Debug.print("ICPSwap.executeWithdraw: Error getting balance: " # e);
-          //#err(e);
+          case (#err(e)) {
+            Debug.print("ICPSwap.executeWithdraw: Error getting balance: " # e);
+          };
         };
       };
 
@@ -741,7 +804,7 @@ module {
                   };
 
                   Debug.print("Attempting to recover " # Nat.toText(withdrawAmount) # " of token0: " # Principal.toText(token0));
-                  let withdrawResult = await executeWithdraw(selfId, withdrawParams);
+                  let withdrawResult = await executeWithdraw(selfId, withdrawParams, false);
 
                   switch (withdrawResult) {
                     case (#ok(_)) {
@@ -778,7 +841,7 @@ module {
                   };
 
                   Debug.print("Attempting to recover " # Nat.toText(withdrawAmount) # " of token1: " # Principal.toText(token1));
-                  let withdrawResult = await executeWithdraw(selfId, withdrawParams);
+                  let withdrawResult = await executeWithdraw(selfId, withdrawParams, false);
 
                   switch (withdrawResult) {
                     case (#ok(_)) {
@@ -827,62 +890,45 @@ module {
   ) : async Result.Result<Types.TransferDepositSwapWithdrawResult, Text> {
     Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Starting combined operation with params: " # debug_show ({ deposit = depositParams; swap = swapParams; withdraw = withdrawParams }));
     try {
-      // Step 1: Execute transfer, deposit and swap using existing function
-      Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Step 1 - Executing transfer, deposit and swap...");
-      let swapResult = await executeTransferDepositAndSwap(selfId, depositParams, swapParams);
-      Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Transfer, deposit and swap result: " # debug_show (swapResult));
+      let receivedToken = withdrawParams.token;
 
-      switch (swapResult) {
-        case (#ok(swapAmount)) {
-          // Step 2: Withdraw
-          Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Step 2 - Executing withdrawal...");
+      // Get token metadata for fee FIRST - we need tokenOutFee for the native depositAndSwap
+      let metadataResult = Map.get(tokenDetails, phash, receivedToken);
 
-          let receivedToken = withdrawParams.token;
+      switch (metadataResult) {
+        case (?metadata) {
+          let tokenOutFee = metadata.tokenTransferFee;
 
-          // Get token metadata for fee
-          let metadataResult = Map.get(tokenDetails, phash, receivedToken);
+          // Step 1: Execute transfer, deposit and swap using native function (saves ~5-8s)
+          Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Step 1 - Executing transfer, deposit and swap with tokenOutFee=" # Nat.toText(tokenOutFee));
+          let swapResult = await executeTransferDepositAndSwap(selfId, depositParams, swapParams, tokenOutFee);
+          Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Transfer, deposit and swap result: " # debug_show (swapResult));
 
-          switch (metadataResult) {
-            case (?metadata) {
-              // Prepare withdraw parameters
-              let withdrawAmount = swapAmount;
+          switch (swapResult) {
+            case (#ok(swapAmount)) {
+              // NOTE: depositAndSwap automatically queues withdrawal via _enqueueWithdraw
+              // We do NOT need to call executeWithdraw - tokens are already being sent to us
+              // The swapAmount returned is pre-fee, actual received = swapAmount - tokenOutFee
+              Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: depositAndSwap succeeded with swapAmount=" # Nat.toText(swapAmount) # " (auto-withdrawal queued by ICPSwap)");
 
-              if (withdrawAmount > metadata.tokenTransferFee) {
-                let withdrawParamsWithFee : Types.ICPSwapWithdrawParams = {
-                  poolId = depositParams.poolId;
-                  token = receivedToken;
-                  amount = withdrawAmount;
-                  fee = metadata.tokenTransferFee;
-                };
+              let receivedAmount = if (swapAmount > tokenOutFee) {
+                swapAmount - tokenOutFee
+              } else { 0 };
 
-                let withdrawResult = await executeWithdraw(selfId, withdrawParamsWithFee);
-                Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Withdrawal result: " # debug_show (withdrawResult));
-
-                switch (withdrawResult) {
-                  case (#ok(_tx_id)) {
-                    #ok({
-                      swapAmount = withdrawAmount;  // Pre-fee amount for price calculation
-                      receivedAmount = withdrawAmount - metadata.tokenTransferFee;  // Post-fee for balance
-                    });
-                  };
-                  case (#err(e)) {
-                    Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Error in withdrawal: " # e);
-                    #err(e);
-                  };
-                };
-              } else {
-                #err("Insufficient balance in pool for withdrawal.");
-              };
+              #ok({
+                swapAmount = swapAmount;      // Pre-fee amount for price calculation
+                receivedAmount = receivedAmount;  // Post-fee amount actually received
+              });
             };
-            case (null) {
-              Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Error getting token metadata");
-              #err("Error getting token metadata");
+            case (#err(e)) {
+              Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Error in transfer, deposit and swap: " # e);
+              #err(e);
             };
           };
         };
-        case (#err(e)) {
-          Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Error in transfer, deposit and swap: " # e);
-          #err(e);
+        case (null) {
+          Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Error getting token metadata for " # Principal.toText(receivedToken));
+          #err("Error getting token metadata for output token");
         };
       };
     } catch (e) {

@@ -331,11 +331,6 @@ persistent actor validation {
     };
 
     // 3051
-    public query func validate_setRewardPenalties(penalties : [(Blob, Nat)]) : async ValidationResult {
-      #Ok("setRewardPenalties called with " # debug_show(penalties.size()) # " penalties");
-    };
-
-    // 3052
     public query func validate_removeRewardPenalty(neuronId : Blob) : async ValidationResult {
       #Ok("removeRewardPenalty called with neuronId: " # debug_show(neuronId));
     };

@@ -105,6 +105,15 @@ module {
     token : Text;
   };
 
+  // Combined deposit and swap args - saves one inter-canister call
+  public type DepositAndSwapArgs = {
+    zeroForOne : Bool;
+    tokenInFee : Nat;
+    tokenOutFee : Nat;
+    amountIn : Text;
+    amountOutMinimum : Text;
+  };
+
   public type ICPSwapPool = actor {
     metadata : query () -> async Result.Result<PoolMetadata, ICPSwapError>;
     //metadata2 : query Principal -> async Result.Result<PoolMetadata, ICPSwapError>;
@@ -117,6 +126,8 @@ module {
     //swap2 : shared (Principal, SwapArgs) -> async Result.Result<Nat, ICPSwapError>;
     withdraw : shared (WithdrawArgs) -> async Result.Result<Nat, ICPSwapError>;
     //withdraw2 : shared (Principal, WithdrawArgs) -> async Result.Result<Nat, ICPSwapError>;
+    // Combined deposit+swap - reduces 2 calls to 1, saving ~5-8s per trade
+    depositAndSwap : shared (DepositAndSwapArgs) -> async Result.Result<Nat, ICPSwapError>;
   };
 
   public type ICPSwapPriceInfo = {
@@ -253,6 +264,9 @@ module {
     swap : (KongSwapArgs) -> async SwapResult;
     swap_async : (KongSwapArgs) -> async SwapAsyncResult;
     requests : query (?Nat64) -> async RequestsResult;
+    // Claim functions for recovering tokens from failed swaps
+    claims : query (Text) -> async ClaimsResult;  // text = principal as string
+    claim : (Nat64) -> async ClaimResult;  // nat64 = claim_id
   };
 
   public type TokenReply = {
@@ -440,13 +454,15 @@ module {
     receivedAmount : Nat; // Amount after withdraw fee (actual tokens received)
   };
 
-  // Kong Swap Transaction Types
+    // Kong Swap Transaction Types
   public type SwapTxStatus = {
     #SwapPending;
     #SwapFailed : Text;
     #SwapSucceeded;
   };
 
+  // DEPRECATED: SwapTxRecord - kept for stable variable backwards compatibility only
+  // Kong now tracks failed swaps as claims - we use recoverKongswapClaims() instead
   public type SwapTxRecord = {
     txId : Nat;
     token0_ledger : Principal;
@@ -459,4 +475,35 @@ module {
     attempts : Nat;
     status : SwapTxStatus;
   };
+
+  // Kong Swap Claim Types (for recovering tokens from failed swaps)
+  public type ClaimsReply = {
+    claim_id : Nat64;
+    status : Text;
+    chain : Text;
+    symbol : Text;
+    canister_id : ?Text;
+    amount : Nat;
+    fee : Nat;
+    to_address : Text;
+    desc : Text;
+    ts : Nat64;
+  };
+
+  public type ClaimReply = {
+    claim_id : Nat64;
+    status : Text;
+    chain : Text;
+    symbol : Text;
+    canister_id : ?Text;
+    amount : Nat;
+    fee : Nat;
+    to_address : Text;
+    desc : Text;
+    transfer_ids : [TransferIdReply];
+    ts : Nat64;
+  };
+
+  public type ClaimsResult = { #Ok : [ClaimsReply]; #Err : Text };
+  public type ClaimResult = { #Ok : ClaimReply; #Err : Text };
 };

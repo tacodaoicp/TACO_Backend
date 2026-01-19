@@ -327,9 +327,14 @@ shared (deployer) persistent actor class treasury() = this {
   // Exchange pool data
   stable var ICPswapPools = Map.new<(Principal, Principal), swaptypes.PoolData>();
 
-  // Transaction tracking
+  // DEPRECATED: pendingTxs and failedTxs - kept for stable variable backwards compatibility only
+  // Kong now tracks failed swaps as claims - we use recoverKongswapClaims() instead
+  // These are no longer used but cannot be deleted to maintain upgrade compatibility
   stable let pendingTxs = Map.new<Nat, swaptypes.SwapTxRecord>();
   stable let failedTxs = Map.new<Nat, swaptypes.SwapTxRecord>();
+
+  // Note: Kong claims are now managed by Kong directly - no local tracking needed
+  // Use KongSwap.getPendingClaims() to query and KongSwap.executeClaim() to recover
 
   // Timer IDs for scheduling
   var shortSyncTimerId : Nat = 0;
@@ -3711,10 +3716,8 @@ shared (deployer) persistent actor class treasury() = this {
     };
 
     // VERBOSE LOGGING: Trading cycle start
-    logger.info("REBALANCE_CYCLE", 
-      "Trading cycle started - Status=" # debug_show(rebalanceState.status) # 
-      " Pending_Txs=" # Nat.toText(Map.size(pendingTxs)) #
-      " Failed_Txs=" # Nat.toText(Map.size(failedTxs)) #
+    logger.info("REBALANCE_CYCLE",
+      "Trading cycle started - Status=" # debug_show(rebalanceState.status) #
       " Executed_Trades=" # Nat.toText(rebalanceState.metrics.totalTradesExecuted) #
       " Failed_Trades=" # Nat.toText(rebalanceState.metrics.totalTradesFailed) #
       " Last_Attempt=" # Int.toText((now() - rebalanceState.metrics.lastRebalanceAttempt) / 1_000_000_000) # "s_ago",
@@ -3725,7 +3728,7 @@ shared (deployer) persistent actor class treasury() = this {
     await updateBalances();
 
     // Retry failed kongswap transactions
-    await* retryFailedKongswapTransactions();
+    await* recoverKongswapClaims();
 
     // Execute price updates and trading step
     try {
@@ -3747,40 +3750,51 @@ shared (deployer) persistent actor class treasury() = this {
   /**
    * Retry failed KongSwap transactions
    *
-   * Checks for and attempts to retry any failed KongSwap
-   * transactions until they succeed or reach max attempts
+   * Checks for and recovers any pending Kong claims (tokens from failed swaps)
+   * Kong automatically creates claims when swaps fail - we just query and execute them
    */
-  private func retryFailedKongswapTransactions() : async* () {
-    Debug.print("Checking for failed transactions to retry...");
+  private func recoverKongswapClaims() : async* () {
+    Debug.print("Checking for Kong claims to recover...");
 
-    let retryableTransactions = Vector.new<(Nat, swaptypes.SwapTxRecord)>();
+    // Get all pending claims from Kong for this treasury
+    let claimsResult = await KongSwap.getPendingClaims(Principal.fromActor(this));
 
-    // Collect transactions that are ready for retry
-    for ((txId, record) in Map.entries(pendingTxs)) {
-      switch (record.status) {
-        case (#SwapFailed(_)) {
-          Vector.add(retryableTransactions, (txId, record));
+    switch (claimsResult) {
+      case (#ok(claims)) {
+        if (claims.size() == 0) {
+          Debug.print("No pending claims to recover");
+          return;
         };
-        case (_) {}; // Skip non-failed transactions
+
+        Debug.print("Found " # Nat.toText(claims.size()) # " pending claims to recover");
+
+        for (claim in claims.vals()) {
+          Debug.print("Recovering claim " # Nat64.toText(claim.claim_id) #
+                     ": " # claim.symbol # " amount=" # Nat.toText(claim.amount));
+
+          let result = await KongSwap.executeClaim(claim.claim_id);
+
+          switch (result) {
+            case (#ok(reply)) {
+              logger.info("CLAIM_RECOVERED",
+                "Successfully recovered Kong claim - ID=" # Nat64.toText(claim.claim_id) #
+                " Symbol=" # reply.symbol #
+                " Amount=" # Nat.toText(reply.amount),
+                "recoverKongswapClaims"
+              );
+            };
+            case (#err(e)) {
+              logger.warn("CLAIM_FAILED",
+                "Failed to recover Kong claim - ID=" # Nat64.toText(claim.claim_id) #
+                " Error=" # e,
+                "recoverKongswapClaims"
+              );
+            };
+          };
+        };
       };
-    };
-
-    // Attempt retries
-    for ((txId, record) in Vector.vals(retryableTransactions)) {
-      Debug.print(
-        "Retrying transaction " # Nat.toText(txId) # " (attempt " #
-        Nat.toText(record.attempts + 1) # " of "
-      );
-
-      let retryResult = await KongSwap.retryTransaction(txId, pendingTxs, failedTxs, rebalanceConfig.maxKongswapAttempts);
-
-      switch (retryResult) {
-        case (#ok(_)) {
-          Debug.print("Retry successful for transaction " # Nat.toText(txId));
-        };
-        case (#err(e)) {
-          Debug.print("Retry failed for transaction " # Nat.toText(txId) # ": " # e);
-        };
+      case (#err(e)) {
+        Debug.print("Error getting claims: " # e);
       };
     };
   };
@@ -4145,11 +4159,10 @@ shared (deployer) persistent actor class treasury() = this {
                         };
 
                         // === ICP FALLBACK: Try selling for ICP instead if eligible ===
-                        // Only for ICPSwap failures (tokens recovered immediately via recoverBalanceFromSpecificPool)
-                        // KongSwap failures use pendingTxs retry mechanism instead - tokens not available
+                        // Works for both ICPSwap and KongSwap failures - tokens are available or will be claimed
                         var fallbackSucceeded = false;
 
-                        if (execution.exchange == #ICPSwap and
+                        if ((execution.exchange == #ICPSwap or execution.exchange == #KongSwap) and
                             buyToken != ICPprincipal and
                             sellToken != ICPprincipal and
                             not isTokenPausedFromTrading(ICPprincipal)) {
@@ -4331,15 +4344,6 @@ shared (deployer) persistent actor class treasury() = this {
                       icpFinalAmount, icpMinAmountOut, icpIdealOut
                     );
 
-                    // Handle pendingTx AFTER parallel execution completes (safe - sequential now)
-                    switch (splitResult.pendingTx) {
-                      case (?pendingRecord) {
-                        Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
-                        logger.warn("TRADE_SPLIT", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
-                      };
-                      case null {};
-                    };
-
                     // Track results
                     var kongSuccess = false;
                     var icpSuccess = false;
@@ -4472,15 +4476,6 @@ shared (deployer) persistent actor class treasury() = this {
                       icpFinalAmount, icpMinAmountOut, icpIdealOut
                     );
 
-                    // Handle pendingTx
-                    switch (splitResult.pendingTx) {
-                      case (?pendingRecord) {
-                        Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
-                        logger.warn("TRADE_PARTIAL", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
-                      };
-                      case null {};
-                    };
-
                     // Track results
                     var kongSuccess = false;
                     var icpSuccess = false;
@@ -4567,7 +4562,7 @@ shared (deployer) persistent actor class treasury() = this {
                 // NEW: Try REDUCED amount before ICP fallback
                 label reducedDirect switch (estimateMaxTradeableAmount(e.kongQuotes, e.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, buyToken)) {
                   case (?reduced) {
-                    // Get symbols for quotes
+                    // Get symbols and decimals for quotes
                     let reducedSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
                       case (?details) { details.tokenSymbol };
                       case null { break reducedDirect };
@@ -4575,6 +4570,14 @@ shared (deployer) persistent actor class treasury() = this {
                     let reducedBuySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
                       case (?details) { details.tokenSymbol };
                       case null { break reducedDirect };
+                    };
+                    let reducedSellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                      case (?details) { details.tokenDecimals };
+                      case null { 8 };
+                    };
+                    let reducedBuyDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                      case (?details) { details.tokenDecimals };
+                      case null { 8 };
                     };
 
                     logger.info("REDUCED_TRADE",
@@ -4593,7 +4596,7 @@ shared (deployer) persistent actor class treasury() = this {
 
                     switch (reduced.exchange) {
                       case (#KongSwap) {
-                        let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, reducedBuySymbol, reduced.amount) } catch (err) { #err("Kong exception: " # Error.message(err)) };
+                        let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, reducedBuySymbol, reduced.amount, reducedSellDecimals, reducedBuyDecimals) } catch (err) { #err("Kong exception: " # Error.message(err)) };
                         switch (kongResult) {
                           case (#ok(q)) {
                             let slipFloat = q.slippage * 100.0;
@@ -4632,8 +4635,8 @@ shared (deployer) persistent actor class treasury() = this {
                       };
                     };
 
-                    // Check if quote succeeded and slippage is acceptable
-                    if (quoteSuccess and slippageBP <= rebalanceConfig.maxSlippageBasisPoints) {
+                    // Check if quote succeeded, slippage is acceptable, and we get actual output
+                    if (quoteSuccess and slippageBP <= rebalanceConfig.maxSlippageBasisPoints and expectedOut > 0) {
                       logger.info("REDUCED_TRADE",
                         "Executing reduced trade - Verified_slippage=" # Nat.toText(slippageBP) # "bp" #
                         " Expected_out=" # Nat.toText(expectedOut),
@@ -4941,15 +4944,6 @@ shared (deployer) persistent actor class treasury() = this {
                         icpFinalAmount, icpMinAmountOut, icpIdealOut
                       );
 
-                      // Handle pendingTx AFTER parallel execution completes (safe - sequential now)
-                      switch (splitResult.pendingTx) {
-                        case (?pendingRecord) {
-                          Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
-                          logger.warn("ICP_FALLBACK_SPLIT", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
-                        };
-                        case null {};
-                      };
-
                       // Track results
                       var kongSuccess = false;
                       var icpSuccess = false;
@@ -5098,15 +5092,6 @@ shared (deployer) persistent actor class treasury() = this {
                         icpFinalAmount, icpMinAmountOut, icpIdealOut
                       );
 
-                      // Handle pendingTx
-                      switch (splitResult.pendingTx) {
-                        case (?pendingRecord) {
-                          Map.set(pendingTxs, Map.nhash, pendingRecord.txId, pendingRecord);
-                          logger.warn("ICP_FALLBACK_PARTIAL", "KongSwap leg needs retry - txId=" # Nat.toText(pendingRecord.txId), "do_executeTradingStep");
-                        };
-                        case null {};
-                      };
-
                       // Track results
                       var kongSuccess = false;
                       var icpSuccess = false;
@@ -5200,6 +5185,12 @@ shared (deployer) persistent actor class treasury() = this {
                             case (?details) { details.tokenSymbol };
                             case null { break reducedIcpFallback };
                           };
+                          let reducedSellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                            case (?details) { details.tokenDecimals };
+                            case null { 8 };
+                          };
+                          // ICP is always 8 decimals
+                          let icpDecimals : Nat = 8;
 
                           logger.info("REDUCED_ICP_FALLBACK",
                             "Attempting reduced ICP fallback - Original=" # Nat.toText(tradeSize) #
@@ -5216,7 +5207,7 @@ shared (deployer) persistent actor class treasury() = this {
 
                           switch (reduced.exchange) {
                             case (#KongSwap) {
-                              let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, "ICP", reduced.amount) } catch (err) { #err("Kong exception: " # Error.message(err)) };
+                              let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, "ICP", reduced.amount, reducedSellDecimals, icpDecimals) } catch (err) { #err("Kong exception: " # Error.message(err)) };
                               switch (kongResult) {
                                 case (#ok(q)) {
                                   let slipFloat = q.slippage * 100.0;
@@ -5255,8 +5246,8 @@ shared (deployer) persistent actor class treasury() = this {
                             };
                           };
 
-                          // Check if quote succeeded and slippage is acceptable
-                          if (icpQuoteSuccess and icpSlippageBP <= rebalanceConfig.maxSlippageBasisPoints) {
+                          // Check if quote succeeded, slippage is acceptable, and we get actual output
+                          if (icpQuoteSuccess and icpSlippageBP <= rebalanceConfig.maxSlippageBasisPoints and icpExpectedOut > 0) {
                             let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
                             let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
                             let minAmountOut : Nat = (icpIdealOut * toleranceMultiplier) / 10000;
@@ -6097,7 +6088,11 @@ shared (deployer) persistent actor class treasury() = this {
         case (?details) { details.tokenSymbol };
         case null { return #err({ reason = "Token details not found for buy token"; kongQuotes = []; icpQuotes = [] }) };
       };
-      let sellDecimals = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+      let sellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?details) { details.tokenDecimals };
+        case null { 8 };
+      };
+      let buyDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
         case (?details) { details.tokenDecimals };
         case null { 8 };
       };
@@ -6182,16 +6177,16 @@ shared (deployer) persistent actor class treasury() = this {
 
       // Start all 20 quote requests in parallel (no await yet)
       // Kong quotes for 10 percentages (uses full amounts - Kong handles fees internally)
-      let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[0]);
-      let kongFuture1 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[1]);
-      let kongFuture2 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[2]);
-      let kongFuture3 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[3]);
-      let kongFuture4 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[4]);
-      let kongFuture5 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[5]);
-      let kongFuture6 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[6]);
-      let kongFuture7 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[7]);
-      let kongFuture8 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[8]);
-      let kongFuture9 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[9]);
+      let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[0], sellDecimals, buyDecimals);
+      let kongFuture1 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[1], sellDecimals, buyDecimals);
+      let kongFuture2 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[2], sellDecimals, buyDecimals);
+      let kongFuture3 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[3], sellDecimals, buyDecimals);
+      let kongFuture4 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[4], sellDecimals, buyDecimals);
+      let kongFuture5 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[5], sellDecimals, buyDecimals);
+      let kongFuture6 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[6], sellDecimals, buyDecimals);
+      let kongFuture7 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[7], sellDecimals, buyDecimals);
+      let kongFuture8 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[8], sellDecimals, buyDecimals);
+      let kongFuture9 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[9], sellDecimals, buyDecimals);
 
       // ICP quotes for 10 percentages (uses fee-adjusted amounts - ICPSwap swaps amountIn-fee)
       let (icpFuture0, icpFuture1, icpFuture2, icpFuture3, icpFuture4, icpFuture5, icpFuture6, icpFuture7, icpFuture8, icpFuture9) = switch (icpPoolData) {
@@ -6254,8 +6249,6 @@ shared (deployer) persistent actor class treasury() = this {
       let buyTokenDetails = Map.get(tokenDetailsMap, phash, buyToken);
       let sellPriceICP : Nat = switch (sellTokenDetails) { case (?d) { d.priceInICP }; case null { 0 } };
       let buyPriceICP : Nat = switch (buyTokenDetails) { case (?d) { d.priceInICP }; case null { 0 } };
-      let buyDecimals : Nat = switch (buyTokenDetails) { case (?d) { d.tokenDecimals }; case null { 8 } };
-
       // Helper to check for dust output: output < 1% of expected at spot price
       func isDustOutput(amountIn : Nat, amountOut : Nat) : Bool {
         if (sellPriceICP == 0 or buyPriceICP == 0 or amountOut == 0) { return false };
@@ -6876,10 +6869,7 @@ shared (deployer) persistent actor class treasury() = this {
   /**
    * Execute a split trade on BOTH exchanges IN PARALLEL
    *
-   * This is safe because:
-   * - Uses KongSwap.executeTransferAndSwapNoTracking (doesn't modify pendingTxs)
-   * - ICPSwap doesn't use pendingTxs
-   * - State updates (pendingTxs, logs) happen AFTER both trades complete
+   * Kong tracks failed swaps as claims - recovery via recoverKongswapClaims()
    */
   private func executeSplitTrade(
     sellToken : Principal,
@@ -6890,7 +6880,7 @@ shared (deployer) persistent actor class treasury() = this {
     icpAmount : Nat,
     icpMinOut : Nat,
     icpIdealOut : Nat,
-  ) : async* { kongResult : Result.Result<TradeRecord, Text>; icpResult : Result.Result<TradeRecord, Text>; pendingTx : ?swaptypes.SwapTxRecord } {
+  ) : async* { kongResult : Result.Result<TradeRecord, Text>; icpResult : Result.Result<TradeRecord, Text> } {
     let startTime = now();
 
     // Get symbols for KongSwap
@@ -6966,9 +6956,7 @@ shared (deployer) persistent actor class treasury() = this {
     let kongRawResult = await kongFuture;
     let icpRawResult = await icpFuture;
 
-    // Process KongSwap result (no state writes during parallel execution)
-    var pendingTxRecord : ?swaptypes.SwapTxRecord = null;
-
+    // Process KongSwap result
     let kongResult : Result.Result<TradeRecord, Text> = switch (kongRawResult) {
       case (#ok(reply)) {
         #ok({
@@ -6984,12 +6972,8 @@ shared (deployer) persistent actor class treasury() = this {
         });
       };
       case (#err(e)) {
+        // Kong tracks failed swaps as claims - we recover via recoverKongswapClaims()
         #err(e);
-      };
-      case (#pendingRetry(info)) {
-        // Save for caller to add to pendingTxs AFTER this function returns
-        pendingTxRecord := ?info.record;
-        #err("KongSwap swap failed (transfer succeeded, needs retry): " # info.error);
       };
     };
 
@@ -7013,7 +6997,7 @@ shared (deployer) persistent actor class treasury() = this {
       };
     };
 
-    { kongResult = kongResult; icpResult = icpResult; pendingTx = pendingTxRecord };
+    { kongResult = kongResult; icpResult = icpResult };
   };
 
   /**
@@ -7046,16 +7030,16 @@ shared (deployer) persistent actor class treasury() = this {
         case (?details) { details.tokenSymbol };
         case null { "UNKNOWN" };
       };
-      let sellDecimals = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+      let sellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details.tokenDecimals };
         case null { 8 };
       };
-      let buyDecimals = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+      let buyDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
         case (?details) { details.tokenDecimals };
         case null { 8 };
       };
-      
-      logger.info("TRADE_EXECUTION", 
+
+      logger.info("TRADE_EXECUTION",
         "Trade execution STARTED - Exchange=" # debug_show(exchange) #
         " Pair=" # sellSymbol # "/" # buySymbol #
         " Amount_in=" # Nat.toText(amountIn) # " (raw)" #
@@ -7114,7 +7098,7 @@ shared (deployer) persistent actor class treasury() = this {
             "executeTrade"
           );
 
-          let swapResult = await KongSwap.executeTransferAndSwap(swapArgs, pendingTxs);
+          let swapResult = await KongSwap.executeTransferAndSwap(swapArgs);
           switch (swapResult) {
             case (#ok(reply)) {
               
@@ -7850,7 +7834,8 @@ shared (deployer) persistent actor class treasury() = this {
     var kongICPPrice : ?Float = null;
     try {
       // Quote 1 ICP (100,000,000 e8s) to ckUSDC
-      let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000);
+      // ICP = 8 decimals, ckUSDC = 6 decimals
+      let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000, 8, 6);
       switch (kongResult) {
         case (#ok(quote)) {
           // Treat 0 (or invalid) as failure; only accept positive prices
@@ -7976,7 +7961,8 @@ shared (deployer) persistent actor class treasury() = this {
       try {
         // Quote 1 token (in smallest units) to ICP
         let oneTokenAmount = 10 ** details.tokenDecimals; // 1 token in smallest unit
-        let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount);
+        // ICP is always 8 decimals
+        let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount, details.tokenDecimals, 8);
         switch (kongResult) {
           case (#ok(quote)) {
             // Treat 0 (or unreasonable) as failure; only accept positive, sane prices
@@ -8292,6 +8278,29 @@ shared (deployer) persistent actor class treasury() = this {
     };
     await recoverPoolBalances();
   };
+
+  /**
+   * Query pending KongSwap claims for this treasury
+   * Returns list of claims that can be recovered
+   */
+  public shared ({ caller }) func admin_getKongClaims() : async Result.Result<[swaptypes.ClaimsReply], Text> {
+    if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
+      return #err("Unauthorized");
+    };
+    await KongSwap.getPendingClaims(Principal.fromActor(this));
+  };
+
+  /**
+   * Execute all pending KongSwap claims to recover tokens
+   */
+  public shared ({ caller }) func admin_executeKongClaims() : async Result.Result<Text, Text> {
+    if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
+      return #err("Unauthorized");
+    };
+    await* recoverKongswapClaims();
+    #ok("Claim recovery completed");
+  };
+
 
   /**
    * Recovery of forgotten balances from ICPSwap pools
