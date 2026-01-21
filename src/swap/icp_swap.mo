@@ -43,7 +43,7 @@ module {
       };
 
       Debug.print("ICPSwap.getPoolByTokens: Calling factory.getPool with args: " # debug_show (args));
-      let result = await factory.getPool(args);
+      let result = await (with timeout = 65) factory.getPool(args);
 
       switch (result) {
         case (#ok(poolData)) {
@@ -71,7 +71,7 @@ module {
         };
       } = actor (FACTORY_CANISTER_ID);
 
-      let result = await factory.getPools();
+      let result = await (with timeout = 65) factory.getPools();
 
       switch (result) {
         case (#ok(pools)) {
@@ -97,7 +97,7 @@ module {
       // Get pool metadata
       Debug.print("ICPSwap.getPrice: Fetching pool metadata...");
 
-      let metadataResult = await pool.metadata();
+      let metadataResult = await (with timeout = 65) pool.metadata();
       Debug.print("ICPSwap.getPrice: Metadata result: " # debug_show (metadataResult));
 
       switch (metadataResult) {
@@ -152,7 +152,7 @@ module {
           // Need to query - fall back to old behavior
           try {
             let factory : Types.SwapFactory = actor (FACTORY_CANISTER_ID);
-            let poolResult = await factory.getPool({
+            let poolResult = await (with timeout = 65) factory.getPool({
               token0 = {
                 address = Principal.toText(token0);
                 standard = if (token0 != Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai")) "ICRC1" else "ICP";
@@ -197,7 +197,7 @@ module {
 
       // Direct call to the pool canister
       let pool : Types.ICPSwapPool = actor (Principal.toText(poolId));
-      let balanceFuture = pool.getUserUnusedBalance(selfId);
+      let balanceFuture = (with timeout = 65) pool.getUserUnusedBalance(selfId);
 
       Vector.add(balanceChecks, (poolId, tokens, balanceFuture));
     };
@@ -226,7 +226,7 @@ module {
                       fee = metadata.tokenTransferFee;
                     };
 
-                    let result = await executeWithdraw(selfId, withdrawParams, false);
+                    let result = await (with timeout = 65) executeWithdraw(selfId, withdrawParams, false);
                     switch (result) {
                       case (#ok(_tx_id)) {
                         let amountOut = balance.balance0 - metadata.tokenTransferFee;
@@ -266,7 +266,7 @@ module {
                       fee = metadata.tokenTransferFee;
                     };
 
-                    let result = await executeWithdraw(selfId, withdrawParams, false);
+                    let result = await (with timeout = 65) executeWithdraw(selfId, withdrawParams, false);
                     switch (result) {
                       case (#ok(_tx_id)) {
                         let amountOut = balance.balance1 - metadata.tokenTransferFee;
@@ -310,7 +310,7 @@ module {
     try {
       let pool : Types.ICPSwapPool = actor (Principal.toText(poolId));
       Debug.print("ICPSwap.getBalance: Fetching user unused balance...");
-      let balanceResult = await pool.getUserUnusedBalance(selfId);
+      let balanceResult = await (with timeout = 65) pool.getUserUnusedBalance(selfId);
       Debug.print("ICPSwap.getBalance: Balance result: " # debug_show (balanceResult));
 
       switch (balanceResult) {
@@ -346,7 +346,7 @@ module {
 
       // Execute swap
       Debug.print("ICPSwap.executeSwap: Executing swap...");
-      let result = await pool.swap(swapArgs);
+      let result = await (with timeout = 65) pool.swap(swapArgs);
       Debug.print("ICPSwap.executeSwap: Swap result: " # debug_show (result));
 
       switch (result) {
@@ -381,8 +381,8 @@ module {
       };
 
       // Start both calls in parallel (no await yet) - reduces total inter-canister calls
-      let metadataFuture = pool.metadata();
-      let quoteFuture = pool.quote(quoteArgs);
+      let metadataFuture = (with timeout = 65) pool.metadata();
+      let quoteFuture = (with timeout = 65) pool.quote(quoteArgs);
 
       // Await both results
       let (metadataResult, quoteResult)= try{(await metadataFuture, await quoteFuture)
@@ -463,7 +463,7 @@ module {
       Debug.print("ICPSwap.transferToPoolSubaccount: Executing transfer...");
       let result : { #Err : Types.ICRC1TransferError; #Ok : Nat } = if (test) {
         #Ok(10 ** 18);
-      } else { await token.icrc1_transfer(transferArgs) };
+      } else { await (with timeout = 65) token.icrc1_transfer(transferArgs) };
       Debug.print("ICPSwap.transferToPoolSubaccount: Transfer result: " # debug_show (result));
 
       switch (result) {
@@ -520,7 +520,7 @@ module {
       Debug.print("ICPSwap.registerPoolDeposit: Prepared deposit args: " # debug_show (depositArgs));
 
       Debug.print("ICPSwap.registerPoolDeposit: Registering deposit...");
-      let result = await pool.deposit(depositArgs);
+      let result = await (with timeout = 65) pool.deposit(depositArgs);
       Debug.print("ICPSwap.registerPoolDeposit: Deposit result: " # debug_show (result));
 
       switch (result) {
@@ -544,14 +544,14 @@ module {
     try {
       // Step 1: Transfer tokens
       Debug.print("ICPSwap.executeTransferAndDeposit: Step 1 - Transferring tokens...");
-      let transferResult = await transferToPoolSubaccount(selfId, params);
+      let transferResult = await (with timeout = 65) transferToPoolSubaccount(selfId, params);
       Debug.print("ICPSwap.executeTransferAndDeposit: Transfer result: " # debug_show (transferResult));
 
       switch (transferResult) {
         case (#ok(_)) {
           // Step 2: Register deposit
           Debug.print("ICPSwap.executeTransferAndDeposit: Step 2 - Registering deposit...");
-          let depositResult = await registerPoolDeposit(params);
+          let depositResult = await (with timeout = 65) registerPoolDeposit(params);
           Debug.print("ICPSwap.executeTransferAndDeposit: Deposit result: " # debug_show (depositResult));
 
           switch (depositResult) {
@@ -582,14 +582,14 @@ module {
     try {
       // Step 1: Register the deposit
       Debug.print("ICPSwap.executeDepositAndSwap: Step 1 - Registering deposit...");
-      let depositResult = await registerPoolDeposit(depositParams);
+      let depositResult = await (with timeout = 65) registerPoolDeposit(depositParams);
       Debug.print("ICPSwap.executeDepositAndSwap: Deposit result: " # debug_show (depositResult));
 
       switch (depositResult) {
         case (#ok(_)) {
           // Step 2: Execute the swap
           Debug.print("ICPSwap.executeDepositAndSwap: Step 2 - Executing swap...");
-          let swapResult = await executeSwap(swapParams);
+          let swapResult = await (with timeout = 65) executeSwap(swapParams);
           Debug.print("ICPSwap.executeDepositAndSwap: Swap result: " # debug_show (swapResult));
 
           switch (swapResult) {
@@ -639,7 +639,7 @@ module {
       };
       Debug.print("ICPSwap.executeDepositAndSwapNative: Calling pool.depositAndSwap with args: " # debug_show(args));
 
-      let result = await pool.depositAndSwap(args);
+      let result = await (with timeout = 65) pool.depositAndSwap(args);
       Debug.print("ICPSwap.executeDepositAndSwapNative: Result: " # debug_show(result));
 
       switch (result) {
@@ -664,7 +664,7 @@ module {
     try {
       // Step 1: Transfer tokens to pool subaccount
       Debug.print("ICPSwap.executeTransferDepositAndSwap: Step 1 - Transferring tokens...");
-      let transferResult = await transferToPoolSubaccount(selfId, depositParams);
+      let transferResult = await (with timeout = 65) transferToPoolSubaccount(selfId, depositParams);
       Debug.print("ICPSwap.executeTransferDepositAndSwap: Transfer result: " # debug_show (transferResult));
 
       switch (transferResult) {
@@ -677,7 +677,7 @@ module {
             depositParams.amount - depositParams.fee
           } else { 0 };
           Debug.print("ICPSwap.executeTransferDepositAndSwap: Step 2 - Executing native depositAndSwap with netAmountIn=" # Nat.toText(netAmountIn));
-          let swapResult = await executeDepositAndSwapNative(
+          let swapResult = await (with timeout = 65) executeDepositAndSwapNative(
             depositParams.poolId,
             swapParams.zeroForOne,
             depositParams.fee,      // tokenInFee
@@ -719,7 +719,7 @@ module {
       // Only check balance when needed (recovery operations)
       // Skip for post-swap withdrawals to save ~2-3s
       if (not skipBalanceCheck) {
-        let balance = await getBalance(selfId, params.poolId);
+        let balance = await (with timeout = 65) getBalance(selfId, params.poolId);
         switch (balance) {
           case (#ok(balance)) {
             if (balance.balance0 < params.amount and balance.balance1 < params.amount) {
@@ -742,7 +742,7 @@ module {
 
       // Execute withdraw
       Debug.print("ICPSwap.executeWithdraw: Executing withdrawal...");
-      let result = await pool.withdraw(withdrawArgs);
+      let result = await (with timeout = 65) pool.withdraw(withdrawArgs);
       Debug.print("ICPSwap.executeWithdraw: Withdrawal result: " # debug_show (result));
 
       switch (result) {
@@ -772,7 +772,7 @@ module {
     try {
       // Direct call to the specific pool canister
       let pool : Types.ICPSwapPool = actor (Principal.toText(poolId));
-      let balanceResult = await pool.getUserUnusedBalance(selfId);
+      let balanceResult = await (with timeout = 65) pool.getUserUnusedBalance(selfId);
 
       switch (balanceResult) {
         case (#ok(balance)) {
@@ -797,7 +797,7 @@ module {
                   };
 
                   Debug.print("Attempting to recover " # Nat.toText(withdrawAmount) # " of token0: " # Principal.toText(token0));
-                  let withdrawResult = await executeWithdraw(selfId, withdrawParams, false);
+                  let withdrawResult = await (with timeout = 65) executeWithdraw(selfId, withdrawParams, false);
 
                   switch (withdrawResult) {
                     case (#ok(_)) {
@@ -834,7 +834,7 @@ module {
                   };
 
                   Debug.print("Attempting to recover " # Nat.toText(withdrawAmount) # " of token1: " # Principal.toText(token1));
-                  let withdrawResult = await executeWithdraw(selfId, withdrawParams, false);
+                  let withdrawResult = await (with timeout = 65) executeWithdraw(selfId, withdrawParams, false);
 
                   switch (withdrawResult) {
                     case (#ok(_)) {
@@ -894,7 +894,7 @@ module {
 
           // Step 1: Execute transfer, deposit and swap using native function (saves ~5-8s)
           Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Step 1 - Executing transfer, deposit and swap with tokenOutFee=" # Nat.toText(tokenOutFee));
-          let swapResult = await executeTransferDepositAndSwap(selfId, depositParams, swapParams, tokenOutFee);
+          let swapResult = await (with timeout = 65) executeTransferDepositAndSwap(selfId, depositParams, swapParams, tokenOutFee);
           Debug.print("ICPSwap.executeTransferDepositSwapAndWithdraw: Transfer, deposit and swap result: " # debug_show (swapResult));
 
           switch (swapResult) {

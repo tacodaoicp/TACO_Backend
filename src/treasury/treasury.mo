@@ -3322,7 +3322,7 @@ shared (deployer) persistent actor class treasury() = this {
       "sendToken"
     );
 
-    let result = await ledger.icrc1_transfer({
+    let result = await (with timeout = 65) ledger.icrc1_transfer({
       from_subaccount = null;
       to = to_account;
       amount = amount_e8s;
@@ -3404,7 +3404,7 @@ shared (deployer) persistent actor class treasury() = this {
             case (?(foundTrades)) { foundTrades.tokenTransferFee };
           };
 
-          let transferTask = ledger.transfer({
+          let transferTask = (with timeout = 65) ledger.transfer({
             memo : Nat64 = 0;
             from_subaccount = ?Blob.fromArray([data.3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
             to = switch (data.0) {
@@ -3425,7 +3425,7 @@ shared (deployer) persistent actor class treasury() = this {
       // Wait for all ICRC1 transfers to complete
       for (transferTask in Vector.vals(transferTasksICRC1)) {
         try {
-          let result = await transferTask.0;
+          let result = await  transferTask.0;
           switch (result) {
             case (#Ok(txIndex)) {
               Vector.put(blocks, transferTask.1.4, (transferTask.1.2, natToNat64(txIndex)));
@@ -3532,7 +3532,7 @@ shared (deployer) persistent actor class treasury() = this {
               case (?(foundTrades)) { foundTrades.tokenTransferFee };
             };
 
-            let transferTask = token.icrc1_transfer({
+            let transferTask = (with timeout = 65) token.icrc1_transfer({
               from_subaccount = ?Blob.fromArray([data.3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
               to = { owner = Principal.fromText(self); subaccount = null };
               amount = (data.1);
@@ -3549,7 +3549,7 @@ shared (deployer) persistent actor class treasury() = this {
               case null { 10000 };
               case (?(foundTrades)) { foundTrades.tokenTransferFee };
             };
-            let transferTask = ledger.transfer({
+            let transferTask = (with timeout = 65)ledger.transfer({
               memo : Nat64 = 0;
               from_subaccount = ?Blob.fromArray([data.3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
               to = Principal.toLedgerAccount(Principal.fromText(self), null);
@@ -3774,7 +3774,7 @@ shared (deployer) persistent actor class treasury() = this {
     Debug.print("Checking for Kong claims to recover...");
 
     // Get all pending claims from Kong for this treasury
-    let claimsResult = await KongSwap.getPendingClaims(Principal.fromActor(this));
+    let claimsResult = await (with timeout = 65) KongSwap.getPendingClaims(Principal.fromActor(this));
 
     switch (claimsResult) {
       case (#ok(claims)) {
@@ -3789,7 +3789,7 @@ shared (deployer) persistent actor class treasury() = this {
           Debug.print("Recovering claim " # Nat64.toText(claim.claim_id) #
                      ": " # claim.symbol # " amount=" # Nat.toText(claim.amount));
 
-          let result = await KongSwap.executeClaim(claim.claim_id);
+          let result = await (with timeout = 65) KongSwap.executeClaim(claim.claim_id);
 
           switch (result) {
             case (#ok(reply)) {
@@ -6076,32 +6076,31 @@ shared (deployer) persistent actor class treasury() = this {
 
       // Start all 20 quote requests in parallel (no await yet)
       // Kong quotes for 10 percentages (uses full amounts - Kong handles fees internally)
-      let kongFuture0 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[0], sellDecimals, buyDecimals);
-      let kongFuture1 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[1], sellDecimals, buyDecimals);
-      let kongFuture2 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[2], sellDecimals, buyDecimals);
-      let kongFuture3 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[3], sellDecimals, buyDecimals);
-      let kongFuture4 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[4], sellDecimals, buyDecimals);
-      let kongFuture5 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[5], sellDecimals, buyDecimals);
-      let kongFuture6 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[6], sellDecimals, buyDecimals);
-      let kongFuture7 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[7], sellDecimals, buyDecimals);
-      let kongFuture8 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[8], sellDecimals, buyDecimals);
-      let kongFuture9 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[9], sellDecimals, buyDecimals);
-
+      let kongFuture0 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[0], sellDecimals, buyDecimals);
+      let kongFuture1 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[1], sellDecimals, buyDecimals);
+      let kongFuture2 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[2], sellDecimals, buyDecimals);
+      let kongFuture3 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[3], sellDecimals, buyDecimals);
+      let kongFuture4 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[4], sellDecimals, buyDecimals);
+      let kongFuture5 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[5], sellDecimals, buyDecimals);
+      let kongFuture6 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[6], sellDecimals, buyDecimals);
+      let kongFuture7 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[7], sellDecimals, buyDecimals);
+      let kongFuture8 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[8], sellDecimals, buyDecimals);
+      let kongFuture9 = (with timeout = 65) KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[9], sellDecimals, buyDecimals);
       // ICP quotes for 10 percentages (uses fee-adjusted amounts - ICPSwap swaps amountIn-fee)
       var skipICPswap=false;
       let (icpFuture0, icpFuture1, icpFuture2, icpFuture3, icpFuture4, icpFuture5, icpFuture6, icpFuture7, icpFuture8, icpFuture9) = switch (icpPoolData) {
         case (?poolData) {
           (
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[0]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[1]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[2]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[3]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[4]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[5]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[6]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[7]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[8]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
-            ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[9]; amountOutMinimum = 0; zeroForOne = zeroForOne })
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[0]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[1]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[2]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[3]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[4]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[5]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[6]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[7]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[8]; amountOutMinimum = 0; zeroForOne = zeroForOne }),
+            (with timeout = 65) ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = icpAmounts[9]; amountOutMinimum = 0; zeroForOne = zeroForOne })
           )
         };
         case null {
@@ -6123,7 +6122,6 @@ shared (deployer) persistent actor class treasury() = this {
       let kongResult7 = try { await kongFuture7 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult8 = try { await kongFuture8 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult9 = try { await kongFuture9 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
-
       let icpResult0 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture0 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
       let icpResult1 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture1 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
       let icpResult2 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture2 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
@@ -6841,7 +6839,7 @@ shared (deployer) persistent actor class treasury() = this {
     let icpPoolResult = Map.get(ICPswapPools, hashpp, (sellToken, buyToken));
 
     // START BOTH TRADES IN PARALLEL (no await yet!)
-    let kongFuture = KongSwap.executeTransferAndSwapNoTracking(kongParams);
+    let kongFuture = (with timeout = 65) KongSwap.executeTransferAndSwapNoTracking(kongParams);
 
     let icpFuture : async Result.Result<swaptypes.TransferDepositSwapWithdrawResult, Text> = switch (icpPoolResult) {
       case (?poolData) {
@@ -6869,7 +6867,7 @@ shared (deployer) persistent actor class treasury() = this {
           amount = null;
         };
 
-        ICPSwap.executeTransferDepositSwapAndWithdraw(
+        (with timeout = 65) ICPSwap.executeTransferDepositSwapAndWithdraw(
           Principal.fromText(self),
           depositParams,
           swapParams,
@@ -7356,7 +7354,7 @@ shared (deployer) persistent actor class treasury() = this {
             );
           };
           try {
-            ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+            ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
           } catch (e_sync) {
             logger.error(
               "SHORT_SYNC",
@@ -7401,7 +7399,7 @@ shared (deployer) persistent actor class treasury() = this {
       } catch (_) {};
       try {
         Debug.print("Sync token details to DAO");
-        ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+        ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
       } catch (_) {};
       for ((token, details) in Map.entries(tokenDetailsMap)) {
         Debug.print("Check token details sync failure for " # Principal.toText(token));
@@ -7433,7 +7431,7 @@ shared (deployer) persistent actor class treasury() = this {
       } catch (_) {};
       try {
         Debug.print("Sync token details to DAO");
-        ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+        ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
       } catch (_) {};
       for ((token, details) in Map.entries(tokenDetailsMap)) {
         Debug.print("Check token details sync failure for " # Principal.toText(token));
@@ -7455,7 +7453,7 @@ shared (deployer) persistent actor class treasury() = this {
     };
 
     try {
-      ignore await dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+      ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
       return #ok("Synced with DAO");
     } catch (e) {
       return #err("Error syncing with DAO: " # Error.message(e));
@@ -7522,8 +7520,8 @@ shared (deployer) persistent actor class treasury() = this {
   private func syncFromDAO() : async () {
     // Run token details and allocation fetches in parallel
 
-    let tokenDetailsFuture = dao.getTokenDetailsWithoutPastPrices();
-    let allocationFuture = dao.getAggregateAllocation();
+    let tokenDetailsFuture = (with timeout = 65) dao.getTokenDetailsWithoutPastPrices();
+    let allocationFuture = (with timeout = 65) dao.getAggregateAllocation();
     let tokenDetailsResult = await tokenDetailsFuture;
     let allocationResult = await allocationFuture;
     Debug.print("Token details result: " # debug_show (tokenDetailsResult));
@@ -7683,7 +7681,7 @@ shared (deployer) persistent actor class treasury() = this {
    * USD prices and converts to ICP-denominated prices.
    */
   private func syncPriceWithNTN() : async* () {
-    let allTokensNTN = try { await priceCheckNTN.getAllTokens() } catch (_) {
+    let allTokensNTN = try { await (with timeout = 65) priceCheckNTN.getAllTokens() } catch (_) {
       if test {
         for (t in [(ICPprincipal, 100000000, 20.0), (Principal.fromText("mxzaz-hqaaa-aaaar-qaada-cai"), 20000000, 4.0), (Principal.fromText("zxeu2-7aaaa-aaaaq-aaafa-cai"), 50000000, 10.0), (Principal.fromText("kknbx-zyaaa-aaaaq-aae4a-cai"), 1000000, 0.2), (Principal.fromText("xevnm-gaaaa-aaaar-qafnq-cai"), 5000000, 1.0)].vals()) {
           switch (Map.get(tokenDetailsMap, phash, t.0)) {
@@ -7765,7 +7763,7 @@ shared (deployer) persistent actor class treasury() = this {
     try {
       // Quote 1 ICP (100,000,000 e8s) to ckUSDC
       // ICP = 8 decimals, ckUSDC = 6 decimals
-      let kongResult = await KongSwap.getQuote("ICP", "ckUSDC", 100000000, 8, 6);
+      let kongResult = await (with timeout = 65) KongSwap.getQuote("ICP", "ckUSDC", 100000000, 8, 6);
       switch (kongResult) {
         case (#ok(quote)) {
           // Treat 0 (or invalid) as failure; only accept positive prices
@@ -7787,7 +7785,7 @@ shared (deployer) persistent actor class treasury() = this {
     // Try ICPSwap for ICP/ckUSDC price
     var icpSwapICPPrice : ?Float = null;
     try {
-      let icpSwapResult = await ICPSwap.getPrice(icpUsdcPoolPrincipal);
+      let icpSwapResult = await (with timeout = 65) ICPSwap.getPrice(icpUsdcPoolPrincipal);
       switch (icpSwapResult) {
         case (#ok(priceInfo)) {
           // The price represents token1 in terms of token0
@@ -7892,7 +7890,7 @@ shared (deployer) persistent actor class treasury() = this {
         // Quote 1 token (in smallest units) to ICP
         let oneTokenAmount = 10 ** details.tokenDecimals; // 1 token in smallest unit
         // ICP is always 8 decimals
-        let kongResult = await KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount, details.tokenDecimals, 8);
+        let kongResult = await (with timeout = 65) KongSwap.getQuote(tokenSymbol, "ICP", oneTokenAmount, details.tokenDecimals, 8);
         switch (kongResult) {
           case (#ok(quote)) {
             // Treat 0 (or unreasonable) as failure; only accept positive, sane prices
@@ -7919,7 +7917,7 @@ shared (deployer) persistent actor class treasury() = this {
       switch (Map.get(ICPswapPools, hashpp, poolKey)) {
         case (?poolData) {
           try {
-            let icpSwapResult = await ICPSwap.getPrice(poolData.canisterId);
+            let icpSwapResult = await (with timeout = 65) ICPSwap.getPrice(poolData.canisterId);
             switch (icpSwapResult) {
               case (#ok(priceInfo)) {
                 // The price from ICPSwap represents token1 in terms of token0
@@ -8096,7 +8094,7 @@ shared (deployer) persistent actor class treasury() = this {
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
       if (principal != ICPprincipal) {
         let token = actor (Principal.toText(principal)) : ICRC1.FullInterface;
-        let metadataFuture = token.icrc1_metadata();
+        let metadataFuture = (with timeout = 65) token.icrc1_metadata();
         Map.set(metadataFutures, phash, principal, metadataFuture);
       };
     };
@@ -8158,7 +8156,7 @@ shared (deployer) persistent actor class treasury() = this {
     let balanceFutures = Map.new<Principal, async Nat>();
 
     let ledger = actor (ICPprincipalText) : Ledger.Interface;
-    let ICPbalanceFuture = ledger.account_balance({
+    let ICPbalanceFuture = (with timeout = 65) ledger.account_balance({
       account = Principal.toLedgerAccount(Principal.fromText(self), null);
     });
 
@@ -8167,7 +8165,7 @@ shared (deployer) persistent actor class treasury() = this {
       if (principal != ICPprincipal) {
         // For ICRC1 tokens
         let token = actor (Principal.toText(principal)) : ICRC1.FullInterface;
-        let balanceFuture = token.icrc1_balance_of({
+        let balanceFuture = (with timeout = 65) token.icrc1_balance_of({
           owner = Principal.fromText(self);
           subaccount = null;
         });
@@ -8216,7 +8214,7 @@ shared (deployer) persistent actor class treasury() = this {
   private func hasAdminPermission(caller : Principal, permission : SpamProtection.AdminFunction) : async Bool {
     if (caller == DAOPrincipal or Principal.isController(caller)) { return true; };
     // call DAO canister to ask if caller is admin
-    await dao.hasAdminPermission(caller, permission);
+    await (with timeout = 65) dao.hasAdminPermission(caller, permission);
   };
 
   //=========================================================================
@@ -8252,7 +8250,7 @@ shared (deployer) persistent actor class treasury() = this {
     if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
       return #err("Unauthorized");
     };
-    await KongSwap.getPendingClaims(Principal.fromActor(this));
+    await (with timeout = 65) KongSwap.getPendingClaims(Principal.fromActor(this));
   };
 
   /**
@@ -8277,14 +8275,14 @@ public shared ({ caller }) func withdrawAllCyclesToSelf() : async Result.Result<
 
     let self = Principal.fromActor(this);
     
-    let balance = await cyclesLedger.icrc1_balance_of({
+    let balance = await (with timeout = 65) cyclesLedger.icrc1_balance_of({
         owner = self;
         subaccount = null;
     });
     
     if (balance == 0) return #ok("Withdrew " # Nat.toText(balance) # " cycles to self");
     
-    ignore switch (await cyclesLedger.withdraw({ to = self; amount = balance-100_000_000 })) {
+    ignore switch (await (with timeout = 65) cyclesLedger.withdraw({ to = self; amount = balance-100_000_000 })) {
         case (#Ok(_)) { balance };
         case (#Err(_)) { 0 };
     };

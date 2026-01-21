@@ -29,7 +29,7 @@ module {
       var searchToken = if (tokenA == "ICP") tokenB else tokenA;
       searchToken := "IC." # searchToken;
 
-      let poolsResult = await kong.pools(?searchToken);
+      let poolsResult = await (with timeout = 65) kong.pools(?searchToken);
 
       switch (poolsResult) {
         case (#Ok(poolsReply)) {
@@ -79,7 +79,7 @@ module {
     Debug.print("KongSwap.getQuote: Getting quote for " # debug_show (amountIn) # " " # tokenA # " to " # tokenB);
     try {
       let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
-      let result = await kong.swap_amounts("IC." # tokenA, amountIn, "IC." # tokenB);
+      let result = await (with timeout = 65) kong.swap_amounts("IC." # tokenA, amountIn, "IC." # tokenB);
 
       switch (result) {
         case (#Ok(quote)) {
@@ -141,7 +141,7 @@ module {
     Debug.print("KongSwap.getPendingClaims: Getting claims for " # Principal.toText(treasuryPrincipal));
     try {
       let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
-      let result = await kong.claims(Principal.toText(treasuryPrincipal));
+      let result = await (with timeout = 65) kong.claims(Principal.toText(treasuryPrincipal));
 
       switch (result) {
         case (#Ok(claims)) {
@@ -164,7 +164,7 @@ module {
     Debug.print("KongSwap.executeClaim: Executing claim " # Nat64.toText(claimId));
     try {
       let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
-      let result = await kong.claim(claimId);
+      let result = await (with timeout = 65) kong.claim(claimId);
 
       switch (result) {
         case (#Ok(reply)) {
@@ -205,7 +205,7 @@ module {
 
       // Execute swap
       Debug.print("KongSwap.executeSwap: Executing swap...");
-      let result = await kong.swap(swapArgs);
+      let result = await (with timeout = 65) kong.swap(swapArgs);
       Debug.print("KongSwap.executeSwap: Swap result: " # debug_show (result));
 
       switch (result) {
@@ -248,7 +248,7 @@ module {
 
       // Execute async swap
       Debug.print("KongSwap.executeSwapAsync: Executing async swap...");
-      let result = await kong.swap_async(swapArgs);
+      let result = await (with timeout = 65) kong.swap_async(swapArgs);
       Debug.print("KongSwap.executeSwapAsync: Async swap result: " # debug_show (result));
 
       switch (result) {
@@ -272,7 +272,7 @@ module {
     Debug.print("KongSwap.getRequestStatus: Getting request status for " # Nat64.toText(requestId));
     try {
       let kong : Types.KongSwap = actor (KONG_CANISTER_ID);
-      let result = await kong.requests(?requestId);
+      let result = await (with timeout = 65) kong.requests(?requestId);
 
       switch (result) {
         case (#Ok(requests)) {
@@ -308,7 +308,7 @@ module {
     try {
       // Step 1: Execute transfer
       Debug.print("KongSwap.executeTransferAndSwap: Step 1 - Executing ICRC1 transfer...");
-      let transferResult = await executeICRC1Transfer(params.token0_ledger, params.amountIn);
+      let transferResult = await (with timeout = 65) executeICRC1Transfer(params.token0_ledger, params.amountIn);
       Debug.print("KongSwap.executeTransferAndSwap: Transfer result: " # debug_show (transferResult));
 
       switch (transferResult) {
@@ -321,7 +321,7 @@ module {
             params with
             txId = ?blockIndex
           };
-          let swapResult = await executeSwap(swapParams);
+          let swapResult = await (with timeout = 65) executeSwap(swapParams);
           Debug.print("KongSwap.executeTransferAndSwap: Swap result: " # debug_show (swapResult));
 
           switch (swapResult) {
@@ -361,13 +361,13 @@ module {
     Debug.print("KongSwap.executeTransferAndSwapNoTracking: Starting");
     try {
       // Step 1: Execute transfer
-      let transferResult = await executeICRC1Transfer(params.token0_ledger, params.amountIn);
+      let transferResult = await (with timeout = 65) executeICRC1Transfer(params.token0_ledger, params.amountIn);
 
       switch (transferResult) {
         case (#ok(blockIndex)) {
           // Step 2: Execute swap
           let swapParams = { params with txId = ?blockIndex };
-          let swapResult = await executeSwap(swapParams);
+          let swapResult = await (with timeout = 65) executeSwap(swapParams);
 
           switch (swapResult) {
             case (#ok(reply)) { #ok(reply) };
@@ -407,7 +407,7 @@ module {
       Debug.print("KongSwap.executeICRC1Transfer: Executing transfer...");
       let result : { #Err : Types.ICRC1TransferError; #Ok : Nat } = if (test) {
         #Ok(10);
-      } else { await tokenCanister.icrc1_transfer(transferArgs) };
+      } else { await (with timeout = 65) tokenCanister.icrc1_transfer(transferArgs) };
       Debug.print("KongSwap.executeICRC1Transfer: Transfer result: " # debug_show (result));
 
       switch (result) {
