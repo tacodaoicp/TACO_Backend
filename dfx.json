@@ -8,7 +8,8 @@
     },
     "treasury": {
       "main": "src/treasury/treasury.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "validation": {
       "main": "src/validation/validation.mo",

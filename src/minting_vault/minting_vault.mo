@@ -30,7 +30,7 @@ import Logger "../helper/logger";
 import DAO_types "../DAO_backend/dao_types";
 import CanisterIds "../helper/CanisterIds";
 
-shared (deployer) actor class MintingVaultDAO() = this {
+shared (deployer) persistent actor class MintingVaultDAO() = this {
 
   private func this_canister_id() : Principal {
       Principal.fromActor(this);

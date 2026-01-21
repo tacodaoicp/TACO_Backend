@@ -18,7 +18,7 @@ import Logger "../../helper/logger";
 import BatchImportTimer "../../helper/batch_import_timer";
 import Cycles "mo:base/ExperimentalCycles";
 
-shared (deployer) actor class RewardDistributionArchive() = this {
+shared (deployer) persistent actor class RewardDistributionArchive() = this {
 
   private func this_canister_id() : Principal {
     Principal.fromActor(this);

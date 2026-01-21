@@ -113,6 +113,7 @@ import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
+
 //import Migration "./migration";
 
 //(with migration = Migration.migrate)
@@ -279,11 +280,16 @@ shared (deployer) persistent actor class treasury() = this {
     shortSyncIntervalNS = 900_000_000_000; // 15 minutes (for prices, balances)
     longSyncIntervalNS = 5 * 3600_000_000_000; // 5 hours (for metadata, pools)
     tokenSyncTimeoutNS = 21_600_000_000_000; // 6 hours
-    minAllocationDiffBasisPoints = 15; // 0.15% minimum allocation difference to trade
+    //minAllocationDiffBasisPoints = 15;
+    // Note: minAllocationDiffBasisPoints is now a standalone stable var (see below)
   };
 
   // Separate stable variable for circuit breaker configuration
   stable var pausedTokenThresholdForCircuitBreaker : Nat = 3; // Circuit breaker when 3+ tokens are paused
+
+  // Minimum allocation difference to trigger trade (basis points, e.g., 15 = 0.15%)
+  // Note: This is a standalone stable var to avoid EOP migration issues
+  stable var minAllocationDiffBasisPoints : Nat = 15;
 
   // Rebalancing state
   stable var rebalanceState : RebalanceState = {
@@ -802,7 +808,7 @@ shared (deployer) persistent actor class treasury() = this {
     "|shortSyncIntervalNS=" # debug_show(config.shortSyncIntervalNS) #
     "|longSyncIntervalNS=" # debug_show(config.longSyncIntervalNS) #
     "|tokenSyncTimeoutNS=" # debug_show(config.tokenSyncTimeoutNS) #
-    "|minAllocationDiffBasisPoints=" # debug_show(config.minAllocationDiffBasisPoints)
+    "|minAllocationDiffBasisPoints=" # debug_show(minAllocationDiffBasisPoints)
   };
 
   /**
@@ -1065,7 +1071,7 @@ shared (deployer) persistent actor class treasury() = this {
       case null {}; // Keep existing value
     };
 
-    // Validate min allocation diff basis points
+    // Validate min allocation diff basis points (stored as standalone stable var)
     switch (updates.minAllocationDiffBasisPoints) {
       case (?value) {
         let minAllowed = 1; // 0.01% minimum
@@ -1076,10 +1082,8 @@ shared (deployer) persistent actor class treasury() = this {
         } else if (value > maxAllowed) {
           validationErrors #= "Minimum allocation diff cannot be more than 500 basis points (5%); ";
         } else {
-          updatedConfig := {
-            updatedConfig with
-            minAllocationDiffBasisPoints = value
-          };
+          // Update standalone stable var (not in RebalanceConfig to avoid EOP migration issues)
+          minAllocationDiffBasisPoints := value;
           hasChanges := true;
         };
       };
@@ -1125,8 +1129,21 @@ shared (deployer) persistent actor class treasury() = this {
  *
  * Accessible by any user with query access.
  */
-  public query func getSystemParameters() : async RebalanceConfig {
-    rebalanceConfig;
+  public query func getSystemParameters() : async TreasuryTypes.RebalanceConfigResponse {
+    {
+      rebalanceIntervalNS = rebalanceConfig.rebalanceIntervalNS;
+      maxTradeAttemptsPerInterval = rebalanceConfig.maxTradeAttemptsPerInterval;
+      minTradeValueICP = rebalanceConfig.minTradeValueICP;
+      maxTradeValueICP = rebalanceConfig.maxTradeValueICP;
+      portfolioRebalancePeriodNS = rebalanceConfig.portfolioRebalancePeriodNS;
+      maxSlippageBasisPoints = rebalanceConfig.maxSlippageBasisPoints;
+      maxTradesStored = rebalanceConfig.maxTradesStored;
+      maxKongswapAttempts = rebalanceConfig.maxKongswapAttempts;
+      shortSyncIntervalNS = rebalanceConfig.shortSyncIntervalNS;
+      longSyncIntervalNS = rebalanceConfig.longSyncIntervalNS;
+      tokenSyncTimeoutNS = rebalanceConfig.tokenSyncTimeoutNS;
+      minAllocationDiffBasisPoints = minAllocationDiffBasisPoints;
+    };
   };
 
   /**
@@ -4559,10 +4576,33 @@ shared (deployer) persistent actor class treasury() = this {
               case (#err(e)) {
                 Debug.print("Could not find execution path: " # e.reason);
 
-                // NEW: Try REDUCED amount before ICP fallback
-                label reducedDirect switch (estimateMaxTradeableAmount(e.kongQuotes, e.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, buyToken)) {
+                // Bug 3 fix: Check if ALL quotes are invalid (both Kong and ICPSwap returned 0)
+                // If so, skip reduced trade entirely and go straight to ICP fallback
+                let allQuotesInvalid = do {
+                  var kongAllZero = true;
+                  var icpAllZero = true;
+                  for (q in e.kongQuotes.vals()) {
+                    if (q.out > 0) { kongAllZero := false };
+                  };
+                  for (q in e.icpQuotes.vals()) {
+                    if (q.out > 0) { icpAllZero := false };
+                  };
+                  kongAllZero and icpAllZero
+                };
+
+                // Only try reduced trade if at least one quote was valid
+                // If all quotes are 0, skip directly to ICP fallback
+                if (allQuotesInvalid) {
+                  logger.info("SKIP_REDUCED",
+                    "All quotes returned 0 for direct pair - skipping reduced trade, going directly to ICP fallback",
+                    "do_executeTradingStep"
+                  );
+                } else {
+                  // NEW: Try REDUCED amount before ICP fallback
+                  // estimateMaxTradeableAmount already checked both exchanges and returns idealOut/minAmountOut
+                  label reducedDirect switch (estimateMaxTradeableAmount(e.kongQuotes, e.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, buyToken)) {
                   case (?reduced) {
-                    // Get symbols and decimals for quotes
+                    // Get symbols for logging
                     let reducedSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
                       case (?details) { details.tokenSymbol };
                       case null { break reducedDirect };
@@ -4571,152 +4611,80 @@ shared (deployer) persistent actor class treasury() = this {
                       case (?details) { details.tokenSymbol };
                       case null { break reducedDirect };
                     };
-                    let reducedSellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
-                      case (?details) { details.tokenDecimals };
-                      case null { 8 };
-                    };
-                    let reducedBuyDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
-                      case (?details) { details.tokenDecimals };
-                      case null { 8 };
-                    };
 
                     logger.info("REDUCED_TRADE",
-                      "Attempting reduced trade - Original=" # Nat.toText(tradeSize) #
+                      "Executing reduced trade directly - Original=" # Nat.toText(tradeSize) #
                       " Reduced=" # Nat.toText(reduced.amount) #
                       " Exchange=" # debug_show(reduced.exchange) #
-                      " Pair=" # reducedSellSymbol # "/" # reducedBuySymbol,
+                      " Pair=" # reducedSellSymbol # "/" # reducedBuySymbol #
+                      " IdealOut=" # Nat.toText(reduced.idealOut) #
+                      " MinAmountOut=" # Nat.toText(reduced.minAmountOut),
                       "do_executeTradingStep"
                     );
 
-                    // Get verification quote at reduced amount - use mutable vars to avoid async type union issues
-                    var slippageBP : Nat = 99999;
-                    var expectedOut : Nat = 0;
-                    var idealOut : Nat = 0;
-                    var quoteSuccess : Bool = false;
+                    // Execute directly - estimateMaxTradeableAmount already calculated idealOut and minAmountOut
+                    let reducedTradeResult = await* executeTrade(
+                      sellToken,
+                      buyToken,
+                      reduced.amount,
+                      reduced.exchange,
+                      reduced.minAmountOut,
+                      reduced.idealOut,
+                    );
 
-                    switch (reduced.exchange) {
-                      case (#KongSwap) {
-                        let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, reducedBuySymbol, reduced.amount, reducedSellDecimals, reducedBuyDecimals) } catch (err) { #err("Kong exception: " # Error.message(err)) };
-                        switch (kongResult) {
-                          case (#ok(q)) {
-                            let slipFloat = q.slippage * 100.0;
-                            slippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
-                            expectedOut := q.receive_amount;
-                            let idealFloat = Float.fromInt(reduced.amount) * q.mid_price;
-                            idealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
-                            quoteSuccess := true;
-                          };
-                          case (#err(quoteErr)) { logger.warn("REDUCED_TRADE", "Kong quote failed: " # quoteErr, "do_executeTradingStep") };
+                    switch (reducedTradeResult) {
+                      case (#ok(record)) {
+                        // Update trade history
+                        let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                        let reducedRecord : TradeRecord = {
+                          record with
+                          error = ?("REDUCED_TRADE: Original amount was " # Nat.toText(tradeSize) # ", traded " # Nat.toText(reduced.amount) # " due to slippage");
                         };
+                        Vector.add(lastTrades, reducedRecord);
+                        if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                          Vector.reverse(lastTrades);
+                          while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                            ignore Vector.removeLast(lastTrades);
+                          };
+                          Vector.reverse(lastTrades);
+                        };
+
+                        rebalanceState := {
+                          rebalanceState with
+                          metrics = {
+                            rebalanceState.metrics with
+                            totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                          };
+                          lastTrades = lastTrades;
+                        };
+
+                        success := true;
+                        logger.info("REDUCED_TRADE",
+                          "REDUCED trade SUCCESS - Sold=" # Nat.toText(record.amountSold) #
+                          " Bought=" # Nat.toText(record.amountBought) #
+                          " Exchange=" # debug_show(record.exchange),
+                          "do_executeTradingStep"
+                        );
+
+                        await updateBalances();
+                        await takePortfolioSnapshot(#PostTrade);
+                        checkPortfolioCircuitBreakerConditions();
+                        await* logPortfolioState("Post-REDUCED-trade completed");
                       };
-                      case (#ICPSwap) {
-                        let icpPoolData = Map.get(ICPswapPools, hashpp, (sellToken, buyToken));
-                        switch (icpPoolData) {
-                          case (?poolData) {
-                            let zeroForOne = sellToken == Principal.fromText(poolData.token0.address);
-                            let icpResult = try { await ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = reduced.amount; amountOutMinimum = 0; zeroForOne = zeroForOne }) } catch (err) { #err("ICP exception: " # Error.message(err)) };
-                            switch (icpResult) {
-                              case (#ok(q)) {
-                                // ICPSwap returns slippage as Float percentage, convert to basis points
-                                let slipFloat = q.slippage * 100.0;
-                                slippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
-                                expectedOut := q.amountOut;
-                                // Calculate ideal (spot) amount: amountOut / (1 - slippage/100)
-                                let slipFactor = if (q.slippage >= 100.0) { 0.01 } else { 1.0 - (q.slippage / 100.0) };
-                                let idealFloat = Float.fromInt(q.amountOut) / slipFactor;
-                                idealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
-                                quoteSuccess := true;
-                              };
-                              case (#err(quoteErr)) { logger.warn("REDUCED_TRADE", "ICPSwap quote failed: " # quoteErr, "do_executeTradingStep") };
-                            };
-                          };
-                          case null { logger.warn("REDUCED_TRADE", "No ICPSwap pool for reduced trade verification", "do_executeTradingStep") };
-                        };
+                      case (#err(reducedError)) {
+                        logger.warn("REDUCED_TRADE",
+                          "REDUCED trade execution failed - Error=" # reducedError,
+                          "do_executeTradingStep"
+                        );
+                        // Continue to ICP fallback
                       };
-                    };
-
-                    // Check if quote succeeded, slippage is acceptable, and we get actual output
-                    if (quoteSuccess and slippageBP <= rebalanceConfig.maxSlippageBasisPoints and expectedOut > 0) {
-                      logger.info("REDUCED_TRADE",
-                        "Executing reduced trade - Verified_slippage=" # Nat.toText(slippageBP) # "bp" #
-                        " Expected_out=" # Nat.toText(expectedOut),
-                        "do_executeTradingStep"
-                      );
-
-                      // Calculate min amount out with our tolerance
-                      let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
-                      let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
-                      let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
-
-                      let reducedTradeResult = await* executeTrade(
-                        sellToken,
-                        buyToken,
-                        reduced.amount,
-                        switch (reduced.exchange) { case (#KongSwap) { #KongSwap }; case (#ICPSwap) { #ICPSwap } },
-                        minAmountOut,
-                        idealOut,
-                      );
-
-                      switch (reducedTradeResult) {
-                        case (#ok(record)) {
-                          // Update trade history
-                          let lastTrades = Vector.clone(rebalanceState.lastTrades);
-                          let reducedRecord : TradeRecord = {
-                            record with
-                            error = ?("REDUCED_TRADE: Original amount was " # Nat.toText(tradeSize) # ", traded " # Nat.toText(reduced.amount) # " due to slippage");
-                          };
-                          Vector.add(lastTrades, reducedRecord);
-                          if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
-                            Vector.reverse(lastTrades);
-                            while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
-                              ignore Vector.removeLast(lastTrades);
-                            };
-                            Vector.reverse(lastTrades);
-                          };
-
-                          rebalanceState := {
-                            rebalanceState with
-                            metrics = {
-                              rebalanceState.metrics with
-                              totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
-                            };
-                            lastTrades = lastTrades;
-                          };
-
-                          success := true;
-                          logger.info("REDUCED_TRADE",
-                            "REDUCED trade SUCCESS - Sold=" # Nat.toText(record.amountSold) #
-                            " Bought=" # Nat.toText(record.amountBought) #
-                            " Exchange=" # debug_show(record.exchange),
-                            "do_executeTradingStep"
-                          );
-
-                          await updateBalances();
-                          await takePortfolioSnapshot(#PostTrade);
-                          checkPortfolioCircuitBreakerConditions();
-                          await* logPortfolioState("Post-REDUCED-trade completed");
-                        };
-                        case (#err(reducedError)) {
-                          logger.warn("REDUCED_TRADE",
-                            "REDUCED trade execution failed - Error=" # reducedError,
-                            "do_executeTradingStep"
-                          );
-                          // Continue to ICP fallback
-                        };
-                      };
-                    } else if (quoteSuccess) {
-                      // Quote succeeded but slippage too high
-                      logger.info("REDUCED_TRADE",
-                        "Verification slippage too high - Slippage=" # Nat.toText(slippageBP) # "bp" #
-                        " Max=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
-                        "do_executeTradingStep"
-                      );
                     };
                   };
                   case null {
                     Debug.print("No viable reduced amount estimated");
                   };
                 };
+                }; // end of else block (allQuotesInvalid check)
 
                 // Guard: if reduced trade succeeded, skip ICP fallback
                 if (success) { return };
@@ -5179,146 +5147,77 @@ shared (deployer) persistent actor class treasury() = this {
                       Debug.print("ICP fallback route also not available: " # icpRouteError.reason);
 
                       // NEW: Try REDUCED amount for ICP fallback (ICP is always valuable - no min check)
+                      // estimateMaxTradeableAmount already checked both exchanges and returns idealOut/minAmountOut
                       label reducedIcpFallback switch (estimateMaxTradeableAmount(icpRouteError.kongQuotes, icpRouteError.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal)) {
                         case (?reduced) {
                           let reducedSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
                             case (?details) { details.tokenSymbol };
                             case null { break reducedIcpFallback };
                           };
-                          let reducedSellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
-                            case (?details) { details.tokenDecimals };
-                            case null { 8 };
-                          };
-                          // ICP is always 8 decimals
-                          let icpDecimals : Nat = 8;
 
                           logger.info("REDUCED_ICP_FALLBACK",
-                            "Attempting reduced ICP fallback - Original=" # Nat.toText(tradeSize) #
+                            "Executing reduced ICP fallback directly - Original=" # Nat.toText(tradeSize) #
                             " Reduced=" # Nat.toText(reduced.amount) #
-                            " Exchange=" # debug_show(reduced.exchange),
+                            " Exchange=" # debug_show(reduced.exchange) #
+                            " IdealOut=" # Nat.toText(reduced.idealOut) #
+                            " MinAmountOut=" # Nat.toText(reduced.minAmountOut),
                             "do_executeTradingStep"
                           );
 
-                          // Get verification quote for sellToken -> ICP - use mutable vars to avoid async type union issues
-                          var icpSlippageBP : Nat = 99999;
-                          var icpExpectedOut : Nat = 0;
-                          var icpIdealOut : Nat = 0;
-                          var icpQuoteSuccess : Bool = false;
+                          // Execute directly - estimateMaxTradeableAmount already calculated idealOut and minAmountOut
+                          let reducedIcpTradeResult = await* executeTrade(
+                            sellToken,
+                            ICPprincipal,
+                            reduced.amount,
+                            reduced.exchange,
+                            reduced.minAmountOut,
+                            reduced.idealOut,
+                          );
 
-                          switch (reduced.exchange) {
-                            case (#KongSwap) {
-                              let kongResult = try { await KongSwap.getQuote(reducedSellSymbol, "ICP", reduced.amount, reducedSellDecimals, icpDecimals) } catch (err) { #err("Kong exception: " # Error.message(err)) };
-                              switch (kongResult) {
-                                case (#ok(q)) {
-                                  let slipFloat = q.slippage * 100.0;
-                                  icpSlippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
-                                  icpExpectedOut := q.receive_amount;
-                                  let idealFloat = Float.fromInt(reduced.amount) * q.mid_price;
-                                  icpIdealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
-                                  icpQuoteSuccess := true;
-                                };
-                                case (#err(quoteErr)) { logger.warn("REDUCED_ICP_FALLBACK", "Kong quote failed: " # quoteErr, "do_executeTradingStep") };
+                          switch (reducedIcpTradeResult) {
+                            case (#ok(record)) {
+                              let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                              let reducedIcpRecord : TradeRecord = {
+                                record with
+                                error = ?("REDUCED_ICP_FALLBACK: Original target was " # buySymbol # ", traded reduced amount " # Nat.toText(reduced.amount) # " for ICP");
                               };
+                              Vector.add(lastTrades, reducedIcpRecord);
+                              if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                                Vector.reverse(lastTrades);
+                                while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                  ignore Vector.removeLast(lastTrades);
+                                };
+                                Vector.reverse(lastTrades);
+                              };
+
+                              rebalanceState := {
+                                rebalanceState with
+                                metrics = {
+                                  rebalanceState.metrics with
+                                  totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                                };
+                                lastTrades = lastTrades;
+                              };
+
+                              success := true;
+                              logger.info("REDUCED_ICP_FALLBACK",
+                                "REDUCED ICP fallback SUCCESS - Sold=" # Nat.toText(record.amountSold) #
+                                " ICP_received=" # Nat.toText(record.amountBought),
+                                "do_executeTradingStep"
+                              );
+
+                              await updateBalances();
+                              await takePortfolioSnapshot(#PostTrade);
+                              checkPortfolioCircuitBreakerConditions();
+                              await* logPortfolioState("Post-REDUCED-ICP-fallback completed");
                             };
-                            case (#ICPSwap) {
-                              let icpPoolData = Map.get(ICPswapPools, hashpp, (sellToken, ICPprincipal));
-                              switch (icpPoolData) {
-                                case (?poolData) {
-                                  let zeroForOne = sellToken == Principal.fromText(poolData.token0.address);
-                                  let icpResult = try { await ICPSwap.getQuote({ poolId = poolData.canisterId; amountIn = reduced.amount; amountOutMinimum = 0; zeroForOne = zeroForOne }) } catch (err) { #err("ICP exception: " # Error.message(err)) };
-                                  switch (icpResult) {
-                                    case (#ok(q)) {
-                                      // ICPSwap returns slippage as Float percentage, convert to basis points
-                                      let slipFloat = q.slippage * 100.0;
-                                      icpSlippageBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
-                                      icpExpectedOut := q.amountOut;
-                                      // Calculate ideal (spot) amount: amountOut / (1 - slippage/100)
-                                      let slipFactor = if (q.slippage >= 100.0) { 0.01 } else { 1.0 - (q.slippage / 100.0) };
-                                      let idealFloat = Float.fromInt(q.amountOut) / slipFactor;
-                                      icpIdealOut := if (isFiniteFloat(idealFloat)) { Int.abs(Float.toInt(idealFloat)) } else { 0 };
-                                      icpQuoteSuccess := true;
-                                    };
-                                    case (#err(quoteErr)) { logger.warn("REDUCED_ICP_FALLBACK", "ICPSwap quote failed: " # quoteErr, "do_executeTradingStep") };
-                                  };
-                                };
-                                case null { logger.warn("REDUCED_ICP_FALLBACK", "No ICPSwap pool for ICP fallback verification", "do_executeTradingStep") };
-                              };
+                            case (#err(reducedIcpError)) {
+                              logger.warn("REDUCED_ICP_FALLBACK",
+                                "REDUCED ICP fallback execution failed - Error=" # reducedIcpError,
+                                "do_executeTradingStep"
+                              );
+                              // Continue to failure path
                             };
-                          };
-
-                          // Check if quote succeeded, slippage is acceptable, and we get actual output
-                          if (icpQuoteSuccess and icpSlippageBP <= rebalanceConfig.maxSlippageBasisPoints and icpExpectedOut > 0) {
-                            let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
-                            let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
-                            let minAmountOut : Nat = (icpIdealOut * toleranceMultiplier) / 10000;
-
-                            logger.info("REDUCED_ICP_FALLBACK",
-                              "Executing reduced ICP fallback - Verified_slippage=" # Nat.toText(icpSlippageBP) # "bp" #
-                              " Expected_out=" # Nat.toText(icpExpectedOut),
-                              "do_executeTradingStep"
-                            );
-
-                            let reducedIcpTradeResult = await* executeTrade(
-                              sellToken,
-                              ICPprincipal,
-                              reduced.amount,
-                              switch (reduced.exchange) { case (#KongSwap) { #KongSwap }; case (#ICPSwap) { #ICPSwap } },
-                              minAmountOut,
-                              icpIdealOut,
-                            );
-
-                            switch (reducedIcpTradeResult) {
-                              case (#ok(record)) {
-                                let lastTrades = Vector.clone(rebalanceState.lastTrades);
-                                let reducedIcpRecord : TradeRecord = {
-                                  record with
-                                  error = ?("REDUCED_ICP_FALLBACK: Original target was " # buySymbol # ", traded reduced amount " # Nat.toText(reduced.amount) # " for ICP");
-                                };
-                                Vector.add(lastTrades, reducedIcpRecord);
-                                if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
-                                  Vector.reverse(lastTrades);
-                                  while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
-                                    ignore Vector.removeLast(lastTrades);
-                                  };
-                                  Vector.reverse(lastTrades);
-                                };
-
-                                rebalanceState := {
-                                  rebalanceState with
-                                  metrics = {
-                                    rebalanceState.metrics with
-                                    totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
-                                  };
-                                  lastTrades = lastTrades;
-                                };
-
-                                success := true;
-                                logger.info("REDUCED_ICP_FALLBACK",
-                                  "REDUCED ICP fallback SUCCESS - Sold=" # Nat.toText(record.amountSold) #
-                                  " ICP_received=" # Nat.toText(record.amountBought),
-                                  "do_executeTradingStep"
-                                );
-
-                                await updateBalances();
-                                await takePortfolioSnapshot(#PostTrade);
-                                checkPortfolioCircuitBreakerConditions();
-                                await* logPortfolioState("Post-REDUCED-ICP-fallback completed");
-                              };
-                              case (#err(reducedIcpError)) {
-                                logger.warn("REDUCED_ICP_FALLBACK",
-                                  "REDUCED ICP fallback execution failed - Error=" # reducedIcpError,
-                                  "do_executeTradingStep"
-                                );
-                                // Continue to failure path
-                              };
-                            };
-                          } else if (icpQuoteSuccess) {
-                            // Quote succeeded but slippage too high
-                            logger.info("REDUCED_ICP_FALLBACK",
-                              "Verification slippage too high - Slippage=" # Nat.toText(icpSlippageBP) # "bp" #
-                              " Max=" # Nat.toText(rebalanceConfig.maxSlippageBasisPoints) # "bp",
-                              "do_executeTradingStep"
-                            );
                           };
                         };
                         case null {
@@ -5604,7 +5503,7 @@ shared (deployer) persistent actor class treasury() = this {
 
     // Create weighted list of tokens to trade based on differences
     // Exclude tokens where the allocation difference is smaller than minAllocationDiffBasisPoints (e.g., 15bp = 0.15%)
-    let minDiffBasisPoints = rebalanceConfig.minAllocationDiffBasisPoints;
+    let minDiffBasisPoints = minAllocationDiffBasisPoints; // Use standalone stable var
 
     let tradePairs = Vector.new<(Principal, Int, Nat)>();
     var excludedDueToMinDiff = 0;
@@ -6189,6 +6088,7 @@ shared (deployer) persistent actor class treasury() = this {
       let kongFuture9 = KongSwap.getQuote(sellSymbol, buySymbol, kongAmounts[9], sellDecimals, buyDecimals);
 
       // ICP quotes for 10 percentages (uses fee-adjusted amounts - ICPSwap swaps amountIn-fee)
+      var skipICPswap=false;
       let (icpFuture0, icpFuture1, icpFuture2, icpFuture3, icpFuture4, icpFuture5, icpFuture6, icpFuture7, icpFuture8, icpFuture9) = switch (icpPoolData) {
         case (?poolData) {
           (
@@ -6205,8 +6105,9 @@ shared (deployer) persistent actor class treasury() = this {
           )
         };
         case null {
-          // No ICPSwap pool - will use error handling when awaiting
-          let errFuture = ICPSwap.getQuote({ poolId = Principal.fromText("aaaaa-aa"); amountIn = 0; amountOutMinimum = 0; zeroForOne = true });
+          var skipICPswap=true;
+          // No ICPSwap pool - create a dummy async that returns error immediately (no actual network call)
+          let errFuture = async { #err("No ICPSwap pool available for this pair") : Result.Result<swaptypes.ICPSwapQuoteResult, Text> };
           (errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture, errFuture)
         };
       };
@@ -6223,19 +6124,22 @@ shared (deployer) persistent actor class treasury() = this {
       let kongResult8 = try { await kongFuture8 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult9 = try { await kongFuture9 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
 
-      let icpResult0 = try { await icpFuture0 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult1 = try { await icpFuture1 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult2 = try { await icpFuture2 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult3 = try { await icpFuture3 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult4 = try { await icpFuture4 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult5 = try { await icpFuture5 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult6 = try { await icpFuture6 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult7 = try { await icpFuture7 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult8 = try { await icpFuture8 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-      let icpResult9 = try { await icpFuture9 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) };
-
+      let icpResult0 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture0 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult1 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture1 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult2 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture2 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult3 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture3 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult4 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture4 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult5 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture5 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult6 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture6 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult7 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture7 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult8 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture8 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let icpResult9 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture9 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
       let kongResults = [kongResult0, kongResult1, kongResult2, kongResult3, kongResult4, kongResult5, kongResult6, kongResult7, kongResult8, kongResult9];
       let icpResults = [icpResult0, icpResult1, icpResult2, icpResult3, icpResult4, icpResult5, icpResult6, icpResult7, icpResult8, icpResult9];
+
+      // Log raw quote results for debugging
+      logger.info("QUOTE_DEBUG", "Raw Kong 100% result: " # debug_show(kongResult9), "findBestExecution");
+      logger.info("QUOTE_DEBUG", "Raw ICPSwap 100% result: " # debug_show(icpResult9), "findBestExecution");
 
       // ========================================
       // PROCESS QUOTE RESULTS
@@ -6804,18 +6708,20 @@ shared (deployer) persistent actor class treasury() = this {
     maxSlippageBP : Nat,
     sellToken : Principal,
     buyToken : Principal
-  ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap } } {
+  ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap }; idealOut : Nat; minAmountOut : Nat } {
     // Need at least one quote at 10% (index 0)
     if (kongQuotes.size() == 0 or icpQuotes.size() == 0) { return null };
 
-    // Get 10% quote slippage (index 0) - use 99999 as sentinel for invalid
+    // Get 10% quote data (index 0) - use 99999 as sentinel for invalid slippage
     let kong10Slip : Nat = if (kongQuotes[0].out > 0) { kongQuotes[0].slipBP } else { 99999 };
     let icp10Slip : Nat = if (icpQuotes[0].out > 0) { icpQuotes[0].slipBP } else { 99999 };
+    let kong10Out : Nat = kongQuotes[0].out;
+    let icp10Out : Nat = icpQuotes[0].out;
 
     // Find best (lowest slippage) exchange
-    let (bestSlip, bestExchange) : (Nat, { #KongSwap; #ICPSwap }) =
-      if (kong10Slip <= icp10Slip) { (kong10Slip, #KongSwap) }
-      else { (icp10Slip, #ICPSwap) };
+    let (bestSlip, bestExchange, best10Out) : (Nat, { #KongSwap; #ICPSwap }, Nat) =
+      if (kong10Slip <= icp10Slip) { (kong10Slip, #KongSwap, kong10Out) }
+      else { (icp10Slip, #ICPSwap, icp10Out) };
 
     // Helper: calculate 1 ICP worth of sell token
     func oneIcpWorth() : Nat {
@@ -6830,40 +6736,64 @@ shared (deployer) persistent actor class treasury() = this {
       }
     };
 
-    // CHANGE 1: If no valid quotes at all, still try 1 ICP worth
-    // The verify step makes a fresh API call - bulk quotes might have failed but single quote might succeed
-    if (bestSlip >= 99999) {
-      let minAmount = oneIcpWorth();
-      if (minAmount > 0) {
-        // Prefer Kong as it has better routing
-        return ?{ amount = minAmount; exchange = #KongSwap };
+    // Helper: calculate idealOut and minAmountOut from expectedOut and slippage
+    // idealOut = expectedOut * 10000 / (10000 - slipBP)
+    // minAmountOut = idealOut * (10000 - maxSlippageBP) / 10000
+    func calcOutputs(expectedOut : Nat, slipBP : Nat) : (Nat, Nat) {
+      let idealOut : Nat = if (slipBP < 9900 and expectedOut > 0) {
+        (expectedOut * 10000) / (10000 - slipBP)
+      } else {
+        expectedOut
       };
-      return null;  // No price data available
+      let toleranceMultiplier : Nat = if (maxSlippageBP >= 10000) { 0 } else { 10000 - maxSlippageBP };
+      let minAmountOut = (idealOut * toleranceMultiplier) / 10000;
+      (idealOut, minAmountOut)
+    };
+
+    // If no valid quotes at all, return null to trigger ICP fallback
+    // DO NOT attempt reduced trade with idealOut=0/minAmountOut=0 - Kong will reject with "Receive amount is zero"
+    if (bestSlip >= 99999) {
+      return null;
     };
 
     // Guard: zero slippage (would divide by zero) - shouldn't happen
     if (bestSlip == 0) { return null };
 
-    // targetSlip = maxSlippageBP * 7 / 10 (70% of max for safety margin)
-    let targetSlip = (maxSlippageBP * 7) / 10;
+    // Pool fee is ~0.3% = 30bp, included in both quoted slippage and our max slippage
+    // We need to subtract it from both to compare pure price impact vs price impact allowance
+    let poolFeeBP : Nat = 30;
 
-    // FIXED: With 10 quotes, index 0 is 10% = amountIn/10
-    // maxAmount = (amountIn/10) * targetSlip / bestSlip
-    //           = (amountIn * targetSlip) / (bestSlip * 10)
-    let maxAmount = (amountIn * targetSlip) / (bestSlip * 10);
+    // Subtract pool fee from both slippages (use 1 as minimum to avoid division by zero)
+    let bestSlipMinusFee = if (bestSlip > poolFeeBP) { bestSlip - poolFeeBP } else { 1 };
+    let maxSlipMinusFee = if (maxSlippageBP > poolFeeBP) { maxSlippageBP - poolFeeBP } else { 1 };
 
-    // CHANGE 2: If calculation gives 0 but we have input, try at least 1 ICP worth
-    // NOTE: Don't check bestSlip <= maxSlippageBP here - let verify step filter bad quotes
-    // Even high-slippage pairs might work with 1 ICP trade
+    // Formula: (amountIn/10) * (maxSlipMinusFee / bestSlipMinusFee) * 0.7
+    // Reordered for integer math to avoid precision loss:
+    // maxAmount = (amountIn * maxSlipMinusFee * 7) / (bestSlipMinusFee * 10 * 10)
+    let rawMaxAmount = (amountIn * maxSlipMinusFee * 7) / (bestSlipMinusFee * 100);
+    // CAP: reduced amount must NEVER exceed original (can happen when bestSlip is close to pool fee)
+    let maxAmount = if (rawMaxAmount > amountIn) { amountIn } else { rawMaxAmount };
+
+    // If calculation gives 0 but we have input, try at least 1 ICP worth
     if (maxAmount == 0 and amountIn > 0) {
       let minAmount = oneIcpWorth();
       if (minAmount > 0) {
-        return ?{ amount = minAmount; exchange = bestExchange };
+        // Scale the 10% quote output: expectedOut = best10Out * minAmount / (amountIn/10)
+        let amountIn10 = amountIn / 10;
+        let expectedOut = if (amountIn10 > 0) { (best10Out * minAmount) / amountIn10 } else { 0 };
+        let (idealOut, minAmountOut) = calcOutputs(expectedOut, bestSlip);
+        return ?{ amount = minAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut };
       };
       return null;
     };
 
-    ?{ amount = maxAmount; exchange = bestExchange }
+    // Scale the 10% quote output to the reduced amount
+    // 10% quote was for amountIn/10, so expectedOut = best10Out * maxAmount / (amountIn/10)
+    let amountIn10 = amountIn / 10;
+    let expectedOut = if (amountIn10 > 0) { (best10Out * maxAmount) / amountIn10 } else { 0 };
+    let (idealOut, minAmountOut) = calcOutputs(expectedOut, bestSlip);
+
+    ?{ amount = maxAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut }
   };
 
   /**
@@ -7998,22 +7928,43 @@ shared (deployer) persistent actor class treasury() = this {
                 let tokenAddress = Principal.toText(principal);
                 
                 Debug.print("ICPSwap price analysis - Raw price: " # Float.toText(priceInfo.price) # ", token0: " # priceInfo.token0.address # ", token1: " # priceInfo.token1.address);
-                
-                // IMPORTANT: ICPSwap prices seem to have scaling issues. Let's be very careful about the math.
-                // The raw price represents token1/token0, but we need to verify this makes sense.
-                
+
+                // ICPSwap sqrtPriceX96 gives raw price without decimal adjustment
+                // actualPrice = rawPrice * (10^token0Decimals / 10^token1Decimals)
+                // ICP always has 8 decimals
+                let icpDecimals : Nat = 8;
+                let tokenDecimals : Nat = details.tokenDecimals;
+
                 let tokenICPPrice = if (tokenAddress == priceInfo.token0.address and icpAddress == priceInfo.token1.address) {
                   // Our token is token0, ICP is token1
-                  // Raw price = token1/token0 = ICP/TOKEN = how much ICP per token
-                  // This is exactly what we want! No inversion needed.
-                  Debug.print("Token is token0, ICP is token1. Raw price = ICP/TOKEN = " # Float.toText(priceInfo.price) # " ICP per " # tokenSymbol # " (CORRECT)");
-                  priceInfo.price
+                  // Raw price = token1/token0 = ICP/TOKEN (in smallest units)
+                  // Need decimal adjustment: actualPrice = rawPrice * (10^tokenDec / 10^icpDec)
+                  let adjustment = Float.fromInt(10 ** (Int.abs(tokenDecimals - icpDecimals)));
+                  let adjustedPrice = if (tokenDecimals > icpDecimals) {
+                    priceInfo.price * adjustment  // e.g., token has 18 dec, ICP has 8 → multiply by 10^10
+                  } else if (tokenDecimals < icpDecimals) {
+                    priceInfo.price / adjustment  // e.g., token has 6 dec, ICP has 8 → divide by 10^2
+                  } else {
+                    priceInfo.price  // Same decimals → no adjustment
+                  };
+                  Debug.print("Token is token0, ICP is token1. Raw=" # Float.toText(priceInfo.price) # " Adjusted=" # Float.toText(adjustedPrice) # " ICP per " # tokenSymbol);
+                  adjustedPrice
                 } else if (tokenAddress == priceInfo.token1.address and icpAddress == priceInfo.token0.address) {
-                  // Our token is token1, ICP is token0  
-                  // Raw price = token1/token0 = TOKEN/ICP = how much token per ICP
-                  // We want ICP/TOKEN, so we need the inverse
-                  let icpPerToken = if (priceInfo.price > 0.0) { 1.0 / priceInfo.price } else { 0.0 };
-                  Debug.print("Token is token1, ICP is token0. Raw price = TOKEN/ICP = " # Float.toText(priceInfo.price) # ". ICP/TOKEN = " # Float.toText(icpPerToken));
+                  // Our token is token1, ICP is token0
+                  // Raw price = token1/token0 = TOKEN/ICP (in smallest units)
+                  // Need decimal adjustment: actualPrice = rawPrice * (10^icpDec / 10^tokenDec)
+                  // Then invert to get ICP per TOKEN
+                  let adjustment = Float.fromInt(10 ** (Int.abs(icpDecimals - tokenDecimals)));
+                  let adjustedPrice = if (tokenDecimals > icpDecimals) {
+                    priceInfo.price / adjustment  // e.g., ckETH (18 dec): 12049976 / 10^10 = 0.001205 ckETH per ICP
+                  } else if (tokenDecimals < icpDecimals) {
+                    priceInfo.price * adjustment  // e.g., token with 6 dec: multiply by 10^2
+                  } else {
+                    priceInfo.price  // Same decimals → no adjustment
+                  };
+                  // Invert to get ICP per TOKEN
+                  let icpPerToken = if (adjustedPrice > 0.0) { 1.0 / adjustedPrice } else { 0.0 };
+                  Debug.print("Token is token1, ICP is token0. Raw=" # Float.toText(priceInfo.price) # " Adjusted=" # Float.toText(adjustedPrice) # " ICP/TOKEN=" # Float.toText(icpPerToken));
                   icpPerToken
                 } else {
                   // Unexpected token configuration - log and skip
@@ -8280,6 +8231,20 @@ shared (deployer) persistent actor class treasury() = this {
   };
 
   /**
+   * Manually refresh ICPSwap pools from factory
+   * Use this to pick up newly created pools
+   */
+  public shared ({ caller }) func admin_refreshICPSwapPools() : async Result.Result<Text, Text> {
+    if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
+      return #err("Unauthorized");
+    };
+    await updateICPSwapPools();
+    #ok("ICPSwap pools refreshed. Found " # Nat.toText(Map.size(ICPswapPools)) # " pool mappings.")
+  };
+
+
+
+  /**
    * Query pending KongSwap claims for this treasury
    * Returns list of claims that can be recovered
    */
@@ -8301,6 +8266,30 @@ shared (deployer) persistent actor class treasury() = this {
     #ok("Claim recovery completed");
   };
 
+public shared ({ caller }) func withdrawAllCyclesToSelf() : async Result.Result<Text, Text> {
+      if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
+      return #err("Unauthorized");
+    };
+    let cyclesLedger : actor {
+        icrc1_balance_of : shared query { owner : Principal; subaccount : ?Blob } -> async Nat;
+        withdraw : shared { to : Principal; amount : Nat } -> async { #Ok : Nat; #Err : Any };
+    } = actor "um5iw-rqaaa-aaaaq-qaaba-cai";
+
+    let self = Principal.fromActor(this);
+    
+    let balance = await cyclesLedger.icrc1_balance_of({
+        owner = self;
+        subaccount = null;
+    });
+    
+    if (balance == 0) return #ok("Withdrew " # Nat.toText(balance) # " cycles to self");
+    
+    ignore switch (await cyclesLedger.withdraw({ to = self; amount = balance-100_000_000 })) {
+        case (#Ok(_)) { balance };
+        case (#Err(_)) { 0 };
+    };
+    #ok("Withdrew " # Nat.toText(balance) # " cycles to self");
+};
 
   /**
    * Recovery of forgotten balances from ICPSwap pools
@@ -8682,6 +8671,72 @@ shared (deployer) persistent actor class treasury() = this {
         portfolioSnapshotStatus := #Stopped;
       };
       portfolioSnapshotTimerId := 0;
+  };
+
+  // ICPSwap Pool Query Functions (Bug 2 fix)
+
+  /**
+   * Get ICPSwap pool info for a specific token pair
+   *
+   * Returns the pool data if a pool exists for the given token pair,
+   * or null if no pool is mapped.
+   */
+  public query func getICPSwapPoolInfo(tokenA : Principal, tokenB : Principal) : async ?{
+    canisterId : Principal;
+    token0 : Text;
+    token1 : Text;
+    fee : Nat;
+  } {
+    switch (Map.get(ICPswapPools, hashpp, (tokenA, tokenB))) {
+      case (?pool) {
+        ?{
+          canisterId = pool.canisterId;
+          token0 = pool.token0.address;
+          token1 = pool.token1.address;
+          fee = pool.fee;
+        }
+      };
+      case null { null };
+    }
+  };
+
+  /**
+   * List all discovered ICPSwap pools
+   *
+   * Returns a unique list of all ICPSwap pools that have been discovered.
+   * Since pools are stored bidirectionally, this filters out duplicates.
+   */
+  public query func listICPSwapPools() : async [{
+    canisterId : Principal;
+    token0 : Text;
+    token1 : Text;
+    fee : Nat;
+  }] {
+    // Use a Set to track seen canister IDs to avoid duplicates
+    let seen = Map.new<Principal, Bool>();
+    let result = Vector.new<{
+      canisterId : Principal;
+      token0 : Text;
+      token1 : Text;
+      fee : Nat;
+    }>();
+
+    for ((_, pool) in Map.entries(ICPswapPools)) {
+      switch (Map.get(seen, phash, pool.canisterId)) {
+        case null {
+          Map.set(seen, phash, pool.canisterId, true);
+          Vector.add(result, {
+            canisterId = pool.canisterId;
+            token0 = pool.token0.address;
+            token1 = pool.token1.address;
+            fee = pool.fee;
+          });
+        };
+        case (?_) {}; // Already seen, skip
+      };
+    };
+
+    Vector.toArray(result)
   };
 
   public query func get_canister_cycles() : async { cycles : Nat } {

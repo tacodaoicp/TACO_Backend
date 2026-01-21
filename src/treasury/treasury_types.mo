@@ -63,7 +63,9 @@ module {
     #UnexpectedError : Text;
   };
 
-  // Rebalance configuration parameters
+  // Rebalance configuration parameters (stable storage type - must match IC version)
+  // Note: minAllocationDiffBasisPoints is stored as standalone stable var in treasury.mo
+  // to avoid EOP migration issues (non-EOP to EOP upgrade cannot change type shapes)
   public type RebalanceConfig = {
     rebalanceIntervalNS : Nat; // How often to check for rebalancing needs
     maxTradeAttemptsPerInterval : Nat; // Maximum number of trade attempts per interval
@@ -76,7 +78,23 @@ module {
     shortSyncIntervalNS : Nat; // frequent sync for prices and balances
     longSyncIntervalNS : Nat; // less frequent sync for metadata updates
     tokenSyncTimeoutNS : Nat; // maximum time without sync before pausing
-    minAllocationDiffBasisPoints : Nat; // Minimum allocation difference to trigger trade (e.g., 15 = 0.15%)
+    //minAllocationDiffBasisPoints : Nat;
+  };
+
+  // Response type for getSystemParameters - includes minAllocationDiffBasisPoints
+  public type RebalanceConfigResponse = {
+    rebalanceIntervalNS : Nat;
+    maxTradeAttemptsPerInterval : Nat;
+    minTradeValueICP : Nat;
+    maxTradeValueICP : Nat;
+    portfolioRebalancePeriodNS : Nat;
+    maxSlippageBasisPoints : Nat;
+    maxTradesStored : Nat;
+    maxKongswapAttempts : Nat;
+    shortSyncIntervalNS : Nat;
+    longSyncIntervalNS : Nat;
+    tokenSyncTimeoutNS : Nat;
+    minAllocationDiffBasisPoints : Nat; // Included in response for API compatibility
   };
 
   public type UpdateConfig = {

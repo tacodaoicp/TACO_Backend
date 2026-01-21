@@ -2361,23 +2361,23 @@ def estimate_max_tradeable_icp(kong_quotes: List[Quote], icp_quotes: List[Quote]
     if min_slip == 0:
         return (0, "")  # Zero slippage shouldn't happen
 
-    # Slippage scales roughly linearly with amount
-    # target_slip = maxSlippageBP * 7 / 10 (70% of max for safety margin)
-    # Using Nat-safe integer math
-    target_slip_bp = (MAX_SLIPPAGE_BP * 7) // 10
+    # Pool fee is ~0.3% = 30bp, included in both quoted slippage and our max slippage
+    # We need to subtract it from both to compare pure price impact vs price impact allowance
+    POOL_FEE_BP = 30
 
-    # The smallest quote is for amount_icp / num_quotes (e.g., 10% for 10 quotes, 20% for 5 quotes)
-    # max_amount = (amount_icp / num_quotes) * target_slip_bp / min_slip
-    #
-    # IMPORTANT: Multiply before dividing to avoid integer precision loss!
-    # Old buggy code: max_icp = (amount_icp // num_quotes * target_slip_bp) // min_slip
-    # For 15 ICP with 500bp slippage: (15 // 5 * 70) // 500 = (3 * 70) // 500 = 0
-    # Fixed: Do all multiplication first, then single division
-    # max_icp = (amount_icp * target_slip_bp) // (min_slip * num_quotes)
+    # Subtract pool fee from both slippages (use 1 as minimum to avoid division by zero)
+    slip_minus_fee = max(1, min_slip - POOL_FEE_BP)
+    max_slip_minus_fee = max(1, MAX_SLIPPAGE_BP - POOL_FEE_BP)
+
+    # Formula: (amount_icp / num_quotes) * (max_slip_minus_fee / slip_minus_fee) * 0.7
+    # Reordered for integer math to avoid precision loss:
+    # max_icp = (amount_icp * max_slip_minus_fee * 7) // (slip_minus_fee * num_quotes * 10)
     #
     # For very small trades with high slippage, ensure at least 1 ICP if any trade is possible
-    if min_slip > 0:
-        max_icp = (amount_icp * target_slip_bp) // (min_slip * num_quotes)
+    if slip_minus_fee > 0:
+        max_icp = (amount_icp * max_slip_minus_fee * 7) // (slip_minus_fee * num_quotes * 10)
+        # CAP: reduced amount must NEVER exceed original (can happen when slip is close to pool fee)
+        max_icp = min(max_icp, amount_icp)
         # If calculation gives 0 but we have some input, try at least 1 ICP
         # This allows tiny trades through fallback instead of failing outright
         # NOTE: Don't check min_slip <= MAX_SLIPPAGE_BP here - let the verify step filter bad quotes

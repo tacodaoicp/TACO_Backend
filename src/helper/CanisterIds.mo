@@ -35,7 +35,7 @@ module CanisterId {
             // Local environment (uses staging dependencies for inter-canister calls)
             (#Local, #DAO_backend, Principal.fromText("tisou-7aaaa-aaaai-atiea-cai")),
             (#Local, #neuronSnapshot, Principal.fromText("tgqd4-eqaaa-aaaai-atifa-cai")),
-            (#Local, #treasury, Principal.fromText("tptia-syaaa-aaaai-atieq-cai")),
+            (#Local, #treasury, Principal.fromText("uxrrr-q7777-77774-qaaaq-cai")),
             (#Local, #validation, Principal.fromText("tbrfi-jiaaa-aaaai-atifq-cai")),
             (#Local, #trading_archive, Principal.fromText("jlycp-kqaaa-aaaan-qz4xa-cai")),
             (#Local, #portfolio_archive, Principal.fromText("lrekt-uaaaa-aaaan-qz4ya-cai")),

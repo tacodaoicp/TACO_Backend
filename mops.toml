@@ -1,3 +1,6 @@
+[toolchain]
+moc = "0.16.0"
+
 [dependencies]
 base = "0.16.0"
 matchers = "https://github.com/kritzcreek/motoko-matchers#3dac8a071b69e4e651b25a7d9683fe831eb7cffd@3dac8a071b69e4e651b25a7d9683fe831eb7cffd"

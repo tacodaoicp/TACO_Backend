@@ -22,6 +22,8 @@ node_modules/
 dist/
 .svelte-kit/
 
+
+
 # environment variables
 .env
 *.pem
@@ -31,3 +33,4 @@ dfx_output.txt
 test_exchange_selection copy.py
 *.csv
 
+__pycache__/
