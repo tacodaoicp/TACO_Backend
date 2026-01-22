@@ -53,6 +53,7 @@ export type AdminFunction = { 'removeToken' : null } |
   { 'getLogs' : null } |
   { 'removeAdmin' : null } |
   { 'stopToken' : null } |
+  { 'backfillPerformanceData' : null } |
   { 'getNeuronUpdates' : null } |
   { 'unpauseToken' : null } |
   { 'updateSystemParameter' : null } |
@@ -101,15 +102,30 @@ export interface AllocationStats {
 export type AuthorizationError = { 'NotAllowed' : null } |
   { 'NotAdmin' : null } |
   { 'UnexpectedError' : string };
+export interface BackfillResult {
+  'startTime' : bigint,
+  'neuronsProcessed' : bigint,
+  'periodsCreated' : bigint,
+  'totalNeuronRewards' : bigint,
+  'endTime' : bigint,
+  'errors' : Array<string>,
+}
 export interface ContinuousDAO {
   'addAdmin' : ActorMethod<[Principal, [] | [string]], Result_1>,
   'addToken' : ActorMethod<[Principal, TokenType], Result_1>,
   'addTokenWithReason' : ActorMethod<[Principal, TokenType, string], Result_1>,
   'admin_addPenalizedNeuron' : ActorMethod<
     [Uint8Array | number[], bigint],
-    Result_16
+    Result_19
+  >,
+  'admin_backfillNeuronAllocationRecords' : ActorMethod<[], Result_18>,
+  'admin_backfillPerformanceData' : ActorMethod<
+    [[] | [bigint], [] | [bigint], [] | [bigint], [] | [boolean]],
+    Result_17
   >,
   'admin_clearAllPastPrices' : ActorMethod<[], Result_1>,
+  'admin_generateTestData' : ActorMethod<[[] | [TestDataConfig]], Result_16>,
+  'admin_getAllActiveNeuronIds' : ActorMethod<[], Array<Uint8Array | number[]>>,
   'admin_getNeuronAllocations' : ActorMethod<
     [],
     Array<[Uint8Array | number[], NeuronAllocation]>
@@ -134,8 +150,25 @@ export interface ContinuousDAO {
     Array<[Principal, Array<AdminPermission>]>
   >,
   'getAggregateAllocation' : ActorMethod<[], Array<[Principal, bigint]>>,
+  'getAllNeuronOwners' : ActorMethod<
+    [],
+    Array<[Uint8Array | number[], Array<Principal>]>
+  >,
   'getAllocationChangesSince' : ActorMethod<[bigint, bigint], Result_12>,
   'getAllocationStats' : ActorMethod<[], AllocationStats>,
+  'getBackfillStatus' : ActorMethod<
+    [],
+    {
+      'neuronsChecked' : bigint,
+      'totalNeuronsWithAllocations' : bigint,
+      'neuronsToBackfill' : bigint,
+      'lastRunTime' : bigint,
+      'lastResult' : [] | [
+        { 'skipped' : bigint, 'errors' : bigint, 'archived' : bigint }
+      ],
+      'isRunning' : boolean,
+    }
+  >,
   'getFollowActionsSince' : ActorMethod<[bigint, bigint], Result_11>,
   'getFollowersWithNeuronCounts' : ActorMethod<[], Array<[Principal, bigint]>>,
   'getHistoricBalanceAndAllocation' : ActorMethod<
@@ -150,6 +183,14 @@ export interface ContinuousDAO {
     [] | [NeuronAllocation]
   >,
   'getNeuronAllocationChangesSince' : ActorMethod<[bigint, bigint], Result_10>,
+  'getNeuronAllocations' : ActorMethod<
+    [bigint, bigint],
+    {
+      'total' : bigint,
+      'hasMore' : boolean,
+      'neurons' : Array<[Uint8Array | number[], NeuronAllocation]>,
+    }
+  >,
   'getNeuronUpdatesSince' : ActorMethod<[bigint, bigint], Result_9>,
   'getPenalizedNeurons' : ActorMethod<
     [],
@@ -173,7 +214,9 @@ export interface ContinuousDAO {
     Array<PublicTokenDetailsEntry>
   >,
   'getUserAllocation' : ActorMethod<[], [] | [UserState]>,
+  'getUserNeurons' : ActorMethod<[Principal], Array<NeuronVP>>,
   'getUserRegisteredTokens' : ActorMethod<[], Array<Principal>>,
+  'getUsersFollowerInfo' : ActorMethod<[Array<Principal>], Array<FollowerInfo>>,
   'getVotingPowerChangesSince' : ActorMethod<[bigint, bigint], Result_8>,
   'get_canister_cycles' : ActorMethod<[], { 'cycles' : bigint }>,
   'grantAdminPermission' : ActorMethod<
@@ -197,6 +240,12 @@ export interface ContinuousDAO {
   'unpauseToken' : ActorMethod<[Principal, string], Result_1>,
   'unregisterUserToken' : ActorMethod<[Principal], Result_3>,
   'updateAllocation' : ActorMethod<[Array<Allocation>], Result_2>,
+  /**
+   * / * Update Minting Vault configuration
+   * /  *
+   * /  * Allows configuration of premium rates, update intervals, and enabling/disabling swapping
+   * /  * Only callable by admins with the updateMintingVaultConfig permission.
+   */
   'updateMintingVaultConfig' : ActorMethod<[UpdateConfig__1], Result_1>,
   'updateSpamParameters' : ActorMethod<
     [
@@ -213,6 +262,12 @@ export interface ContinuousDAO {
     Result_1
   >,
   'updateSystemState' : ActorMethod<[SystemState, string], Result_1>,
+  /**
+   * / * Update treasury rebalance configuration
+   * /  *
+   * /  * Allows configuration of trading intervals, sizes, and safety limits
+   * /  * Only callable by admins with the updateTreasuryConfig permission.
+   */
   'updateTreasuryConfig' : ActorMethod<
     [UpdateConfig, [] | [boolean], [] | [string]],
     Result_1
@@ -241,6 +296,10 @@ export interface FollowRecord {
   'followed' : Principal,
   'follower' : Principal,
   'since' : bigint,
+}
+export interface FollowerInfo {
+  'canBeFollowed' : boolean,
+  'followerCount' : bigint,
 }
 export interface HistoricBalanceAllocation {
   'allocations' : Array<[Principal, bigint]>,
@@ -349,7 +408,15 @@ export type Result_14 = { 'ok' : bigint } |
   { 'err' : AuthorizationError };
 export type Result_15 = { 'ok' : boolean } |
   { 'err' : AuthorizationError };
-export type Result_16 = { 'ok' : null } |
+export type Result_16 = { 'ok' : TestDataResult } |
+  { 'err' : string };
+export type Result_17 = { 'ok' : BackfillResult } |
+  { 'err' : AuthorizationError };
+export type Result_18 = {
+    'ok' : { 'skipped' : bigint, 'errors' : bigint, 'archived' : bigint }
+  } |
+  { 'err' : AuthorizationError };
+export type Result_19 = { 'ok' : null } |
   { 'err' : AuthorizationError };
 export type Result_2 = { 'ok' : string } |
   { 'err' : UpdateError };
@@ -389,6 +456,18 @@ export type SystemParameter = { 'MaxFollowers' : bigint } |
 export type SystemState = { 'Paused' : null } |
   { 'Active' : null } |
   { 'Emergency' : null };
+export interface TestDataConfig {
+  'allocationFrequencyDays' : bigint,
+  'priceFrequencyDays' : bigint,
+  'daysBack' : bigint,
+}
+export interface TestDataResult {
+  'neuronsProcessed' : bigint,
+  'tokensProcessed' : bigint,
+  'errors' : Array<string>,
+  'allocationsCreated' : bigint,
+  'pricesCreated' : bigint,
+}
 export interface TokenDetails {
   'lastTimeSynced' : bigint,
   'balance' : bigint,
@@ -439,6 +518,7 @@ export interface UpdateConfig {
   'maxTradesStored' : [] | [bigint],
   'maxTradeValueICP' : [] | [bigint],
   'minTradeValueICP' : [] | [bigint],
+  'minAllocationDiffBasisPoints' : [] | [bigint],
   'portfolioRebalancePeriodNS' : [] | [bigint],
   'longSyncIntervalNS' : [] | [bigint],
   'maxTradeAttemptsPerInterval' : [] | [bigint],

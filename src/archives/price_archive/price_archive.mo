@@ -34,17 +34,17 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
 
   // ICRC3 State Management for Scalable Storage (500GB)
   private stable var icrc3State : ?ICRC3.State = null;
-  private var icrc3StateRef = { var value = icrc3State };
+  private transient var icrc3StateRef = { var value = icrc3State };
 
   // Initialize the generic base class with price-specific configuration
-  private let initialConfig : ArchiveTypes.ArchiveConfig = {
+  private transient let initialConfig : ArchiveTypes.ArchiveConfig = {
     maxBlocksPerCanister = 1000000; // 1M blocks per canister
     blockRetentionPeriodNS = 31536000000000000; // 1 year in nanoseconds
     enableCompression = false;
     autoArchiveEnabled = true;
   };
 
-  private let base = ArchiveBase.ArchiveBase<PriceBlockData>(
+  private transient let base = ArchiveBase.ArchiveBase<PriceBlockData>(
     this_canister_id(),
     ["3price"],
     initialConfig,
@@ -63,9 +63,9 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
   private stable var lastImportedPriceTime : Int = 0;
 
   // Treasury interface for batch imports
-  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
-  private let TREASURY_ID = canister_ids.getCanisterId(#treasury);
-  private let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(TREASURY_ID));
+  transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  private transient let TREASURY_ID = canister_ids.getCanisterId(#treasury);
+  private transient let treasuryCanister : TreasuryTypes.Self = actor (Principal.toText(TREASURY_ID));
 
   // Helper function to get price range bucket for indexing
   private func getPriceRangeBucket(priceICP : Nat) : Nat {
@@ -106,7 +106,7 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
     // Use original event timestamp from PriceBlockData, not import time!
     let timestamp = price.timestamp;
     let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
-    
+
     // Use base class to store the block
     let blockIndex = base.storeBlock<system>(
       blockValue,
@@ -114,7 +114,7 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
       [price.token],
       timestamp
     );
-    
+
     // Update price-specific indexes
     base.addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, Map.nhash);
 
@@ -127,11 +127,57 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
     };
     Map.set(lastKnownPrices, Map.phash, price.token, priceInfo);
 
-    base.logger.info("Archive", "Archived price block at index: " # Nat.toText(blockIndex) # 
-      " Token: " # Principal.toText(price.token) # 
+    base.logger.info("Archive", "Archived price block at index: " # Nat.toText(blockIndex) #
+      " Token: " # Principal.toText(price.token) #
       " Price: " # Nat.toText(price.priceICP) # " ICP", "archivePriceBlock");
 
     #ok(blockIndex);
+  };
+
+  // Bulk archive function for test data generation - archives multiple price records at once
+  public shared ({ caller }) func archivePriceBlockBatch<system>(
+    prices: [PriceBlockData]
+  ) : async Result.Result<{ archived: Nat; failed: Nat }, ArchiveError> {
+    if (not base.isAuthorized(caller, #ArchiveData)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (prices.size() > 1000) {
+      return #err(#InvalidData); // Limit batch size
+    };
+
+    var archived : Nat = 0;
+    var failed : Nat = 0;
+
+    for (price in prices.vals()) {
+      let timestamp = price.timestamp;
+      let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
+
+      let blockIndex = base.storeBlock<system>(
+        blockValue,
+        "3price",
+        [price.token],
+        timestamp
+      );
+
+      // Update price-specific indexes
+      base.addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, Map.nhash);
+
+      // Update price-specific statistics and tracking
+      totalPriceUpdates += 1;
+      let priceInfo = {
+        icpPrice = price.priceICP;
+        usdPrice = price.priceUSD;
+        timestamp = timestamp;
+      };
+      Map.set(lastKnownPrices, Map.phash, price.token, priceInfo);
+
+      archived += 1;
+    };
+
+    base.logger.info("Archive", "Batch archived " # Nat.toText(archived) # " price blocks", "archivePriceBlockBatch");
+
+    #ok({ archived = archived; failed = failed });
   };
 
   //=========================================================================

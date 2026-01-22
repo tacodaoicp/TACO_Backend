@@ -4,7 +4,8 @@
   "canisters": {
     "DAO_backend": {
       "main": "src/DAO_backend/DAO.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "treasury": {
       "main": "src/treasury/treasury.mo",
@@ -29,7 +30,8 @@
     },
     "price_archive": {
       "main": "src/archives/price_archive/price_archive.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "dao_admin_archive": {
       "main": "src/archives/dao_admin_archive/dao_admin_archive.mo",
@@ -45,7 +47,8 @@
     },
     "rewards": {
       "main": "src/rewards/rewards.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "nns_neuron_controller": {
       "main": "src/nns_neuron_controller/main.mo",
@@ -53,7 +56,8 @@
     },
     "dao_neuron_allocation_archive": {
       "main": "src/archives/dao_neuron_allocation_archive/dao_neuron_allocation_archive.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "reward_distribution_archive": {
       "main": "src/archives/reward_distribution_archive/reward_distribution_archive.mo",

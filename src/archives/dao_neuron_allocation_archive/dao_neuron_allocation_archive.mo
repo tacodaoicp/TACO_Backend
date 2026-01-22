@@ -181,6 +181,42 @@ shared (deployer) persistent actor class DAONeuronAllocationArchive() = this {
     #ok(blockIndex);
   };
 
+  // Bulk archive function for test data generation - archives multiple allocation changes at once
+  public shared ({ caller }) func archiveNeuronAllocationChangeBatch<system>(
+    changes: [NeuronAllocationChangeBlockData]
+  ) : async Result.Result<{ archived: Nat; failed: Nat }, ArchiveError> {
+    if (not base.isAuthorized(caller, #ArchiveData)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (changes.size() > 1000) {
+      return #err(#InvalidData); // Limit batch size
+    };
+
+    var archived : Nat = 0;
+    var failed : Nat = 0;
+
+    for (change in changes.vals()) {
+      let blockValue = neuronAllocationChangeToValue(change, change.timestamp, null);
+      let blockIndex = base.storeBlock<system>(
+        blockValue,
+        "3neuron_allocation_change",
+        Array.map(change.newAllocations, func(a: Allocation) : Principal { a.token }),
+        change.timestamp
+      );
+
+      // Update custom indexes
+      updateNeuronIndex(change.neuronId, blockIndex);
+      updateMakerIndex(change.maker, blockIndex);
+      updateTimestampIndex(change.timestamp, blockIndex);
+
+      totalNeuronAllocationChanges += 1;
+      archived += 1;
+    };
+
+    #ok({ archived = archived; failed = failed });
+  };
+
   //=========================================================================
   // Query Methods for Rewards System
   //=========================================================================
@@ -322,6 +358,109 @@ shared (deployer) persistent actor class DAONeuronAllocationArchive() = this {
         #ok([]);
       };
     };
+  };
+
+  // Bulk query for multiple neurons at once - optimized for backfill operations
+  // Returns allocation changes for multiple neurons in a single call
+  public shared query ({ caller }) func getAllNeuronsAllocationChangesInTimeRange(
+    startTime: Int,
+    endTime: Int,
+    offset: Nat,
+    limit: Nat
+  ) : async Result.Result<{
+    neurons: [(Blob, {
+      preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+      inTimespanChanges: [NeuronAllocationChangeBlockData];
+    })];
+    totalNeurons: Nat;
+    hasMore: Bool;
+  }, ArchiveError> {
+    if (not base.isAuthorized(caller, #QueryData)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (limit > 100) {
+      return #err(#InvalidData);
+    };
+
+    if (startTime > endTime) {
+      return #err(#InvalidTimeRange);
+    };
+
+    // Get all neuron IDs from the index
+    let allNeuronIds = Iter.toArray(Map.keys(neuronIndex));
+    let totalNeurons = Array.size(allNeuronIds);
+
+    // Apply pagination
+    let startIdx = if (offset >= totalNeurons) { totalNeurons } else { offset };
+    let endIdx = if (startIdx + limit >= totalNeurons) { totalNeurons } else { startIdx + limit };
+    let hasMore = endIdx < totalNeurons;
+
+    var results : [(Blob, {
+      preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+      inTimespanChanges: [NeuronAllocationChangeBlockData];
+    })] = [];
+
+    // Process each neuron in the page
+    var i = startIdx;
+    while (i < endIdx) {
+      let neuronId = allNeuronIds[i];
+
+      // Get block indices for this neuron
+      switch (Map.get(neuronIndex, Map.bhash, neuronId)) {
+        case (?blockIndices) {
+          var inTimespanChanges : [NeuronAllocationChangeBlockData] = [];
+          var preTimespanAllocation : ?NeuronAllocationChangeBlockData = null;
+
+          let indicesArray = Iter.toArray(blockIndices.vals());
+
+          // Iterate through all block indices
+          for (blockIndex in indicesArray.vals()) {
+            let getBlocksArgs = [{
+              start = blockIndex;
+              length = 1;
+            }];
+
+            let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
+
+            if (Array.size(icrc3Result.blocks) > 0) {
+              let block = icrc3Result.blocks[0];
+
+              switch (parseBlockForNeuronAllocation(block, neuronId, 0, Int.abs(Time.now()) + 1000000000)) {
+                case (?changeData) {
+                  if (changeData.timestamp < startTime) {
+                    preTimespanAllocation := ?changeData;
+                  } else if (changeData.timestamp >= startTime and changeData.timestamp <= endTime) {
+                    inTimespanChanges := Array.append(inTimespanChanges, [changeData]);
+                  };
+                };
+                case (_) {};
+              };
+            };
+          };
+
+          results := Array.append(results, [(neuronId, {
+            preTimespanAllocation = preTimespanAllocation;
+            inTimespanChanges = inTimespanChanges;
+          })]);
+        };
+        case (_) {
+          // No blocks for this neuron, include with empty data
+          results := Array.append(results, [(neuronId, {
+            preTimespanAllocation = null;
+            inTimespanChanges = [];
+          })]);
+        };
+      };
+
+      i += 1;
+    };
+
+    #ok({
+      neurons = results;
+      totalNeurons = totalNeurons;
+      hasMore = hasMore;
+    });
   };
 
   // Comprehensive query method that returns both pre-timespan allocation and in-timespan changes

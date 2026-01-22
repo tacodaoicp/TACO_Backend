@@ -13,6 +13,25 @@ export const idlFactory = ({ IDL }) => {
     'InsufficientRewardPot' : IDL.Null,
   });
   const Result__1 = IDL.Variant({ 'ok' : IDL.Text, 'err' : RewardsError });
+  const BackfillConfig = IDL.Record({
+    'periodDays' : IDL.Nat,
+    'startTime' : IDL.Int,
+    'skipExistingPeriods' : IDL.Bool,
+    'clearExisting' : IDL.Bool,
+    'maxPeriods' : IDL.Nat,
+  });
+  const BackfillResult = IDL.Record({
+    'startTime' : IDL.Int,
+    'neuronsProcessed' : IDL.Nat,
+    'periodsCreated' : IDL.Nat,
+    'totalNeuronRewards' : IDL.Nat,
+    'endTime' : IDL.Int,
+    'errors' : IDL.Vec(IDL.Text),
+  });
+  const Result__1_10 = IDL.Variant({
+    'ok' : BackfillResult,
+    'err' : RewardsError,
+  });
   const PriceType = IDL.Variant({ 'ICP' : IDL.Null, 'USD' : IDL.Null });
   const Allocation = IDL.Record({
     'token' : IDL.Principal,
@@ -61,7 +80,7 @@ export const idlFactory = ({ IDL }) => {
     'inTimespanChanges' : IDL.Vec(NeuronAllocationChangeBlockData),
     'initialValue' : IDL.Float64,
   });
-  const Result__1_6 = IDL.Variant({
+  const Result__1_9 = IDL.Variant({
     'ok' : PerformanceResult,
     'err' : RewardsError,
   });
@@ -80,7 +99,7 @@ export const idlFactory = ({ IDL }) => {
     'targetAccount' : Account,
     'transactionId' : IDL.Opt(IDL.Nat),
   });
-  const Result__1_3 = IDL.Variant({
+  const Result__1_2 = IDL.Variant({
     'ok' : IDL.Vec(WithdrawalRecord),
     'err' : RewardsError,
   });
@@ -103,6 +122,7 @@ export const idlFactory = ({ IDL }) => {
     'rewardScore' : IDL.Float64,
     'checkpoints' : IDL.Vec(CheckpointData),
     'neuronId' : IDL.Vec(IDL.Nat8),
+    'performanceScoreICP' : IDL.Opt(IDL.Float64),
   });
   const FailedNeuron = IDL.Record({
     'errorMessage' : IDL.Text,
@@ -121,20 +141,79 @@ export const idlFactory = ({ IDL }) => {
     'neuronRewards' : IDL.Vec(NeuronReward),
     'failedNeurons' : IDL.Vec(FailedNeuron),
   });
-  const Result__1_5 = IDL.Variant({
+  const Result__1_8 = IDL.Variant({
     'ok' : IDL.Record({ 'distributions' : IDL.Vec(DistributionRecord) }),
+    'err' : RewardsError,
+  });
+  const LeaderboardTimeframe = IDL.Variant({
+    'AllTime' : IDL.Null,
+    'OneWeek' : IDL.Null,
+    'OneYear' : IDL.Null,
+    'OneMonth' : IDL.Null,
+  });
+  const LeaderboardPriceType = IDL.Variant({
+    'ICP' : IDL.Null,
+    'USD' : IDL.Null,
+  });
+  const LeaderboardEntry = IDL.Record({
+    'principal' : IDL.Principal,
+    'performanceScore' : IDL.Float64,
+    'lastActivity' : IDL.Int,
+    'rank' : IDL.Nat,
+    'distributionsCount' : IDL.Nat,
+    'neuronId' : IDL.Vec(IDL.Nat8),
+  });
+  const NeuronPerformanceDetail = IDL.Record({
+    'lastAllocationChange' : IDL.Int,
+    'votingPower' : IDL.Nat,
+    'performance' : IDL.Record({
+      'oneMonthICP' : IDL.Opt(IDL.Float64),
+      'oneMonthUSD' : IDL.Opt(IDL.Float64),
+      'oneWeekICP' : IDL.Opt(IDL.Float64),
+      'oneWeekUSD' : IDL.Opt(IDL.Float64),
+      'oneYearICP' : IDL.Opt(IDL.Float64),
+      'oneYearUSD' : IDL.Opt(IDL.Float64),
+      'allTimeICP' : IDL.Opt(IDL.Float64),
+      'allTimeUSD' : IDL.Opt(IDL.Float64),
+    }),
+    'distributionsParticipated' : IDL.Nat,
+    'neuronId' : IDL.Vec(IDL.Nat8),
+  });
+  const Result__1_7 = IDL.Variant({
+    'ok' : NeuronPerformanceDetail,
+    'err' : RewardsError,
+  });
+  const Result__1_6 = IDL.Variant({
+    'ok' : IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat)),
+    'err' : RewardsError,
+  });
+  const Result__1_5 = IDL.Variant({
+    'ok' : IDL.Opt(IDL.Nat),
     'err' : RewardsError,
   });
   const Result__1_4 = IDL.Variant({
     'ok' : IDL.Vec(IDL.Vec(IDL.Nat8)),
     'err' : RewardsError,
   });
-  const Result__1_2 = IDL.Variant({
-    'ok' : IDL.Record({
-      'totalRecordsInHistory' : IDL.Nat,
-      'totalWithdrawn' : IDL.Nat,
-      'totalWithdrawals' : IDL.Nat,
+  const UserPerformanceResult = IDL.Record({
+    'principal' : IDL.Principal,
+    'lastActivity' : IDL.Int,
+    'totalVotingPower' : IDL.Nat,
+    'aggregatedPerformance' : IDL.Record({
+      'oneMonthICP' : IDL.Opt(IDL.Float64),
+      'oneMonthUSD' : IDL.Opt(IDL.Float64),
+      'oneWeekICP' : IDL.Opt(IDL.Float64),
+      'oneWeekUSD' : IDL.Opt(IDL.Float64),
+      'oneYearICP' : IDL.Opt(IDL.Float64),
+      'oneYearUSD' : IDL.Opt(IDL.Float64),
+      'allTimeICP' : IDL.Opt(IDL.Float64),
+      'allTimeUSD' : IDL.Opt(IDL.Float64),
     }),
+    'distributionsParticipated' : IDL.Nat,
+    'neurons' : IDL.Vec(NeuronPerformanceDetail),
+  });
+  const Result__1_3 = IDL.Variant({
+    'ok' : UserPerformanceResult,
     'err' : RewardsError,
   });
   const Result__1_1 = IDL.Variant({
@@ -157,18 +236,47 @@ export const idlFactory = ({ IDL }) => {
   const Result = IDL.Variant({ 'Ok' : IDL.Nat, 'Err' : TransferError });
   const Rewards = IDL.Service({
     'addToRewardSkipList' : IDL.Func([IDL.Vec(IDL.Nat8)], [Result__1], []),
+    'admin_backfillDistributionHistory' : IDL.Func(
+        [BackfillConfig],
+        [Result__1_10],
+        [],
+      ),
     'calculateNeuronPerformance' : IDL.Func(
         [IDL.Vec(IDL.Nat8), IDL.Int, IDL.Int, PriceType],
-        [Result__1_6],
+        [Result__1_9],
         [],
+      ),
+    'calculateNeuronPerformanceQuery' : IDL.Func(
+        [IDL.Vec(IDL.Nat8), IDL.Int, IDL.Int, PriceType],
+        [Result__1_9],
+        ['composite_query'],
       ),
     'getAllNeuronRewardBalances' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat))],
         ['query'],
       ),
-    'getAllWithdrawalHistory' : IDL.Func([IDL.Opt(IDL.Nat)], [Result__1_3], []),
+    'getAllWithdrawalHistory' : IDL.Func([IDL.Opt(IDL.Nat)], [Result__1_2], []),
     'getAvailableBalance' : IDL.Func([], [IDL.Nat], []),
+    'getBackfillStatus' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'startedAt' : IDL.Int,
+            'dataStartTime' : IDL.Int,
+            'lastErrors' : IDL.Vec(IDL.Text),
+            'totalPeriods' : IDL.Nat,
+            'currentPeriodStart' : IDL.Int,
+            'elapsedNS' : IDL.Int,
+            'periodsCompleted' : IDL.Nat,
+            'dataEndTime' : IDL.Int,
+            'currentPeriodEnd' : IDL.Int,
+            'progressPercent' : IDL.Nat,
+            'inProgress' : IDL.Bool,
+          }),
+        ],
+        ['query'],
+      ),
     'getCanisterStatus' : IDL.Func(
         [],
         [
@@ -197,6 +305,7 @@ export const idlFactory = ({ IDL }) => {
             'rewardSkipListSize' : IDL.Nat,
             'maxDistributionHistory' : IDL.Nat,
             'periodicRewardPot' : IDL.Nat,
+            'rewardPenaltiesCount' : IDL.Nat,
             'performanceScorePower' : IDL.Float64,
             'totalDistributions' : IDL.Nat,
             'nextScheduledDistribution' : IDL.Opt(IDL.Int),
@@ -234,7 +343,44 @@ export const idlFactory = ({ IDL }) => {
       ),
     'getDistributionsSince' : IDL.Func(
         [IDL.Int, IDL.Nat],
-        [Result__1_5],
+        [Result__1_8],
+        ['query'],
+      ),
+    'getLeaderboard' : IDL.Func(
+        [
+          LeaderboardTimeframe,
+          LeaderboardPriceType,
+          IDL.Opt(IDL.Nat),
+          IDL.Opt(IDL.Nat),
+        ],
+        [IDL.Vec(LeaderboardEntry)],
+        ['query'],
+      ),
+    'getLeaderboardInfo' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'updateEnabled' : IDL.Bool,
+            'lastUpdate' : IDL.Int,
+            'leaderboardCounts' : IDL.Record({
+              'oneMonthICP' : IDL.Nat,
+              'oneMonthUSD' : IDL.Nat,
+              'oneWeekICP' : IDL.Nat,
+              'oneWeekUSD' : IDL.Nat,
+              'oneYearICP' : IDL.Nat,
+              'oneYearUSD' : IDL.Nat,
+              'allTimeICP' : IDL.Nat,
+              'allTimeUSD' : IDL.Nat,
+            }),
+            'totalDistributions' : IDL.Nat,
+            'maxSize' : IDL.Nat,
+          }),
+        ],
+        ['query'],
+      ),
+    'getNeuronPerformance' : IDL.Func(
+        [IDL.Vec(IDL.Nat8)],
+        [Result__1_7],
         ['query'],
       ),
     'getNeuronRewardBalance' : IDL.Func(
@@ -247,15 +393,36 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat))],
         ['query'],
       ),
+    'getRewardPenalties' : IDL.Func([], [Result__1_6], ['query']),
+    'getRewardPenalty' : IDL.Func(
+        [IDL.Vec(IDL.Nat8)],
+        [Result__1_5],
+        ['query'],
+      ),
     'getRewardSkipList' : IDL.Func([], [Result__1_4], ['query']),
     'getTacoBalance' : IDL.Func([], [IDL.Nat], []),
     'getTotalDistributed' : IDL.Func([], [IDL.Nat], ['query']),
+    'getUserPerformance' : IDL.Func(
+        [IDL.Principal],
+        [Result__1_3],
+        ['composite_query'],
+      ),
     'getUserWithdrawalHistory' : IDL.Func(
         [IDL.Opt(IDL.Nat)],
-        [Result__1_3],
+        [Result__1_2],
         [],
       ),
-    'getWithdrawalStats' : IDL.Func([], [Result__1_2], []),
+    'getWithdrawalStats' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'totalRecordsInHistory' : IDL.Nat,
+            'totalWithdrawn' : IDL.Nat,
+            'totalWithdrawals' : IDL.Nat,
+          }),
+        ],
+        ['query'],
+      ),
     'getWithdrawalsSince' : IDL.Func(
         [IDL.Int, IDL.Nat],
         [Result__1_1],
@@ -266,11 +433,23 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Record({ 'cycles' : IDL.Nat })],
         ['query'],
       ),
+    'refreshLeaderboards' : IDL.Func([], [Result__1], []),
     'removeFromRewardSkipList' : IDL.Func([IDL.Vec(IDL.Nat8)], [Result__1], []),
+    'removeRewardPenalty' : IDL.Func([IDL.Vec(IDL.Nat8)], [Result__1], []),
     'setDistributionEnabled' : IDL.Func([IDL.Bool], [Result__1], []),
     'setDistributionPeriod' : IDL.Func([IDL.Nat], [Result__1], []),
     'setPerformanceScorePower' : IDL.Func([IDL.Float64], [Result__1], []),
     'setPeriodicRewardPot' : IDL.Func([IDL.Nat], [Result__1], []),
+    'setRewardPenalties' : IDL.Func(
+        [IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat))],
+        [Result__1],
+        [],
+      ),
+    'setRewardPenalty' : IDL.Func(
+        [IDL.Vec(IDL.Nat8), IDL.Nat],
+        [Result__1],
+        [],
+      ),
     'setRewardSkipList' : IDL.Func(
         [IDL.Vec(IDL.Vec(IDL.Nat8))],
         [Result__1],
@@ -283,6 +462,11 @@ export const idlFactory = ({ IDL }) => {
     'triggerDistribution' : IDL.Func([], [Result__1], []),
     'triggerDistributionCustom' : IDL.Func(
         [IDL.Int, IDL.Int, PriceType],
+        [Result__1],
+        [],
+      ),
+    'updateLeaderboardConfig' : IDL.Func(
+        [IDL.Opt(IDL.Nat), IDL.Opt(IDL.Bool)],
         [Result__1],
         [],
       ),

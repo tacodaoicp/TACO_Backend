@@ -25,6 +25,7 @@ import TreasuryTypes "../treasury/treasury_types";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import CanisterIds "../helper/CanisterIds";
+import Buffer "mo:base/Buffer";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
 //import Migration "./migration";
@@ -123,6 +124,116 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   //let NACHOS_ID = canister_ids.getCanisterId(#nachos);
 
   transient let NEURON_SNAPSHOT_ID = canister_ids.getCanisterId(#neuronSnapshot);
+  transient let REWARDS_ID = canister_ids.getCanisterId(#rewards);
+  transient let DAO_NEURON_ALLOCATION_ARCHIVE_ID = canister_ids.getCanisterId(#dao_neuron_allocation_archive);
+  transient let PRICE_ARCHIVE_ID = canister_ids.getCanisterId(#price_archive);
+
+  // Rewards canister interface for backfill operations
+  type BackfillConfig = {
+    startTime: Int;
+    periodDays: Nat;
+    maxPeriods: Nat;
+    clearExisting: Bool;
+  };
+
+  type BackfillResult = {
+    periodsCreated: Nat;
+    neuronsProcessed: Nat;
+    totalNeuronRewards: Nat;
+    errors: [Text];
+    startTime: Int;
+    endTime: Int;
+  };
+
+  type RewardsError = {
+    #SystemError: Text;
+    #NeuronNotFound;
+    #InvalidTimeRange;
+    #PriceDataMissing: {token: Principal; timestamp: Int};
+    #AllocationDataMissing;
+    #DistributionInProgress;
+    #InsufficientRewardPot;
+    #NotAuthorized;
+  };
+
+  type RewardsCanister = actor {
+    admin_backfillDistributionHistory: (BackfillConfig) -> async Result.Result<BackfillResult, RewardsError>;
+  };
+
+  transient let rewardsCanister : RewardsCanister = actor (Principal.toText(REWARDS_ID));
+
+
+
+  type AllocationChangeType = {
+    #UserUpdate: {userInitiated: Bool};
+    #FollowAction: {followedUser: Principal};
+    #SystemRebalance;
+    #VotingPowerChange;
+  };
+
+  type NeuronAllocationChangeBlockData = {
+    id: Nat;
+    timestamp: Int;
+    neuronId: Blob;
+    changeType: AllocationChangeType;
+    oldAllocations: [Allocation];
+    newAllocations: [Allocation];
+    votingPower: Nat;
+    maker: Principal;
+    reason: ?Text;
+    penaltyMultiplier: ?Nat;
+  };
+
+  type PriceSource = {
+    #Exchange: { #KongSwap; #ICPSwap };
+    #NTN;
+    #Aggregated;
+    #Oracle;
+  };
+
+  type PriceBlockData = {
+    token: Principal;
+    priceICP: Nat;
+    priceUSD: Float;
+    source: PriceSource;
+    volume24h: ?Nat;
+    change24h: ?Float;
+    timestamp: Int;
+  };
+
+  type ArchiveError = {
+    #NotAuthorized;
+    #InvalidData;
+    #SystemError: Text;
+    #InvalidTimeRange;
+  };
+
+  type NeuronAllocationArchive = actor {
+    archiveNeuronAllocationChangeBatch: ([NeuronAllocationChangeBlockData]) -> async Result.Result<{ archived: Nat; failed: Nat }, ArchiveError>;
+    getNeuronAllocationChangesByNeuron: query (Blob, Nat) -> async Result.Result<[NeuronAllocationChangeBlockData], ArchiveError>;
+  };
+
+  type PriceArchive = actor {
+    archivePriceBlockBatch: ([PriceBlockData]) -> async Result.Result<{ archived: Nat; failed: Nat }, ArchiveError>;
+  };
+
+  transient let neuronAllocationArchive : NeuronAllocationArchive = actor (Principal.toText(DAO_NEURON_ALLOCATION_ARCHIVE_ID));
+  transient let priceArchive : PriceArchive = actor (Principal.toText(PRICE_ARCHIVE_ID));
+
+  // Test data generation types
+  public type TestDataConfig = {
+    daysBack: Nat;              // How many days of history (default 90)
+    allocationFrequencyDays: Nat; // How often to create allocation changes (default 7)
+    priceFrequencyDays: Nat;    // How often to create price records (default 1)
+  };
+
+  public type TestDataResult = {
+    neuronsProcessed: Nat;
+    allocationsCreated: Nat;
+    pricesCreated: Nat;
+    tokensProcessed: Nat;
+    errors: [Text];
+  };
 
   //spamGuard.setAllowedCanisters([Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai")]);
   //spamGuard.setSelf(Principal.fromText("ywhqf-eyaaa-aaaad-qg6tq-cai"));
@@ -1477,6 +1588,290 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     #ok(count);
   };
 
+  // Admin function to backfill historical performance data for all neurons
+  // This calculates and populates distributionHistory in the rewards canister
+  // as if the performance tracking system had been running from the beginning
+  public shared ({ caller }) func admin_backfillPerformanceData(
+    startTimestamp: ?Int,   // Optional, defaults to 30 days ago if null
+    periodDays: ?Nat,       // Optional, defaults to 7 days
+    maxPeriods: ?Nat,       // Optional, defaults to 52 (1 year of weekly periods)
+    clearExisting: ?Bool    // Optional, defaults to false
+  ) : async Result.Result<BackfillResult, AuthorizationError> {
+    if (not isAdmin(caller, #backfillPerformanceData)) {
+      return #err(#NotAdmin);
+    };
+
+    let NANOSECONDS_PER_DAY : Int = 86_400_000_000_000;
+    let now = Time.now();
+
+    // Set defaults
+    let startTime = switch (startTimestamp) {
+      case (?t) { t };
+      case null { now - (30 * NANOSECONDS_PER_DAY) }; // Default to 30 days ago
+    };
+
+    let config : BackfillConfig = {
+      startTime = startTime;
+      periodDays = switch (periodDays) { case (?p) p; case null 7 };
+      maxPeriods = switch (maxPeriods) { case (?m) m; case null 52 };
+      clearExisting = switch (clearExisting) { case (?c) c; case null false };
+    };
+
+    logger.info("Admin", "Starting performance data backfill from " # Int.toText(config.startTime), "admin_backfillPerformanceData");
+
+    // Call rewards canister to perform the backfill
+    let result = try {
+      await rewardsCanister.admin_backfillDistributionHistory(config)
+    } catch (e) {
+      logger.error("Admin", "Failed to call rewards canister: " # Error.message(e), "admin_backfillPerformanceData");
+      return #err(#UnexpectedError("Failed to call rewards canister: " # Error.message(e)));
+    };
+
+    switch (result) {
+      case (#ok(backfillResult)) {
+        logger.info("Admin", "Backfill completed: " # Nat.toText(backfillResult.periodsCreated) # " periods created", "admin_backfillPerformanceData");
+        #ok(backfillResult)
+      };
+      case (#err(error)) {
+        let errorMsg = debug_show(error);
+        logger.error("Admin", "Backfill failed: " # errorMsg, "admin_backfillPerformanceData");
+        #err(#UnexpectedError("Rewards canister error: " # errorMsg))
+      };
+    }
+  };
+
+  // Admin function to generate test data for staging archives
+  // Creates fake allocation changes and price records for testing the backfill functionality
+  // STAGING ONLY - do not run on production
+  public shared ({ caller }) func admin_generateTestData(
+    config: ?TestDataConfig
+  ) : async Result.Result<TestDataResult, Text> {
+    if (not Principal.isController(caller)) {
+      return #err("Not authorized - controller only");
+    };
+
+    // Only allow on staging environment
+    if (canister_ids.getEnvironment() != #Staging) {
+      return #err("This function is only available on staging");
+    };
+
+    let NANOSECONDS_PER_DAY : Int = 86_400_000_000_000;
+    let now = Time.now();
+
+    // Set defaults
+    let cfg : TestDataConfig = switch (config) {
+      case (?c) { c };
+      case null { { daysBack = 90; allocationFrequencyDays = 7; priceFrequencyDays = 1 } };
+    };
+
+    let errorsBuffer = Buffer.Buffer<Text>(10);
+    var allocationsCreated : Nat = 0;
+    var pricesCreated : Nat = 0;
+
+    // Get all neuron IDs from neuronAllocationMap
+    let neuronIds = Buffer.Buffer<Blob>(Map.size(neuronAllocationMap));
+    for ((neuronId, _) in Map.entries(neuronAllocationMap)) {
+      neuronIds.add(neuronId);
+    };
+    let neuronsProcessed = neuronIds.size();
+
+    if (neuronsProcessed == 0) {
+      return #err("No neurons found in neuronAllocationMap");
+    };
+
+    // Get all active tokens from tokenDetailsMap
+    let tokens = Buffer.Buffer<Principal>(Map.size(tokenDetailsMap));
+    for ((tokenId, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active) {
+        tokens.add(tokenId);
+      };
+    };
+    let tokensProcessed = tokens.size();
+
+    if (tokensProcessed == 0) {
+      return #err("No active tokens found");
+    };
+
+    logger.info("TestData", "Generating test data for " # Nat.toText(neuronsProcessed) # " neurons and " # Nat.toText(tokensProcessed) # " tokens", "admin_generateTestData");
+
+    // Generate allocation changes for each neuron
+    let allocationsBuffer = Buffer.Buffer<NeuronAllocationChangeBlockData>(neuronsProcessed * (cfg.daysBack / cfg.allocationFrequencyDays + 1));
+    var allocationId : Nat = 0;
+
+    for (neuronId in neuronIds.vals()) {
+      var timestamp = now - (cfg.daysBack * NANOSECONDS_PER_DAY);
+      var prevAllocations : [Allocation] = [];
+
+      while (timestamp < now) {
+        // Generate random allocations that sum to 10000 basis points
+        let newAllocations = generateRandomAllocations(Buffer.toArray(tokens), timestamp);
+
+        let change : NeuronAllocationChangeBlockData = {
+          id = allocationId;
+          timestamp = timestamp;
+          neuronId = neuronId;
+          changeType = #UserUpdate({ userInitiated = true });
+          oldAllocations = prevAllocations;
+          newAllocations = newAllocations;
+          votingPower = 100_000_000 + (allocationId * 1_000_000); // Varying VP
+          maker = Principal.fromText("2vxsx-fae"); // Anonymous principal for test
+          reason = ?"Test data generation";
+          penaltyMultiplier = ?100; // No penalty
+        };
+
+        allocationsBuffer.add(change);
+        prevAllocations := newAllocations;
+        allocationId += 1;
+        timestamp += cfg.allocationFrequencyDays * NANOSECONDS_PER_DAY;
+      };
+    };
+
+    // Archive allocation changes in batch
+    if (allocationsBuffer.size() > 0) {
+      let archiveResult = try {
+        await neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(allocationsBuffer))
+      } catch (e) {
+        errorsBuffer.add("Failed to archive allocations: " # Error.message(e));
+        #err(#SystemError(Error.message(e)))
+      };
+
+      switch (archiveResult) {
+        case (#ok(result)) {
+          allocationsCreated := result.archived;
+          logger.info("TestData", "Archived " # Nat.toText(result.archived) # " allocation changes", "admin_generateTestData");
+        };
+        case (#err(error)) {
+          errorsBuffer.add("Allocation archive error: " # debug_show(error));
+        };
+      };
+    };
+
+    // Generate price records for each token
+    let pricesBuffer = Buffer.Buffer<PriceBlockData>(tokensProcessed * cfg.daysBack);
+
+    for (tokenId in tokens.vals()) {
+      var timestamp = now - (cfg.daysBack * NANOSECONDS_PER_DAY);
+
+      // Base prices vary by token (use hash of principal for deterministic randomness)
+      let baseUsdPrice = getBasePrice(tokenId);
+      var currentPrice = baseUsdPrice;
+
+      while (timestamp < now) {
+        // Add small random variation (±5%)
+        let variation = 1.0 + (Float.fromInt(timestamp / 1_000_000_000) - Float.fromInt((timestamp / 1_000_000_000) / 10 * 10)) / 100.0 - 0.05;
+        currentPrice := baseUsdPrice * variation;
+
+        // Convert USD to ICP (assume 1 ICP = 10 USD for test)
+        let icpPrice = Int.abs(Float.toInt(currentPrice * 100_000_000.0 / 10.0));
+
+        let price : PriceBlockData = {
+          token = tokenId;
+          priceICP = icpPrice;
+          priceUSD = currentPrice;
+          source = #NTN;
+          volume24h = null;
+          change24h = null;
+          timestamp = timestamp;
+        };
+
+        pricesBuffer.add(price);
+        timestamp += cfg.priceFrequencyDays * NANOSECONDS_PER_DAY;
+      };
+    };
+
+    // Archive price records in batches of 1000 (archive limit)
+    let BATCH_SIZE = 1000;
+    let pricesArray = Buffer.toArray(pricesBuffer);
+    let totalPrices = pricesArray.size();
+    var priceOffset = 0;
+
+    while (priceOffset < totalPrices) {
+      let batchEnd = Nat.min(priceOffset + BATCH_SIZE, totalPrices);
+      let batchSize = batchEnd - priceOffset;
+
+      // Create batch slice
+      let batch = Array.tabulate<PriceBlockData>(batchSize, func(i) { pricesArray[priceOffset + i] });
+
+      let archiveResult = try {
+        await priceArchive.archivePriceBlockBatch(batch)
+      } catch (e) {
+        errorsBuffer.add("Failed to archive prices batch at offset " # Nat.toText(priceOffset) # ": " # Error.message(e));
+        #err(#SystemError(Error.message(e)))
+      };
+
+      switch (archiveResult) {
+        case (#ok(result)) {
+          pricesCreated += result.archived;
+          logger.info("TestData", "Archived batch of " # Nat.toText(result.archived) # " price records (offset " # Nat.toText(priceOffset) # ")", "admin_generateTestData");
+        };
+        case (#err(error)) {
+          errorsBuffer.add("Price archive error at offset " # Nat.toText(priceOffset) # ": " # debug_show(error));
+        };
+      };
+
+      priceOffset := batchEnd;
+    };
+
+    logger.info("TestData", "Test data generation complete: " # Nat.toText(allocationsCreated) # " allocations, " # Nat.toText(pricesCreated) # " prices", "admin_generateTestData");
+
+    #ok({
+      neuronsProcessed = neuronsProcessed;
+      allocationsCreated = allocationsCreated;
+      pricesCreated = pricesCreated;
+      tokensProcessed = tokensProcessed;
+      errors = Buffer.toArray(errorsBuffer);
+    })
+  };
+
+  // Helper function to generate random allocations that sum to 10000 basis points
+  private func generateRandomAllocations(tokens: [Principal], seed: Int) : [Allocation] {
+    let numTokens = tokens.size();
+    if (numTokens == 0) return [];
+
+    let allocations = Buffer.Buffer<Allocation>(numTokens);
+    var remaining : Nat = 10000;
+
+    // Use seed for pseudo-random distribution
+    let seedNat = Int.abs(seed / 1_000_000_000_000);
+
+    var i = 0;
+    while (i < numTokens - 1 and remaining > 0) {
+      // Allocate between 10% and 40% of remaining to each token
+      let portion = (remaining * ((seedNat + i) % 30 + 10)) / 100;
+      let allocation = if (portion > remaining) remaining else portion;
+
+      if (allocation > 0) {
+        allocations.add({
+          token = tokens[i];
+          basisPoints = allocation;
+        });
+        remaining -= allocation;
+      };
+      i += 1;
+    };
+
+    // Give remainder to last token
+    if (remaining > 0 and numTokens > 0) {
+      allocations.add({
+        token = tokens[numTokens - 1];
+        basisPoints = remaining;
+      });
+    };
+
+    Buffer.toArray(allocations)
+  };
+
+  // Helper function to get base price for a token (deterministic based on principal)
+  private func getBasePrice(token: Principal) : Float {
+    let text = Principal.toText(token);
+    let len = text.size();
+    // Use length as a simple hash for price range
+    if (len < 10) { 0.001 }  // Small principal = low price token
+    else if (len < 20) { 1.0 }
+    else if (len < 30) { 10.0 }
+    else { 0.1 }
+  };
+
   // Adds or updates a single penalized neuron
   public shared ({ caller }) func admin_addPenalizedNeuron(neuronId : Blob, multiplier : Nat) : async Result.Result<(), AuthorizationError> {
     if (not isAdmin(caller, #updateSystemParameter)) {
@@ -1504,6 +1899,213 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     #ok(existed);
   };
 
+  // Backfill status tracking
+  stable var backfillStatus : {
+    isRunning: Bool;
+    lastRunTime: Int;
+    lastResult: ?{ archived: Nat; skipped: Nat; errors: Nat };
+    totalNeuronsWithAllocations: Nat;
+    neuronsChecked: Nat;
+    neuronsToBackfill: Nat;
+  } = {
+    isRunning = false;
+    lastRunTime = 0;
+    lastResult = null;
+    totalNeuronsWithAllocations = 0;
+    neuronsChecked = 0;
+    neuronsToBackfill = 0;
+  };
+
+  // Query function to check backfill status
+  public query func getBackfillStatus() : async {
+    isRunning: Bool;
+    lastRunTime: Int;
+    lastResult: ?{ archived: Nat; skipped: Nat; errors: Nat };
+    totalNeuronsWithAllocations: Nat;
+    neuronsChecked: Nat;
+    neuronsToBackfill: Nat;
+  } {
+    backfillStatus;
+  };
+
+  // Backfill allocation records for neurons that have allocations but no archive records
+  // This is a one-time fix for neurons that were discovered before we started creating
+  // allocation change records on neuron discovery
+  // Skips neurons that already have archive records
+  // Uses the neuron's lastUpdate timestamp for historical accuracy
+  // Writes directly to archive in batches of 100
+  public shared ({ caller }) func admin_backfillNeuronAllocationRecords() : async Result.Result<{ archived: Nat; skipped: Nat; errors: Nat }, AuthorizationError> {
+    if (not isAdmin(caller, #updateSystemParameter)) {
+      return #err(#NotAdmin);
+    };
+
+    // Check if already running
+    if (backfillStatus.isRunning) {
+      return #err(#UnexpectedError("Backfill already in progress"));
+    };
+
+    // Mark as running
+    backfillStatus := {
+      isRunning = true;
+      lastRunTime = Time.now();
+      lastResult = null;
+      totalNeuronsWithAllocations = 0;
+      neuronsChecked = 0;
+      neuronsToBackfill = 0;
+    };
+
+    let BATCH_SIZE = 100;
+    var totalArchived : Nat = 0;
+    var totalSkipped : Nat = 0;
+    var totalErrors : Nat = 0;
+    var allocationId : Nat = 0;
+
+    // Collect all neurons with allocations
+    let neuronsWithAllocations = Buffer.Buffer<(Blob, NeuronAllocation)>(Map.size(neuronAllocationMap));
+    for ((neuronId, neuronAlloc) in Map.entries(neuronAllocationMap)) {
+      if (neuronAlloc.allocations.size() > 0) {
+        neuronsWithAllocations.add((neuronId, neuronAlloc));
+      };
+    };
+
+    // Update status
+    backfillStatus := {
+      backfillStatus with
+      totalNeuronsWithAllocations = neuronsWithAllocations.size();
+    };
+
+    logger.info("Backfill", "Found " # Nat.toText(neuronsWithAllocations.size()) # " neurons with allocations to check", "admin_backfillNeuronAllocationRecords");
+
+    // Process in batches - first check which neurons need backfill
+    let neuronsToBackfillBuffer = Buffer.Buffer<(Blob, NeuronAllocation)>(neuronsWithAllocations.size());
+    var checked : Nat = 0;
+
+    for ((neuronId, neuronAlloc) in neuronsWithAllocations.vals()) {
+      checked += 1;
+      // Update progress every 10 neurons
+      if (checked % 10 == 0) {
+        backfillStatus := {
+          backfillStatus with
+          neuronsChecked = checked;
+        };
+      };
+
+      // Check if neuron already has records in archive
+      try {
+        let existingRecords = await neuronAllocationArchive.getNeuronAllocationChangesByNeuron(neuronId, 1);
+        switch (existingRecords) {
+          case (#ok(records)) {
+            if (records.size() > 0) {
+              // Already has records, skip
+              totalSkipped += 1;
+            } else {
+              // No records, needs backfill
+              neuronsToBackfillBuffer.add((neuronId, neuronAlloc));
+            };
+          };
+          case (#err(_)) {
+            // Error checking, assume needs backfill
+            neuronsToBackfillBuffer.add((neuronId, neuronAlloc));
+          };
+        };
+      } catch (e) {
+        // Exception checking, assume needs backfill
+        neuronsToBackfillBuffer.add((neuronId, neuronAlloc));
+        logger.warn("Backfill", "Exception checking neuron archive status: " # Error.message(e), "admin_backfillNeuronAllocationRecords");
+      };
+    };
+
+    // Update status
+    backfillStatus := {
+      backfillStatus with
+      neuronsChecked = checked;
+      neuronsToBackfill = neuronsToBackfillBuffer.size();
+    };
+
+    logger.info("Backfill", "Need to backfill " # Nat.toText(neuronsToBackfillBuffer.size()) # " neurons, skipped " # Nat.toText(totalSkipped) # " with existing records", "admin_backfillNeuronAllocationRecords");
+
+    // Now archive the neurons that need backfill in batches
+    let batchBuffer = Buffer.Buffer<NeuronAllocationChangeBlockData>(BATCH_SIZE);
+
+    for ((neuronId, neuronAlloc) in neuronsToBackfillBuffer.vals()) {
+      // Use the neuron's lastUpdate timestamp for historical accuracy
+      // If lastUpdate is 0, use current time as fallback
+      let timestamp = if (neuronAlloc.lastUpdate > 0) { neuronAlloc.lastUpdate } else { Time.now() };
+
+      let change : NeuronAllocationChangeBlockData = {
+        id = allocationId;
+        timestamp = timestamp;
+        neuronId = neuronId;
+        changeType = #VotingPowerChange;
+        oldAllocations = [];
+        newAllocations = neuronAlloc.allocations;
+        votingPower = neuronAlloc.votingPower;
+        maker = neuronAlloc.lastAllocationMaker;
+        reason = ?"Backfill: Initial allocation record for archive";
+        penaltyMultiplier = getPenaltyMultiplier(neuronId);
+      };
+      batchBuffer.add(change);
+      allocationId += 1;
+
+      // When batch is full, archive it
+      if (batchBuffer.size() >= BATCH_SIZE) {
+        try {
+          let result = await neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(batchBuffer));
+          switch (result) {
+            case (#ok(r)) {
+              totalArchived += r.archived;
+              totalErrors += r.failed;
+              logger.info("Backfill", "Archived batch of " # Nat.toText(r.archived) # " records", "admin_backfillNeuronAllocationRecords");
+            };
+            case (#err(e)) {
+              totalErrors += batchBuffer.size();
+              logger.error("Backfill", "Failed to archive batch: " # debug_show(e), "admin_backfillNeuronAllocationRecords");
+            };
+          };
+        } catch (e) {
+          totalErrors += batchBuffer.size();
+          logger.error("Backfill", "Exception archiving batch: " # Error.message(e), "admin_backfillNeuronAllocationRecords");
+        };
+        batchBuffer.clear();
+      };
+    };
+
+    // Archive remaining records
+    if (batchBuffer.size() > 0) {
+      try {
+        let result = await neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(batchBuffer));
+        switch (result) {
+          case (#ok(r)) {
+            totalArchived += r.archived;
+            totalErrors += r.failed;
+            logger.info("Backfill", "Archived final batch of " # Nat.toText(r.archived) # " records", "admin_backfillNeuronAllocationRecords");
+          };
+          case (#err(e)) {
+            totalErrors += batchBuffer.size();
+            logger.error("Backfill", "Failed to archive final batch: " # debug_show(e), "admin_backfillNeuronAllocationRecords");
+          };
+        };
+      } catch (e) {
+        totalErrors += batchBuffer.size();
+        logger.error("Backfill", "Exception archiving final batch: " # Error.message(e), "admin_backfillNeuronAllocationRecords");
+      };
+    };
+
+    // Update final status
+    let finalResult = { archived = totalArchived; skipped = totalSkipped; errors = totalErrors };
+    backfillStatus := {
+      isRunning = false;
+      lastRunTime = Time.now();
+      lastResult = ?finalResult;
+      totalNeuronsWithAllocations = neuronsWithAllocations.size();
+      neuronsChecked = checked;
+      neuronsToBackfill = neuronsToBackfillBuffer.size();
+    };
+
+    logger.info("Backfill", "Completed: archived " # Nat.toText(totalArchived) # ", skipped " # Nat.toText(totalSkipped) # ", errors " # Nat.toText(totalErrors), "admin_backfillNeuronAllocationRecords");
+    #ok(finalResult);
+  };
+
   // Query to get all penalized neurons - called by neuronSnapshot at start of snapshot
   public query func getPenalizedNeurons() : async [(Blob, Nat)] {
     Iter.toArray(Map.entries(penalizedNeurons));
@@ -1512,6 +2114,75 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   // Query to get count of penalized neurons
   public query func getPenalizedNeuronsCount() : async Nat {
     Map.size(penalizedNeurons);
+  };
+
+  // Query to get all neuron owners (neuronId -> principals)
+  // Used by rewards canister for leaderboard computation
+  public query func getAllNeuronOwners() : async [(Blob, [Principal])] {
+    // Build a map of neuronId -> list of principals who own it
+    let neuronOwners = Map.new<Blob, [Principal]>();
+
+    // Iterate through all users
+    for ((principal, userState) in Map.entries(userStates)) {
+      // For each neuron this user owns
+      for (neuronVP in userState.neurons.vals()) {
+        let neuronId = neuronVP.neuronId;
+
+        // Get existing owners for this neuron
+        let existingOwners = switch (Map.get(neuronOwners, bhash, neuronId)) {
+          case (?owners) { owners };
+          case null { [] : [Principal] };
+        };
+
+        // Add this principal to the list
+        let updatedOwners = Array.append(existingOwners, [principal]);
+        Map.set(neuronOwners, bhash, neuronId, updatedOwners);
+      };
+    };
+
+    Iter.toArray(Map.entries(neuronOwners))
+  };
+
+  // Get all unique neuron IDs that have allocation history
+  // Used by rewards canister for backfilling historical performance data
+  public query func admin_getAllActiveNeuronIds() : async [Blob] {
+    let neuronIds = Buffer.Buffer<Blob>(Map.size(neuronAllocationMap));
+    for ((neuronId, _) in Map.entries(neuronAllocationMap)) {
+      neuronIds.add(neuronId);
+    };
+    Buffer.toArray(neuronIds)
+  };
+
+  // Batch query for follower metadata
+  // Used by frontend to enrich leaderboard entries
+  public type FollowerInfo = {
+    followerCount: Nat;
+    canBeFollowed: Bool;
+  };
+
+  public query func getUsersFollowerInfo(principals: [Principal]) : async [FollowerInfo] {
+    Array.map<Principal, FollowerInfo>(
+      principals,
+      func (p) {
+        switch (Map.get(userStates, phash, p)) {
+          case (?state) {
+            let count = state.allocationFollowedBy.size();
+            { followerCount = count; canBeFollowed = count < MAX_FOLLOWERS }
+          };
+          case null {
+            { followerCount = 0; canBeFollowed = true }
+          };
+        }
+      }
+    )
+  };
+
+  // Get neurons owned by a specific principal (for user performance lookup)
+  public query func getUserNeurons(principal: Principal) : async [NeuronVP] {
+    switch (Map.get(userStates, phash, principal)) {
+      case (?state) { state.neurons };
+      case null { [] };
+    }
   };
 
   // Helper function to apply penalty to a voting power value
@@ -2139,6 +2810,20 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
                   Map.set(aggregateAllocation, phash, alloc.token, currentVP + vpToAdd);
                 };
                 aggregateUpdated := true;
+
+                // Create allocation change record for this new neuron so it appears in archive
+                let neuronAllocationChange: NeuronAllocationChangeRecord = {
+                  timestamp = timenow;
+                  neuronId = newNeuron.neuronId;
+                  changeType = #VotingPowerChange;
+                  oldAllocations = [];
+                  newAllocations = currentUserState.allocations;
+                  votingPower = newNeuron.votingPower;
+                  maker = caller;
+                  reason = ?"New neuron discovered with inherited allocations";
+                  penaltyMultiplier = getPenaltyMultiplier(newNeuron.neuronId);
+                };
+                addNeuronAllocationChange(neuronAllocationChange);
               };
             };
           };
@@ -2807,6 +3492,46 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       Map.get(neuronAllocationMap, bhash, neuronId);
     } else {
       null;
+    };
+  };
+
+  // Get multiple neuron allocations with pagination
+  // Returns neurons that have allocations (size > 0)
+  public query ({ caller }) func getNeuronAllocations(offset : Nat, limit : Nat) : async {
+    neurons: [(Blob, NeuronAllocation)];
+    total: Nat;
+    hasMore: Bool;
+  } {
+    if (not isAllowedQuery(caller)) {
+      return { neurons = []; total = 0; hasMore = false };
+    };
+
+    let maxLimit = 100;
+    let actualLimit = if (limit > maxLimit) { maxLimit } else { limit };
+
+    // Collect all neurons with allocations
+    let allNeurons = Buffer.Buffer<(Blob, NeuronAllocation)>(Map.size(neuronAllocationMap));
+    for ((neuronId, neuronAlloc) in Map.entries(neuronAllocationMap)) {
+      if (neuronAlloc.allocations.size() > 0) {
+        allNeurons.add((neuronId, neuronAlloc));
+      };
+    };
+
+    let total = allNeurons.size();
+    let startIdx = if (offset >= total) { total } else { offset };
+    let endIdx = if (startIdx + actualLimit >= total) { total } else { startIdx + actualLimit };
+
+    let resultBuffer = Buffer.Buffer<(Blob, NeuronAllocation)>(actualLimit);
+    var i = startIdx;
+    while (i < endIdx) {
+      resultBuffer.add(allNeurons.get(i));
+      i += 1;
+    };
+
+    {
+      neurons = Buffer.toArray(resultBuffer);
+      total = total;
+      hasMore = endIdx < total;
     };
   };
 

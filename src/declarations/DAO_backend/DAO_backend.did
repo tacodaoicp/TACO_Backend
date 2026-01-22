@@ -64,6 +64,7 @@ type UpdateConfig =
    maxTradeAttemptsPerInterval: opt nat;
    maxTradeValueICP: opt nat;
    maxTradesStored: opt nat;
+   minAllocationDiffBasisPoints: opt nat;
    minTradeValueICP: opt nat;
    portfolioRebalancePeriodNS: opt nat;
    priceUpdateIntervalNS: opt nat;
@@ -121,6 +122,20 @@ type TokenDetails =
    tokenSymbol: text;
    tokenTransferFee: nat;
    tokenType: TokenType;
+ };
+type TestDataResult = 
+ record {
+   allocationsCreated: nat;
+   errors: vec text;
+   neuronsProcessed: nat;
+   pricesCreated: nat;
+   tokensProcessed: nat;
+ };
+type TestDataConfig = 
+ record {
+   allocationFrequencyDays: nat;
+   daysBack: nat;
+   priceFrequencyDays: nat;
  };
 type SystemState = 
  variant {
@@ -192,10 +207,29 @@ type Result_2 =
    err: UpdateError;
    ok: text;
  };
-type Result_16 = 
+type Result_19 = 
  variant {
    err: AuthorizationError;
    ok;
+ };
+type Result_18 = 
+ variant {
+   err: AuthorizationError;
+   ok: record {
+         archived: nat;
+         errors: nat;
+         skipped: nat;
+       };
+ };
+type Result_17 = 
+ variant {
+   err: AuthorizationError;
+   ok: BackfillResult;
+ };
+type Result_16 = 
+ variant {
+   err: text;
+   ok: TestDataResult;
  };
 type Result_15 = 
  variant {
@@ -354,6 +388,11 @@ type HistoricBalanceAllocation =
    totalWorthInICP: nat;
    totalWorthInUSD: float64;
  };
+type FollowerInfo = 
+ record {
+   canBeFollowed: bool;
+   followerCount: nat;
+ };
 type FollowRecord = 
  record {
    followed: principal;
@@ -388,8 +427,13 @@ type ContinuousDAO =
    addToken: (token: principal, tokenType: TokenType) -> (Result_1);
    addTokenWithReason: (token: principal, tokenType: TokenType, reason:
     text) -> (Result_1);
-   admin_addPenalizedNeuron: (neuronId: blob, multiplier: nat) -> (Result_16);
+   admin_addPenalizedNeuron: (neuronId: blob, multiplier: nat) -> (Result_19);
+   admin_backfillNeuronAllocationRecords: () -> (Result_18);
+   admin_backfillPerformanceData: (startTimestamp: opt int, periodDays:
+    opt nat, maxPeriods: opt nat, clearExisting: opt bool) -> (Result_17);
    admin_clearAllPastPrices: () -> (Result_1);
+   admin_generateTestData: (config: opt TestDataConfig) -> (Result_16);
+   admin_getAllActiveNeuronIds: () -> (vec blob) query;
    admin_getNeuronAllocations: () ->
     (vec record {
            blob;
@@ -420,9 +464,26 @@ type ContinuousDAO =
                                         principal;
                                         nat;
                                       }) query;
+   getAllNeuronOwners: () -> (vec record {
+                                    blob;
+                                    vec principal;
+                                  }) query;
    getAllocationChangesSince: (sinceTimestamp: int, limit: nat) ->
     (Result_12) query;
    getAllocationStats: () -> (AllocationStats) query;
+   getBackfillStatus: () ->
+    (record {
+       isRunning: bool;
+       lastResult: opt record {
+                         archived: nat;
+                         errors: nat;
+                         skipped: nat;
+                       };
+       lastRunTime: int;
+       neuronsChecked: nat;
+       neuronsToBackfill: nat;
+       totalNeuronsWithAllocations: nat;
+     }) query;
    getFollowActionsSince: (sinceTimestamp: int, limit: nat) ->
     (Result_11) query;
    getFollowersWithNeuronCounts: () -> (vec record {
@@ -440,6 +501,15 @@ type ContinuousDAO =
    getNeuronAllocation: (neuronId: blob) -> (opt NeuronAllocation) query;
    getNeuronAllocationChangesSince: (sinceTimestamp: int, limit: nat) ->
     (Result_10) query;
+   getNeuronAllocations: (offset: nat, limit: nat) ->
+    (record {
+       hasMore: bool;
+       neurons: vec record {
+                      blob;
+                      NeuronAllocation;
+                    };
+       total: nat;
+     }) query;
    getNeuronUpdatesSince: (sinceTimestamp: int, limit: nat) ->
     (Result_9) query;
    getPenalizedNeurons: () -> (vec record {
@@ -462,7 +532,10 @@ type ContinuousDAO =
    getTokenDetailsWithoutPastPrices: () ->
     (vec PublicTokenDetailsEntry) query;
    getUserAllocation: () -> (opt UserState) query;
+   getUserNeurons: ("principal": principal) -> (vec NeuronVP) query;
    getUserRegisteredTokens: () -> (vec principal) query;
+   getUsersFollowerInfo: (principals: vec principal) ->
+    (vec FollowerInfo) query;
    getVotingPowerChangesSince: (sinceTimestamp: int, limit: nat) ->
     (Result_8) query;
    get_canister_cycles: () -> (record {cycles: nat;}) query;
@@ -509,6 +582,15 @@ type ContinuousDAO =
     reason: opt text) -> (Result_1);
    votingPowerMetrics: () -> (Result) query;
  };
+type BackfillResult = 
+ record {
+   endTime: int;
+   errors: vec text;
+   neuronsProcessed: nat;
+   periodsCreated: nat;
+   startTime: int;
+   totalNeuronRewards: nat;
+ };
 type AuthorizationError = 
  variant {
    NotAdmin;
@@ -551,6 +633,7 @@ type AdminFunction =
  variant {
    addAdmin;
    addToken;
+   backfillPerformanceData;
    clearLogs;
    createAuction;
    deleteToken;

@@ -15,6 +15,7 @@ import Nat64 "mo:base/Nat64";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
 import Bool "mo:base/Bool";
+import Blob "mo:base/Blob";
 
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
@@ -22,8 +23,9 @@ import AdminAuth "../helper/admin_authorization";
 import ICRC "../helper/icrc.types";
 import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
+import Migration "migration";
 
-
+(with migration = Migration.migrate)
 shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
@@ -93,7 +95,8 @@ shared (deployer) persistent actor class Rewards() = this {
   // Periodic distribution types
   public type NeuronReward = {
     neuronId: Blob;
-    performanceScore: Float;
+    performanceScore: Float;           // USD-based performance (backward compatible)
+    performanceScoreICP: ?Float;       // ICP-based performance (new, optional for migration)
     votingPower: Nat;
     rewardScore: Float;
     rewardAmount: Nat; // Reward amount in TACO satoshis (integer)
@@ -134,6 +137,24 @@ shared (deployer) persistent actor class Rewards() = this {
     #NotAuthorized;
   };
 
+  // Backfill types for populating historical performance data
+  public type BackfillConfig = {
+    startTime: Int;           // Earliest time to backfill from
+    periodDays: Nat;          // Days per distribution period (default 7)
+    maxPeriods: Nat;          // Max periods to backfill (default 52)
+    clearExisting: Bool;      // Whether to clear existing history first
+    skipExistingPeriods: Bool; // Whether to skip periods that already exist in history
+  };
+
+  public type BackfillResult = {
+    periodsCreated: Nat;
+    neuronsProcessed: Nat;
+    totalNeuronRewards: Nat;
+    errors: [Text];
+    startTime: Int;
+    endTime: Int;
+  };
+
   // Withdrawal types
   public type WithdrawalRecord = {
     id: Nat;
@@ -145,6 +166,64 @@ shared (deployer) persistent actor class Rewards() = this {
     targetAccount: ICRC.Account;
     timestamp: Int;
     transactionId: ?Nat; // ICRC1 transaction ID if successful
+  };
+
+  // Leaderboard types
+  public type LeaderboardTimeframe = {
+    #OneWeek;      // Latest distribution period (7 days)
+    #OneMonth;     // Average of last ~4 distributions (28 days)
+    #OneYear;      // Average of last 52 distributions (364 days)
+    #AllTime;      // Compound return across all distributions
+  };
+
+  public type LeaderboardPriceType = {
+    #USD;
+    #ICP;
+  };
+
+  public type LeaderboardEntry = {
+    rank: Nat;                          // 1-100
+    principal: Principal;               // User principal
+    neuronId: Blob;                     // Best performing neuron for this timeframe
+    performanceScore: Float;            // Performance score for this timeframe/priceType
+    distributionsCount: Nat;            // How many distributions in this timeframe
+    lastActivity: Int;                  // Timestamp of last allocation change
+  };
+
+  // Individual neuron/user performance lookup types
+  public type NeuronPerformanceDetail = {
+    neuronId: Blob;
+    votingPower: Nat;
+    performance: {
+      oneWeekUSD: ?Float;
+      oneWeekICP: ?Float;
+      oneMonthUSD: ?Float;
+      oneMonthICP: ?Float;
+      oneYearUSD: ?Float;
+      oneYearICP: ?Float;
+      allTimeUSD: ?Float;
+      allTimeICP: ?Float;
+    };
+    distributionsParticipated: Nat;
+    lastAllocationChange: Int;
+  };
+
+  public type UserPerformanceResult = {
+    principal: Principal;
+    neurons: [NeuronPerformanceDetail];
+    aggregatedPerformance: {
+      oneWeekUSD: ?Float;
+      oneWeekICP: ?Float;
+      oneMonthUSD: ?Float;
+      oneMonthICP: ?Float;
+      oneYearUSD: ?Float;
+      oneYearICP: ?Float;
+      allTimeUSD: ?Float;
+      allTimeICP: ?Float;
+    };
+    totalVotingPower: Nat;
+    distributionsParticipated: Nat;
+    lastActivity: Int;
   };
 
   // Configuration
@@ -161,6 +240,17 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var lastDistributionTime : Int = 0;
   stable var nextScheduledDistributionTime : ?Int = null; // When the next distribution is scheduled to run
   private transient var distributionTimerId : ?Nat = null;
+
+  // Backfill state
+  stable var backfillInProgress : Bool = false;
+  stable var backfillPeriodsCompleted : Nat = 0;
+  stable var backfillTotalPeriods : Nat = 0;
+  stable var backfillStartedAt : Int = 0;
+  stable var backfillCurrentPeriodStart : Int = 0;
+  stable var backfillCurrentPeriodEnd : Int = 0;
+  stable var backfillDataStartTime : Int = 0;  // The startTime from config
+  stable var backfillDataEndTime : Int = 0;    // Will be set to now()
+  stable var backfillLastErrors : [Text] = []; // Last 5 errors for debugging
 
   // DEPRECATED: Legacy skiplist - kept for migration compatibility, no longer used
   // Use rewardPenalties instead (with multiplier=0 for skip behavior)
@@ -187,6 +277,31 @@ shared (deployer) persistent actor class Rewards() = this {
   
   // Withdrawal history (circular buffer using Vector)
   private stable let withdrawalHistory = Vector.new<WithdrawalRecord>();
+
+  // Leaderboard storage (8 pre-computed leaderboards)
+  stable var leaderboards: {
+    oneWeekUSD: [LeaderboardEntry];
+    oneWeekICP: [LeaderboardEntry];
+    oneMonthUSD: [LeaderboardEntry];
+    oneMonthICP: [LeaderboardEntry];
+    oneYearUSD: [LeaderboardEntry];
+    oneYearICP: [LeaderboardEntry];
+    allTimeUSD: [LeaderboardEntry];
+    allTimeICP: [LeaderboardEntry];
+  } = {
+    oneWeekUSD = [];
+    oneWeekICP = [];
+    oneMonthUSD = [];
+    oneMonthICP = [];
+    oneYearUSD = [];
+    oneYearICP = [];
+    allTimeUSD = [];
+    allTimeICP = [];
+  };
+
+  stable var leaderboardLastUpdate: Int = 0;
+  stable var leaderboardSize: Nat = 100;               // Top N per leaderboard
+  stable var leaderboardUpdateEnabled: Bool = true;    // On/off switch
 
   // External canister interfaces
   private transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
@@ -238,18 +353,28 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // External canister interfaces
+  // Note: Archive methods are query methods (same subnet, composite query compatible)
   type NeuronAllocationArchive = actor {
-    getNeuronAllocationChangesByNeuronInTimeRange: (Blob, Int, Int, Nat) -> async Result.Result<[NeuronAllocationChangeBlockData], ArchiveError>;
-    getNeuronAllocationChangesWithContext: (Blob, Int, Int, Nat) -> async Result.Result<{
+    getNeuronAllocationChangesByNeuronInTimeRange: query (Blob, Int, Int, Nat) -> async Result.Result<[NeuronAllocationChangeBlockData], ArchiveError>;
+    getNeuronAllocationChangesWithContext: query (Blob, Int, Int, Nat) -> async Result.Result<{
       preTimespanAllocation: ?NeuronAllocationChangeBlockData;
       inTimespanChanges: [NeuronAllocationChangeBlockData];
+    }, ArchiveError>;
+    // Bulk query for multiple neurons - optimized for backfill operations
+    getAllNeuronsAllocationChangesInTimeRange: query (Int, Int, Nat, Nat) -> async Result.Result<{
+      neurons: [(Blob, {
+        preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+        inTimespanChanges: [NeuronAllocationChangeBlockData];
+      })];
+      totalNeurons: Nat;
+      hasMore: Bool;
     }, ArchiveError>;
   };
 
   type PriceArchive = actor {
-    getPriceAtTime: (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
-    getPricesAtTime: ([Principal], Int) -> async Result.Result<[(Principal, ?PriceInfo)], ArchiveError>;
-    getPriceAtOrAfterTime: (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
+    getPriceAtTime: query (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
+    getPricesAtTime: query ([Principal], Int) -> async Result.Result<[(Principal, ?PriceInfo)], ArchiveError>;
+    getPriceAtOrAfterTime: query (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
   };
 
   type NeuronAllocation = {
@@ -261,6 +386,9 @@ shared (deployer) persistent actor class Rewards() = this {
 
   type DAOCanister = actor {
     admin_getNeuronAllocations: () -> async [(Blob, NeuronAllocation)];
+    getAllNeuronOwners: query () -> async [(Blob, [Principal])];
+    admin_getAllActiveNeuronIds: query () -> async [Blob];
+    getNeuronAllocation: query (Blob) -> async ?NeuronAllocation;
   };
 
   private transient let neuronAllocationArchive : NeuronAllocationArchive = actor (Principal.toText(DAO_NEURON_ALLOCATION_ARCHIVE_ID));
@@ -268,9 +396,12 @@ shared (deployer) persistent actor class Rewards() = this {
   private transient let daoCanister : DAOCanister = actor (Principal.toText(DAO_ID));
 
   //=========================================================================
-  // Main Query Method
+  // Main Performance Calculation Method
   //=========================================================================
 
+  // Note: This is a shared (update) function because it's called internally
+  // by the distribution system. For external callers who just want to query
+  // performance, use calculateNeuronPerformanceQuery which is a composite query.
   public shared func calculateNeuronPerformance(
     neuronId: Blob,
     startTime: Int,
@@ -304,8 +435,18 @@ shared (deployer) persistent actor class Rewards() = this {
         })) {
           case (?exactChange) { exactChange.oldAllocations };
           case (null) {
-            // No allocation data found
-            return #err(#NeuronNotFound);
+            // No archive allocation data found - fallback to current DAO allocation
+            let currentAlloc = await daoCanister.getNeuronAllocation(neuronId);
+            switch (currentAlloc) {
+              case (?alloc) {
+                if (alloc.allocations.size() > 0) {
+                  alloc.allocations  // Use current allocation as baseline
+                } else {
+                  return #err(#NeuronNotFound);
+                }
+              };
+              case (null) { return #err(#NeuronNotFound); };
+            };
           };
         };
       };
@@ -638,6 +779,249 @@ shared (deployer) persistent actor class Rewards() = this {
     });
   };
 
+  // Composite query version for external callers - significantly cheaper (~0 cycles)
+  // Uses the same logic but as a composite query that can call archive query methods
+  public composite query func calculateNeuronPerformanceQuery(
+    neuronId: Blob,
+    startTime: Int,
+    endTime: Int,
+    priceType: PriceType
+  ) : async Result.Result<PerformanceResult, RewardsError> {
+
+    if (startTime >= endTime) {
+      return #err(#InvalidTimeRange);
+    };
+
+    // Get allocation data from the neuron allocation archive
+    let allocationResult = await neuronAllocationArchive.getNeuronAllocationChangesWithContext(
+      neuronId, startTime, endTime, 100
+    );
+
+    let allocationData = switch (allocationResult) {
+      case (#ok(data)) { data };
+      case (#err(error)) {
+        return #err(#SystemError("Failed to get allocation data: " # debug_show(error)));
+      };
+    };
+
+    // Determine the active allocation at start time
+    let startAllocation = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { preAlloc.newAllocations };
+      case (null) {
+        switch (Array.find(allocationData.inTimespanChanges, func(change: NeuronAllocationChangeBlockData) : Bool {
+          change.timestamp == startTime
+        })) {
+          case (?exactChange) { exactChange.oldAllocations };
+          case (null) {
+            return #err(#NeuronNotFound);
+          };
+        };
+      };
+    };
+
+    // Build timeline of allocation changes with makers
+    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal)>(10);
+
+    let startMaker = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { ?preAlloc.maker };
+      case (null) { null };
+    };
+    timelineBuffer.add((startTime, startAllocation, startMaker));
+
+    for (change in allocationData.inTimespanChanges.vals()) {
+      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker));
+    };
+
+    timelineBuffer.add((endTime, [], null));
+
+    let timeline = Buffer.toArray(timelineBuffer);
+
+    // Process each period between allocation changes
+    let checkpointsBuffer = Buffer.Buffer<CheckpointData>(timeline.size());
+    var assetValues = Buffer.Buffer<(Principal, Float)>(10);
+    var previousPrices = Buffer.Buffer<(Principal, Float)>(10);
+
+    for (i in Iter.range(0, timeline.size() - 2)) {
+      let (timestamp, allocations, maker) = timeline[i];
+      let (nextTimestamp, _, _) = timeline[i + 1];
+
+      // Collect all unique tokens
+      let allTokensBuffer = Buffer.Buffer<Principal>(10);
+      let existingTokens : [Principal] = Array.map<(Principal, Float), Principal>(Buffer.toArray(assetValues), func((t, _)) { t });
+      for (token in existingTokens.vals()) { allTokensBuffer.add(token); };
+      let newTokens : [Principal] = Array.map<Allocation, Principal>(allocations, func(a) { a.token });
+      for (token in newTokens.vals()) {
+        let isDuplicate = Array.find<Principal>(existingTokens, func(t) { Principal.equal(t, token) });
+        switch (isDuplicate) {
+          case null { allTokensBuffer.add(token); };
+          case _ {};
+        };
+      };
+      let allTokens = Buffer.toArray(allTokensBuffer);
+
+      // Get prices for all tokens at once
+      let batchPriceResult = await priceArchive.getPricesAtTime(allTokens, timestamp);
+      let tokenPrices = switch (batchPriceResult) {
+        case (#ok(prices)) { prices };
+        case (#err(_)) {
+          return #err(#SystemError("Failed to get price data"));
+        };
+      };
+
+      // Helper function to find price for a token
+      let findPrice = func(token: Principal) : ?PriceInfo {
+        let priceEntry = Array.find<(Principal, ?PriceInfo)>(tokenPrices, func((t, _)) {
+          Principal.equal(t, token)
+        });
+        switch (priceEntry) {
+          case (?(_, price)) { price };
+          case null { null };
+        };
+      };
+
+      let tokenPricesBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
+      let tokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(allocations.size());
+
+      // Update asset values based on price changes
+      let updatedAssetValues = Buffer.Buffer<(Principal, Float)>(assetValues.size());
+      let updatedPrices = Buffer.Buffer<(Principal, Float)>(assetValues.size());
+      let oldPriceByToken = Buffer.toArray(previousPrices);
+
+      let findOldPrice = func(token: Principal) : ?Float {
+        let entry = Array.find<(Principal, Float)>(oldPriceByToken, func((t, _)) { Principal.equal(t, token) });
+        switch (entry) {
+          case (?(t, p)) { ?p };
+          case null { null };
+        }
+      };
+
+      if (assetValues.size() > 0) {
+        for (j in Iter.range(0, assetValues.size() - 1)) {
+          let (token, oldValue) = assetValues.get(j);
+
+          switch (findOldPrice(token)) {
+            case (?oldPrice) {
+              var priceInfoOpt : ?PriceInfo = findPrice(token);
+              if (priceInfoOpt == null) {
+                let futureResStep1 = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                switch (futureResStep1) {
+                  case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
+                  case _ {};
+                };
+              };
+
+              switch (priceInfoOpt) {
+                case (?priceInfo) {
+                  let newPrice = getPriceValue(priceInfo, priceType);
+                  let priceRatio = newPrice / oldPrice;
+                  let newValue = oldValue * priceRatio;
+                  updatedAssetValues.add((token, newValue));
+                  updatedPrices.add((token, newPrice));
+                };
+                case null {};
+              };
+            };
+            case null {
+              var priceInfoOpt2 : ?PriceInfo = findPrice(token);
+              if (priceInfoOpt2 == null) {
+                let futureResNew = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                switch (futureResNew) {
+                  case (#ok(?futurePrice)) { priceInfoOpt2 := ?futurePrice; };
+                  case _ {};
+                };
+              };
+              switch (priceInfoOpt2) {
+                case (?priceInfo) {
+                  let newPrice = getPriceValue(priceInfo, priceType);
+                  let newValue = oldValue;
+                  updatedAssetValues.add((token, newValue));
+                  updatedPrices.add((token, newPrice));
+                };
+                case null {};
+              };
+            };
+          };
+        };
+      };
+
+      // Calculate total portfolio value after price changes
+      var totalValueAfterPriceChanges : Float = 0.0;
+      if (updatedAssetValues.size() > 0) {
+        for (j in Iter.range(0, updatedAssetValues.size() - 1)) {
+          let (_, value) = updatedAssetValues.get(j);
+          totalValueAfterPriceChanges += value;
+        };
+      } else {
+        totalValueAfterPriceChanges := 1.0;
+      };
+
+      // Rebalance to new allocations
+      for (allocation in allocations.vals()) {
+        let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
+        let tokenValue = totalValueAfterPriceChanges * allocationPercent;
+
+        var priceInfoOpt : ?PriceInfo = findPrice(allocation.token);
+        if (priceInfoOpt == null) {
+          let futureRes2 = await priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+          switch (futureRes2) {
+            case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
+            case _ {};
+          };
+        };
+
+        switch (priceInfoOpt) {
+          case (?priceInfo) {
+            tokenPricesBuffer.add((allocation.token, priceInfo));
+            tokenValuesBuffer.add((allocation.token, tokenValue));
+          };
+          case null {};
+        };
+      };
+
+      // Create checkpoint
+      let checkpoint : CheckpointData = {
+        timestamp = timestamp;
+        allocations = allocations;
+        tokenValues = Buffer.toArray(tokenValuesBuffer);
+        totalPortfolioValue = totalValueAfterPriceChanges;
+        pricesUsed = Buffer.toArray(tokenPricesBuffer);
+        maker = maker;
+      };
+      checkpointsBuffer.add(checkpoint);
+
+      // Update asset values for next iteration
+      assetValues := Buffer.Buffer<(Principal, Float)>(allocations.size());
+      previousPrices := updatedPrices;
+
+      for (allocation in allocations.vals()) {
+        let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
+        let tokenValue = totalValueAfterPriceChanges * allocationPercent;
+        assetValues.add((allocation.token, tokenValue));
+      };
+    };
+
+    let checkpoints = Buffer.toArray(checkpointsBuffer);
+
+    let finalValue = if (checkpoints.size() == 0) {
+      1.0
+    } else {
+      checkpoints[checkpoints.size() - 1].totalPortfolioValue
+    };
+
+    #ok({
+      neuronId = neuronId;
+      startTime = startTime;
+      endTime = endTime;
+      initialValue = 1.0;
+      finalValue = finalValue;
+      performanceScore = finalValue / 1.0;
+      allocationChanges = Array.size(allocationData.inTimespanChanges);
+      checkpoints = checkpoints;
+      preTimespanAllocation = allocationData.preTimespanAllocation;
+      inTimespanChanges = allocationData.inTimespanChanges;
+    });
+  };
+
   //=========================================================================
   // Helper Functions (for when we implement the full logic)
   //=========================================================================
@@ -653,6 +1037,55 @@ shared (deployer) persistent actor class Rewards() = this {
       case (#ICP) { Float.fromInt(priceInfo.icpPrice) / 100000000.0 }; // Convert from e8s
       case (#USD) { priceInfo.usdPrice };
     };
+  };
+
+  // Recompute performance score from existing checkpoints using a different price type
+  // This is cycle-efficient because checkpoints already contain both USD and ICP prices
+  private func recomputePerformanceFromCheckpoints(
+    checkpoints: [CheckpointData],
+    targetPriceType: PriceType
+  ) : Float {
+    if (checkpoints.size() < 2) return 1.0;
+
+    let firstCheckpoint = checkpoints[0];
+    let lastCheckpoint = checkpoints[checkpoints.size() - 1];
+
+    // Calculate initial portfolio value with target price type
+    var initialValue : Float = 0.0;
+    for (allocation in firstCheckpoint.allocations.vals()) {
+      let priceOpt = Array.find<(Principal, PriceInfo)>(
+        firstCheckpoint.pricesUsed,
+        func ((t, _)) { Principal.equal(t, allocation.token) }
+      );
+      switch (priceOpt) {
+        case (?(_, priceInfo)) {
+          let price = getPriceValue(priceInfo, targetPriceType);
+          let allocationPercent = Float.fromInt(allocation.basisPoints) / 10000.0;
+          initialValue += allocationPercent * price;
+        };
+        case null {};
+      };
+    };
+
+    // Calculate final portfolio value with target price type
+    var finalValue : Float = 0.0;
+    for (allocation in lastCheckpoint.allocations.vals()) {
+      let priceOpt = Array.find<(Principal, PriceInfo)>(
+        lastCheckpoint.pricesUsed,
+        func ((t, _)) { Principal.equal(t, allocation.token) }
+      );
+      switch (priceOpt) {
+        case (?(_, priceInfo)) {
+          let price = getPriceValue(priceInfo, targetPriceType);
+          let allocationPercent = Float.fromInt(allocation.basisPoints) / 10000.0;
+          finalValue += allocationPercent * price;
+        };
+        case null {};
+      };
+    };
+
+    if (initialValue == 0.0) return 1.0;
+    finalValue / initialValue
   };
 
   // Calculate portfolio value given allocations and prices
@@ -1021,9 +1454,17 @@ shared (deployer) persistent actor class Rewards() = this {
             case (null) { baseRewardScore }; // No penalty
           };
 
+          // Recompute ICP performance from the same checkpoints (no additional canister calls!)
+          let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
+            ?recomputePerformanceFromCheckpoints(performance.checkpoints, #ICP)
+          } else {
+            null
+          };
+
           let neuronReward : NeuronReward = {
             neuronId = neuronId;
-            performanceScore = performance.performanceScore;
+            performanceScore = performance.performanceScore;  // USD-based (original)
+            performanceScoreICP = performanceICP;             // ICP-based (recomputed)
             votingPower = votingPower;
             rewardScore = rewardScore;
             rewardAmount = 0; // Will be calculated later
@@ -1197,6 +1638,22 @@ shared (deployer) persistent actor class Rewards() = this {
         Vector.put(distributionHistory, historyIndex, finalRecord);
       };
     };
+
+    // Trigger leaderboard update after distribution completes
+    // Run asynchronously to avoid blocking distribution finalization
+    if (leaderboardUpdateEnabled and errorMessage == "") {
+      logger.info("Leaderboard", "Triggering leaderboard update after distribution completion", "completeDistribution");
+      ignore Timer.setTimer<system>(
+        #nanoseconds(0),
+        func() : async () {
+          try {
+            await* computeAllLeaderboards<system>();
+          } catch (e) {
+            logger.error("Leaderboard", "Failed to update leaderboards: " # Error.message(e), "completeDistribution");
+          };
+        }
+      );
+    };
   };
 
   // Helper function to extract voting power from performance result
@@ -1261,6 +1718,487 @@ shared (deployer) persistent actor class Rewards() = this {
           #err(#SystemError("Failed to trigger custom distribution: " # Error.message(error)));
         };
       };
+    };
+  };
+
+  //=========================================================================
+  // Leaderboard Admin Functions
+  //=========================================================================
+
+  // Update leaderboard configuration
+  public shared ({ caller }) func updateLeaderboardConfig(
+    size: ?Nat,
+    enabled: ?Bool
+  ) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (size) { case (?s) leaderboardSize := s; case null {} };
+    switch (enabled) { case (?e) leaderboardUpdateEnabled := e; case null {} };
+
+    #ok("Leaderboard configuration updated")
+  };
+
+  // Manual refresh of all leaderboards (for testing/emergency)
+  public shared ({ caller }) func refreshLeaderboards() : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    try {
+      await* computeAllLeaderboards<system>();
+      #ok("All leaderboards refreshed successfully")
+    } catch (error) {
+      #err(#SystemError("Failed to refresh leaderboards: " # Error.message(error)))
+    };
+  };
+
+  //=========================================================================
+  // Backfill Historical Performance Data
+  //=========================================================================
+
+  // Admin function to backfill distribution history from historical allocation data
+  // This calculates performance for all neurons across historical time periods
+  // and populates distributionHistory as if the system had been running from the start
+  // Optimized to use bulk queries - reduces inter-canister calls by ~27x
+  public shared ({ caller }) func admin_backfillDistributionHistory(
+    config: BackfillConfig
+  ) : async Result.Result<BackfillResult, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let NANOSECONDS_PER_DAY : Int = 86_400_000_000_000;
+    let periodNS = config.periodDays * NANOSECONDS_PER_DAY;
+    let now = Time.now();
+    let NEURONS_PER_BATCH : Nat = 50; // Process 50 neurons per bulk query
+
+    // Validate config
+    if (config.startTime >= now) {
+      return #err(#SystemError("startTime must be in the past"));
+    };
+    if (config.periodDays == 0) {
+      return #err(#SystemError("periodDays must be greater than 0"));
+    };
+    if (config.maxPeriods == 0) {
+      return #err(#SystemError("maxPeriods must be greater than 0"));
+    };
+
+    logger.info("Backfill", "Starting backfill from " # Int.toText(config.startTime) # " with " # Nat.toText(config.periodDays) # " day periods, max " # Nat.toText(config.maxPeriods) # " periods", "admin_backfillDistributionHistory");
+
+    // Set backfill status
+    backfillInProgress := true;
+    backfillPeriodsCompleted := 0;
+    backfillTotalPeriods := config.maxPeriods;
+    backfillStartedAt := Time.now();
+    backfillDataStartTime := config.startTime;
+    backfillDataEndTime := now;
+    backfillCurrentPeriodStart := config.startTime;
+    backfillCurrentPeriodEnd := config.startTime;
+
+    // Clear existing history if requested
+    if (config.clearExisting) {
+      while (Vector.size(distributionHistory) > 0) {
+        ignore Vector.removeLast(distributionHistory);
+      };
+      distributionCounter := 0;
+      logger.info("Backfill", "Cleared existing distribution history", "admin_backfillDistributionHistory");
+    };
+
+    // Calculate periods
+    var periodsCreated : Nat = 0;
+    var totalNeuronRewards : Nat = 0;
+    var totalNeuronsProcessed : Nat = 0;
+    let errorsBuffer = Buffer.Buffer<Text>(10);
+    var periodStart = config.startTime;
+    var actualEndTime = config.startTime;
+
+    // Process each period
+    label periodLoop while (periodsCreated < config.maxPeriods and periodStart < now) {
+      let periodEnd = Int.min(periodStart + periodNS, now);
+
+      // Update current period tracking for status queries
+      backfillCurrentPeriodStart := periodStart;
+      backfillCurrentPeriodEnd := periodEnd;
+
+      if (periodEnd <= periodStart) {
+        break periodLoop;
+      };
+
+      // Skip periods that already exist in history if configured
+      if (config.skipExistingPeriods) {
+        var periodExists = false;
+        for (dist in Vector.vals(distributionHistory)) {
+          if (dist.startTime == periodStart and dist.endTime == periodEnd) {
+            periodExists := true;
+          };
+        };
+        if (periodExists) {
+          logger.info("Backfill", "Skipping existing period " # Int.toText(periodStart) # " - " # Int.toText(periodEnd), "admin_backfillDistributionHistory");
+          periodsCreated += 1;
+          backfillPeriodsCompleted := periodsCreated;
+          periodStart := periodEnd;
+          continue periodLoop;
+        };
+      };
+
+      let neuronRewardsBuffer = Buffer.Buffer<NeuronReward>(100);
+      let failedNeuronsBuffer = Buffer.Buffer<FailedNeuron>(10);
+      var totalRewardScore : Float = 0.0;
+
+      // Use parallel bulk queries - issue 10 queries at once, then await all
+      let PARALLEL_QUERIES : Nat = 10;
+      let MAX_RETRIES : Nat = 3;
+      var offset : Nat = 0;
+      var hasMore = true;
+
+      label batchLoop while (hasMore) {
+        // Issue up to 10 parallel queries
+        let futures = Buffer.Buffer<async Result.Result<{
+          neurons: [(Blob, {
+            preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+            inTimespanChanges: [NeuronAllocationChangeBlockData];
+          })];
+          totalNeurons: Nat;
+          hasMore: Bool;
+        }, ArchiveError>>(PARALLEL_QUERIES);
+
+        // Launch parallel queries
+        for (i in Iter.range(0, PARALLEL_QUERIES - 1)) {
+          let queryOffset = offset + (i * NEURONS_PER_BATCH);
+          futures.add(
+            neuronAllocationArchive.getAllNeuronsAllocationChangesInTimeRange(
+              periodStart, periodEnd, queryOffset, NEURONS_PER_BATCH
+            )
+          );
+        };
+
+        // Await all parallel queries
+        var anyHasMore = false;
+        var queryIndex = 0;
+        var failedQueries : Nat = 0;
+        label futureLoop for (future in futures.vals()) {
+          let bulkResult = try {
+            await future
+          } catch (e) {
+            let errorMsg = "Period " # Int.toText(periodStart) # " batch " # Nat.toText(queryIndex) # ": Failed to get bulk allocation data: " # Error.message(e);
+            errorsBuffer.add(errorMsg);
+            // Update last errors for status tracking
+            let currentErrors = Buffer.fromArray<Text>(backfillLastErrors);
+            currentErrors.add(errorMsg);
+            // Keep only last 5 errors
+            while (currentErrors.size() > 5) {
+              ignore currentErrors.remove(0);
+            };
+            backfillLastErrors := Buffer.toArray(currentErrors);
+            queryIndex += 1;
+            failedQueries += 1;
+            // Continue to next future instead of breaking out
+            continue futureLoop;
+          };
+
+          switch (bulkResult) {
+            case (#ok(data)) {
+              if (data.hasMore and queryIndex == PARALLEL_QUERIES - 1) {
+                anyHasMore := true;
+              };
+              totalNeuronsProcessed := data.totalNeurons;
+
+              // Process each neuron in this batch
+              label neuronLoop for ((neuronId, allocationData) in data.neurons.vals()) {
+                // Skip neurons with no allocation data for this period
+                let startAllocation = switch (allocationData.preTimespanAllocation) {
+                  case (?preAlloc) { preAlloc.newAllocations };
+                  case (null) {
+                    switch (Array.find(allocationData.inTimespanChanges, func(change: NeuronAllocationChangeBlockData) : Bool {
+                      change.timestamp == periodStart
+                    })) {
+                      case (?exactChange) { exactChange.oldAllocations };
+                      case (null) { continue neuronLoop }; // No allocation data, skip to next neuron
+                    };
+                  };
+                };
+
+                if (startAllocation.size() == 0) {
+                  continue neuronLoop; // Skip neurons with empty allocations
+                };
+
+                // Build timeline and calculate performance inline (avoiding extra inter-canister calls)
+                try {
+                  let performanceResult = await calculatePerformanceFromAllocationData(
+                    neuronId, periodStart, periodEnd, #USD, allocationData, startAllocation
+                  );
+
+                  switch (performanceResult) {
+                    case (#ok(performance)) {
+                      // Calculate ICP performance from the same checkpoints
+                      let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
+                        ?recomputePerformanceFromCheckpoints(performance.checkpoints, #ICP)
+                      } else { null };
+
+                      let rewardScore = performance.performanceScore;
+                      totalRewardScore += rewardScore;
+
+                      let neuronReward : NeuronReward = {
+                        neuronId = neuronId;
+                        performanceScore = performance.performanceScore;
+                        performanceScoreICP = performanceICP;
+                        votingPower = 0; // Historical data doesn't track VP changes
+                        rewardScore = rewardScore;
+                        rewardAmount = 0; // No actual rewards for backfilled data
+                        checkpoints = performance.checkpoints;
+                      };
+
+                      neuronRewardsBuffer.add(neuronReward);
+                      totalNeuronRewards += 1;
+                    };
+                    case (#err(error)) {
+                      switch (error) {
+                        case (#NeuronNotFound) { }; // Expected for inactive neurons
+                        case (#PriceDataMissing(_)) { }; // Expected for old periods
+                        case (_) {
+                          failedNeuronsBuffer.add({
+                            neuronId = neuronId;
+                            errorMessage = debug_show(error);
+                          });
+                        };
+                      };
+                    };
+                  };
+                } catch (e) {
+                  failedNeuronsBuffer.add({
+                    neuronId = neuronId;
+                    errorMessage = Error.message(e);
+                  });
+                };
+              };
+            };
+            case (#err(error)) {
+              errorsBuffer.add("Period " # Int.toText(periodStart) # " batch " # Nat.toText(queryIndex) # ": Bulk query error: " # debug_show(error));
+            };
+          };
+          queryIndex += 1;
+        };
+
+        // Move offset forward by all parallel batches
+        offset += PARALLEL_QUERIES * NEURONS_PER_BATCH;
+        hasMore := anyHasMore;
+      };
+
+      // Only create distribution record if we have at least one neuron reward
+      if (neuronRewardsBuffer.size() > 0) {
+        distributionCounter += 1;
+
+        let distributionRecord : DistributionRecord = {
+          id = distributionCounter;
+          startTime = periodStart;
+          endTime = periodEnd;
+          distributionTime = periodEnd;
+          totalRewardPot = 0;
+          actualDistributed = 0;
+          totalRewardScore = totalRewardScore;
+          neuronsProcessed = neuronRewardsBuffer.size();
+          neuronRewards = Buffer.toArray(neuronRewardsBuffer);
+          failedNeurons = Buffer.toArray(failedNeuronsBuffer);
+          status = #Completed;
+        };
+
+        Vector.add(distributionHistory, distributionRecord);
+        periodsCreated += 1;
+        backfillPeriodsCompleted := periodsCreated;
+        actualEndTime := periodEnd;
+
+        logger.info("Backfill", "Created period " # Nat.toText(periodsCreated) # " with " # Nat.toText(neuronRewardsBuffer.size()) # " neurons", "admin_backfillDistributionHistory");
+      } else {
+        // Log when no neurons found for period (common when querying time ranges before data exists)
+        logger.info("Backfill", "No neurons found for period " # Int.toText(periodStart) # " - " # Int.toText(periodEnd) # " (failed: " # Nat.toText(failedNeuronsBuffer.size()) # ")", "admin_backfillDistributionHistory");
+        if (failedNeuronsBuffer.size() > 0) {
+          errorsBuffer.add("Period " # Int.toText(periodStart) # "-" # Int.toText(periodEnd) # ": No successful neuron calculations, " # Nat.toText(failedNeuronsBuffer.size()) # " failed");
+        };
+      };
+
+      periodStart := periodEnd;
+    };
+
+    // Trim to maxDistributionHistory if needed
+    while (Vector.size(distributionHistory) > maxDistributionHistory) {
+      Vector.reverse(distributionHistory);
+      ignore Vector.removeLast(distributionHistory);
+      Vector.reverse(distributionHistory);
+    };
+
+    // Recompute all leaderboards
+    try {
+      await* computeAllLeaderboards<system>();
+      logger.info("Backfill", "Leaderboards recomputed successfully", "admin_backfillDistributionHistory");
+    } catch (e) {
+      errorsBuffer.add("Failed to recompute leaderboards: " # Error.message(e));
+    };
+
+    // Mark backfill as complete
+    backfillInProgress := false;
+
+    logger.info("Backfill", "Backfill completed: " # Nat.toText(periodsCreated) # " periods, " # Nat.toText(totalNeuronRewards) # " neuron rewards", "admin_backfillDistributionHistory");
+
+    #ok({
+      periodsCreated = periodsCreated;
+      neuronsProcessed = totalNeuronsProcessed;
+      totalNeuronRewards = totalNeuronRewards;
+      errors = Buffer.toArray(errorsBuffer);
+      startTime = config.startTime;
+      endTime = actualEndTime;
+    })
+  };
+
+  // Helper function to calculate performance from pre-fetched allocation data
+  // This avoids redundant inter-canister calls when we already have the allocation data
+  private func calculatePerformanceFromAllocationData(
+    neuronId: Blob,
+    startTime: Int,
+    endTime: Int,
+    priceType: PriceType,
+    allocationData: {
+      preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+      inTimespanChanges: [NeuronAllocationChangeBlockData];
+    },
+    startAllocation: [Allocation]
+  ) : async Result.Result<PerformanceResult, RewardsError> {
+
+    // Build timeline of allocation changes with makers
+    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal)>(10);
+
+    // Add start point
+    let startMaker = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { ?preAlloc.maker };
+      case (null) { null };
+    };
+    timelineBuffer.add((startTime, startAllocation, startMaker));
+
+    // Add all in-timespan changes
+    for (change in allocationData.inTimespanChanges.vals()) {
+      if (change.timestamp > startTime and change.timestamp <= endTime) {
+        timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker));
+      };
+    };
+
+    // Add end point with final allocation
+    let finalAllocation = if (allocationData.inTimespanChanges.size() > 0) {
+      let lastChange = allocationData.inTimespanChanges[allocationData.inTimespanChanges.size() - 1];
+      lastChange.newAllocations
+    } else {
+      startAllocation
+    };
+
+    let lastMaker = if (allocationData.inTimespanChanges.size() > 0) {
+      ?allocationData.inTimespanChanges[allocationData.inTimespanChanges.size() - 1].maker
+    } else {
+      startMaker
+    };
+    timelineBuffer.add((endTime, finalAllocation, lastMaker));
+
+    let timeline = Buffer.toArray(timelineBuffer);
+
+    if (timeline.size() < 2) {
+      return #err(#AllocationDataMissing);
+    };
+
+    // Calculate checkpoints and performance
+    let checkpointsBuffer = Buffer.Buffer<CheckpointData>(timeline.size());
+    var cumulativeReturn : Float = 1.0;
+
+    var i = 0;
+    while (i < timeline.size() - 1) {
+      let (segmentStart, allocations, maker) = timeline[i];
+      let (segmentEnd, _, _) = timeline[i + 1];
+
+      // Get prices at start and end of segment
+      let startPrices = try {
+        await getPricesForAllocations(allocations, segmentStart)
+      } catch (e) {
+        return #err(#SystemError("Failed to get start prices: " # Error.message(e)));
+      };
+
+      let endPrices = try {
+        await getPricesForAllocations(allocations, segmentEnd)
+      } catch (e) {
+        return #err(#SystemError("Failed to get end prices: " # Error.message(e)));
+      };
+
+      // Calculate segment return
+      var startValue : Float = 0.0;
+      var endValue : Float = 0.0;
+      let tokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(allocations.size());
+      let pricesUsedBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
+
+      for (alloc in allocations.vals()) {
+        let weight = Float.fromInt(alloc.basisPoints) / 10000.0;
+
+        let startPrice = switch (Array.find(startPrices, func(p: (Principal, ?PriceInfo)) : Bool { p.0 == alloc.token })) {
+          case (?(_, ?price)) {
+            switch (priceType) {
+              case (#USD) { price.usdPrice };
+              case (#ICP) { Float.fromInt(price.icpPrice) / 100000000.0 };
+            };
+          };
+          case (_) { return #err(#PriceDataMissing({ token = alloc.token; timestamp = segmentStart })); };
+        };
+
+        let endPrice = switch (Array.find(endPrices, func(p: (Principal, ?PriceInfo)) : Bool { p.0 == alloc.token })) {
+          case (?(_, ?price)) {
+            pricesUsedBuffer.add((alloc.token, price));
+            switch (priceType) {
+              case (#USD) { price.usdPrice };
+              case (#ICP) { Float.fromInt(price.icpPrice) / 100000000.0 };
+            };
+          };
+          case (_) { return #err(#PriceDataMissing({ token = alloc.token; timestamp = segmentEnd })); };
+        };
+
+        startValue += weight * startPrice;
+        endValue += weight * endPrice;
+        tokenValuesBuffer.add((alloc.token, weight * endPrice));
+      };
+
+      // Calculate segment return and compound it
+      let segmentReturn = if (startValue > 0.0) { endValue / startValue } else { 1.0 };
+      cumulativeReturn *= segmentReturn;
+
+      // Create checkpoint
+      let checkpoint : CheckpointData = {
+        timestamp = segmentEnd;
+        allocations = allocations;
+        tokenValues = Buffer.toArray(tokenValuesBuffer);
+        totalPortfolioValue = cumulativeReturn;
+        pricesUsed = Buffer.toArray(pricesUsedBuffer);
+        maker = maker;
+      };
+      checkpointsBuffer.add(checkpoint);
+
+      i += 1;
+    };
+
+    #ok({
+      neuronId = neuronId;
+      startTime = startTime;
+      endTime = endTime;
+      initialValue = 1.0;
+      finalValue = cumulativeReturn;
+      performanceScore = cumulativeReturn;
+      allocationChanges = allocationData.inTimespanChanges.size();
+      checkpoints = Buffer.toArray(checkpointsBuffer);
+      preTimespanAllocation = allocationData.preTimespanAllocation;
+      inTimespanChanges = allocationData.inTimespanChanges;
+    })
+  };
+
+  // Helper to get prices for a set of allocations at a given time
+  private func getPricesForAllocations(allocations: [Allocation], timestamp: Int) : async [(Principal, ?PriceInfo)] {
+    let tokens = Array.map<Allocation, Principal>(allocations, func(a) { a.token });
+    let pricesResult = await priceArchive.getPricesAtTime(tokens, timestamp);
+    switch (pricesResult) {
+      case (#ok(prices)) { prices };
+      case (#err(_)) { [] };
     };
   };
 
@@ -1381,6 +2319,45 @@ shared (deployer) persistent actor class Rewards() = this {
       lastDistributionTime = lastDistributionTime;
       nextDistributionTime = lastDistributionTime + distributionPeriodNS;
       distributionEnabled = distributionEnabled;
+    };
+  };
+
+  // Get backfill status
+  public query func getBackfillStatus() : async {
+    inProgress: Bool;
+    periodsCompleted: Nat;
+    totalPeriods: Nat;
+    startedAt: Int;
+    elapsedNS: Int;
+    currentPeriodStart: Int;
+    currentPeriodEnd: Int;
+    dataStartTime: Int;
+    dataEndTime: Int;
+    progressPercent: Nat;  // 0-100
+    lastErrors: [Text];    // Last 5 errors for debugging
+  } {
+    let totalTimeRange = backfillDataEndTime - backfillDataStartTime;
+    let processedTimeRange = backfillCurrentPeriodEnd - backfillDataStartTime;
+    let progress : Nat = if (totalTimeRange > 0 and backfillInProgress) {
+      Int.abs(processedTimeRange * 100 / totalTimeRange)
+    } else if (backfillPeriodsCompleted > 0) {
+      100
+    } else {
+      0
+    };
+
+    {
+      inProgress = backfillInProgress;
+      periodsCompleted = backfillPeriodsCompleted;
+      totalPeriods = backfillTotalPeriods;
+      startedAt = backfillStartedAt;
+      elapsedNS = if (backfillInProgress) { Time.now() - backfillStartedAt } else { 0 };
+      currentPeriodStart = backfillCurrentPeriodStart;
+      currentPeriodEnd = backfillCurrentPeriodEnd;
+      dataStartTime = backfillDataStartTime;
+      dataEndTime = backfillDataEndTime;
+      progressPercent = progress;
+      lastErrors = backfillLastErrors;
     };
   };
 
@@ -1663,6 +2640,78 @@ shared (deployer) persistent actor class Rewards() = this {
     };
   };
 
+  //=========================================================================
+  // Leaderboard Query Functions
+  //=========================================================================
+
+  // Get leaderboard for a specific timeframe and price type
+  public query func getLeaderboard(
+    timeframe: LeaderboardTimeframe,
+    priceType: LeaderboardPriceType,
+    limit: ?Nat,
+    offset: ?Nat
+  ) : async [LeaderboardEntry] {
+    // Select the correct leaderboard
+    let selectedLeaderboard = switch (timeframe, priceType) {
+      case (#OneWeek, #USD) { leaderboards.oneWeekUSD };
+      case (#OneWeek, #ICP) { leaderboards.oneWeekICP };
+      case (#OneMonth, #USD) { leaderboards.oneMonthUSD };
+      case (#OneMonth, #ICP) { leaderboards.oneMonthICP };
+      case (#OneYear, #USD) { leaderboards.oneYearUSD };
+      case (#OneYear, #ICP) { leaderboards.oneYearICP };
+      case (#AllTime, #USD) { leaderboards.allTimeUSD };
+      case (#AllTime, #ICP) { leaderboards.allTimeICP };
+    };
+
+    let start = switch (offset) { case (?o) o; case null 0 };
+    let count = switch (limit) { case (?l) l; case null leaderboardSize };
+    let end = Nat.min(start + count, selectedLeaderboard.size());
+
+    if (start >= selectedLeaderboard.size()) {
+      return [];
+    };
+
+    Array.tabulate<LeaderboardEntry>(
+      end - start,
+      func (i) { selectedLeaderboard[start + i] }
+    )
+  };
+
+  // Get leaderboard metadata/info
+  public query func getLeaderboardInfo() : async {
+    lastUpdate: Int;
+    maxSize: Nat;
+    updateEnabled: Bool;
+    leaderboardCounts: {
+      oneWeekUSD: Nat;
+      oneWeekICP: Nat;
+      oneMonthUSD: Nat;
+      oneMonthICP: Nat;
+      oneYearUSD: Nat;
+      oneYearICP: Nat;
+      allTimeUSD: Nat;
+      allTimeICP: Nat;
+    };
+    totalDistributions: Nat;
+  } {
+    {
+      lastUpdate = leaderboardLastUpdate;
+      maxSize = leaderboardSize;
+      updateEnabled = leaderboardUpdateEnabled;
+      leaderboardCounts = {
+        oneWeekUSD = leaderboards.oneWeekUSD.size();
+        oneWeekICP = leaderboards.oneWeekICP.size();
+        oneMonthUSD = leaderboards.oneMonthUSD.size();
+        oneMonthICP = leaderboards.oneMonthICP.size();
+        oneYearUSD = leaderboards.oneYearUSD.size();
+        oneYearICP = leaderboards.oneYearICP.size();
+        allTimeUSD = leaderboards.allTimeUSD.size();
+        allTimeICP = leaderboards.allTimeICP.size();
+      };
+      totalDistributions = Vector.size(distributionHistory);
+    }
+  };
+
   // Get configuration
   public query func getConfiguration() : async {
     distributionPeriodNS: Nat;
@@ -1828,18 +2877,510 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok(Buffer.toArray(userRecords));
   };
 
-  // Get withdrawal statistics (admin only)
+  // Get withdrawal statistics
   // Public query - allows anyone to view withdrawal stats (read-only transparency)
-  public shared func getWithdrawalStats() : async Result.Result<{
+  public query func getWithdrawalStats() : async {
     totalWithdrawn: Nat;
     totalWithdrawals: Nat;
     totalRecordsInHistory: Nat;
-  }, RewardsError> {
-    #ok({
+  } {
+    {
       totalWithdrawn = totalWithdrawn;
       totalWithdrawals = totalWithdrawals;
       totalRecordsInHistory = Vector.size(withdrawalHistory);
-    });
+    }
+  };
+
+  //=========================================================================
+  // Leaderboard Computation Functions
+  //=========================================================================
+
+  private func computeAllLeaderboards<system>() : async* () {
+    if (not leaderboardUpdateEnabled) {
+      return;
+    };
+
+    logger.info("Leaderboard", "Starting leaderboard computation for all 8 timeframe/price combinations", "computeAllLeaderboards");
+
+    // 1. Fetch neuron ownership data from DAO
+    let neuronOwners = try {
+      await daoCanister.getAllNeuronOwners()
+    } catch (e) {
+      logger.error("Leaderboard", "Failed to fetch neuron owners from DAO: " # Error.message(e), "computeAllLeaderboards");
+      return; // Skip leaderboard update if we can't get ownership data
+    };
+
+    // Build a map of neuronId -> principals
+    let neuronToPrincipals = Map.new<Blob, [Principal]>();
+    for ((neuronId, principals) in neuronOwners.vals()) {
+      Map.set(neuronToPrincipals, bhash, neuronId, principals);
+    };
+
+    // 2. Get all distribution history
+    let allDistributions = distributionHistory;
+
+    // 3. For each combination of timeframe and price type, compute leaderboard
+    leaderboards := {
+      oneWeekUSD = computeLeaderboardFor(neuronToPrincipals, #OneWeek, #USD, allDistributions);
+      oneWeekICP = computeLeaderboardFor(neuronToPrincipals, #OneWeek, #ICP, allDistributions);
+      oneMonthUSD = computeLeaderboardFor(neuronToPrincipals, #OneMonth, #USD, allDistributions);
+      oneMonthICP = computeLeaderboardFor(neuronToPrincipals, #OneMonth, #ICP, allDistributions);
+      oneYearUSD = computeLeaderboardFor(neuronToPrincipals, #OneYear, #USD, allDistributions);
+      oneYearICP = computeLeaderboardFor(neuronToPrincipals, #OneYear, #ICP, allDistributions);
+      allTimeUSD = computeLeaderboardFor(neuronToPrincipals, #AllTime, #USD, allDistributions);
+      allTimeICP = computeLeaderboardFor(neuronToPrincipals, #AllTime, #ICP, allDistributions);
+    };
+
+    leaderboardLastUpdate := Time.now();
+
+    logger.info("Leaderboard", "Leaderboard computation completed successfully", "computeAllLeaderboards");
+  };
+
+  private func computeLeaderboardFor(
+    neuronToPrincipals: Map.Map<Blob, [Principal]>,
+    timeframe: LeaderboardTimeframe,
+    priceType: LeaderboardPriceType,
+    allDistributions: Vector.Vector<DistributionRecord>
+  ) : [LeaderboardEntry] {
+
+    // 1. Determine which distributions to include based on timeframe
+    let distributionsToAnalyze = selectDistributions(allDistributions, timeframe);
+
+    // 2. Aggregate per-neuron performance scores
+    type NeuronPerformance = {
+      neuronId: Blob;
+      performanceScores: [Float];  // One per distribution
+      distributionCount: Nat;
+      lastActivity: Int;
+    };
+
+    let neuronPerformances = Map.new<Blob, NeuronPerformance>();
+
+    for (distribution in distributionsToAnalyze.vals()) {
+      for (neuronReward in distribution.neuronRewards.vals()) {
+        // Select the correct performance score based on price type
+        let score : Float = switch (priceType) {
+          case (#USD) { neuronReward.performanceScore };
+          case (#ICP) {
+            switch (neuronReward.performanceScoreICP) {
+              case (?icpScore) { icpScore };
+              case null { neuronReward.performanceScore }; // Fallback for old data without ICP score
+            }
+          };
+        };
+
+        let existingPerf = Map.get(neuronPerformances, bhash, neuronReward.neuronId);
+
+        switch (existingPerf) {
+          case (?existing) {
+            // Append this period's performance score
+            let updatedScores = Array.append(existing.performanceScores, [score]);
+            Map.set(neuronPerformances, bhash, neuronReward.neuronId, {
+              neuronId = existing.neuronId;
+              performanceScores = updatedScores;
+              distributionCount = existing.distributionCount + 1;
+              lastActivity = Int.max(existing.lastActivity, distribution.endTime);
+            });
+          };
+          case null {
+            // First distribution for this neuron
+            Map.set(neuronPerformances, bhash, neuronReward.neuronId, {
+              neuronId = neuronReward.neuronId;
+              performanceScores = [score];
+              distributionCount = 1;
+              lastActivity = distribution.endTime;
+            });
+          };
+        };
+      };
+    };
+
+    // 3. Calculate aggregate performance score for each neuron based on timeframe
+    type ScoredNeuron = {
+      neuronId: Blob;
+      aggregateScore: Float;
+      distributionCount: Nat;
+      lastActivity: Int;
+    };
+
+    let scoredNeurons = Array.map<(Blob, NeuronPerformance), ScoredNeuron>(
+      Iter.toArray(Map.entries(neuronPerformances)),
+      func ((neuronId, perf)) : ScoredNeuron {
+        let aggregateScore = switch (timeframe) {
+          case (#OneWeek) {
+            // Latest period only
+            if (perf.performanceScores.size() > 0) {
+              perf.performanceScores[perf.performanceScores.size() - 1]
+            } else { 1.0 }
+          };
+          case (#OneMonth) {
+            // Average of last ~4 periods
+            calculateAverage(perf.performanceScores)
+          };
+          case (#OneYear) {
+            // Average of all periods (up to 52)
+            calculateAverage(perf.performanceScores)
+          };
+          case (#AllTime) {
+            // Compound return: multiply all performance scores
+            calculateCompoundReturn(perf.performanceScores)
+          };
+        };
+
+        {
+          neuronId;
+          aggregateScore;
+          distributionCount = perf.distributionCount;
+          lastActivity = perf.lastActivity;
+        }
+      }
+    );
+
+    // 4. Group by Principal and select best neuron per user
+    type UserPerformance = {
+      principal: Principal;
+      bestNeuron: ScoredNeuron;
+    };
+
+    let userPerformances = Map.new<Principal, UserPerformance>();
+
+    for (scored in scoredNeurons.vals()) {
+      switch (Map.get(neuronToPrincipals, bhash, scored.neuronId)) {
+        case (?principals) {
+          // For each principal owning this neuron
+          for (principal in principals.vals()) {
+            switch (Map.get(userPerformances, phash, principal)) {
+              case (?existing) {
+                // Keep neuron with highest aggregate score for this user
+                if (scored.aggregateScore > existing.bestNeuron.aggregateScore) {
+                  Map.set(userPerformances, phash, principal, {
+                    principal;
+                    bestNeuron = scored;
+                  });
+                };
+              };
+              case null {
+                // First neuron for this user
+                Map.set(userPerformances, phash, principal, {
+                  principal;
+                  bestNeuron = scored;
+                });
+              };
+            };
+          };
+        };
+        case null { /* Neuron has no owners, skip */ };
+      };
+    };
+
+    // 5. Sort by aggregate performance score (descending)
+    let sortedUsers = Array.sort<UserPerformance>(
+      Iter.toArray(Map.vals(userPerformances)),
+      func (a, b) {
+        Float.compare(b.bestNeuron.aggregateScore, a.bestNeuron.aggregateScore)
+      }
+    );
+
+    // 6. Take top N and create leaderboard entries
+    let topN = Array.tabulate<LeaderboardEntry>(
+      Nat.min(leaderboardSize, sortedUsers.size()),
+      func (i) : LeaderboardEntry {
+        let user = sortedUsers[i];
+        {
+          rank = i + 1;
+          principal = user.principal;
+          neuronId = user.bestNeuron.neuronId;
+          performanceScore = user.bestNeuron.aggregateScore;
+          distributionsCount = user.bestNeuron.distributionCount;
+          lastActivity = user.bestNeuron.lastActivity;
+        }
+      }
+    );
+
+    topN
+  };
+
+  //=========================================================================
+  // Leaderboard Helper Functions
+  //=========================================================================
+
+  private func selectDistributions(
+    allDistributions: Vector.Vector<DistributionRecord>,
+    timeframe: LeaderboardTimeframe
+  ) : [DistributionRecord] {
+    let count = Vector.size(allDistributions);
+
+    let periodsToInclude = switch (timeframe) {
+      case (#OneWeek) { 1 };     // Latest period only
+      case (#OneMonth) { 4 };    // Last ~4 weeks
+      case (#OneYear) { 52 };    // Last 52 weeks
+      case (#AllTime) { count }; // All available
+    };
+
+    let startIdx = if (count > periodsToInclude) {
+      count - periodsToInclude
+    } else { 0 };
+
+    Array.tabulate<DistributionRecord>(
+      Nat.min(periodsToInclude, count),
+      func (i) { Vector.get(allDistributions, startIdx + i) }
+    )
+  };
+
+  private func calculateAverage(scores: [Float]) : Float {
+    if (scores.size() == 0) return 1.0;
+
+    var sum : Float = 0.0;
+    for (score in scores.vals()) {
+      sum += score;
+    };
+    sum / Float.fromInt(scores.size())
+  };
+
+  private func calculateCompoundReturn(scores: [Float]) : Float {
+    if (scores.size() == 0) return 1.0;
+
+    var compound : Float = 1.0;
+    for (score in scores.vals()) {
+      compound *= score;
+    };
+    compound
+  };
+
+  //=========================================================================
+  // Individual Performance Lookup Functions
+  //=========================================================================
+
+  // Get performance for a single neuron across all timeframes
+  public query func getNeuronPerformance(neuronId: Blob) : async Result.Result<NeuronPerformanceDetail, RewardsError> {
+    // Aggregate performance scores from distribution history
+    var oneWeekScoresUSD = Buffer.Buffer<Float>(1);
+    var oneWeekScoresICP = Buffer.Buffer<Float>(1);
+    var oneMonthScoresUSD = Buffer.Buffer<Float>(4);
+    var oneMonthScoresICP = Buffer.Buffer<Float>(4);
+    var oneYearScoresUSD = Buffer.Buffer<Float>(52);
+    var oneYearScoresICP = Buffer.Buffer<Float>(52);
+    var allTimeScoresUSD = Buffer.Buffer<Float>(100);
+    var allTimeScoresICP = Buffer.Buffer<Float>(100);
+    var lastActivity : Int = 0;
+    var votingPower : Nat = 0;
+
+    let distributionCount = Vector.size(distributionHistory);
+
+    if (distributionCount == 0) {
+      return #err(#NeuronNotFound);
+    };
+
+    var foundNeuron = false;
+
+    // Iterate from oldest to newest for proper ordering
+    for (i in Iter.range(0, distributionCount - 1)) {
+      let dist = Vector.get(distributionHistory, i);
+
+      for (reward in dist.neuronRewards.vals()) {
+        if (reward.neuronId == neuronId) {
+          foundNeuron := true;
+          let distIndex = distributionCount - 1 - i; // 0 = most recent
+
+          // Update voting power (use most recent)
+          votingPower := reward.votingPower;
+
+          // USD scores
+          if (distIndex == 0) oneWeekScoresUSD.add(reward.performanceScore);
+          if (distIndex < 4) oneMonthScoresUSD.add(reward.performanceScore);
+          if (distIndex < 52) oneYearScoresUSD.add(reward.performanceScore);
+          allTimeScoresUSD.add(reward.performanceScore);
+
+          // ICP scores
+          switch (reward.performanceScoreICP) {
+            case (?icpScore) {
+              if (distIndex == 0) oneWeekScoresICP.add(icpScore);
+              if (distIndex < 4) oneMonthScoresICP.add(icpScore);
+              if (distIndex < 52) oneYearScoresICP.add(icpScore);
+              allTimeScoresICP.add(icpScore);
+            };
+            case null {};
+          };
+
+          lastActivity := Int.max(lastActivity, dist.endTime);
+        };
+      };
+    };
+
+    if (not foundNeuron) {
+      return #err(#NeuronNotFound);
+    };
+
+    #ok({
+      neuronId;
+      votingPower;
+      performance = {
+        oneWeekUSD = if (oneWeekScoresUSD.size() > 0) ?oneWeekScoresUSD.get(0) else null;
+        oneWeekICP = if (oneWeekScoresICP.size() > 0) ?oneWeekScoresICP.get(0) else null;
+        oneMonthUSD = if (oneMonthScoresUSD.size() > 0) ?calculateAverage(Buffer.toArray(oneMonthScoresUSD)) else null;
+        oneMonthICP = if (oneMonthScoresICP.size() > 0) ?calculateAverage(Buffer.toArray(oneMonthScoresICP)) else null;
+        oneYearUSD = if (oneYearScoresUSD.size() > 0) ?calculateAverage(Buffer.toArray(oneYearScoresUSD)) else null;
+        oneYearICP = if (oneYearScoresICP.size() > 0) ?calculateAverage(Buffer.toArray(oneYearScoresICP)) else null;
+        allTimeUSD = if (allTimeScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresUSD)) else null;
+        allTimeICP = if (allTimeScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresICP)) else null;
+      };
+      distributionsParticipated = allTimeScoresUSD.size();
+      lastAllocationChange = lastActivity;
+    })
+  };
+
+  // Get performance for all neurons owned by a user
+  // Uses composite query to call DAO canister query methods
+  public composite query func getUserPerformance(userPrincipal: Principal) : async Result.Result<UserPerformanceResult, RewardsError> {
+    // Step 1: Get all neurons owned by this user from DAO (composite query call)
+    let neuronOwners = try {
+      await daoCanister.getAllNeuronOwners()
+    } catch (e) {
+      return #err(#SystemError("Failed to query DAO: " # Error.message(e)));
+    };
+
+    // Find neurons owned by this principal
+    let userNeuronIds = Buffer.Buffer<Blob>(5);
+    for ((neuronId, principals) in neuronOwners.vals()) {
+      for (p in principals.vals()) {
+        if (Principal.equal(p, userPrincipal)) {
+          userNeuronIds.add(neuronId);
+        };
+      };
+    };
+
+    if (userNeuronIds.size() == 0) {
+      return #err(#NeuronNotFound);
+    };
+
+    // Step 2: Get performance for each neuron (using the query function logic inline)
+    let neuronDetails = Buffer.Buffer<NeuronPerformanceDetail>(userNeuronIds.size());
+    var totalVP : Nat = 0;
+    var maxDistributions : Nat = 0;
+    var maxLastActivity : Int = 0;
+
+    // Aggregate scores across all neurons for user-level performance
+    var userOneWeekUSD = Buffer.Buffer<Float>(userNeuronIds.size());
+    var userOneWeekICP = Buffer.Buffer<Float>(userNeuronIds.size());
+    var userOneMonthUSD = Buffer.Buffer<Float>(userNeuronIds.size());
+    var userOneMonthICP = Buffer.Buffer<Float>(userNeuronIds.size());
+    var userOneYearUSD = Buffer.Buffer<Float>(userNeuronIds.size());
+    var userOneYearICP = Buffer.Buffer<Float>(userNeuronIds.size());
+    var userAllTimeUSD = Buffer.Buffer<Float>(userNeuronIds.size());
+    var userAllTimeICP = Buffer.Buffer<Float>(userNeuronIds.size());
+
+    for (neuronId in userNeuronIds.vals()) {
+      // Inline neuron performance calculation (can't call query from shared)
+      var oneWeekScoresUSD = Buffer.Buffer<Float>(1);
+      var oneWeekScoresICP = Buffer.Buffer<Float>(1);
+      var oneMonthScoresUSD = Buffer.Buffer<Float>(4);
+      var oneMonthScoresICP = Buffer.Buffer<Float>(4);
+      var oneYearScoresUSD = Buffer.Buffer<Float>(52);
+      var oneYearScoresICP = Buffer.Buffer<Float>(52);
+      var allTimeScoresUSD = Buffer.Buffer<Float>(100);
+      var allTimeScoresICP = Buffer.Buffer<Float>(100);
+      var lastActivity : Int = 0;
+      var votingPower : Nat = 0;
+
+      let distributionCount = Vector.size(distributionHistory);
+      var foundNeuron = false;
+
+      for (i in Iter.range(0, distributionCount - 1)) {
+        let dist = Vector.get(distributionHistory, i);
+
+        for (reward in dist.neuronRewards.vals()) {
+          if (reward.neuronId == neuronId) {
+            foundNeuron := true;
+            let distIndex = distributionCount - 1 - i;
+
+            votingPower := reward.votingPower;
+
+            if (distIndex == 0) oneWeekScoresUSD.add(reward.performanceScore);
+            if (distIndex < 4) oneMonthScoresUSD.add(reward.performanceScore);
+            if (distIndex < 52) oneYearScoresUSD.add(reward.performanceScore);
+            allTimeScoresUSD.add(reward.performanceScore);
+
+            switch (reward.performanceScoreICP) {
+              case (?icpScore) {
+                if (distIndex == 0) oneWeekScoresICP.add(icpScore);
+                if (distIndex < 4) oneMonthScoresICP.add(icpScore);
+                if (distIndex < 52) oneYearScoresICP.add(icpScore);
+                allTimeScoresICP.add(icpScore);
+              };
+              case null {};
+            };
+
+            lastActivity := Int.max(lastActivity, dist.endTime);
+          };
+        };
+      };
+
+      if (foundNeuron) {
+        let detail : NeuronPerformanceDetail = {
+          neuronId;
+          votingPower;
+          performance = {
+            oneWeekUSD = if (oneWeekScoresUSD.size() > 0) ?oneWeekScoresUSD.get(0) else null;
+            oneWeekICP = if (oneWeekScoresICP.size() > 0) ?oneWeekScoresICP.get(0) else null;
+            oneMonthUSD = if (oneMonthScoresUSD.size() > 0) ?calculateAverage(Buffer.toArray(oneMonthScoresUSD)) else null;
+            oneMonthICP = if (oneMonthScoresICP.size() > 0) ?calculateAverage(Buffer.toArray(oneMonthScoresICP)) else null;
+            oneYearUSD = if (oneYearScoresUSD.size() > 0) ?calculateAverage(Buffer.toArray(oneYearScoresUSD)) else null;
+            oneYearICP = if (oneYearScoresICP.size() > 0) ?calculateAverage(Buffer.toArray(oneYearScoresICP)) else null;
+            allTimeUSD = if (allTimeScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresUSD)) else null;
+            allTimeICP = if (allTimeScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresICP)) else null;
+          };
+          distributionsParticipated = allTimeScoresUSD.size();
+          lastAllocationChange = lastActivity;
+        };
+
+        neuronDetails.add(detail);
+        totalVP += detail.votingPower;
+        maxDistributions := Nat.max(maxDistributions, detail.distributionsParticipated);
+        maxLastActivity := Int.max(maxLastActivity, detail.lastAllocationChange);
+
+        // Collect scores for aggregation
+        switch (detail.performance.oneWeekUSD) { case (?v) userOneWeekUSD.add(v); case null {} };
+        switch (detail.performance.oneWeekICP) { case (?v) userOneWeekICP.add(v); case null {} };
+        switch (detail.performance.oneMonthUSD) { case (?v) userOneMonthUSD.add(v); case null {} };
+        switch (detail.performance.oneMonthICP) { case (?v) userOneMonthICP.add(v); case null {} };
+        switch (detail.performance.oneYearUSD) { case (?v) userOneYearUSD.add(v); case null {} };
+        switch (detail.performance.oneYearICP) { case (?v) userOneYearICP.add(v); case null {} };
+        switch (detail.performance.allTimeUSD) { case (?v) userAllTimeUSD.add(v); case null {} };
+        switch (detail.performance.allTimeICP) { case (?v) userAllTimeICP.add(v); case null {} };
+      };
+    };
+
+    if (neuronDetails.size() == 0) {
+      return #err(#NeuronNotFound);
+    };
+
+    // Aggregate user performance: use the BEST performing neuron for each timeframe (same as leaderboard)
+    let findBest = func (scores: Buffer.Buffer<Float>) : ?Float {
+      if (scores.size() == 0) return null;
+      var best : Float = scores.get(0);
+      for (score in scores.vals()) {
+        if (score > best) { best := score };
+      };
+      ?best
+    };
+
+    #ok({
+      principal = userPrincipal;
+      neurons = Buffer.toArray(neuronDetails);
+      aggregatedPerformance = {
+        oneWeekUSD = findBest(userOneWeekUSD);
+        oneWeekICP = findBest(userOneWeekICP);
+        oneMonthUSD = findBest(userOneMonthUSD);
+        oneMonthICP = findBest(userOneMonthICP);
+        oneYearUSD = findBest(userOneYearUSD);
+        oneYearICP = findBest(userOneYearICP);
+        allTimeUSD = findBest(userAllTimeUSD);
+        allTimeICP = findBest(userAllTimeICP);
+      };
+      totalVotingPower = totalVP;
+      distributionsParticipated = maxDistributions;
+      lastActivity = maxLastActivity;
+    })
   };
 
   private func isAdmin(caller: Principal) : Bool {

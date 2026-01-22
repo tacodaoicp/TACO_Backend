@@ -35,6 +35,7 @@ module {
     #startRebalancing;
     #stopRebalancing;
     #recoverPoolBalances;
+    #backfillPerformanceData;
   };
 
   public type AdminPermission = {
