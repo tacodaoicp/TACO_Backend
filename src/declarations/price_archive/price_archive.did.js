@@ -29,7 +29,11 @@ export const idlFactory = ({ IDL }) => {
     'InvalidBlockType' : IDL.Null,
     'InvalidTimeRange' : IDL.Null,
   });
-  const Result_9 = IDL.Variant({ 'ok' : IDL.Nat, 'err' : ArchiveError });
+  const Result_10 = IDL.Variant({ 'ok' : IDL.Nat, 'err' : ArchiveError });
+  const Result_9 = IDL.Variant({
+    'ok' : IDL.Record({ 'failed' : IDL.Nat, 'archived' : IDL.Nat }),
+    'err' : ArchiveError,
+  });
   const Result_1 = IDL.Variant({ 'ok' : IDL.Text, 'err' : IDL.Text });
   const ArchiveStatus = IDL.Record({
     'supportedBlockTypes' : IDL.Vec(IDL.Text),
@@ -180,7 +184,12 @@ export const idlFactory = ({ IDL }) => {
   });
   const Result = IDL.Variant({ 'ok' : IDL.Text, 'err' : ArchiveError });
   const PriceArchiveV2 = IDL.Service({
-    'archivePriceBlock' : IDL.Func([PriceBlockData], [Result_9], []),
+    'archivePriceBlock' : IDL.Func([PriceBlockData], [Result_10], []),
+    'archivePriceBlockBatch' : IDL.Func(
+        [IDL.Vec(PriceBlockData)],
+        [Result_9],
+        [],
+      ),
     'catchUpImport' : IDL.Func([], [Result_1], []),
     'forceResetMiddleLoop' : IDL.Func([], [Result_1], []),
     'getArchiveStats' : IDL.Func([], [ArchiveStatus], ['query']),

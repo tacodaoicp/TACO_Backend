@@ -71,7 +71,8 @@ export type LogLevel = { 'INFO' : null } |
   { 'WARN' : null } |
   { 'ERROR' : null };
 export interface PriceArchiveV2 {
-  'archivePriceBlock' : ActorMethod<[PriceBlockData], Result_9>,
+  'archivePriceBlock' : ActorMethod<[PriceBlockData], Result_10>,
+  'archivePriceBlockBatch' : ActorMethod<[Array<PriceBlockData>], Result_9>,
   'catchUpImport' : ActorMethod<[], Result_1>,
   'forceResetMiddleLoop' : ActorMethod<[], Result_1>,
   'getArchiveStats' : ActorMethod<[], ArchiveStatus>,
@@ -124,6 +125,8 @@ export type Result = { 'ok' : string } |
   { 'err' : ArchiveError };
 export type Result_1 = { 'ok' : string } |
   { 'err' : string };
+export type Result_10 = { 'ok' : bigint } |
+  { 'err' : ArchiveError };
 export type Result_2 = { 'ok' : ArchiveQueryResult } |
   { 'err' : ArchiveError };
 export type Result_3 = {
@@ -147,7 +150,7 @@ export type Result_5 = {
   { 'err' : ArchiveError };
 export type Result_8 = { 'ok' : ArchiveStatus } |
   { 'err' : ArchiveError };
-export type Result_9 = { 'ok' : bigint } |
+export type Result_9 = { 'ok' : { 'failed' : bigint, 'archived' : bigint } } |
   { 'err' : ArchiveError };
 export type TacoBlockType = { 'NeuronUpdate' : null } |
   { 'VotingPower' : null } |

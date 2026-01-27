@@ -34,3 +34,6 @@ test_exchange_selection copy.py
 *.csv
 
 __pycache__/
+leaderboard.md
+trading_overview.md
+

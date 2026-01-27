@@ -49,7 +49,10 @@ type TacoBlockType =
 type Result_9 = 
  variant {
    err: ArchiveError;
-   ok: nat;
+   ok: record {
+         archived: nat;
+         failed: nat;
+       };
  };
 type Result_8 = 
  variant {
@@ -89,6 +92,11 @@ type Result_2 =
    err: ArchiveError;
    ok: ArchiveQueryResult;
  };
+type Result_10 = 
+ variant {
+   err: ArchiveError;
+   ok: nat;
+ };
 type Result_1 = 
  variant {
    err: text;
@@ -118,7 +126,8 @@ type PriceBlockData =
  };
 type PriceArchiveV2 = 
  service {
-   archivePriceBlock: (price: PriceBlockData) -> (Result_9);
+   archivePriceBlock: (price: PriceBlockData) -> (Result_10);
+   archivePriceBlockBatch: (prices: vec PriceBlockData) -> (Result_9);
    catchUpImport: () -> (Result_1);
    forceResetMiddleLoop: () -> (Result_1);
    getArchiveStats: () -> (ArchiveStatus) query;

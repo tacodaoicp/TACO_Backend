@@ -23,9 +23,9 @@ import AdminAuth "../helper/admin_authorization";
 import ICRC "../helper/icrc.types";
 import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
-import Migration "migration";
+//import Migration "migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
@@ -1773,6 +1773,7 @@ shared (deployer) persistent actor class Rewards() = this {
     let periodNS = config.periodDays * NANOSECONDS_PER_DAY;
     let now = Time.now();
     let NEURONS_PER_BATCH : Nat = 50; // Process 50 neurons per bulk query
+    let PARALLEL_NEURON_BATCH : Nat = 5; // Process 5 neurons in parallel for performance calculation
 
     // Validate config
     if (config.startTime >= now) {
@@ -1847,6 +1848,10 @@ shared (deployer) persistent actor class Rewards() = this {
       let failedNeuronsBuffer = Buffer.Buffer<FailedNeuron>(10);
       var totalRewardScore : Float = 0.0;
 
+      // Price cache for this period - prefetch common timestamps to avoid redundant calls
+      // Key: timestamp, Value: Map of token -> price
+      let periodPriceCache = Map.new<Int, [(Principal, ?PriceInfo)]>();
+
       // Use parallel bulk queries - issue 10 queries at once, then await all
       let PARALLEL_QUERIES : Nat = 10;
       let MAX_RETRIES : Nat = 3;
@@ -1905,9 +1910,19 @@ shared (deployer) persistent actor class Rewards() = this {
               };
               totalNeuronsProcessed := data.totalNeurons;
 
-              // Process each neuron in this batch
-              label neuronLoop for ((neuronId, allocationData) in data.neurons.vals()) {
-                // Skip neurons with no allocation data for this period
+              // Collect neurons with valid allocation data for parallel processing
+              type NeuronToProcess = {
+                neuronId: Blob;
+                allocationData: {
+                  preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+                  inTimespanChanges: [NeuronAllocationChangeBlockData];
+                };
+                startAllocation: [Allocation];
+              };
+              let neuronsToProcess = Buffer.Buffer<NeuronToProcess>(data.neurons.size());
+
+              // First pass: collect neurons that can be processed
+              for ((neuronId, allocationData) in data.neurons.vals()) {
                 let startAllocation = switch (allocationData.preTimespanAllocation) {
                   case (?preAlloc) { preAlloc.newAllocations };
                   case (null) {
@@ -1915,63 +1930,96 @@ shared (deployer) persistent actor class Rewards() = this {
                       change.timestamp == periodStart
                     })) {
                       case (?exactChange) { exactChange.oldAllocations };
-                      case (null) { continue neuronLoop }; // No allocation data, skip to next neuron
+                      case (null) { [] }; // No allocation data
                     };
                   };
                 };
 
-                if (startAllocation.size() == 0) {
-                  continue neuronLoop; // Skip neurons with empty allocations
+                if (startAllocation.size() > 0) {
+                  neuronsToProcess.add({
+                    neuronId = neuronId;
+                    allocationData = allocationData;
+                    startAllocation = startAllocation;
+                  });
+                };
+              };
+
+              // Second pass: process neurons in parallel batches
+              let neuronsArray = Buffer.toArray(neuronsToProcess);
+              var batchStart : Nat = 0;
+
+              while (batchStart < neuronsArray.size()) {
+                let batchEnd = Nat.min(batchStart + PARALLEL_NEURON_BATCH, neuronsArray.size());
+                let batchSize = batchEnd - batchStart;
+
+                // Launch parallel futures for this batch
+                let perfFutures = Buffer.Buffer<async Result.Result<PerformanceResult, RewardsError>>(batchSize);
+                let batchNeurons = Buffer.Buffer<NeuronToProcess>(batchSize);
+
+                var idx = batchStart;
+                while (idx < batchEnd) {
+                  let neuron = neuronsArray[idx];
+                  batchNeurons.add(neuron);
+                  perfFutures.add(
+                    calculatePerformanceFromAllocationData(
+                      neuron.neuronId, periodStart, periodEnd, #USD, neuron.allocationData, neuron.startAllocation, ?periodPriceCache
+                    )
+                  );
+                  idx += 1;
                 };
 
-                // Build timeline and calculate performance inline (avoiding extra inter-canister calls)
-                try {
-                  let performanceResult = await calculatePerformanceFromAllocationData(
-                    neuronId, periodStart, periodEnd, #USD, allocationData, startAllocation
-                  );
+                // Await all futures in this batch
+                var futureIdx : Nat = 0;
+                for (future in perfFutures.vals()) {
+                  let neuron = Buffer.toArray(batchNeurons)[futureIdx];
+                  try {
+                    let performanceResult = await future;
 
-                  switch (performanceResult) {
-                    case (#ok(performance)) {
-                      // Calculate ICP performance from the same checkpoints
-                      let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
-                        ?recomputePerformanceFromCheckpoints(performance.checkpoints, #ICP)
-                      } else { null };
+                    switch (performanceResult) {
+                      case (#ok(performance)) {
+                        let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
+                          ?recomputePerformanceFromCheckpoints(performance.checkpoints, #ICP)
+                        } else { null };
 
-                      let rewardScore = performance.performanceScore;
-                      totalRewardScore += rewardScore;
+                        let rewardScore = performance.performanceScore;
+                        totalRewardScore += rewardScore;
 
-                      let neuronReward : NeuronReward = {
-                        neuronId = neuronId;
-                        performanceScore = performance.performanceScore;
-                        performanceScoreICP = performanceICP;
-                        votingPower = 0; // Historical data doesn't track VP changes
-                        rewardScore = rewardScore;
-                        rewardAmount = 0; // No actual rewards for backfilled data
-                        checkpoints = performance.checkpoints;
+                        let neuronReward : NeuronReward = {
+                          neuronId = neuron.neuronId;
+                          performanceScore = performance.performanceScore;
+                          performanceScoreICP = performanceICP;
+                          votingPower = 0;
+                          rewardScore = rewardScore;
+                          rewardAmount = 0;
+                          checkpoints = performance.checkpoints;
+                        };
+
+                        neuronRewardsBuffer.add(neuronReward);
+                        totalNeuronRewards += 1;
                       };
-
-                      neuronRewardsBuffer.add(neuronReward);
-                      totalNeuronRewards += 1;
-                    };
-                    case (#err(error)) {
-                      switch (error) {
-                        case (#NeuronNotFound) { }; // Expected for inactive neurons
-                        case (#PriceDataMissing(_)) { }; // Expected for old periods
-                        case (_) {
-                          failedNeuronsBuffer.add({
-                            neuronId = neuronId;
-                            errorMessage = debug_show(error);
-                          });
+                      case (#err(error)) {
+                        switch (error) {
+                          case (#NeuronNotFound) { };
+                          case (#PriceDataMissing(_)) { };
+                          case (_) {
+                            failedNeuronsBuffer.add({
+                              neuronId = neuron.neuronId;
+                              errorMessage = debug_show(error);
+                            });
+                          };
                         };
                       };
                     };
+                  } catch (e) {
+                    failedNeuronsBuffer.add({
+                      neuronId = neuron.neuronId;
+                      errorMessage = Error.message(e);
+                    });
                   };
-                } catch (e) {
-                  failedNeuronsBuffer.add({
-                    neuronId = neuronId;
-                    errorMessage = Error.message(e);
-                  });
+                  futureIdx += 1;
                 };
+
+                batchStart := batchEnd;
               };
             };
             case (#err(error)) {
@@ -2053,6 +2101,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // Helper function to calculate performance from pre-fetched allocation data
   // This avoids redundant inter-canister calls when we already have the allocation data
+  // Optional priceCache parameter enables caching during backfill to avoid redundant price fetches
   private func calculatePerformanceFromAllocationData(
     neuronId: Blob,
     startTime: Int,
@@ -2062,7 +2111,8 @@ shared (deployer) persistent actor class Rewards() = this {
       preTimespanAllocation: ?NeuronAllocationChangeBlockData;
       inTimespanChanges: [NeuronAllocationChangeBlockData];
     },
-    startAllocation: [Allocation]
+    startAllocation: [Allocation],
+    priceCache: ?Map.Map<Int, [(Principal, ?PriceInfo)]>
   ) : async Result.Result<PerformanceResult, RewardsError> {
 
     // Build timeline of allocation changes with makers
@@ -2104,60 +2154,144 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     // Calculate checkpoints and performance
-    let checkpointsBuffer = Buffer.Buffer<CheckpointData>(timeline.size());
+    let checkpointsBuffer = Buffer.Buffer<CheckpointData>(timeline.size() + 1);
     var cumulativeReturn : Float = 1.0;
+
+    // Add START checkpoint (needed for ICP performance recomputation which requires >= 2 checkpoints)
+    let (initialTimestamp, initialAllocations, initialMaker) = timeline[0];
+    let initialPrices = try {
+      switch (priceCache) {
+        case (?cache) { await getPricesForAllocationsCached(initialAllocations, initialTimestamp, cache) };
+        case null { await getPricesForAllocations(initialAllocations, initialTimestamp) };
+      }
+    } catch (e) {
+      return #err(#SystemError("Failed to get initial prices for start checkpoint: " # Error.message(e)));
+    };
+
+    let startTokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(initialAllocations.size());
+    let startPricesUsedBuffer = Buffer.Buffer<(Principal, PriceInfo)>(initialAllocations.size());
+    var startTotalWeight : Float = 0.0;
+
+    // First pass: collect tokens with valid prices
+    for (alloc in initialAllocations.vals()) {
+      switch (Array.find(initialPrices, func(p: (Principal, ?PriceInfo)) : Bool { p.0 == alloc.token })) {
+        case (?(_, ?price)) {
+          let weight = Float.fromInt(alloc.basisPoints) / 10000.0;
+          startTotalWeight += weight;
+          let priceValue = switch (priceType) {
+            case (#USD) { price.usdPrice };
+            case (#ICP) { Float.fromInt(price.icpPrice) / 100000000.0 };
+          };
+          startTokenValuesBuffer.add((alloc.token, weight * priceValue));
+          startPricesUsedBuffer.add((alloc.token, price));
+        };
+        case (_) {}; // Skip tokens without price data
+      };
+    };
+
+    // If no tokens have valid prices for start checkpoint, fail
+    if (startTokenValuesBuffer.size() == 0) {
+      return #err(#PriceDataMissing({ token = initialAllocations[0].token; timestamp = initialTimestamp }));
+    };
+
+    // Add start checkpoint with initial portfolio value of 1.0
+    checkpointsBuffer.add({
+      timestamp = initialTimestamp;
+      allocations = initialAllocations;
+      tokenValues = Buffer.toArray(startTokenValuesBuffer);
+      totalPortfolioValue = 1.0;
+      pricesUsed = Buffer.toArray(startPricesUsedBuffer);
+      maker = initialMaker;
+    });
 
     var i = 0;
     while (i < timeline.size() - 1) {
       let (segmentStart, allocations, maker) = timeline[i];
       let (segmentEnd, _, _) = timeline[i + 1];
 
-      // Get prices at start and end of segment
+      // Get prices at start and end of segment (use cache if provided)
       let startPrices = try {
-        await getPricesForAllocations(allocations, segmentStart)
+        switch (priceCache) {
+          case (?cache) { await getPricesForAllocationsCached(allocations, segmentStart, cache) };
+          case null { await getPricesForAllocations(allocations, segmentStart) };
+        }
       } catch (e) {
         return #err(#SystemError("Failed to get start prices: " # Error.message(e)));
       };
 
       let endPrices = try {
-        await getPricesForAllocations(allocations, segmentEnd)
+        switch (priceCache) {
+          case (?cache) { await getPricesForAllocationsCached(allocations, segmentEnd, cache) };
+          case null { await getPricesForAllocations(allocations, segmentEnd) };
+        }
       } catch (e) {
         return #err(#SystemError("Failed to get end prices: " # Error.message(e)));
       };
 
-      // Calculate segment return
+      // Calculate segment return - skip tokens without prices and normalize weights
       var startValue : Float = 0.0;
       var endValue : Float = 0.0;
       let tokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(allocations.size());
       let pricesUsedBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
 
+      // First pass: collect tokens with valid prices and calculate total weight
+      type ValidAlloc = { token: Principal; weight: Float; startPrice: Float; endPrice: Float; endPriceInfo: PriceInfo };
+      let validAllocsBuffer = Buffer.Buffer<ValidAlloc>(allocations.size());
+      var totalValidWeight : Float = 0.0;
+
       for (alloc in allocations.vals()) {
         let weight = Float.fromInt(alloc.basisPoints) / 10000.0;
 
-        let startPrice = switch (Array.find(startPrices, func(p: (Principal, ?PriceInfo)) : Bool { p.0 == alloc.token })) {
+        let startPriceOpt = switch (Array.find(startPrices, func(p: (Principal, ?PriceInfo)) : Bool { p.0 == alloc.token })) {
           case (?(_, ?price)) {
-            switch (priceType) {
+            ?(switch (priceType) {
               case (#USD) { price.usdPrice };
               case (#ICP) { Float.fromInt(price.icpPrice) / 100000000.0 };
-            };
+            })
           };
-          case (_) { return #err(#PriceDataMissing({ token = alloc.token; timestamp = segmentStart })); };
+          case (_) { null }; // Skip - no start price
         };
 
-        let endPrice = switch (Array.find(endPrices, func(p: (Principal, ?PriceInfo)) : Bool { p.0 == alloc.token })) {
+        let endPriceOpt = switch (Array.find(endPrices, func(p: (Principal, ?PriceInfo)) : Bool { p.0 == alloc.token })) {
           case (?(_, ?price)) {
-            pricesUsedBuffer.add((alloc.token, price));
-            switch (priceType) {
+            ?(switch (priceType) {
               case (#USD) { price.usdPrice };
               case (#ICP) { Float.fromInt(price.icpPrice) / 100000000.0 };
-            };
+            }, price)
           };
-          case (_) { return #err(#PriceDataMissing({ token = alloc.token; timestamp = segmentEnd })); };
+          case (_) { null }; // Skip - no end price
         };
 
-        startValue += weight * startPrice;
-        endValue += weight * endPrice;
-        tokenValuesBuffer.add((alloc.token, weight * endPrice));
+        // Only include token if both start and end prices are available
+        switch (startPriceOpt, endPriceOpt) {
+          case (?sPrice, ?(ePrice, ePriceInfo)) {
+            validAllocsBuffer.add({
+              token = alloc.token;
+              weight = weight;
+              startPrice = sPrice;
+              endPrice = ePrice;
+              endPriceInfo = ePriceInfo;
+            });
+            totalValidWeight += weight;
+          };
+          case _ {}; // Skip tokens without complete price data
+        };
+      };
+
+      // If no tokens have valid prices, fail this segment
+      if (validAllocsBuffer.size() == 0) {
+        return #err(#PriceDataMissing({ token = allocations[0].token; timestamp = segmentStart }));
+      };
+
+      // Second pass: calculate values with normalized weights
+      for (validAlloc in validAllocsBuffer.vals()) {
+        // Normalize weight so remaining tokens sum to 100%
+        let normalizedWeight = validAlloc.weight / totalValidWeight;
+
+        startValue += normalizedWeight * validAlloc.startPrice;
+        endValue += normalizedWeight * validAlloc.endPrice;
+        tokenValuesBuffer.add((validAlloc.token, normalizedWeight * validAlloc.endPrice));
+        pricesUsedBuffer.add((validAlloc.token, validAlloc.endPriceInfo));
       };
 
       // Calculate segment return and compound it
@@ -2199,6 +2333,42 @@ shared (deployer) persistent actor class Rewards() = this {
     switch (pricesResult) {
       case (#ok(prices)) { prices };
       case (#err(_)) { [] };
+    };
+  };
+
+  // Cached version for backfill - checks cache first, fetches if not found
+  private func getPricesForAllocationsCached(
+    allocations: [Allocation],
+    timestamp: Int,
+    cache: Map.Map<Int, [(Principal, ?PriceInfo)]>
+  ) : async [(Principal, ?PriceInfo)] {
+    // Check cache first
+    switch (Map.get(cache, Map.ihash, timestamp)) {
+      case (?cached) {
+        // Return cached prices, but only for tokens in allocations
+        let tokens = Array.map<Allocation, Principal>(allocations, func(a) { a.token });
+        let filteredPrices = Buffer.Buffer<(Principal, ?PriceInfo)>(tokens.size());
+        for (token in tokens.vals()) {
+          let found = Array.find<(Principal, ?PriceInfo)>(cached, func(p) { p.0 == token });
+          switch (found) {
+            case (?price) { filteredPrices.add(price) };
+            case null {
+              // Token not in cache, need to fetch it
+              let newPrices = await getPricesForAllocations(allocations, timestamp);
+              // Update cache with all fetched tokens
+              Map.set(cache, Map.ihash, timestamp, newPrices);
+              return newPrices;
+            };
+          };
+        };
+        Buffer.toArray(filteredPrices)
+      };
+      case null {
+        // Not in cache, fetch and store
+        let prices = await getPricesForAllocations(allocations, timestamp);
+        Map.set(cache, Map.ihash, timestamp, prices);
+        prices
+      };
     };
   };
 

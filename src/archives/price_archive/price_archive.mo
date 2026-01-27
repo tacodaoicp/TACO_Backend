@@ -206,25 +206,98 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
     #ok(Map.get(lastKnownPrices, Map.phash, token));
   };
 
+  //=========================================================================
+  // Binary Search Helpers for Efficient Historical Queries
+  //=========================================================================
+
+  // Extract timestamp from a block result
+  // Looks for tx.timestamp first, then tx.data.ts as fallback
+  private func extractBlockTimestamp(blocks: [{id: Nat; block: ICRC3Service.Value}]) : Int {
+    if (blocks.size() == 0) return 0;
+
+    switch (blocks[0].block) {
+      case (#Map(entries)) {
+        for ((key, value) in entries.vals()) {
+          if (key == "tx") {
+            switch (value) {
+              case (#Map(txEntries)) {
+                for ((txKey, txValue) in txEntries.vals()) {
+                  switch (txKey, txValue) {
+                    case ("timestamp", #Int(t)) { return t };
+                    case ("data", #Map(dataEntries)) {
+                      for ((dataKey, dataValue) in dataEntries.vals()) {
+                        if (dataKey == "ts") {
+                          switch (dataValue) {
+                            case (#Int(t)) { return t };
+                            case _ {};
+                          };
+                        };
+                      };
+                    };
+                    case _ {};
+                  };
+                };
+              };
+              case _ {};
+            };
+          };
+        };
+      };
+      case _ {};
+    };
+    0
+  };
+
+  // Binary search to find block index near target timestamp
+  // Returns index of block with timestamp <= targetTimestamp
+  // Uses O(log n) iterations - ~15 for 37K blocks, ~20 for 1M blocks
+  private func findBlockIndexNearTimestamp(targetTimestamp: Int, totalBlocks: Nat) : Nat {
+    if (totalBlocks == 0) return 0;
+    if (totalBlocks == 1) return 0;
+
+    var low : Nat = 0;
+    var high : Nat = totalBlocks - 1;
+
+    // Binary search: each iteration halves the search space
+    while (low + 1 < high) {
+      let mid = (low + high) / 2;
+      let midResult = base.icrc3_get_blocks([{ start = mid; length = 1 }]);
+      let midTimestamp = extractBlockTimestamp(midResult.blocks);
+
+      if (midTimestamp <= targetTimestamp) {
+        low := mid;
+      } else {
+        high := mid;
+      };
+    };
+
+    low
+  };
+
+  //=========================================================================
+  // Price Query Functions (using binary search)
+  //=========================================================================
+
   // New method for rewards calculation - get price at specific time
   public query ({ caller }) func getPriceAtTime(token : Principal, timestamp : Int) : async Result.Result<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}, ArchiveError> {
     // Query method is open for everyone. (Data not sensitive and query methods are free)
-    //if (not base.isQueryAuthorized(caller)) {
-    //  return #err(#NotAuthorized);
-    //};
 
-    // First get a small sample to check total blocks
-    let sampleArgs = [{ start = 0; length = 1 }];
-    let sampleResult = base.icrc3_get_blocks(sampleArgs);
-    
-    // Use ICRC3 interface directly to get recent blocks and search for the most recent price
+    // Get total blocks count
+    let sampleResult = base.icrc3_get_blocks([{ start = 0; length = 1 }]);
     let totalBlocks = sampleResult.log_length;
-    let startBlock = if (totalBlocks > 5000) { totalBlocks - 5000 } else { 0 };
-    let getBlocksArgs = [{
-      start = startBlock;
-      length = 5000; // Get more recent blocks
-    }];
-    
+
+    if (totalBlocks == 0) return #ok(null);
+
+    // Binary search to find approximate block position (~15 iterations for 37K blocks)
+    let targetBlock = findBlockIndexNearTimestamp(timestamp, totalBlocks);
+
+    // Search a window around the target (larger window for "at or before" to find best match)
+    // Increased from 500 to 2000 to handle sparse price data (e.g., ICP prices)
+    let WINDOW_SIZE : Nat = 2000;
+    let searchStart = if (targetBlock > WINDOW_SIZE) { targetBlock - WINDOW_SIZE } else { 0 };
+    let searchLength = Nat.min(WINDOW_SIZE * 2, totalBlocks - searchStart);
+
+    let getBlocksArgs = [{ start = searchStart; length = searchLength }];
     let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
     
     // Find the most recent price block for this token at or before the timestamp
@@ -323,13 +396,22 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
   public query ({ caller }) func getPriceAtOrAfterTime(token : Principal, timestamp : Int) : async Result.Result<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}, ArchiveError> {
     // Query method is open for everyone.
 
-    // First get a small sample to check total blocks
-    let sampleArgs = [{ start = 0; length = 1 }];
-    let sampleResult = base.icrc3_get_blocks(sampleArgs);
-
+    // Get total blocks count
+    let sampleResult = base.icrc3_get_blocks([{ start = 0; length = 1 }]);
     let totalBlocks = sampleResult.log_length;
-    let startBlock = if (totalBlocks > 5000) { totalBlocks - 5000 } else { 0 };
-    let getBlocksArgs = [{ start = startBlock; length = 5000 }];
+
+    if (totalBlocks == 0) return #ok(null);
+
+    // Binary search to find approximate block position
+    let targetBlock = findBlockIndexNearTimestamp(timestamp, totalBlocks);
+
+    // For "at or after", search more forward from target (bias search window forward)
+    // Increased from 500 to 2000 to handle sparse price data (e.g., ICP prices)
+    let WINDOW_SIZE : Nat = 2000;
+    let searchStart = if (targetBlock > WINDOW_SIZE / 4) { targetBlock - WINDOW_SIZE / 4 } else { 0 };
+    let searchLength = Nat.min(WINDOW_SIZE, totalBlocks - searchStart);
+
+    let getBlocksArgs = [{ start = searchStart; length = searchLength }];
     let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
 
     // Find the nearest price block for this token at or after the timestamp
@@ -688,16 +770,28 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
   //=========================================================================
 
   public query ({ caller }) func getPricesAtTime(tokens : [Principal], timestamp : Int) : async Result.Result<[(Principal, ?{icpPrice: Nat; usdPrice: Float; timestamp: Int})], ArchiveError> {
-    let sampleArgs = [{ start = 0; length = 1 }];
-    let sampleResult = base.icrc3_get_blocks(sampleArgs);
-    
+    // Get total blocks count
+    let sampleResult = base.icrc3_get_blocks([{ start = 0; length = 1 }]);
     let totalBlocks = sampleResult.log_length;
-    let startBlock = if (totalBlocks > 5000) { totalBlocks - 5000 } else { 0 };
-    let getBlocksArgs = [{
-      start = startBlock;
-      length = 5000;
-    }];
-    
+
+    if (totalBlocks == 0) {
+      // Return null prices for all tokens if no blocks exist
+      let emptyResults = Array.map<Principal, (Principal, ?{icpPrice: Nat; usdPrice: Float; timestamp: Int})>(tokens, func(token) {
+        (token, null)
+      });
+      return #ok(emptyResults);
+    };
+
+    // Binary search to find approximate block position (~15 iterations for 37K blocks)
+    let targetBlock = findBlockIndexNearTimestamp(timestamp, totalBlocks);
+
+    // Search a window around the target (larger window for batch queries to find prices for multiple tokens)
+    // Increased from 500 to 2000 to handle sparse price data (e.g., ICP prices)
+    let WINDOW_SIZE : Nat = 2000;
+    let searchStart = if (targetBlock > WINDOW_SIZE) { targetBlock - WINDOW_SIZE } else { 0 };
+    let searchLength = Nat.min(WINDOW_SIZE * 2, totalBlocks - searchStart);
+
+    let getBlocksArgs = [{ start = searchStart; length = searchLength }];
     let icrc3Result = base.icrc3_get_blocks(getBlocksArgs);
     
     // Map to store most recent price for each token
