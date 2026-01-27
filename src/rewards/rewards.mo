@@ -43,6 +43,9 @@ shared (deployer) persistent actor class Rewards() = this {
 
   private  let SNS_GOVERNANCE_CANISTER_ID : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
+  // ICP token principal for price derivation
+  private let ICP_PRINCIPAL : Principal = Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai");
+
   // Helper functions for TACO amount conversions
   private func tacoTokensToSatoshis(tokens: Nat) : Nat {
     tokens * TACO_SATOSHIS_PER_TOKEN
@@ -226,6 +229,28 @@ shared (deployer) persistent actor class Rewards() = this {
     lastActivity: Int;
   };
 
+  // Graph data type for performance visualization (per-neuron)
+  public type NeuronPerformanceGraphData = {
+    neuronId: Blob;
+    timeframe: { startTime: Int; endTime: Int };
+    checkpoints: [CheckpointData];  // Contains timestamp, allocations, tokenValues, pricesUsed, maker
+    performanceScoreUSD: Float;
+    performanceScoreICP: ?Float;
+  };
+
+  // Graph data type for user performance visualization (aggregated across neurons)
+  public type UserPerformanceGraphData = {
+    timeframe: { startTime: Int; endTime: Int };
+    neuronData: [{
+      neuronId: Blob;
+      checkpoints: [CheckpointData];
+      performanceScoreUSD: Float;
+      performanceScoreICP: ?Float;
+    }];
+    aggregatedPerformanceUSD: Float;  // Compound performance across all neurons
+    aggregatedPerformanceICP: ?Float;
+  };
+
   // Configuration
   stable var distributionPeriodNS : Nat = 604_800_000_000_000; // 7 days in nanoseconds
   stable var periodicRewardPot : Nat = 1000; // Default reward pot in whole TACO tokens
@@ -402,12 +427,15 @@ shared (deployer) persistent actor class Rewards() = this {
   // Note: This is a shared (update) function because it's called internally
   // by the distribution system. For external callers who just want to query
   // performance, use calculateNeuronPerformanceQuery which is a composite query.
-  public shared func calculateNeuronPerformance(
+  public shared ({ caller }) func calculateNeuronPerformance(
     neuronId: Blob,
     startTime: Int,
     endTime: Int,
     priceType: PriceType
   ) : async Result.Result<PerformanceResult, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
     
     if (startTime >= endTime) {
       return #err(#InvalidTimeRange);
@@ -1086,6 +1114,84 @@ shared (deployer) persistent actor class Rewards() = this {
 
     if (initialValue == 0.0) return 1.0;
     finalValue / initialValue
+  };
+
+  // Extract ICP's USD price from a checkpoint's pricesUsed array
+  private func getIcpUsdPriceFromCheckpoint(pricesUsed: [(Principal, PriceInfo)]) : ?Float {
+    for ((token, priceInfo) in pricesUsed.vals()) {
+      if (Principal.equal(token, ICP_PRINCIPAL)) {
+        return ?priceInfo.usdPrice;
+      };
+    };
+    null
+  };
+
+  // Recompute ICP performance using derived prices (USD price / ICP USD rate)
+  // This fixes incorrect stored icpPrice values by deriving them from correct USD prices
+  private func recomputePerformanceFromCheckpointsDerived(
+    checkpoints: [CheckpointData]
+  ) : ?Float {
+    if (checkpoints.size() < 2) return null;
+
+    let firstCheckpoint = checkpoints[0];
+    let lastCheckpoint = checkpoints[checkpoints.size() - 1];
+
+    // Get ICP/USD rate for first checkpoint
+    let firstIcpUsd = switch (getIcpUsdPriceFromCheckpoint(firstCheckpoint.pricesUsed)) {
+      case (?rate) {
+        if (rate <= 0.0) return null; // Avoid division by zero
+        rate
+      };
+      case null { return null }; // Can't derive without ICP rate
+    };
+
+    // Get ICP/USD rate for last checkpoint
+    let lastIcpUsd = switch (getIcpUsdPriceFromCheckpoint(lastCheckpoint.pricesUsed)) {
+      case (?rate) {
+        if (rate <= 0.0) return null;
+        rate
+      };
+      case null { return null };
+    };
+
+    // Calculate initial portfolio value in ICP terms
+    var initialValue : Float = 0.0;
+    for (allocation in firstCheckpoint.allocations.vals()) {
+      let priceOpt = Array.find<(Principal, PriceInfo)>(
+        firstCheckpoint.pricesUsed,
+        func ((t, _)) { Principal.equal(t, allocation.token) }
+      );
+      switch (priceOpt) {
+        case (?(_, priceInfo)) {
+          // Derive ICP price: token_usd_price / icp_usd_price
+          let derivedIcpPrice = priceInfo.usdPrice / firstIcpUsd;
+          let allocationPercent = Float.fromInt(allocation.basisPoints) / 10000.0;
+          initialValue += allocationPercent * derivedIcpPrice;
+        };
+        case null {};
+      };
+    };
+
+    // Calculate final portfolio value in ICP terms
+    var finalValue : Float = 0.0;
+    for (allocation in lastCheckpoint.allocations.vals()) {
+      let priceOpt = Array.find<(Principal, PriceInfo)>(
+        lastCheckpoint.pricesUsed,
+        func ((t, _)) { Principal.equal(t, allocation.token) }
+      );
+      switch (priceOpt) {
+        case (?(_, priceInfo)) {
+          let derivedIcpPrice = priceInfo.usdPrice / lastIcpUsd;
+          let allocationPercent = Float.fromInt(allocation.basisPoints) / 10000.0;
+          finalValue += allocationPercent * derivedIcpPrice;
+        };
+        case null {};
+      };
+    };
+
+    if (initialValue <= 0.0) return null;
+
+    ?(finalValue / initialValue)
   };
 
   // Calculate portfolio value given allocations and prices
@@ -2670,6 +2776,21 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Voting power power updated");
   };
 
+  // Set max distribution history (number of distributions to keep)
+  public shared ({ caller }) func setMaxDistributionHistory(max: Nat) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (max == 0) {
+      return #err(#SystemError("Max distribution history must be > 0"));
+    };
+
+    maxDistributionHistory := max;
+    logger.info("Config", "Max distribution history set to " # Nat.toText(max), "setMaxDistributionHistory");
+    #ok("Max distribution history updated");
+  };
+
   //=========================================================================
   // Reward Penalty Management Functions
   //=========================================================================
@@ -3399,6 +3520,166 @@ shared (deployer) persistent actor class Rewards() = this {
     })
   };
 
+  // Get user performance graph data from precomputed distribution history
+  // This is much more efficient than calculateNeuronPerformanceQuery as it reads stored data
+  // Use this for performance visualization graphs
+  // Takes userPrincipal and looks up their neurons from DAO, then reads checkpoints locally
+  public composite query func getUserPerformanceGraphData(
+    userPrincipal: Principal, // User to get graph data for
+    startTime: Int,           // Start of time range (nanoseconds)
+    endTime: Int              // End of time range (nanoseconds)
+  ) : async Result.Result<UserPerformanceGraphData, RewardsError> {
+    if (startTime >= endTime) {
+      return #err(#InvalidTimeRange);
+    };
+
+    // Step 1: Get user's neurons from DAO (composite query call)
+    let neuronOwners = try {
+      await daoCanister.getAllNeuronOwners()
+    } catch (e) {
+      return #err(#SystemError("Failed to query DAO: " # Error.message(e)));
+    };
+
+    // Step 2: Find neurons owned by this principal
+    let neuronIds = Buffer.Buffer<Blob>(5);
+    for ((neuronId, principals) in neuronOwners.vals()) {
+      for (p in principals.vals()) {
+        if (Principal.equal(p, userPrincipal)) {
+          neuronIds.add(neuronId);
+        };
+      };
+    };
+
+    if (neuronIds.size() == 0) {
+      return #err(#NeuronNotFound);
+    };
+
+    // Step 3: Read checkpoints from distribution history (local, fast)
+    let totalDistributions = Vector.size(distributionHistory);
+
+    if (totalDistributions == 0) {
+      return #err(#NeuronNotFound);
+    };
+
+    // Create a map to track data per neuron
+    let neuronDataMap = Buffer.Buffer<{
+      neuronId: Blob;
+      checkpoints: Buffer.Buffer<CheckpointData>;
+      performanceUSD: Float;
+      performanceICP: Float;
+      hasIcpScore: Bool;
+      found: Bool;
+    }>(neuronIds.size());
+
+    // Initialize tracking for each neuron
+    for (nid in neuronIds.vals()) {
+      neuronDataMap.add({
+        neuronId = nid;
+        checkpoints = Buffer.Buffer<CheckpointData>(20);
+        performanceUSD = 1.0;
+        performanceICP = 1.0;
+        hasIcpScore = false;
+        found = false;
+      });
+    };
+
+    var actualStartTime : Int = endTime;
+    var actualEndTime : Int = startTime;
+
+    // Iterate through distributions in chronological order (oldest first for proper checkpoint ordering)
+    for (distIndex in Iter.range(0, totalDistributions - 1)) {
+      let dist = Vector.get(distributionHistory, distIndex);
+
+      // Skip distributions outside our time range
+      if (dist.endTime < startTime or dist.startTime > endTime) {
+        // Skip this distribution
+      } else {
+        // Track actual time bounds
+        if (dist.startTime < actualStartTime) { actualStartTime := dist.startTime };
+        if (dist.endTime > actualEndTime) { actualEndTime := dist.endTime };
+
+        // Look for each neuron's data in this distribution
+        for (reward in dist.neuronRewards.vals()) {
+          // Check if this neuron is in our list
+          for (i in Iter.range(0, neuronDataMap.size() - 1)) {
+            let entry = neuronDataMap.get(i);
+            if (entry.neuronId == reward.neuronId) {
+              // Add checkpoints
+              for (checkpoint in reward.checkpoints.vals()) {
+                entry.checkpoints.add(checkpoint);
+              };
+
+              // Compound performance scores
+              let newPerfUSD = entry.performanceUSD * reward.performanceScore;
+              var newPerfICP = entry.performanceICP;
+              var newHasIcp = entry.hasIcpScore;
+              switch (reward.performanceScoreICP) {
+                case (?icpScore) {
+                  newPerfICP := entry.performanceICP * icpScore;
+                  newHasIcp := true;
+                };
+                case null {};
+              };
+
+              // Update the entry (recreate since records are immutable)
+              neuronDataMap.put(i, {
+                neuronId = entry.neuronId;
+                checkpoints = entry.checkpoints;
+                performanceUSD = newPerfUSD;
+                performanceICP = newPerfICP;
+                hasIcpScore = newHasIcp;
+                found = true;
+              });
+            };
+          };
+        };
+      };
+    };
+
+    // Build the result
+    let resultNeurons = Buffer.Buffer<{
+      neuronId: Blob;
+      checkpoints: [CheckpointData];
+      performanceScoreUSD: Float;
+      performanceScoreICP: ?Float;
+    }>(neuronDataMap.size());
+
+    var aggregatedUSD : Float = 1.0;
+    var aggregatedICP : Float = 1.0;
+    var anyIcpScore = false;
+    var foundAny = false;
+
+    for (entry in neuronDataMap.vals()) {
+      if (entry.found) {
+        foundAny := true;
+        resultNeurons.add({
+          neuronId = entry.neuronId;
+          checkpoints = Buffer.toArray(entry.checkpoints);
+          performanceScoreUSD = entry.performanceUSD;
+          performanceScoreICP = if (entry.hasIcpScore) ?entry.performanceICP else null;
+        });
+
+        // Aggregate by compounding (geometric mean would be better but compound is simpler)
+        aggregatedUSD *= entry.performanceUSD;
+        if (entry.hasIcpScore) {
+          aggregatedICP *= entry.performanceICP;
+          anyIcpScore := true;
+        };
+      };
+    };
+
+    if (not foundAny) {
+      return #err(#NeuronNotFound);
+    };
+
+    #ok({
+      timeframe = { startTime = actualStartTime; endTime = actualEndTime };
+      neuronData = Buffer.toArray(resultNeurons);
+      aggregatedPerformanceUSD = aggregatedUSD;
+      aggregatedPerformanceICP = if (anyIcpScore) ?aggregatedICP else null;
+    })
+  };
+
   // Get performance for all neurons owned by a user
   // Uses composite query to call DAO canister query methods
   public composite query func getUserPerformance(userPrincipal: Principal) : async Result.Result<UserPerformanceResult, RewardsError> {
@@ -3560,6 +3841,142 @@ shared (deployer) persistent actor class Rewards() = this {
   //=========================================================================
   // Admin Functions
   //=========================================================================
+
+  // Recalculate ICP performance scores for all distributions using derived prices
+  // This fixes incorrect stored icpPrice values by deriving them from correct USD prices
+  // Uses yield points (await async {}) to avoid instruction limit
+  public shared ({ caller }) func admin_recalculateAllIcpPerformance() : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let totalDistributions = Vector.size(distributionHistory);
+    var updatedCount : Nat = 0;
+    var neuronsProcessed : Nat = 0;
+
+    for (i in Iter.range(0, totalDistributions - 1)) {
+      let existingRecord = Vector.get(distributionHistory, i);
+
+      // Create buffer for updated neuron rewards
+      let updatedRewardsBuffer = Buffer.Buffer<NeuronReward>(existingRecord.neuronRewards.size());
+
+      for (neuronReward in existingRecord.neuronRewards.vals()) {
+        // Recalculate ICP performance using derived prices
+        let newIcpScore = recomputePerformanceFromCheckpointsDerived(neuronReward.checkpoints);
+
+        // Create updated reward preserving all other fields
+        let updatedReward : NeuronReward = {
+          neuronId = neuronReward.neuronId;
+          performanceScore = neuronReward.performanceScore;    // USD score unchanged
+          performanceScoreICP = newIcpScore;                   // Recalculated
+          votingPower = neuronReward.votingPower;
+          rewardScore = neuronReward.rewardScore;
+          rewardAmount = neuronReward.rewardAmount;
+          checkpoints = neuronReward.checkpoints;
+        };
+        updatedRewardsBuffer.add(updatedReward);
+        neuronsProcessed += 1;
+
+        // Yield every 50 neurons to avoid instruction limit
+        if (neuronsProcessed % 50 == 0) {
+          await async {};
+        };
+      };
+
+      // Create updated distribution record
+      let updatedRecord : DistributionRecord = {
+        id = existingRecord.id;
+        startTime = existingRecord.startTime;
+        endTime = existingRecord.endTime;
+        distributionTime = existingRecord.distributionTime;
+        totalRewardPot = existingRecord.totalRewardPot;
+        actualDistributed = existingRecord.actualDistributed;
+        totalRewardScore = existingRecord.totalRewardScore;
+        neuronsProcessed = existingRecord.neuronsProcessed;
+        neuronRewards = Buffer.toArray(updatedRewardsBuffer);
+        failedNeurons = existingRecord.failedNeurons;
+        status = existingRecord.status;
+      };
+
+      Vector.put(distributionHistory, i, updatedRecord);
+      updatedCount += 1;
+
+      // Also yield after each distribution
+      await async {};
+    };
+
+    #ok("Recalculated ICP performance for " # Nat.toText(updatedCount) # " distributions (" # Nat.toText(neuronsProcessed) # " neurons)")
+  };
+
+  // Recalculate ICP performance for a single distribution (for testing/debugging)
+  public shared ({ caller }) func admin_recalculateIcpPerformanceForDistribution(
+    distributionId: Nat
+  ) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    // Find distribution by ID
+    var foundIndex : ?Nat = null;
+    let totalDistributions = Vector.size(distributionHistory);
+    for (i in Iter.range(0, totalDistributions - 1)) {
+      let record = Vector.get(distributionHistory, i);
+      if (record.id == distributionId) {
+        foundIndex := ?i;
+      };
+    };
+
+    switch (foundIndex) {
+      case (?index) {
+        let existingRecord = Vector.get(distributionHistory, index);
+
+        // Create buffer for updated neuron rewards
+        let updatedRewardsBuffer = Buffer.Buffer<NeuronReward>(existingRecord.neuronRewards.size());
+        var neuronsProcessed : Nat = 0;
+
+        for (neuronReward in existingRecord.neuronRewards.vals()) {
+          let newIcpScore = recomputePerformanceFromCheckpointsDerived(neuronReward.checkpoints);
+
+          let updatedReward : NeuronReward = {
+            neuronId = neuronReward.neuronId;
+            performanceScore = neuronReward.performanceScore;
+            performanceScoreICP = newIcpScore;
+            votingPower = neuronReward.votingPower;
+            rewardScore = neuronReward.rewardScore;
+            rewardAmount = neuronReward.rewardAmount;
+            checkpoints = neuronReward.checkpoints;
+          };
+          updatedRewardsBuffer.add(updatedReward);
+          neuronsProcessed += 1;
+
+          // Yield every 50 neurons
+          if (neuronsProcessed % 50 == 0) {
+            await async {};
+          };
+        };
+
+        let updatedRecord : DistributionRecord = {
+          id = existingRecord.id;
+          startTime = existingRecord.startTime;
+          endTime = existingRecord.endTime;
+          distributionTime = existingRecord.distributionTime;
+          totalRewardPot = existingRecord.totalRewardPot;
+          actualDistributed = existingRecord.actualDistributed;
+          totalRewardScore = existingRecord.totalRewardScore;
+          neuronsProcessed = existingRecord.neuronsProcessed;
+          neuronRewards = Buffer.toArray(updatedRewardsBuffer);
+          failedNeurons = existingRecord.failedNeurons;
+          status = existingRecord.status;
+        };
+
+        Vector.put(distributionHistory, index, updatedRecord);
+        #ok("Recalculated ICP performance for distribution #" # Nat.toText(distributionId) # " (" # Nat.toText(neuronsProcessed) # " neurons)")
+      };
+      case null {
+        #err(#SystemError("Distribution not found with ID: " # Nat.toText(distributionId)))
+      };
+    };
+  };
 
   //=========================================================================
   // Withdrawal Functions
@@ -3800,6 +4217,50 @@ shared (deployer) persistent actor class Rewards() = this {
 
   public query func get_canister_cycles() : async { cycles : Nat } {
     { cycles = Cycles.balance() };
+  };
+
+  //=========================================================================
+  // Logging Functions
+  //=========================================================================
+
+  /**
+   * Get the last N log entries
+   */
+  public query ({ caller }) func getLogs(count : Nat) : async [Logger.LogEntry] {
+    if (not isAdmin(caller)) {
+      return [];
+    };
+    logger.getLastLogs(count);
+  };
+
+  /**
+   * Get the last N log entries for a specific context
+   */
+  public query ({ caller }) func getLogsByContext(context : Text, count : Nat) : async [Logger.LogEntry] {
+    if (not isAdmin(caller)) {
+      return [];
+    };
+    logger.getContextLogs(context, count);
+  };
+
+  /**
+   * Get the last N log entries for a specific level
+   */
+  public query ({ caller }) func getLogsByLevel(level : Logger.LogLevel, count : Nat) : async [Logger.LogEntry] {
+    if (not isAdmin(caller)) {
+      return [];
+    };
+    logger.getLogsByLevel(level, count);
+  };
+
+  /**
+   * Clear all logs
+   */
+  public shared ({ caller }) func clearLogs() : async () {
+    if (not isAdmin(caller)) {
+      return;
+    };
+    logger.clearLogs();
   };
 
 }
