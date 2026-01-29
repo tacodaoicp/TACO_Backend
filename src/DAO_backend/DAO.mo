@@ -2143,6 +2143,56 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     Iter.toArray(Map.entries(neuronOwners))
   };
 
+  // Returns mapping of neuronId -> [Principal] where principals are "active decision makers"
+  // Active = lastAllocationMaker for that neuron, OR follows someone, OR has ever directly made an allocation
+  // This excludes passive hotkeys who share a neuron but never made any decisions
+  public query func getActiveDecisionMakers() : async [(Blob, [Principal])] {
+    let neuronToActiveUsers = Map.new<Blob, [Principal]>();
+
+    // Step 1: Get all current makers from neuronAllocationMap
+    // Each neuron has exactly one lastAllocationMaker (the strategy maker)
+    for ((neuronId, neuronAlloc) in Map.entries(neuronAllocationMap)) {
+      Map.set(neuronToActiveUsers, bhash, neuronId, [neuronAlloc.lastAllocationMaker]);
+    };
+
+    // Step 2: Add other active principals who own neurons
+    // A principal is "active" if they:
+    //   a) Currently follow someone (allocationFollows.size() > 0), OR
+    //   b) Have ever directly made an allocation (pastAllocations contains an entry where allocationMaker == self)
+    // This handles the case where someone followed then unfollowed - they still have past direct allocations
+    for ((principal, userState) in Map.entries(userStates)) {
+      let isFollowing = userState.allocationFollows.size() > 0;
+
+      // Check if user has ever made a direct allocation (not via following)
+      let hasEverDirectlyAllocated = Array.find<{ from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal }>(
+        userState.pastAllocations,
+        func(pa) { Principal.equal(pa.allocationMaker, principal) }
+      ) != null;
+
+      if (isFollowing or hasEverDirectlyAllocated) {
+        // This user is an active decision maker - add them for all their neurons
+        for (neuron in userState.neurons.vals()) {
+          switch (Map.get(neuronToActiveUsers, bhash, neuron.neuronId)) {
+            case (?existingPrincipals) {
+              let alreadyExists = Array.find<Principal>(existingPrincipals, func(p) { Principal.equal(p, principal) });
+              switch (alreadyExists) {
+                case (?_) { }; // Already in list
+                case null {
+                  Map.set(neuronToActiveUsers, bhash, neuron.neuronId, Array.append(existingPrincipals, [principal]));
+                };
+              };
+            };
+            case null {
+              Map.set(neuronToActiveUsers, bhash, neuron.neuronId, [principal]);
+            };
+          };
+        };
+      };
+    };
+
+    Iter.toArray(Map.entries(neuronToActiveUsers))
+  };
+
   // Get all unique neuron IDs that have allocation history
   // Used by rewards canister for backfilling historical performance data
   public query func admin_getAllActiveNeuronIds() : async [Blob] {

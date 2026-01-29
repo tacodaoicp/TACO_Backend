@@ -247,8 +247,15 @@ shared (deployer) persistent actor class Rewards() = this {
       performanceScoreUSD: Float;
       performanceScoreICP: ?Float;
     }];
-    aggregatedPerformanceUSD: Float;  // Compound performance across all neurons
+    aggregatedPerformanceUSD: Float;  // Compound performance across all neurons (AllTime)
     aggregatedPerformanceICP: ?Float;
+    // Timeframe-specific performance for the best neuron (matches leaderboard calculation)
+    oneWeekUSD: ?Float;
+    oneWeekICP: ?Float;
+    oneMonthUSD: ?Float;
+    oneMonthICP: ?Float;
+    oneYearUSD: ?Float;
+    oneYearICP: ?Float;
   };
 
   // Configuration
@@ -325,7 +332,7 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   stable var leaderboardLastUpdate: Int = 0;
-  stable var leaderboardSize: Nat = 100;               // Top N per leaderboard
+  stable var leaderboardSize: Nat = 50;                // Top N per leaderboard
   stable var leaderboardUpdateEnabled: Bool = true;    // On/off switch
 
   // External canister interfaces
@@ -412,6 +419,7 @@ shared (deployer) persistent actor class Rewards() = this {
   type DAOCanister = actor {
     admin_getNeuronAllocations: () -> async [(Blob, NeuronAllocation)];
     getAllNeuronOwners: query () -> async [(Blob, [Principal])];
+    getActiveDecisionMakers: query () -> async [(Blob, [Principal])];  // Only active makers + followers, excludes passive hotkeys
     admin_getAllActiveNeuronIds: query () -> async [Blob];
     getNeuronAllocation: query (Blob) -> async ?NeuronAllocation;
   };
@@ -442,7 +450,7 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     // Get allocation data from the neuron allocation archive
-    let allocationResult = await neuronAllocationArchive.getNeuronAllocationChangesWithContext(
+    let allocationResult = await (with timeout = 65)  neuronAllocationArchive.getNeuronAllocationChangesWithContext(
       neuronId, startTime, endTime, 100
     );
 
@@ -464,7 +472,7 @@ shared (deployer) persistent actor class Rewards() = this {
           case (?exactChange) { exactChange.oldAllocations };
           case (null) {
             // No archive allocation data found - fallback to current DAO allocation
-            let currentAlloc = await daoCanister.getNeuronAllocation(neuronId);
+            let currentAlloc = await (with timeout = 65)  daoCanister.getNeuronAllocation(neuronId);
             switch (currentAlloc) {
               case (?alloc) {
                 if (alloc.allocations.size() > 0) {
@@ -548,7 +556,7 @@ shared (deployer) persistent actor class Rewards() = this {
         let tokens = Array.map<Allocation, Principal>(allocations, func(allocation) { allocation.token });
         
         // Get prices for all tokens at once
-        let batchPriceResult = await priceArchive.getPricesAtTime(tokens, timestamp);
+        let batchPriceResult = await (with timeout = 65)  priceArchive.getPricesAtTime(tokens, timestamp);
         let tokenPrices = switch (batchPriceResult) {
           case (#ok(prices)) { prices };
           case (#err(_)) {
@@ -568,7 +576,7 @@ shared (deployer) persistent actor class Rewards() = this {
             case (?( _, ?pi)) { priceOpt := ?pi; };
             case _ {
               // Fallback 1: try to find closest price after timestamp
-              let futureRes = await priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+              let futureRes = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
               switch (futureRes) {
                 case (#ok(?futurePrice)) { priceOpt := ?futurePrice; };
                 case _ { priceOpt := null; };
@@ -629,7 +637,7 @@ shared (deployer) persistent actor class Rewards() = this {
         let allTokens = Buffer.toArray(allTokensBuffer);
         
         // Get prices for all tokens at once
-        let batchPriceResult = await priceArchive.getPricesAtTime(allTokens, timestamp);
+        let batchPriceResult = await (with timeout = 65)  priceArchive.getPricesAtTime(allTokens, timestamp);
         let tokenPrices = switch (batchPriceResult) {
           case (#ok(prices)) { prices };
           case (#err(_)) {
@@ -675,7 +683,7 @@ shared (deployer) persistent actor class Rewards() = this {
                 // Get new price for this token from batch result, with fallback to future
                 var priceInfoOpt : ?PriceInfo = findPrice(token);
                 if (priceInfoOpt == null) {
-                  let futureResStep1 = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                  let futureResStep1 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
                   switch (futureResStep1) {
                     case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
                     case _ {};
@@ -701,7 +709,7 @@ shared (deployer) persistent actor class Rewards() = this {
                 // using the price at this checkpoint to populate updatedPrices.
                 var priceInfoOpt2 : ?PriceInfo = findPrice(token);
                 if (priceInfoOpt2 == null) {
-                  let futureResNew = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                  let futureResNew = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
                   switch (futureResNew) {
                     case (#ok(?futurePrice)) { priceInfoOpt2 := ?futurePrice; };
                     case _ {};
@@ -743,7 +751,7 @@ shared (deployer) persistent actor class Rewards() = this {
           // Get price info for this token from batch result, with same fallback rules
           var priceInfoOpt : ?PriceInfo = findPrice(allocation.token);
           if (priceInfoOpt == null) {
-            let futureRes2 = await priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+            let futureRes2 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
             switch (futureRes2) {
               case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
               case _ {};
@@ -821,7 +829,7 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     // Get allocation data from the neuron allocation archive
-    let allocationResult = await neuronAllocationArchive.getNeuronAllocationChangesWithContext(
+    let allocationResult = await (with timeout = 65)  neuronAllocationArchive.getNeuronAllocationChangesWithContext(
       neuronId, startTime, endTime, 100
     );
 
@@ -888,7 +896,7 @@ shared (deployer) persistent actor class Rewards() = this {
       let allTokens = Buffer.toArray(allTokensBuffer);
 
       // Get prices for all tokens at once
-      let batchPriceResult = await priceArchive.getPricesAtTime(allTokens, timestamp);
+      let batchPriceResult = await (with timeout = 65)  priceArchive.getPricesAtTime(allTokens, timestamp);
       let tokenPrices = switch (batchPriceResult) {
         case (#ok(prices)) { prices };
         case (#err(_)) {
@@ -931,7 +939,7 @@ shared (deployer) persistent actor class Rewards() = this {
             case (?oldPrice) {
               var priceInfoOpt : ?PriceInfo = findPrice(token);
               if (priceInfoOpt == null) {
-                let futureResStep1 = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                let futureResStep1 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
                 switch (futureResStep1) {
                   case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
                   case _ {};
@@ -952,7 +960,7 @@ shared (deployer) persistent actor class Rewards() = this {
             case null {
               var priceInfoOpt2 : ?PriceInfo = findPrice(token);
               if (priceInfoOpt2 == null) {
-                let futureResNew = await priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                let futureResNew = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
                 switch (futureResNew) {
                   case (#ok(?futurePrice)) { priceInfoOpt2 := ?futurePrice; };
                   case _ {};
@@ -990,7 +998,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
         var priceInfoOpt : ?PriceInfo = findPrice(allocation.token);
         if (priceInfoOpt == null) {
-          let futureRes2 = await priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+          let futureRes2 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
           switch (futureRes2) {
             case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
             case _ {};
@@ -1126,10 +1134,12 @@ shared (deployer) persistent actor class Rewards() = this {
     null
   };
 
-  // Recompute ICP performance using derived prices (USD price / ICP USD rate)
-  // This fixes incorrect stored icpPrice values by deriving them from correct USD prices
+  // Recompute ICP performance from USD performance and ICP/USD exchange rates
+  // Formula: ICP_performance = USD_performance × (start_icp_usd / end_icp_usd)
+  // This is simpler and more reliable than recalculating from individual token prices
   private func recomputePerformanceFromCheckpointsDerived(
-    checkpoints: [CheckpointData]
+    checkpoints: [CheckpointData],
+    usdPerformance: Float  // The already-correct USD performance score
   ) : ?Float {
     if (checkpoints.size() < 2) return null;
 
@@ -1154,44 +1164,10 @@ shared (deployer) persistent actor class Rewards() = this {
       case null { return null };
     };
 
-    // Calculate initial portfolio value in ICP terms
-    var initialValue : Float = 0.0;
-    for (allocation in firstCheckpoint.allocations.vals()) {
-      let priceOpt = Array.find<(Principal, PriceInfo)>(
-        firstCheckpoint.pricesUsed,
-        func ((t, _)) { Principal.equal(t, allocation.token) }
-      );
-      switch (priceOpt) {
-        case (?(_, priceInfo)) {
-          // Derive ICP price: token_usd_price / icp_usd_price
-          let derivedIcpPrice = priceInfo.usdPrice / firstIcpUsd;
-          let allocationPercent = Float.fromInt(allocation.basisPoints) / 10000.0;
-          initialValue += allocationPercent * derivedIcpPrice;
-        };
-        case null {};
-      };
-    };
-
-    // Calculate final portfolio value in ICP terms
-    var finalValue : Float = 0.0;
-    for (allocation in lastCheckpoint.allocations.vals()) {
-      let priceOpt = Array.find<(Principal, PriceInfo)>(
-        lastCheckpoint.pricesUsed,
-        func ((t, _)) { Principal.equal(t, allocation.token) }
-      );
-      switch (priceOpt) {
-        case (?(_, priceInfo)) {
-          let derivedIcpPrice = priceInfo.usdPrice / lastIcpUsd;
-          let allocationPercent = Float.fromInt(allocation.basisPoints) / 10000.0;
-          finalValue += allocationPercent * derivedIcpPrice;
-        };
-        case null {};
-      };
-    };
-
-    if (initialValue <= 0.0) return null;
-
-    ?(finalValue / initialValue)
+    // ICP performance = USD performance × (start_icp_usd / end_icp_usd)
+    // If ICP got cheaper, your ICP performance is better than USD performance
+    // If ICP got more expensive, your ICP performance is worse
+    ?(usdPerformance * (firstIcpUsd / lastIcpUsd))
   };
 
   // Calculate portfolio value given allocations and prices
@@ -1235,7 +1211,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
     let now = Time.now();
     let nextRunTime = now + distributionPeriodNS;
-    await startDistributionTimerAt(nextRunTime)
+    await (with timeout = 65)  startDistributionTimerAt(nextRunTime)
   };
 
   // Start distribution timer with a specific target datetime
@@ -1404,7 +1380,7 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     // Validate that we have enough available balance for the distribution
-    let availableBalance = await getAvailableBalance();
+    let availableBalance = await (with timeout = 65)  getAvailableBalance();
     let rewardPotSatoshis = tacoTokensToSatoshis(periodicRewardPot);
     
     if (availableBalance < rewardPotSatoshis) {
@@ -1422,7 +1398,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Get all neurons from DAO
     try {
-      let neuronsResult = await daoCanister.admin_getNeuronAllocations();
+      let neuronsResult = await (with timeout = 65)  daoCanister.admin_getNeuronAllocations();
       let allNeurons = neuronsResult;
       
       logger.info("Distribution", "Found " # Nat.toText(allNeurons.size()) # " total neurons", "runPeriodicDistribution");
@@ -1535,7 +1511,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
     try {
       // Calculate performance for this neuron
-      let performanceResult = await calculateNeuronPerformance(
+      let performanceResult = await (with timeout = 65)  calculateNeuronPerformance(
         neuronId,
         startTime,
         endTime,
@@ -1958,7 +1934,7 @@ shared (deployer) persistent actor class Rewards() = this {
       // Key: timestamp, Value: Map of token -> price
       let periodPriceCache = Map.new<Int, [(Principal, ?PriceInfo)]>();
 
-      // Use parallel bulk queries - issue 10 queries at once, then await all
+      // Use parallel bulk queries - issue 10 queries at once, then await (with timeout = 65)  all
       let PARALLEL_QUERIES : Nat = 10;
       let MAX_RETRIES : Nat = 3;
       var offset : Nat = 0;
@@ -1979,13 +1955,13 @@ shared (deployer) persistent actor class Rewards() = this {
         for (i in Iter.range(0, PARALLEL_QUERIES - 1)) {
           let queryOffset = offset + (i * NEURONS_PER_BATCH);
           futures.add(
-            neuronAllocationArchive.getAllNeuronsAllocationChangesInTimeRange(
+            (with timeout = 65) neuronAllocationArchive.getAllNeuronsAllocationChangesInTimeRange(
               periodStart, periodEnd, queryOffset, NEURONS_PER_BATCH
             )
           );
         };
 
-        // Await all parallel queries
+        // await (with timeout = 65)  all parallel queries
         var anyHasMore = false;
         var queryIndex = 0;
         var failedQueries : Nat = 0;
@@ -2067,19 +2043,19 @@ shared (deployer) persistent actor class Rewards() = this {
                   let neuron = neuronsArray[idx];
                   batchNeurons.add(neuron);
                   perfFutures.add(
-                    calculatePerformanceFromAllocationData(
+                    (with timeout = 65) calculatePerformanceFromAllocationData(
                       neuron.neuronId, periodStart, periodEnd, #USD, neuron.allocationData, neuron.startAllocation, ?periodPriceCache
                     )
                   );
                   idx += 1;
                 };
 
-                // Await all futures in this batch
+                // await (with timeout = 65)  all futures in this batch
                 var futureIdx : Nat = 0;
                 for (future in perfFutures.vals()) {
                   let neuron = Buffer.toArray(batchNeurons)[futureIdx];
                   try {
-                    let performanceResult = await future;
+                    let performanceResult = await  future;
 
                     switch (performanceResult) {
                       case (#ok(performance)) {
@@ -2267,8 +2243,8 @@ shared (deployer) persistent actor class Rewards() = this {
     let (initialTimestamp, initialAllocations, initialMaker) = timeline[0];
     let initialPrices = try {
       switch (priceCache) {
-        case (?cache) { await getPricesForAllocationsCached(initialAllocations, initialTimestamp, cache) };
-        case null { await getPricesForAllocations(initialAllocations, initialTimestamp) };
+        case (?cache) { await (with timeout = 65)  getPricesForAllocationsCached(initialAllocations, initialTimestamp, cache) };
+        case null { await (with timeout = 65)  getPricesForAllocations(initialAllocations, initialTimestamp) };
       }
     } catch (e) {
       return #err(#SystemError("Failed to get initial prices for start checkpoint: " # Error.message(e)));
@@ -2318,8 +2294,8 @@ shared (deployer) persistent actor class Rewards() = this {
       // Get prices at start and end of segment (use cache if provided)
       let startPrices = try {
         switch (priceCache) {
-          case (?cache) { await getPricesForAllocationsCached(allocations, segmentStart, cache) };
-          case null { await getPricesForAllocations(allocations, segmentStart) };
+          case (?cache) { await (with timeout = 65)  getPricesForAllocationsCached(allocations, segmentStart, cache) };
+          case null { await (with timeout = 65)  getPricesForAllocations(allocations, segmentStart) };
         }
       } catch (e) {
         return #err(#SystemError("Failed to get start prices: " # Error.message(e)));
@@ -2327,8 +2303,8 @@ shared (deployer) persistent actor class Rewards() = this {
 
       let endPrices = try {
         switch (priceCache) {
-          case (?cache) { await getPricesForAllocationsCached(allocations, segmentEnd, cache) };
-          case null { await getPricesForAllocations(allocations, segmentEnd) };
+          case (?cache) { await (with timeout = 65)  getPricesForAllocationsCached(allocations, segmentEnd, cache) };
+          case null { await (with timeout = 65)  getPricesForAllocations(allocations, segmentEnd) };
         }
       } catch (e) {
         return #err(#SystemError("Failed to get end prices: " # Error.message(e)));
@@ -2435,7 +2411,7 @@ shared (deployer) persistent actor class Rewards() = this {
   // Helper to get prices for a set of allocations at a given time
   private func getPricesForAllocations(allocations: [Allocation], timestamp: Int) : async [(Principal, ?PriceInfo)] {
     let tokens = Array.map<Allocation, Principal>(allocations, func(a) { a.token });
-    let pricesResult = await priceArchive.getPricesAtTime(tokens, timestamp);
+    let pricesResult = await (with timeout = 65)  priceArchive.getPricesAtTime(tokens, timestamp);
     switch (pricesResult) {
       case (#ok(prices)) { prices };
       case (#err(_)) { [] };
@@ -2460,7 +2436,7 @@ shared (deployer) persistent actor class Rewards() = this {
             case (?price) { filteredPrices.add(price) };
             case null {
               // Token not in cache, need to fetch it
-              let newPrices = await getPricesForAllocations(allocations, timestamp);
+              let newPrices = await (with timeout = 65)  getPricesForAllocations(allocations, timestamp);
               // Update cache with all fetched tokens
               Map.set(cache, Map.ihash, timestamp, newPrices);
               return newPrices;
@@ -2471,7 +2447,7 @@ shared (deployer) persistent actor class Rewards() = this {
       };
       case null {
         // Not in cache, fetch and store
-        let prices = await getPricesForAllocations(allocations, timestamp);
+        let prices = await (with timeout = 65)  getPricesForAllocations(allocations, timestamp);
         Map.set(cache, Map.ihash, timestamp, prices);
         prices
       };
@@ -2515,7 +2491,7 @@ shared (deployer) persistent actor class Rewards() = this {
     };
     
     try {
-      await tacoLedger.icrc1_balance_of(account)
+      await (with timeout = 65)  tacoLedger.icrc1_balance_of(account)
     } catch (error) {
       logger.error("TacoBalance", "Failed to get TACO balance: " # Error.message(error), "getTacoBalance");
       0 // Return 0 on error
@@ -3041,6 +3017,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // Restore timer after canister upgrade
   system func postupgrade() {
+    leaderboardSize:=50;
     // Restore timer if we have a scheduled time
     switch (nextScheduledDistributionTime) {
       case (?scheduledTime) {
@@ -3193,17 +3170,23 @@ shared (deployer) persistent actor class Rewards() = this {
 
     logger.info("Leaderboard", "Starting leaderboard computation for all 8 timeframe/price combinations", "computeAllLeaderboards");
 
-    // 1. Fetch neuron ownership data from DAO
-    let neuronOwners = try {
-      await daoCanister.getAllNeuronOwners()
+    // 1. Fetch active decision makers from DAO (makers + followers, excludes passive hotkeys)
+    // Falls back to getAllNeuronOwners if getActiveDecisionMakers is not available
+    let activeDecisionMakers = try {
+      await (with timeout = 65) daoCanister.getActiveDecisionMakers()
     } catch (e) {
-      logger.error("Leaderboard", "Failed to fetch neuron owners from DAO: " # Error.message(e), "computeAllLeaderboards");
-      return; // Skip leaderboard update if we can't get ownership data
+      logger.warn("Leaderboard", "getActiveDecisionMakers failed, falling back to getAllNeuronOwners: " # Error.message(e), "computeAllLeaderboards");
+      try {
+        await (with timeout = 65) daoCanister.getAllNeuronOwners()
+      } catch (e2) {
+        logger.error("Leaderboard", "Failed to fetch neuron owners from DAO: " # Error.message(e2), "computeAllLeaderboards");
+        return;
+      }
     };
 
-    // Build a map of neuronId -> principals
+    // Build a map of neuronId -> principals (only active decision makers)
     let neuronToPrincipals = Map.new<Blob, [Principal]>();
-    for ((neuronId, principals) in neuronOwners.vals()) {
+    for ((neuronId, principals) in activeDecisionMakers.vals()) {
       Map.set(neuronToPrincipals, bhash, neuronId, principals);
     };
 
@@ -3305,12 +3288,12 @@ shared (deployer) persistent actor class Rewards() = this {
             } else { 1.0 }
           };
           case (#OneMonth) {
-            // Average of last ~4 periods
-            calculateAverage(perf.performanceScores)
+            // Compound return of last ~4 periods
+            calculateCompoundReturn(perf.performanceScores)
           };
           case (#OneYear) {
-            // Average of all periods (up to 52)
-            calculateAverage(perf.performanceScores)
+            // Compound return of all periods (up to 52)
+            calculateCompoundReturn(perf.performanceScores)
           };
           case (#AllTime) {
             // Compound return: multiply all performance scores
@@ -3527,7 +3510,9 @@ shared (deployer) persistent actor class Rewards() = this {
   public composite query func getUserPerformanceGraphData(
     userPrincipal: Principal, // User to get graph data for
     startTime: Int,           // Start of time range (nanoseconds)
-    endTime: Int              // End of time range (nanoseconds)
+    endTime: Int,             // End of time range (nanoseconds)
+    timeframe: LeaderboardTimeframe, // Which timeframe to optimize best neuron selection for
+    priceType: PriceType      // Which price type to optimize best neuron selection for
   ) : async Result.Result<UserPerformanceGraphData, RewardsError> {
     if (startTime >= endTime) {
       return #err(#InvalidTimeRange);
@@ -3535,7 +3520,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Step 1: Get user's neurons from DAO (composite query call)
     let neuronOwners = try {
-      await daoCanister.getAllNeuronOwners()
+      await (with timeout = 65)  daoCanister.getAllNeuronOwners()
     } catch (e) {
       return #err(#SystemError("Failed to query DAO: " # Error.message(e)));
     };
@@ -3604,12 +3589,21 @@ shared (deployer) persistent actor class Rewards() = this {
           for (i in Iter.range(0, neuronDataMap.size() - 1)) {
             let entry = neuronDataMap.get(i);
             if (entry.neuronId == reward.neuronId) {
-              // Add checkpoints
+              // Scale checkpoints so totalPortfolioValue is cumulative across distributions
+              // entry.performanceUSD is the compounded score from all PRIOR distributions
+              let priorPerformance = entry.performanceUSD;
               for (checkpoint in reward.checkpoints.vals()) {
-                entry.checkpoints.add(checkpoint);
+                entry.checkpoints.add({
+                  timestamp = checkpoint.timestamp;
+                  allocations = checkpoint.allocations;
+                  tokenValues = checkpoint.tokenValues;
+                  totalPortfolioValue = priorPerformance * checkpoint.totalPortfolioValue;
+                  pricesUsed = checkpoint.pricesUsed;
+                  maker = checkpoint.maker;
+                });
               };
 
-              // Compound performance scores
+              // Compound performance scores (AFTER using priorPerformance for scaling)
               let newPerfUSD = entry.performanceUSD * reward.performanceScore;
               var newPerfICP = entry.performanceICP;
               var newHasIcp = entry.hasIcpScore;
@@ -3636,34 +3630,104 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     };
 
-    // Build the result
+    // Build the result - select the best neuron matching leaderboard logic
+    // The leaderboard picks best neuron per (timeframe, priceType), so we do the same
     let resultNeurons = Buffer.Buffer<{
       neuronId: Blob;
       checkpoints: [CheckpointData];
       performanceScoreUSD: Float;
       performanceScoreICP: ?Float;
-    }>(neuronDataMap.size());
+    }>(1);
 
-    var aggregatedUSD : Float = 1.0;
-    var aggregatedICP : Float = 1.0;
-    var anyIcpScore = false;
     var foundAny = false;
+    let distCount = Vector.size(distributionHistory);
 
-    for (entry in neuronDataMap.vals()) {
+    // For each neuron, compute its score for the requested (timeframe, priceType)
+    // This matches exactly how computeLeaderboardFor works
+    type NeuronScore = {
+      neuronIdx: Nat;
+      selectionScore: Float;   // Score for the requested (timeframe, priceType) - used to pick best neuron
+      // All timeframe scores for the best neuron
+      oneWeekUSD: ?Float;
+      oneWeekICP: ?Float;
+      oneMonthUSD: ?Float;
+      oneMonthICP: ?Float;
+      oneYearUSD: ?Float;
+      oneYearICP: ?Float;
+    };
+
+    var bestScore : Float = -999999.0;
+    var bestNeuronScore : ?NeuronScore = null;
+
+    for (i in Iter.range(0, neuronDataMap.size() - 1)) {
+      let entry = neuronDataMap.get(i);
       if (entry.found) {
         foundAny := true;
-        resultNeurons.add({
-          neuronId = entry.neuronId;
-          checkpoints = Buffer.toArray(entry.checkpoints);
-          performanceScoreUSD = entry.performanceUSD;
-          performanceScoreICP = if (entry.hasIcpScore) ?entry.performanceICP else null;
-        });
 
-        // Aggregate by compounding (geometric mean would be better but compound is simpler)
-        aggregatedUSD *= entry.performanceUSD;
-        if (entry.hasIcpScore) {
-          aggregatedICP *= entry.performanceICP;
-          anyIcpScore := true;
+        // Collect per-distribution scores for this neuron
+        var weekScoresUSD = Buffer.Buffer<Float>(1);
+        var weekScoresICP = Buffer.Buffer<Float>(1);
+        var monthScoresUSD = Buffer.Buffer<Float>(4);
+        var monthScoresICP = Buffer.Buffer<Float>(4);
+        var yearScoresUSD = Buffer.Buffer<Float>(52);
+        var yearScoresICP = Buffer.Buffer<Float>(52);
+        var allTimeScoresUSD = Buffer.Buffer<Float>(100);
+        var allTimeScoresICP = Buffer.Buffer<Float>(100);
+
+        for (di in Iter.range(0, distCount - 1)) {
+          let dist = Vector.get(distributionHistory, di);
+          for (reward in dist.neuronRewards.vals()) {
+            if (reward.neuronId == entry.neuronId) {
+              let distIdx : Nat = distCount - 1 - di; // 0 = newest
+              let usdScore = reward.performanceScore;
+              let icpScoreVal = switch (reward.performanceScoreICP) {
+                case (?s) { s };
+                case null { reward.performanceScore }; // Fallback to USD
+              };
+
+              if (distIdx == 0) { weekScoresUSD.add(usdScore); weekScoresICP.add(icpScoreVal); };
+              if (distIdx < 4) { monthScoresUSD.add(usdScore); monthScoresICP.add(icpScoreVal); };
+              if (distIdx < 52) { yearScoresUSD.add(usdScore); yearScoresICP.add(icpScoreVal); };
+              allTimeScoresUSD.add(usdScore);
+              allTimeScoresICP.add(icpScoreVal);
+            };
+          };
+        };
+
+        // Compute all timeframe scores
+        let owUSD = if (weekScoresUSD.size() > 0) ?weekScoresUSD.get(0) else null;
+        let owICP = if (weekScoresICP.size() > 0) ?weekScoresICP.get(0) else null;
+        let omUSD = if (monthScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(monthScoresUSD)) else null;
+        let omICP = if (monthScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(monthScoresICP)) else null;
+        let oyUSD = if (yearScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(yearScoresUSD)) else null;
+        let oyICP = if (yearScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(yearScoresICP)) else null;
+        let oaUSD = if (allTimeScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresUSD)) else null;
+        let oaICP = if (allTimeScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresICP)) else null;
+
+        // Determine the selection score based on requested (timeframe, priceType)
+        let selScore : Float = switch (timeframe, priceType) {
+          case (#OneWeek, #USD) { switch (owUSD) { case (?v) v; case null 0.0 } };
+          case (#OneWeek, #ICP) { switch (owICP) { case (?v) v; case null 0.0 } };
+          case (#OneMonth, #USD) { switch (omUSD) { case (?v) v; case null 0.0 } };
+          case (#OneMonth, #ICP) { switch (omICP) { case (?v) v; case null 0.0 } };
+          case (#OneYear, #USD) { switch (oyUSD) { case (?v) v; case null 0.0 } };
+          case (#OneYear, #ICP) { switch (oyICP) { case (?v) v; case null 0.0 } };
+          case (#AllTime, #USD) { switch (oaUSD) { case (?v) v; case null 0.0 } };
+          case (#AllTime, #ICP) { switch (oaICP) { case (?v) v; case null 0.0 } };
+        };
+
+        if (selScore > bestScore) {
+          bestScore := selScore;
+          bestNeuronScore := ?{
+            neuronIdx = i;
+            selectionScore = selScore;
+            oneWeekUSD = owUSD;
+            oneWeekICP = owICP;
+            oneMonthUSD = omUSD;
+            oneMonthICP = omICP;
+            oneYearUSD = oyUSD;
+            oneYearICP = oyICP;
+          };
         };
       };
     };
@@ -3672,11 +3736,48 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#NeuronNotFound);
     };
 
+    // Build result with the best neuron for the requested (timeframe, priceType)
+    var bestOneWeekUSD : ?Float = null;
+    var bestOneWeekICP : ?Float = null;
+    var bestOneMonthUSD : ?Float = null;
+    var bestOneMonthICP : ?Float = null;
+    var bestOneYearUSD : ?Float = null;
+    var bestOneYearICP : ?Float = null;
+    var aggregatedUSD : Float = 0.0;
+    var aggregatedICP : ?Float = null;
+
+    switch (bestNeuronScore) {
+      case (?bns) {
+        let best = neuronDataMap.get(bns.neuronIdx);
+        resultNeurons.add({
+          neuronId = best.neuronId;
+          checkpoints = Buffer.toArray(best.checkpoints);
+          performanceScoreUSD = best.performanceUSD;
+          performanceScoreICP = if (best.hasIcpScore) ?best.performanceICP else null;
+        });
+        aggregatedUSD := best.performanceUSD;
+        aggregatedICP := if (best.hasIcpScore) ?best.performanceICP else null;
+        bestOneWeekUSD := bns.oneWeekUSD;
+        bestOneWeekICP := bns.oneWeekICP;
+        bestOneMonthUSD := bns.oneMonthUSD;
+        bestOneMonthICP := bns.oneMonthICP;
+        bestOneYearUSD := bns.oneYearUSD;
+        bestOneYearICP := bns.oneYearICP;
+      };
+      case null {};
+    };
+
     #ok({
       timeframe = { startTime = actualStartTime; endTime = actualEndTime };
       neuronData = Buffer.toArray(resultNeurons);
       aggregatedPerformanceUSD = aggregatedUSD;
-      aggregatedPerformanceICP = if (anyIcpScore) ?aggregatedICP else null;
+      aggregatedPerformanceICP = aggregatedICP;
+      oneWeekUSD = bestOneWeekUSD;
+      oneWeekICP = bestOneWeekICP;
+      oneMonthUSD = bestOneMonthUSD;
+      oneMonthICP = bestOneMonthICP;
+      oneYearUSD = bestOneYearUSD;
+      oneYearICP = bestOneYearICP;
     })
   };
 
@@ -3685,7 +3786,7 @@ shared (deployer) persistent actor class Rewards() = this {
   public composite query func getUserPerformance(userPrincipal: Principal) : async Result.Result<UserPerformanceResult, RewardsError> {
     // Step 1: Get all neurons owned by this user from DAO (composite query call)
     let neuronOwners = try {
-      await daoCanister.getAllNeuronOwners()
+      await (with timeout = 65)  daoCanister.getAllNeuronOwners()
     } catch (e) {
       return #err(#SystemError("Failed to query DAO: " # Error.message(e)));
     };
@@ -3773,10 +3874,10 @@ shared (deployer) persistent actor class Rewards() = this {
           performance = {
             oneWeekUSD = if (oneWeekScoresUSD.size() > 0) ?oneWeekScoresUSD.get(0) else null;
             oneWeekICP = if (oneWeekScoresICP.size() > 0) ?oneWeekScoresICP.get(0) else null;
-            oneMonthUSD = if (oneMonthScoresUSD.size() > 0) ?calculateAverage(Buffer.toArray(oneMonthScoresUSD)) else null;
-            oneMonthICP = if (oneMonthScoresICP.size() > 0) ?calculateAverage(Buffer.toArray(oneMonthScoresICP)) else null;
-            oneYearUSD = if (oneYearScoresUSD.size() > 0) ?calculateAverage(Buffer.toArray(oneYearScoresUSD)) else null;
-            oneYearICP = if (oneYearScoresICP.size() > 0) ?calculateAverage(Buffer.toArray(oneYearScoresICP)) else null;
+            oneMonthUSD = if (oneMonthScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(oneMonthScoresUSD)) else null;
+            oneMonthICP = if (oneMonthScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(oneMonthScoresICP)) else null;
+            oneYearUSD = if (oneYearScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(oneYearScoresUSD)) else null;
+            oneYearICP = if (oneYearScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(oneYearScoresICP)) else null;
             allTimeUSD = if (allTimeScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresUSD)) else null;
             allTimeICP = if (allTimeScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresICP)) else null;
           };
@@ -3844,7 +3945,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // Recalculate ICP performance scores for all distributions using derived prices
   // This fixes incorrect stored icpPrice values by deriving them from correct USD prices
-  // Uses yield points (await async {}) to avoid instruction limit
+  // Uses yield points (await (with timeout = 65)  async {}) to avoid instruction limit
   public shared ({ caller }) func admin_recalculateAllIcpPerformance() : async Result.Result<Text, RewardsError> {
     if (not isAdmin(caller)) {
       return #err(#NotAuthorized);
@@ -3862,7 +3963,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
       for (neuronReward in existingRecord.neuronRewards.vals()) {
         // Recalculate ICP performance using derived prices
-        let newIcpScore = recomputePerformanceFromCheckpointsDerived(neuronReward.checkpoints);
+        let newIcpScore = recomputePerformanceFromCheckpointsDerived(neuronReward.checkpoints, neuronReward.performanceScore);
 
         // Create updated reward preserving all other fields
         let updatedReward : NeuronReward = {
@@ -3879,7 +3980,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
         // Yield every 50 neurons to avoid instruction limit
         if (neuronsProcessed % 50 == 0) {
-          await async {};
+          await (with timeout = 65)  async {};
         };
       };
 
@@ -3902,7 +4003,7 @@ shared (deployer) persistent actor class Rewards() = this {
       updatedCount += 1;
 
       // Also yield after each distribution
-      await async {};
+      await (with timeout = 65)  async {};
     };
 
     #ok("Recalculated ICP performance for " # Nat.toText(updatedCount) # " distributions (" # Nat.toText(neuronsProcessed) # " neurons)")
@@ -3935,7 +4036,7 @@ shared (deployer) persistent actor class Rewards() = this {
         var neuronsProcessed : Nat = 0;
 
         for (neuronReward in existingRecord.neuronRewards.vals()) {
-          let newIcpScore = recomputePerformanceFromCheckpointsDerived(neuronReward.checkpoints);
+          let newIcpScore = recomputePerformanceFromCheckpointsDerived(neuronReward.checkpoints, neuronReward.performanceScore);
 
           let updatedReward : NeuronReward = {
             neuronId = neuronReward.neuronId;
@@ -3951,7 +4052,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
           // Yield every 50 neurons
           if (neuronsProcessed % 50 == 0) {
-            await async {};
+            await (with timeout = 65)  async {};
           };
         };
 
@@ -3998,7 +4099,7 @@ shared (deployer) persistent actor class Rewards() = this {
       };
 
       // Fetch caller's neurons from SNS governance
-      let neuronsResult = await snsGov.list_neurons({
+      let neuronsResult = await (with timeout = 65)  snsGov.list_neurons({
         of_principal = ?caller;
         limit = 1000; // Should be enough for most users
         start_page_at = null;
@@ -4091,7 +4192,7 @@ shared (deployer) persistent actor class Rewards() = this {
         created_at_time = ?Nat64.fromNat(Int.abs(Time.now()));
       };
 
-      let transferResult = await tacoLedger.icrc1_transfer(transferArgs);
+      let transferResult = await (with timeout = 65)  tacoLedger.icrc1_transfer(transferArgs);
       
       switch (transferResult) {
         case (#Ok(transactionId)) {
@@ -4155,8 +4256,8 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // Get available balance for distribution (canister balance minus current neuron balances)
   public func getAvailableBalance() : async Nat {
-    let canisterBalance = await getTacoBalance();
-    let currentNeuronBalances = await getCurrentTotalNeuronBalances();
+    let canisterBalance = await (with timeout = 65)  getTacoBalance();
+    let currentNeuronBalances = await (with timeout = 65)  getCurrentTotalNeuronBalances();
     
     if (canisterBalance >= currentNeuronBalances) {
       canisterBalance - currentNeuronBalances
