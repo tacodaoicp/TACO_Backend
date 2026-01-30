@@ -321,6 +321,7 @@ module {
   public type NeuronReward = {
     neuronId: Blob;
     performanceScore: Float;
+    performanceScoreICP: ?Float;
     votingPower: Nat;
     rewardScore: Float;
     rewardAmount: Nat; // Reward amount in TACO satoshis (integer)
@@ -346,6 +347,7 @@ module {
     totalPortfolioValue: Float; // Sum of all token values
     pricesUsed: [(Principal, PriceInfo)]; // Prices used for this calculation
     maker: ?Principal; // The principal responsible for the allocation at this checkpoint
+    reason: ?Text; // The note/reason for this allocation change
   };
 
   public type PriceInfo = {
@@ -1086,6 +1088,7 @@ module {
     #Map([
       ("neuronId", #Blob(reward.neuronId)),
       ("performanceScore", floatToValue(reward.performanceScore)),
+      ("performanceScoreICP", switch (reward.performanceScoreICP) { case (?v) { floatToValue(v) }; case null { #Text("") }; }),
       ("votingPower", #Nat(reward.votingPower)),
       ("rewardScore", floatToValue(reward.rewardScore)),
       ("rewardAmount", #Nat(reward.rewardAmount)),
@@ -1142,7 +1145,8 @@ module {
       ("tokenValues", #Array(Array.map(checkpoint.tokenValues, tokenValueToValue))),
       ("totalPortfolioValue", floatToValue(checkpoint.totalPortfolioValue)),
       ("pricesUsed", #Array(Array.map(checkpoint.pricesUsed, priceInfoEntryToValue))),
-      ("maker", switch (checkpoint.maker) { case (?p) { principalToValue(p) }; case null { #Text("") }; })
+      ("maker", switch (checkpoint.maker) { case (?p) { principalToValue(p) }; case null { #Text("") }; }),
+      ("reason", switch (checkpoint.reason) { case (?r) { #Text(r) }; case null { #Text("") }; })
     ]);
   };
 

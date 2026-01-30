@@ -30,7 +30,7 @@ shared (deployer) persistent actor class RewardDistributionArchive() = this {
 
   // ICRC3 State Management for Scalable Storage (500GB)
   private stable var icrc3State : ?ICRC3.State = null;
-  private var icrc3StateRef = { var value = icrc3State };
+  private transient var icrc3StateRef = { var value = icrc3State };
 
   // Initialize the generic base class with reward distribution-specific configuration
   private let initialConfig : ArchiveTypes.ArchiveConfig = {
@@ -40,7 +40,7 @@ shared (deployer) persistent actor class RewardDistributionArchive() = this {
     autoArchiveEnabled = true;
   };
 
-  private let base = ArchiveBase.ArchiveBase<RewardDistributionBlockData>(
+  private transient let base = ArchiveBase.ArchiveBase<RewardDistributionBlockData>(
     this_canister_id(),
     ["3reward_distribution"],
     initialConfig,
@@ -60,7 +60,7 @@ shared (deployer) persistent actor class RewardDistributionArchive() = this {
   private stable var lastImportedDistributionTimestamp : Int = 0;
 
   // Rewards canister interface for batch imports
-  let canister_ids = CanisterIds.CanisterIds(this_canister_id());
+  transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   private let REWARDS_ID = canister_ids.getCanisterId(#rewards);
 
   // Define the rewards canister interface
@@ -88,6 +88,7 @@ shared (deployer) persistent actor class RewardDistributionArchive() = this {
   type NeuronReward = {
     neuronId: Blob;
     performanceScore: Float;
+    performanceScoreICP: ?Float;
     votingPower: Nat;
     rewardScore: Float;
     rewardAmount: Nat;
@@ -113,6 +114,7 @@ shared (deployer) persistent actor class RewardDistributionArchive() = this {
     totalPortfolioValue: Float;
     pricesUsed: [(Principal, PriceInfo)];
     maker: ?Principal;
+    reason: ?Text;
   };
 
   type Allocation = {

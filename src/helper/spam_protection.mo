@@ -36,6 +36,7 @@ module {
     #stopRebalancing;
     #recoverPoolBalances;
     #backfillPerformanceData;
+    #manageBannedWords;
   };
 
   public type AdminPermission = {

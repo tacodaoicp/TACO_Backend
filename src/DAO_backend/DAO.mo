@@ -28,9 +28,10 @@ import CanisterIds "../helper/CanisterIds";
 import Buffer "mo:base/Buffer";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
-//import Migration "./migration";
+import Char "mo:base/Char";
+import Migration "./migration";
 
-//(with migration = Migration.migrate)
+(with migration = Migration.migrate)
 
 shared (deployer) persistent actor class ContinuousDAO() = this {
 
@@ -101,6 +102,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   stable var ALLOCATION_WINDOW = 86_400_000_000_000; // 24 hours in nanoseconds
   stable var MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY = 10;
   stable var MAX_NEURON_ALLOCATION_CHANGES = 10000; // Configurable circular buffer size
+  stable var bannedWords : [Text] = [];
 
   stable var sns_governance_canister_id : ?Principal = ?Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
 
@@ -822,7 +824,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   // Updates user's token allocation strategy. Validates total basis points = 10000.
   // Updates aggregate allocation and triggers updates for all followers.
   // Worst-case cost when 1000 max updates: 110 million cycles
-  public shared ({ caller }) func updateAllocation(newAllocations : [Allocation]) : async Result.Result<Text, UpdateError> {
+  public shared ({ caller }) func updateAllocation(newAllocations : [Allocation], note : ?Text) : async Result.Result<Text, UpdateError> {
     if (not isAllowed(caller)) {
       return #err(#NotAllowed);
     };
@@ -865,6 +867,29 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       if (not validateAllocations(newAllocations)) {
         return #err(#InvalidAllocation);
       };
+    };
+
+    // Validate note if provided
+    let validatedNote : ?Text = switch (note) {
+      case (?n) {
+        let trimmed = Text.trimStart(Text.trimEnd(n, #char ' '), #char ' ');
+        if (trimmed.size() == 0) {
+          null;
+        } else {
+          if (trimmed.size() > 150) {
+            return #err(#UnexpectedError("Note must be at most 150 characters"));
+          };
+          let normalized = normalizeForBannedCheck(trimmed);
+          switch (containsBannedWord(normalized)) {
+            case (?_word) {
+              return #err(#UnexpectedError("Note contains a prohibited word"));
+            };
+            case null {};
+          };
+          ?trimmed;
+        };
+      };
+      case null { null };
     };
 
     let timenow = Time.now();
@@ -1000,7 +1025,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
             newAllocations = newAllocations;
             votingPower = neuron.votingPower;
             maker = caller;
-            reason = null; // No reason for regular user updates
+            reason = if (principal == caller) { validatedNote } else { null };
             penaltyMultiplier = getPenaltyMultiplier(neuron.neuronId);
           };
           addNeuronAllocationChange(neuronAllocationChange);
@@ -1016,12 +1041,12 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
           pastAllocations = if (userState.lastAllocationUpdate == 0) {
             userState.pastAllocations;
           } else if (pastAllocationsSize < MAX_PAST_ALLOCATIONS) {
-            let a = Vector.fromArray<{ from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal }>(userState.pastAllocations);
-            Vector.add(a, { from = userState.lastAllocationUpdate; to = timenow; allocation = userState.allocations; allocationMaker = userState.lastAllocationMaker });
+            let a = Vector.fromArray<{ from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal; note : ?Text }>(userState.pastAllocations);
+            Vector.add(a, { from = userState.lastAllocationUpdate; to = timenow; allocation = userState.allocations; allocationMaker = userState.lastAllocationMaker; note = if (principal == caller) { validatedNote } else { null } });
             Vector.toArray(a);
           } else {
-            let a = Vector.fromArray<{ from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal }>(userState.pastAllocations);
-            Vector.add(a, { from = userState.lastAllocationUpdate; to = timenow; allocation = userState.allocations; allocationMaker = userState.lastAllocationMaker });
+            let a = Vector.fromArray<{ from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal; note : ?Text }>(userState.pastAllocations);
+            Vector.add(a, { from = userState.lastAllocationUpdate; to = timenow; allocation = userState.allocations; allocationMaker = userState.lastAllocationMaker; note = if (principal == caller) { validatedNote } else { null } });
             Vector.reverse(a);
             ignore Vector.removeLast(a);
             Vector.reverse(a);
@@ -1208,7 +1233,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
     let newFollowUnfollowActions = Vector.fromArray<Int>(Array.filter<Int>(userStateCaller.followUnfollowActions, func(f) { f > timenow - 86400000000000 }));
 
-    if (userStateCaller.followUnfollowActions.size() >= MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY) {
+    if (Vector.size(newFollowUnfollowActions) >= MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY) {
       return #err(#FollowUnfollowLimitReached);
     };
     Vector.add(newFollowUnfollowActions, timenow);
@@ -1297,7 +1322,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     let timenow = Time.now();
     let newFollowUnfollowActions = Vector.fromArray<Int>(Array.filter<Int>(userStateCaller.followUnfollowActions, func(f) { f > timenow - 86400000000000 }));
 
-    if (userStateCaller.followUnfollowActions.size() >= MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY) {
+    if (Vector.size(newFollowUnfollowActions) >= MAX_FOLLOW_UNFOLLOW_ACTIONS_PER_DAY) {
       return #err(#FollowUnfollowLimitReached);
     };
     Vector.add(newFollowUnfollowActions, timenow);
@@ -2143,54 +2168,43 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     Iter.toArray(Map.entries(neuronOwners))
   };
 
-  // Returns mapping of neuronId -> [Principal] where principals are "active decision makers"
-  // Active = lastAllocationMaker for that neuron, OR follows someone, OR has ever directly made an allocation
-  // This excludes passive hotkeys who share a neuron but never made any decisions
+  // Returns mapping of neuronId -> [Principal] where each neuron has exactly 1 owner.
+  // Owner = the active principal whose userState.neurons contains the neuron.
+  // Active = lastAllocationUpdate > 0 (has ever had an allocation set).
+  // Passive hotkeys (never allocated) are excluded.
+  // If multiple active principals share a neuron (hotkey transfer between snapshots),
+  // the one with the most recent lastVotingPowerUpdate wins.
   public query func getActiveDecisionMakers() : async [(Blob, [Principal])] {
-    let neuronToActiveUsers = Map.new<Blob, [Principal]>();
+    let neuronOwner = Map.new<Blob, (Principal, Int)>(); // (owner, lastVotingPowerUpdate)
 
-    // Step 1: Get all current makers from neuronAllocationMap
-    // Each neuron has exactly one lastAllocationMaker (the strategy maker)
-    for ((neuronId, neuronAlloc) in Map.entries(neuronAllocationMap)) {
-      Map.set(neuronToActiveUsers, bhash, neuronId, [neuronAlloc.lastAllocationMaker]);
-    };
+    label userLoop for ((principal, userState) in Map.entries(userStates)) {
+      // Active = has ever had an allocation set (directly or via follow)
+      // Passive hotkeys who never allocated have lastAllocationUpdate == 0
+      if (userState.lastAllocationUpdate == 0) {
+        continue userLoop;
+      };
 
-    // Step 2: Add other active principals who own neurons
-    // A principal is "active" if they:
-    //   a) Currently follow someone (allocationFollows.size() > 0), OR
-    //   b) Have ever directly made an allocation (pastAllocations contains an entry where allocationMaker == self)
-    // This handles the case where someone followed then unfollowed - they still have past direct allocations
-    for ((principal, userState) in Map.entries(userStates)) {
-      let isFollowing = userState.allocationFollows.size() > 0;
-
-      // Check if user has ever made a direct allocation (not via following)
-      let hasEverDirectlyAllocated = Array.find<{ from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal }>(
-        userState.pastAllocations,
-        func(pa) { Principal.equal(pa.allocationMaker, principal) }
-      ) != null;
-
-      if (isFollowing or hasEverDirectlyAllocated) {
-        // This user is an active decision maker - add them for all their neurons
-        for (neuron in userState.neurons.vals()) {
-          switch (Map.get(neuronToActiveUsers, bhash, neuron.neuronId)) {
-            case (?existingPrincipals) {
-              let alreadyExists = Array.find<Principal>(existingPrincipals, func(p) { Principal.equal(p, principal) });
-              switch (alreadyExists) {
-                case (?_) { }; // Already in list
-                case null {
-                  Map.set(neuronToActiveUsers, bhash, neuron.neuronId, Array.append(existingPrincipals, [principal]));
-                };
-              };
+      for (neuron in userState.neurons.vals()) {
+        switch (Map.get(neuronOwner, bhash, neuron.neuronId)) {
+          case (?(existingOwner, existingVPUpdate)) {
+            // Conflict: tiebreak by lastVotingPowerUpdate (newer wins)
+            // Handles hotkey transfer: new holder refreshes more recently
+            if (userState.lastVotingPowerUpdate > existingVPUpdate) {
+              Map.set(neuronOwner, bhash, neuron.neuronId, (principal, userState.lastVotingPowerUpdate));
             };
-            case null {
-              Map.set(neuronToActiveUsers, bhash, neuron.neuronId, [principal]);
-            };
+          };
+          case null {
+            Map.set(neuronOwner, bhash, neuron.neuronId, (principal, userState.lastVotingPowerUpdate));
           };
         };
       };
     };
 
-    Iter.toArray(Map.entries(neuronToActiveUsers))
+    let result = Buffer.Buffer<(Blob, [Principal])>(Map.size(neuronOwner));
+    for ((neuronId, (owner, _)) in Map.entries(neuronOwner)) {
+      result.add((neuronId, [owner]));
+    };
+    Buffer.toArray(result)
   };
 
   // Get all unique neuron IDs that have allocation history
@@ -2539,6 +2553,29 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
     total == BASIS_POINTS_TOTAL;
   };
+
+  // Normalize text for banned word checking: lowercase + strip non-alphanumeric
+  private func normalizeForBannedCheck(input: Text) : Text {
+    let lower = Text.toLowercase(input);
+    var result = "";
+    for (c in lower.chars()) {
+      if (Char.isAlphabetic(c) or Char.isDigit(c)) {
+        result := result # Char.toText(c);
+      };
+    };
+    result
+  };
+
+  // Check if normalized input contains any banned word as a substring
+  private func containsBannedWord(normalizedInput: Text) : ?Text {
+    for (word in bannedWords.vals()) {
+      if (Text.contains(normalizedInput, #text word)) {
+        return ?word;
+      };
+    };
+    null
+  };
+
 
   // Getting basis points for each token based on total voting power. This is easier than precalculating the basis points for each token during the updateAllocation call.
   // This makes it also possible to easily handle tokens that are paused in future.
@@ -4499,5 +4536,51 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
   public query func get_canister_cycles() : async { cycles : Nat } {
     { cycles = Cycles.balance() };
-  };  
+  };
+
+  // Admin adds banned words (normalized: lowercase, alpha-only, deduplicated)
+  public shared ({ caller }) func addBannedWords(words: [Text]) : async Result.Result<Text, AuthorizationError> {
+    if (not isAdmin(caller, #manageBannedWords)) { return #err(#NotAdmin) };
+
+    let newWords = Buffer.Buffer<Text>(bannedWords.size() + words.size());
+    for (w in bannedWords.vals()) { newWords.add(w) };
+
+    var added : Nat = 0;
+    for (word in words.vals()) {
+      let normalized = normalizeForBannedCheck(word);
+      if (normalized.size() > 0) {
+        var exists = false;
+        for (existing in bannedWords.vals()) {
+          if (existing == normalized) { exists := true };
+        };
+        if (not exists) {
+          newWords.add(normalized);
+          added += 1;
+        };
+      };
+    };
+
+    bannedWords := Buffer.toArray(newWords);
+    #ok("Added " # Nat.toText(added) # " banned words. Total: " # Nat.toText(bannedWords.size()))
+  };
+
+  // Admin removes banned words
+  public shared ({ caller }) func removeBannedWords(words: [Text]) : async Result.Result<Text, AuthorizationError> {
+    if (not isAdmin(caller, #manageBannedWords)) { return #err(#NotAdmin) };
+
+    let normalizedToRemove = Array.map<Text, Text>(words, normalizeForBannedCheck);
+    bannedWords := Array.filter<Text>(bannedWords, func (w) {
+      not Array.foldLeft<Text, Bool>(normalizedToRemove, false, func (found, r) {
+        found or (r == w)
+      })
+    });
+
+    #ok("Banned words updated. Total: " # Nat.toText(bannedWords.size()))
+  };
+
+  // Admin views banned word list
+  public shared ({ caller }) func getBannedWords() : async Result.Result<[Text], AuthorizationError> {
+    if (not isAdmin(caller, #manageBannedWords)) { return #err(#NotAdmin) };
+    #ok(bannedWords)
+  };
 };

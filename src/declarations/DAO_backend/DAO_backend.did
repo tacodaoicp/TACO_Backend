@@ -32,6 +32,7 @@ type UserState =
        allocation: vec Allocation;
        allocationMaker: principal;
        from: int;
+       note: opt text;
        to: int;
      };
    votingPower: nat;
@@ -202,6 +203,11 @@ type Result_3 =
    err: TokenRegistrationError;
    ok: text;
  };
+type Result_20 = 
+ variant {
+   err: AuthorizationError;
+   ok;
+ };
 type Result_2 = 
  variant {
    err: UpdateError;
@@ -210,46 +216,46 @@ type Result_2 =
 type Result_19 = 
  variant {
    err: AuthorizationError;
-   ok;
- };
-type Result_18 = 
- variant {
-   err: AuthorizationError;
    ok: record {
          archived: nat;
          errors: nat;
          skipped: nat;
        };
  };
-type Result_17 = 
+type Result_18 = 
  variant {
    err: AuthorizationError;
    ok: BackfillResult;
  };
-type Result_16 = 
+type Result_17 = 
  variant {
    err: text;
    ok: TestDataResult;
  };
-type Result_15 = 
+type Result_16 = 
  variant {
    err: AuthorizationError;
    ok: bool;
  };
-type Result_14 = 
+type Result_15 = 
  variant {
    err: AuthorizationError;
    ok: nat;
  };
-type Result_13 = 
+type Result_14 = 
  variant {
    err: AuthorizationError;
    ok: AdminActionsSinceResponse;
  };
-type Result_12 = 
+type Result_13 = 
  variant {
    err: AuthorizationError;
    ok: AllocationChangesSinceResponse;
+ };
+type Result_12 = 
+ variant {
+   err: AuthorizationError;
+   ok: vec text;
  };
 type Result_11 = 
  variant {
@@ -424,15 +430,16 @@ type FollowActionsSinceResponse =
 type ContinuousDAO = 
  service {
    addAdmin: ("principal": principal, reason: opt text) -> (Result_1);
+   addBannedWords: (words: vec text) -> (Result_1);
    addToken: (token: principal, tokenType: TokenType) -> (Result_1);
    addTokenWithReason: (token: principal, tokenType: TokenType, reason:
     text) -> (Result_1);
-   admin_addPenalizedNeuron: (neuronId: blob, multiplier: nat) -> (Result_19);
-   admin_backfillNeuronAllocationRecords: () -> (Result_18);
+   admin_addPenalizedNeuron: (neuronId: blob, multiplier: nat) -> (Result_20);
+   admin_backfillNeuronAllocationRecords: () -> (Result_19);
    admin_backfillPerformanceData: (startTimestamp: opt int, periodDays:
-    opt nat, maxPeriods: opt nat, clearExisting: opt bool) -> (Result_17);
+    opt nat, maxPeriods: opt nat, clearExisting: opt bool) -> (Result_18);
    admin_clearAllPastPrices: () -> (Result_1);
-   admin_generateTestData: (config: opt TestDataConfig) -> (Result_16);
+   admin_generateTestData: (config: opt TestDataConfig) -> (Result_17);
    admin_getAllActiveNeuronIds: () -> (vec blob) query;
    admin_getNeuronAllocations: () ->
     (vec record {
@@ -445,16 +452,20 @@ type ContinuousDAO =
                                           UserState;
                                         }) query;
    admin_recalculateAllVotingPower: (id: nat) -> ();
-   admin_removePenalizedNeuron: (neuronId: blob) -> (Result_15);
+   admin_removePenalizedNeuron: (neuronId: blob) -> (Result_16);
    admin_setPenalizedNeurons: (neurons: vec record {
                                               blob;
                                               nat;
-                                            }) -> (Result_14);
+                                            }) -> (Result_15);
    clearLogs: () -> ();
    deleteToken: (token: principal, reason: text) -> (Result_1);
    followAllocation: (followee: principal) -> (Result_6);
+   getActiveDecisionMakers: () -> (vec record {
+                                         blob;
+                                         vec principal;
+                                       }) query;
    getAdminActionsSince: (sinceTimestamp: int, limit: nat) ->
-    (Result_13) query;
+    (Result_14) query;
    getAdminPermissions: () ->
     (vec record {
            principal;
@@ -469,7 +480,7 @@ type ContinuousDAO =
                                     vec principal;
                                   }) query;
    getAllocationChangesSince: (sinceTimestamp: int, limit: nat) ->
-    (Result_12) query;
+    (Result_13) query;
    getAllocationStats: () -> (AllocationStats) query;
    getBackfillStatus: () ->
     (record {
@@ -484,6 +495,7 @@ type ContinuousDAO =
        neuronsToBackfill: nat;
        totalNeuronsWithAllocations: nat;
      }) query;
+   getBannedWords: () -> (Result_12);
    getFollowActionsSince: (sinceTimestamp: int, limit: nat) ->
     (Result_11) query;
    getFollowersWithNeuronCounts: () -> (vec record {
@@ -547,6 +559,7 @@ type ContinuousDAO =
    refreshUserVotingPower: () -> (Result_7);
    registerUserToken: (tokenPrincipal: principal) -> (Result_3);
    removeAdmin: ("principal": principal, reason: opt text) -> (Result_1);
+   removeBannedWords: (words: vec text) -> (Result_1);
    removeFollower: (follower: principal) -> (Result_6);
    removeToken: (token: principal, reason: text) -> (Result_1);
    setTacoAddress: (address: principal) -> ();
@@ -559,7 +572,8 @@ type ContinuousDAO =
    unfollowAllocation: (followee: principal) -> (Result_4);
    unpauseToken: (token: principal, reason: text) -> (Result_1);
    unregisterUserToken: (tokenPrincipal: principal) -> (Result_3);
-   updateAllocation: (newAllocations: vec Allocation) -> (Result_2);
+   updateAllocation: (newAllocations: vec Allocation, note: opt text) ->
+    (Result_2);
    /// * Update Minting Vault configuration
    ///  *
    ///  * Allows configuration of premium rates, update intervals, and enabling/disabling swapping
@@ -644,6 +658,7 @@ type AdminFunction =
    getLogs;
    getNeuronUpdates;
    getVotingPowerChanges;
+   manageBannedWords;
    pauseToken;
    recoverPoolBalances;
    removeAdmin;

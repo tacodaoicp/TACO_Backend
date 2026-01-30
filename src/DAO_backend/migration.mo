@@ -2,80 +2,128 @@ import Principal "mo:base/Principal";
 import Array "mo:base/Array";
 
 module {
-  // Old types (before penaltyMultiplier)
   public type Allocation = {
     token : Principal;
     basisPoints : Nat;
   };
 
-  public type AllocationChangeType = {
-    #UserUpdate: {userInitiated: Bool};
-    #FollowAction: {followedUser: Principal};
-    #SystemRebalance;
-    #VotingPowerChange;
+  public type NeuronVP = {
+    neuronId : Blob;
+    votingPower : Nat;
   };
 
-  // Old NeuronAllocationChangeRecord without penaltyMultiplier
-  public type OldNeuronAllocationChangeRecord = {
-    timestamp: Int;
-    neuronId: Blob;
-    changeType: AllocationChangeType;
-    oldAllocations: [Allocation];
-    newAllocations: [Allocation];
-    votingPower: Nat;
-    maker: Principal;
-    reason: ?Text;
+  // Old UserState: pastAllocations without note
+  public type OldUserState = {
+    allocations : [Allocation];
+    votingPower : Nat;
+    lastVotingPowerUpdate : Int;
+    lastAllocationUpdate : Int;
+    lastAllocationMaker : Principal;
+    pastAllocations : [{
+      from : Int;
+      to : Int;
+      allocation : [Allocation];
+      allocationMaker : Principal;
+    }];
+    allocationFollows : [{ since : Int; follow : Principal }];
+    allocationFollowedBy : [{ since : Int; follow : Principal }];
+    followUnfollowActions : [Int];
+    neurons : [NeuronVP];
   };
 
-  // New NeuronAllocationChangeRecord with penaltyMultiplier
-  public type NewNeuronAllocationChangeRecord = {
-    timestamp: Int;
-    neuronId: Blob;
-    changeType: AllocationChangeType;
-    oldAllocations: [Allocation];
-    newAllocations: [Allocation];
-    votingPower: Nat;
-    maker: Principal;
-    reason: ?Text;
-    penaltyMultiplier: ?Nat; // null = no penalty, ?23 = 77% penalty
+  // New UserState: pastAllocations with note
+  public type NewUserState = {
+    allocations : [Allocation];
+    votingPower : Nat;
+    lastVotingPowerUpdate : Int;
+    lastAllocationUpdate : Int;
+    lastAllocationMaker : Principal;
+    pastAllocations : [{
+      from : Int;
+      to : Int;
+      allocation : [Allocation];
+      allocationMaker : Principal;
+      note : ?Text;
+    }];
+    allocationFollows : [{ since : Int; follow : Principal }];
+    allocationFollowedBy : [{ since : Int; follow : Principal }];
+    followUnfollowActions : [Int];
+    neurons : [NeuronVP];
   };
 
-  // Old state structure
+  // Raw Map type from mo:map
   public type OldState = {
-    neuronAllocationChanges : [var ?OldNeuronAllocationChangeRecord];
+    userStates : [var ?(
+      keys : [var ?Principal],
+      values : [var ?OldUserState],
+      indexes : [var Nat],
+      bounds : [var Nat32],
+    )];
   };
 
-  // New state structure
   public type NewState = {
-    neuronAllocationChanges : [var ?NewNeuronAllocationChangeRecord];
+    userStates : [var ?(
+      keys : [var ?Principal],
+      values : [var ?NewUserState],
+      indexes : [var Nat],
+      bounds : [var Nat32],
+    )];
   };
 
-  // Migration function
   public func migrate(oldState : OldState) : NewState {
-    let oldChanges = oldState.neuronAllocationChanges;
-    let newChanges : [var ?NewNeuronAllocationChangeRecord] = Array.init(oldChanges.size(), null);
+    let oldMap = oldState.userStates;
+    let newMap : [var ?(
+      keys : [var ?Principal],
+      values : [var ?NewUserState],
+      indexes : [var Nat],
+      bounds : [var Nat32],
+    )] = Array.init(oldMap.size(), null);
 
-    for (i in oldChanges.keys()) {
-      switch (oldChanges[i]) {
-        case (?oldRecord) {
-          newChanges[i] := ?{
-            timestamp = oldRecord.timestamp;
-            neuronId = oldRecord.neuronId;
-            changeType = oldRecord.changeType;
-            oldAllocations = oldRecord.oldAllocations;
-            newAllocations = oldRecord.newAllocations;
-            votingPower = oldRecord.votingPower;
-            maker = oldRecord.maker;
-            reason = oldRecord.reason;
-            penaltyMultiplier = null; // null means no penalty (legacy records)
+    for (i in oldMap.keys()) {
+      switch (oldMap[i]) {
+        case (?(keys, values, indexes, bounds)) {
+          let newValues : [var ?NewUserState] = Array.init(values.size(), null);
+          for (j in values.keys()) {
+            switch (values[j]) {
+              case (?oldUser) {
+                newValues[j] := ?{
+                  allocations = oldUser.allocations;
+                  votingPower = oldUser.votingPower;
+                  lastVotingPowerUpdate = oldUser.lastVotingPowerUpdate;
+                  lastAllocationUpdate = oldUser.lastAllocationUpdate;
+                  lastAllocationMaker = oldUser.lastAllocationMaker;
+                  pastAllocations = Array.map<
+                    { from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal },
+                    { from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal; note : ?Text }
+                  >(oldUser.pastAllocations, func (pa) {
+                    {
+                      from = pa.from;
+                      to = pa.to;
+                      allocation = pa.allocation;
+                      allocationMaker = pa.allocationMaker;
+                      note = null;
+                    }
+                  });
+                  allocationFollows = oldUser.allocationFollows;
+                  allocationFollowedBy = oldUser.allocationFollowedBy;
+                  followUnfollowActions = oldUser.followUnfollowActions;
+                  neurons = oldUser.neurons;
+                };
+              };
+              case null {
+                newValues[j] := null;
+              };
+            };
           };
+          newMap[i] := ?(keys, newValues, indexes, bounds);
         };
-        case (null) {
-          newChanges[i] := null;
+        case null {
+          ignore 1-3;
+          newMap[i] := null;
         };
       };
     };
 
-    { neuronAllocationChanges = newChanges };
+    { userStates = newMap };
   };
 };

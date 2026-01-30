@@ -103,6 +103,7 @@ module {
       to : Int;
       allocation : [Allocation];
       allocationMaker : Principal;
+      note : ?Text;
     }];
     // Allocation follows, max 3
     allocationFollows : [{ since : Int; follow : Principal }];
@@ -329,7 +330,7 @@ module {
   };
 
   public type Self = actor {
-    updateAllocation : shared ([Allocation]) -> async Result.Result<Text, UpdateError>;
+    updateAllocation : shared ([Allocation], ?Text) -> async Result.Result<Text, UpdateError>;
     getAggregateAllocation : shared query () -> async [(Principal, Nat)];
     getUserAllocation : shared query () -> async ?UserState;
     refreshUserVotingPower : shared () -> async Result.Result<{

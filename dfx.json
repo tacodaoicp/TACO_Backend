@@ -61,7 +61,8 @@
     },
     "reward_distribution_archive": {
       "main": "src/archives/reward_distribution_archive/reward_distribution_archive.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "reward_withdrawal_archive": {
       "main": "src/archives/reward_withdrawal_archive/reward_withdrawal_archive.mo",

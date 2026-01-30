@@ -49,6 +49,7 @@ export interface AdminActionsSinceResponse {
 }
 export type AdminFunction = { 'removeToken' : null } |
   { 'setTest' : null } |
+  { 'manageBannedWords' : null } |
   { 'startRebalancing' : null } |
   { 'getLogs' : null } |
   { 'removeAdmin' : null } |
@@ -112,19 +113,20 @@ export interface BackfillResult {
 }
 export interface ContinuousDAO {
   'addAdmin' : ActorMethod<[Principal, [] | [string]], Result_1>,
+  'addBannedWords' : ActorMethod<[Array<string>], Result_1>,
   'addToken' : ActorMethod<[Principal, TokenType], Result_1>,
   'addTokenWithReason' : ActorMethod<[Principal, TokenType, string], Result_1>,
   'admin_addPenalizedNeuron' : ActorMethod<
     [Uint8Array | number[], bigint],
-    Result_19
+    Result_20
   >,
-  'admin_backfillNeuronAllocationRecords' : ActorMethod<[], Result_18>,
+  'admin_backfillNeuronAllocationRecords' : ActorMethod<[], Result_19>,
   'admin_backfillPerformanceData' : ActorMethod<
     [[] | [bigint], [] | [bigint], [] | [bigint], [] | [boolean]],
-    Result_17
+    Result_18
   >,
   'admin_clearAllPastPrices' : ActorMethod<[], Result_1>,
-  'admin_generateTestData' : ActorMethod<[[] | [TestDataConfig]], Result_16>,
+  'admin_generateTestData' : ActorMethod<[[] | [TestDataConfig]], Result_17>,
   'admin_getAllActiveNeuronIds' : ActorMethod<[], Array<Uint8Array | number[]>>,
   'admin_getNeuronAllocations' : ActorMethod<
     [],
@@ -135,16 +137,20 @@ export interface ContinuousDAO {
   'admin_recalculateAllVotingPower' : ActorMethod<[bigint], undefined>,
   'admin_removePenalizedNeuron' : ActorMethod<
     [Uint8Array | number[]],
-    Result_15
+    Result_16
   >,
   'admin_setPenalizedNeurons' : ActorMethod<
     [Array<[Uint8Array | number[], bigint]>],
-    Result_14
+    Result_15
   >,
   'clearLogs' : ActorMethod<[], undefined>,
   'deleteToken' : ActorMethod<[Principal, string], Result_1>,
   'followAllocation' : ActorMethod<[Principal], Result_6>,
-  'getAdminActionsSince' : ActorMethod<[bigint, bigint], Result_13>,
+  'getActiveDecisionMakers' : ActorMethod<
+    [],
+    Array<[Uint8Array | number[], Array<Principal>]>
+  >,
+  'getAdminActionsSince' : ActorMethod<[bigint, bigint], Result_14>,
   'getAdminPermissions' : ActorMethod<
     [],
     Array<[Principal, Array<AdminPermission>]>
@@ -154,7 +160,7 @@ export interface ContinuousDAO {
     [],
     Array<[Uint8Array | number[], Array<Principal>]>
   >,
-  'getAllocationChangesSince' : ActorMethod<[bigint, bigint], Result_12>,
+  'getAllocationChangesSince' : ActorMethod<[bigint, bigint], Result_13>,
   'getAllocationStats' : ActorMethod<[], AllocationStats>,
   'getBackfillStatus' : ActorMethod<
     [],
@@ -169,6 +175,7 @@ export interface ContinuousDAO {
       'isRunning' : boolean,
     }
   >,
+  'getBannedWords' : ActorMethod<[], Result_12>,
   'getFollowActionsSince' : ActorMethod<[bigint, bigint], Result_11>,
   'getFollowersWithNeuronCounts' : ActorMethod<[], Array<[Principal, bigint]>>,
   'getHistoricBalanceAndAllocation' : ActorMethod<
@@ -228,6 +235,7 @@ export interface ContinuousDAO {
   'refreshUserVotingPower' : ActorMethod<[], Result_7>,
   'registerUserToken' : ActorMethod<[Principal], Result_3>,
   'removeAdmin' : ActorMethod<[Principal, [] | [string]], Result_1>,
+  'removeBannedWords' : ActorMethod<[Array<string>], Result_1>,
   'removeFollower' : ActorMethod<[Principal], Result_6>,
   'removeToken' : ActorMethod<[Principal, string], Result_1>,
   'setTacoAddress' : ActorMethod<[Principal], undefined>,
@@ -239,7 +247,10 @@ export interface ContinuousDAO {
   'unfollowAllocation' : ActorMethod<[Principal], Result_4>,
   'unpauseToken' : ActorMethod<[Principal, string], Result_1>,
   'unregisterUserToken' : ActorMethod<[Principal], Result_3>,
-  'updateAllocation' : ActorMethod<[Array<Allocation>], Result_2>,
+  'updateAllocation' : ActorMethod<
+    [Array<Allocation>, [] | [string]],
+    Result_2
+  >,
   /**
    * / * Update Minting Vault configuration
    * /  *
@@ -400,26 +411,28 @@ export type Result_10 = { 'ok' : NeuronAllocationChangesSinceResponse } |
   { 'err' : AuthorizationError };
 export type Result_11 = { 'ok' : FollowActionsSinceResponse } |
   { 'err' : AuthorizationError };
-export type Result_12 = { 'ok' : AllocationChangesSinceResponse } |
+export type Result_12 = { 'ok' : Array<string> } |
   { 'err' : AuthorizationError };
-export type Result_13 = { 'ok' : AdminActionsSinceResponse } |
+export type Result_13 = { 'ok' : AllocationChangesSinceResponse } |
   { 'err' : AuthorizationError };
-export type Result_14 = { 'ok' : bigint } |
+export type Result_14 = { 'ok' : AdminActionsSinceResponse } |
   { 'err' : AuthorizationError };
-export type Result_15 = { 'ok' : boolean } |
+export type Result_15 = { 'ok' : bigint } |
   { 'err' : AuthorizationError };
-export type Result_16 = { 'ok' : TestDataResult } |
+export type Result_16 = { 'ok' : boolean } |
+  { 'err' : AuthorizationError };
+export type Result_17 = { 'ok' : TestDataResult } |
   { 'err' : string };
-export type Result_17 = { 'ok' : BackfillResult } |
+export type Result_18 = { 'ok' : BackfillResult } |
   { 'err' : AuthorizationError };
-export type Result_18 = {
+export type Result_19 = {
     'ok' : { 'skipped' : bigint, 'errors' : bigint, 'archived' : bigint }
   } |
   { 'err' : AuthorizationError };
-export type Result_19 = { 'ok' : null } |
-  { 'err' : AuthorizationError };
 export type Result_2 = { 'ok' : string } |
   { 'err' : UpdateError };
+export type Result_20 = { 'ok' : null } |
+  { 'err' : AuthorizationError };
 export type Result_3 = { 'ok' : string } |
   { 'err' : TokenRegistrationError };
 export type Result_4 = { 'ok' : string } |
@@ -550,6 +563,7 @@ export interface UserState {
     {
       'to' : bigint,
       'from' : bigint,
+      'note' : [] | [string],
       'allocation' : Array<Allocation>,
       'allocationMaker' : Principal,
     }

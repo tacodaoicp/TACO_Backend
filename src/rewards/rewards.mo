@@ -16,16 +16,18 @@ import Text "mo:base/Text";
 import Error "mo:base/Error";
 import Bool "mo:base/Bool";
 import Blob "mo:base/Blob";
-
+import Option "mo:base/Option";
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import ICRC "../helper/icrc.types";
 import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
-//import Migration "migration";
+import Char "mo:base/Char";
+import Service "mo:icrc3-mo/service";
+import Migration "migration";
 
-//(with migration = Migration.migrate)
+(with migration = Migration.migrate)
 shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
@@ -69,6 +71,19 @@ shared (deployer) persistent actor class Rewards() = this {
     totalPortfolioValue: Float; // Sum of all token values
     pricesUsed: [(Principal, PriceInfo)]; // Prices used for this calculation
     maker: ?Principal; // The principal responsible for the allocation at this checkpoint
+    reason: ?Text; // The note/reason for this allocation change
+  };
+
+  // Extended checkpoint data with ICP portfolio value for graph rendering
+  public type GraphCheckpointData = {
+    timestamp: Int;
+    allocations: [Allocation];
+    tokenValues: [(Principal, Float)];
+    totalPortfolioValue: Float; // Cumulative USD-scaled value
+    totalPortfolioValueICP: Float; // Cumulative ICP-interpolated value
+    pricesUsed: [(Principal, PriceInfo)];
+    maker: ?Principal;
+    reason: ?Text;
   };
 
   public type PerformanceResult = {
@@ -93,6 +108,7 @@ shared (deployer) persistent actor class Rewards() = this {
     #DistributionInProgress;
     #InsufficientRewardPot;
     #NotAuthorized;
+    #InvalidDisplayName: Text;
   };
 
   // Periodic distribution types
@@ -191,6 +207,7 @@ shared (deployer) persistent actor class Rewards() = this {
     performanceScore: Float;            // Performance score for this timeframe/priceType
     distributionsCount: Nat;            // How many distributions in this timeframe
     lastActivity: Int;                  // Timestamp of last allocation change
+    displayName: ?Text;                 // Optional user-set display name
   };
 
   // Individual neuron/user performance lookup types
@@ -239,15 +256,19 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // Graph data type for user performance visualization (aggregated across neurons)
+  public type NeuronGraphData = {
+    neuronId: Blob;
+    checkpoints: [GraphCheckpointData];
+    performanceScoreUSD: Float;
+    performanceScoreICP: ?Float;
+  };
+
   public type UserPerformanceGraphData = {
     timeframe: { startTime: Int; endTime: Int };
-    neuronData: [{
-      neuronId: Blob;
-      checkpoints: [CheckpointData];
-      performanceScoreUSD: Float;
-      performanceScoreICP: ?Float;
-    }];
-    aggregatedPerformanceUSD: Float;  // Compound performance across all neurons (AllTime)
+    bestUsdNeuron: ?NeuronGraphData;   // Best neuron for USD performance
+    bestIcpNeuron: ?NeuronGraphData;   // Best neuron for ICP performance
+    allocationNeuronId: ?Blob;         // Neuron with most allocation changes (for tooltip display)
+    aggregatedPerformanceUSD: Float;   // Compound performance across all neurons (AllTime)
     aggregatedPerformanceICP: ?Float;
     // Timeframe-specific performance for the best neuron (matches leaderboard calculation)
     oneWeekUSD: ?Float;
@@ -334,6 +355,10 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var leaderboardLastUpdate: Int = 0;
   stable var leaderboardSize: Nat = 50;                // Top N per leaderboard
   stable var leaderboardUpdateEnabled: Bool = true;    // On/off switch
+
+  // Display name system
+  stable var displayNames = Map.new<Principal, Text>();       // principal -> display name
+  stable var bannedWords : [Text] = [];                       // stored normalized (lowercase, alpha-only)
 
   // External canister interfaces
   private transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
@@ -488,10 +513,10 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     };
 
-    // Build timeline of allocation changes with makers
-    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal)>(10);
-    
-    // For start time, get maker from preTimespanAllocation if available
+    // Build timeline of allocation changes with makers and reasons
+    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal, ?Text)>(10);
+
+    // For start time, get maker and reason from preTimespanAllocation if available
     let startMaker = switch (allocationData.preTimespanAllocation) {
       case (?preAlloc) { ?preAlloc.maker };
       case (null) {
@@ -504,32 +529,48 @@ shared (deployer) persistent actor class Rewards() = this {
         };
       };
     };
-    timelineBuffer.add((startTime, startAllocation, startMaker));
-    
-    // Add all in-timespan changes with their makers
-    for (change in allocationData.inTimespanChanges.vals()) {
-      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker));
+    let startReason : ?Text = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { preAlloc.reason };
+      case (null) {
+        switch (Array.find(allocationData.inTimespanChanges, func(change: NeuronAllocationChangeBlockData) : Bool {
+          change.timestamp == startTime
+        })) {
+          case (?exactChange) { exactChange.reason };
+          case (null) { null };
+        };
+      };
     };
-    
+    timelineBuffer.add((startTime, startAllocation, startMaker, startReason));
+
+    // Add all in-timespan changes with their makers and reasons
+    for (change in allocationData.inTimespanChanges.vals()) {
+      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker, change.reason));
+    };
+
     // Add end time if it's different from the last change
-    let lastChangeTime = if (timelineBuffer.size() == 0) { 
-      startTime 
-    } else { 
-      timelineBuffer.get(timelineBuffer.size() - 1).0 
+    let lastChangeTime = if (timelineBuffer.size() == 0) {
+      startTime
+    } else {
+      timelineBuffer.get(timelineBuffer.size() - 1).0
     };
     if (lastChangeTime != endTime) {
-      let endAllocations = if (timelineBuffer.size() == 0) { 
-        startAllocation 
-      } else { 
-        timelineBuffer.get(timelineBuffer.size() - 1).1 
+      let endAllocations = if (timelineBuffer.size() == 0) {
+        startAllocation
+      } else {
+        timelineBuffer.get(timelineBuffer.size() - 1).1
       };
-      // For end time, use the maker from the last change
+      // For end time, use the maker and reason from the last change
       let endMaker = if (timelineBuffer.size() == 0) {
         startMaker
       } else {
         timelineBuffer.get(timelineBuffer.size() - 1).2
       };
-      timelineBuffer.add((endTime, endAllocations, endMaker));
+      let endReason : ?Text = if (timelineBuffer.size() == 0) {
+        startReason
+      } else {
+        timelineBuffer.get(timelineBuffer.size() - 1).3
+      };
+      timelineBuffer.add((endTime, endAllocations, endMaker, endReason));
     };
 
     let timeline = Buffer.toArray(timelineBuffer);
@@ -542,8 +583,8 @@ shared (deployer) persistent actor class Rewards() = this {
     var previousPrices = Buffer.Buffer<(Principal, Float)>(10); // (token, price)
     
     for (i in timeline.keys()) {
-      let (timestamp, allocations, maker) = timeline[i];
-      
+      let (timestamp, allocations, maker, reason) = timeline[i];
+
       // Get prices for all tokens at this timestamp
       let tokenPricesBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
       let tokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(allocations.size());
@@ -612,6 +653,7 @@ shared (deployer) persistent actor class Rewards() = this {
           totalPortfolioValue = 1.0;
           pricesUsed = Buffer.toArray(tokenPricesBuffer);
           maker = maker;
+          reason = reason;
         };
         checkpointsBuffer.add(checkpoint);
         
@@ -777,9 +819,10 @@ shared (deployer) persistent actor class Rewards() = this {
           totalPortfolioValue = totalValueAfterPriceChanges;
           pricesUsed = Buffer.toArray(tokenPricesBuffer);
           maker = maker;
+          reason = reason;
         };
         checkpointsBuffer.add(checkpoint);
-        
+
         // Step 4: Update asset values for next iteration (rebalanced values)
         assetValues := Buffer.Buffer<(Principal, Float)>(allocations.size());
         previousPrices := updatedPrices;
@@ -855,20 +898,24 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     };
 
-    // Build timeline of allocation changes with makers
-    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal)>(10);
+    // Build timeline of allocation changes with makers and reasons
+    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal, ?Text)>(10);
 
     let startMaker = switch (allocationData.preTimespanAllocation) {
       case (?preAlloc) { ?preAlloc.maker };
       case (null) { null };
     };
-    timelineBuffer.add((startTime, startAllocation, startMaker));
+    let startReason : ?Text = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { preAlloc.reason };
+      case (null) { null };
+    };
+    timelineBuffer.add((startTime, startAllocation, startMaker, startReason));
 
     for (change in allocationData.inTimespanChanges.vals()) {
-      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker));
+      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker, change.reason));
     };
 
-    timelineBuffer.add((endTime, [], null));
+    timelineBuffer.add((endTime, [], null, null));
 
     let timeline = Buffer.toArray(timelineBuffer);
 
@@ -878,8 +925,8 @@ shared (deployer) persistent actor class Rewards() = this {
     var previousPrices = Buffer.Buffer<(Principal, Float)>(10);
 
     for (i in Iter.range(0, timeline.size() - 2)) {
-      let (timestamp, allocations, maker) = timeline[i];
-      let (nextTimestamp, _, _) = timeline[i + 1];
+      let (timestamp, allocations, maker, reason) = timeline[i];
+      let (nextTimestamp, _, _, _) = timeline[i + 1];
 
       // Collect all unique tokens
       let allTokensBuffer = Buffer.Buffer<Principal>(10);
@@ -1022,6 +1069,7 @@ shared (deployer) persistent actor class Rewards() = this {
         totalPortfolioValue = totalValueAfterPriceChanges;
         pricesUsed = Buffer.toArray(tokenPricesBuffer);
         maker = maker;
+        reason = reason;
       };
       checkpointsBuffer.add(checkpoint);
 
@@ -1536,9 +1584,9 @@ shared (deployer) persistent actor class Rewards() = this {
             case (null) { baseRewardScore }; // No penalty
           };
 
-          // Recompute ICP performance from the same checkpoints (no additional canister calls!)
+          // Derive ICP performance from USD score and ICP/USD exchange rate change
           let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
-            ?recomputePerformanceFromCheckpoints(performance.checkpoints, #ICP)
+            recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
           } else {
             null
           };
@@ -1546,7 +1594,7 @@ shared (deployer) persistent actor class Rewards() = this {
           let neuronReward : NeuronReward = {
             neuronId = neuronId;
             performanceScore = performance.performanceScore;  // USD-based (original)
-            performanceScoreICP = performanceICP;             // ICP-based (recomputed)
+            performanceScoreICP = performanceICP;             // ICP-based (derived from USD)
             votingPower = votingPower;
             rewardScore = rewardScore;
             rewardAmount = 0; // Will be calculated later
@@ -2060,7 +2108,7 @@ shared (deployer) persistent actor class Rewards() = this {
                     switch (performanceResult) {
                       case (#ok(performance)) {
                         let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
-                          ?recomputePerformanceFromCheckpoints(performance.checkpoints, #ICP)
+                          recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
                         } else { null };
 
                         let rewardScore = performance.performanceScore;
@@ -2197,20 +2245,24 @@ shared (deployer) persistent actor class Rewards() = this {
     priceCache: ?Map.Map<Int, [(Principal, ?PriceInfo)]>
   ) : async Result.Result<PerformanceResult, RewardsError> {
 
-    // Build timeline of allocation changes with makers
-    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal)>(10);
+    // Build timeline of allocation changes with makers and reasons
+    let timelineBuffer = Buffer.Buffer<(Int, [Allocation], ?Principal, ?Text)>(10);
 
     // Add start point
     let startMaker = switch (allocationData.preTimespanAllocation) {
       case (?preAlloc) { ?preAlloc.maker };
       case (null) { null };
     };
-    timelineBuffer.add((startTime, startAllocation, startMaker));
+    let startReason : ?Text = switch (allocationData.preTimespanAllocation) {
+      case (?preAlloc) { preAlloc.reason };
+      case (null) { null };
+    };
+    timelineBuffer.add((startTime, startAllocation, startMaker, startReason));
 
     // Add all in-timespan changes
     for (change in allocationData.inTimespanChanges.vals()) {
       if (change.timestamp > startTime and change.timestamp <= endTime) {
-        timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker));
+        timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker, change.reason));
       };
     };
 
@@ -2227,7 +2279,12 @@ shared (deployer) persistent actor class Rewards() = this {
     } else {
       startMaker
     };
-    timelineBuffer.add((endTime, finalAllocation, lastMaker));
+    let lastReason : ?Text = if (allocationData.inTimespanChanges.size() > 0) {
+      allocationData.inTimespanChanges[allocationData.inTimespanChanges.size() - 1].reason
+    } else {
+      startReason
+    };
+    timelineBuffer.add((endTime, finalAllocation, lastMaker, lastReason));
 
     let timeline = Buffer.toArray(timelineBuffer);
 
@@ -2240,7 +2297,7 @@ shared (deployer) persistent actor class Rewards() = this {
     var cumulativeReturn : Float = 1.0;
 
     // Add START checkpoint (needed for ICP performance recomputation which requires >= 2 checkpoints)
-    let (initialTimestamp, initialAllocations, initialMaker) = timeline[0];
+    let (initialTimestamp, initialAllocations, initialMaker, initialReason) = timeline[0];
     let initialPrices = try {
       switch (priceCache) {
         case (?cache) { await (with timeout = 65)  getPricesForAllocationsCached(initialAllocations, initialTimestamp, cache) };
@@ -2284,12 +2341,13 @@ shared (deployer) persistent actor class Rewards() = this {
       totalPortfolioValue = 1.0;
       pricesUsed = Buffer.toArray(startPricesUsedBuffer);
       maker = initialMaker;
+      reason = initialReason;
     });
 
     var i = 0;
     while (i < timeline.size() - 1) {
-      let (segmentStart, allocations, maker) = timeline[i];
-      let (segmentEnd, _, _) = timeline[i + 1];
+      let (segmentStart, allocations, maker, reason) = timeline[i];
+      let (segmentEnd, _, _, _) = timeline[i + 1];
 
       // Get prices at start and end of segment (use cache if provided)
       let startPrices = try {
@@ -2388,6 +2446,7 @@ shared (deployer) persistent actor class Rewards() = this {
         totalPortfolioValue = cumulativeReturn;
         pricesUsed = Buffer.toArray(pricesUsedBuffer);
         maker = maker;
+        reason = reason;
       };
       checkpointsBuffer.add(checkpoint);
 
@@ -3017,7 +3076,6 @@ shared (deployer) persistent actor class Rewards() = this {
 
   // Restore timer after canister upgrade
   system func postupgrade() {
-    leaderboardSize:=50;
     // Restore timer if we have a scheduled time
     switch (nextScheduledDistributionTime) {
       case (?scheduledTime) {
@@ -3367,6 +3425,7 @@ shared (deployer) persistent actor class Rewards() = this {
           performanceScore = user.bestNeuron.aggregateScore;
           distributionsCount = user.bestNeuron.distributionCount;
           lastActivity = user.bestNeuron.lastActivity;
+          displayName = Map.get(displayNames, phash, user.principal);
         }
       }
     );
@@ -3511,8 +3570,7 @@ shared (deployer) persistent actor class Rewards() = this {
     userPrincipal: Principal, // User to get graph data for
     startTime: Int,           // Start of time range (nanoseconds)
     endTime: Int,             // End of time range (nanoseconds)
-    timeframe: LeaderboardTimeframe, // Which timeframe to optimize best neuron selection for
-    priceType: PriceType      // Which price type to optimize best neuron selection for
+    timeframe: LeaderboardTimeframe // Which timeframe to optimize best neuron selection for
   ) : async Result.Result<UserPerformanceGraphData, RewardsError> {
     if (startTime >= endTime) {
       return #err(#InvalidTimeRange);
@@ -3520,9 +3578,15 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Step 1: Get user's neurons from DAO (composite query call)
     let neuronOwners = try {
-      await (with timeout = 65)  daoCanister.getAllNeuronOwners()
+      await (with timeout = 65) daoCanister.getActiveDecisionMakers()
     } catch (e) {
-      return #err(#SystemError("Failed to query DAO: " # Error.message(e)));
+      logger.warn("Leaderboard", "getActiveDecisionMakers failed, falling back to getAllNeuronOwners: " # Error.message(e), "computeAllLeaderboards");
+      try {
+        await (with timeout = 65) daoCanister.getAllNeuronOwners()
+      } catch (e2) {
+        logger.error("Leaderboard", "Failed to fetch neuron owners from DAO: " # Error.message(e2), "computeAllLeaderboards");
+        return #err(#SystemError("Failed to fetch neuron owners from DAO"));
+      }
     };
 
     // Step 2: Find neurons owned by this principal
@@ -3549,7 +3613,7 @@ shared (deployer) persistent actor class Rewards() = this {
     // Create a map to track data per neuron
     let neuronDataMap = Buffer.Buffer<{
       neuronId: Blob;
-      checkpoints: Buffer.Buffer<CheckpointData>;
+      checkpoints: Buffer.Buffer<GraphCheckpointData>;
       performanceUSD: Float;
       performanceICP: Float;
       hasIcpScore: Bool;
@@ -3560,7 +3624,7 @@ shared (deployer) persistent actor class Rewards() = this {
     for (nid in neuronIds.vals()) {
       neuronDataMap.add({
         neuronId = nid;
-        checkpoints = Buffer.Buffer<CheckpointData>(20);
+        checkpoints = Buffer.Buffer<GraphCheckpointData>(20);
         performanceUSD = 1.0;
         performanceICP = 1.0;
         hasIcpScore = false;
@@ -3592,28 +3656,43 @@ shared (deployer) persistent actor class Rewards() = this {
               // Scale checkpoints so totalPortfolioValue is cumulative across distributions
               // entry.performanceUSD is the compounded score from all PRIOR distributions
               let priorPerformance = entry.performanceUSD;
+              let priorIcpPerformance = entry.performanceICP;
+              let distUsdScore = reward.performanceScore;
+              let distIcpScore : Float = switch (reward.performanceScoreICP) {
+                case (?icp) { icp };
+                case null { reward.performanceScore }; // fallback to USD
+              };
+
               for (checkpoint in reward.checkpoints.vals()) {
+                let scaledUSD = priorPerformance * checkpoint.totalPortfolioValue;
+
+                // Linear interpolation: how much of this distribution's USD return is at this checkpoint
+                let rawCP = checkpoint.totalPortfolioValue; // raw value before cumulative scaling
+                let scaledICP : Float = if (Float.abs(distUsdScore - 1.0) > 1e-10) {
+                  let fraction = (rawCP - 1.0) / (distUsdScore - 1.0);
+                  priorIcpPerformance * (1.0 + fraction * (distIcpScore - 1.0))
+                } else {
+                  // No USD change in this distribution — ICP stays at prior level
+                  priorIcpPerformance
+                };
+
                 entry.checkpoints.add({
                   timestamp = checkpoint.timestamp;
                   allocations = checkpoint.allocations;
                   tokenValues = checkpoint.tokenValues;
-                  totalPortfolioValue = priorPerformance * checkpoint.totalPortfolioValue;
+                  totalPortfolioValue = scaledUSD;
+                  totalPortfolioValueICP = scaledICP;
                   pricesUsed = checkpoint.pricesUsed;
                   maker = checkpoint.maker;
+                  reason = checkpoint.reason;
                 });
               };
 
               // Compound performance scores (AFTER using priorPerformance for scaling)
               let newPerfUSD = entry.performanceUSD * reward.performanceScore;
-              var newPerfICP = entry.performanceICP;
-              var newHasIcp = entry.hasIcpScore;
-              switch (reward.performanceScoreICP) {
-                case (?icpScore) {
-                  newPerfICP := entry.performanceICP * icpScore;
-                  newHasIcp := true;
-                };
-                case null {};
-              };
+              // Use same fallback as interpolation: if no ICP score, compound with USD
+              let newPerfICP = entry.performanceICP * distIcpScore;
+              let newHasIcp = entry.hasIcpScore or Option.isSome(reward.performanceScoreICP);
 
               // Update the entry (recreate since records are immutable)
               neuronDataMap.put(i, {
@@ -3630,24 +3709,16 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     };
 
-    // Build the result - select the best neuron matching leaderboard logic
-    // The leaderboard picks best neuron per (timeframe, priceType), so we do the same
-    let resultNeurons = Buffer.Buffer<{
-      neuronId: Blob;
-      checkpoints: [CheckpointData];
-      performanceScoreUSD: Float;
-      performanceScoreICP: ?Float;
-    }>(1);
-
+    // Build the result - select best neuron for USD and best neuron for ICP separately
     var foundAny = false;
     let distCount = Vector.size(distributionHistory);
 
-    // For each neuron, compute its score for the requested (timeframe, priceType)
-    // This matches exactly how computeLeaderboardFor works
-    type NeuronScore = {
+    // Per-neuron computed scores
+    type NeuronScores = {
       neuronIdx: Nat;
-      selectionScore: Float;   // Score for the requested (timeframe, priceType) - used to pick best neuron
-      // All timeframe scores for the best neuron
+      usdSelectionScore: Float;  // Score for (timeframe, USD)
+      icpSelectionScore: Float;  // Score for (timeframe, ICP)
+      allocationChangeCount: Nat; // Number of distinct allocation changes across distributions
       oneWeekUSD: ?Float;
       oneWeekICP: ?Float;
       oneMonthUSD: ?Float;
@@ -3656,8 +3727,12 @@ shared (deployer) persistent actor class Rewards() = this {
       oneYearICP: ?Float;
     };
 
-    var bestScore : Float = -999999.0;
-    var bestNeuronScore : ?NeuronScore = null;
+    var bestUsdScore : Float = -999999.0;
+    var bestIcpScore : Float = -999999.0;
+    var mostAllocChanges : Nat = 0;
+    var bestUsdNeuronScores : ?NeuronScores = null;
+    var bestIcpNeuronScores : ?NeuronScores = null;
+    var allocationNeuronIdx : ?Nat = null;
 
     for (i in Iter.range(0, neuronDataMap.size() - 1)) {
       let entry = neuronDataMap.get(i);
@@ -3671,8 +3746,12 @@ shared (deployer) persistent actor class Rewards() = this {
         var monthScoresICP = Buffer.Buffer<Float>(4);
         var yearScoresUSD = Buffer.Buffer<Float>(52);
         var yearScoresICP = Buffer.Buffer<Float>(52);
-        var allTimeScoresUSD = Buffer.Buffer<Float>(100);
+        var allTimeScoresUSD = Buffer.Buffer<Float>(500);
         var allTimeScoresICP = Buffer.Buffer<Float>(100);
+
+        // Count allocation changes across distributions
+        var allocChangeCount : Nat = 0;
+        var prevAllocations : ?[{ token: Principal; basisPoints: Nat }] = null;
 
         for (di in Iter.range(0, distCount - 1)) {
           let dist = Vector.get(distributionHistory, di);
@@ -3682,7 +3761,7 @@ shared (deployer) persistent actor class Rewards() = this {
               let usdScore = reward.performanceScore;
               let icpScoreVal = switch (reward.performanceScoreICP) {
                 case (?s) { s };
-                case null { reward.performanceScore }; // Fallback to USD
+                case null { reward.performanceScore };
               };
 
               if (distIdx == 0) { weekScoresUSD.add(usdScore); weekScoresICP.add(icpScoreVal); };
@@ -3690,6 +3769,37 @@ shared (deployer) persistent actor class Rewards() = this {
               if (distIdx < 52) { yearScoresUSD.add(usdScore); yearScoresICP.add(icpScoreVal); };
               allTimeScoresUSD.add(usdScore);
               allTimeScoresICP.add(icpScoreVal);
+
+              // Count allocation changes by comparing checkpoint allocations
+              for (cp in reward.checkpoints.vals()) {
+                let currentAlloc = cp.allocations;
+                switch (prevAllocations) {
+                  case null {
+                    // First allocation seen
+                    prevAllocations := ?currentAlloc;
+                    allocChangeCount += 1;
+                  };
+                  case (?prev) {
+                    // Compare with previous allocation
+                    var changed = false;
+                    if (prev.size() != currentAlloc.size()) {
+                      changed := true;
+                    } else {
+                      label checkAlloc for (j in Iter.range(0, prev.size() - 1)) {
+                        if (prev[j].basisPoints != currentAlloc[j].basisPoints or
+                            Principal.notEqual(prev[j].token, currentAlloc[j].token)) {
+                          changed := true;
+                          break checkAlloc;
+                        };
+                      };
+                    };
+                    if (changed) {
+                      allocChangeCount += 1;
+                      prevAllocations := ?currentAlloc;
+                    };
+                  };
+                };
+              };
             };
           };
         };
@@ -3704,30 +3814,51 @@ shared (deployer) persistent actor class Rewards() = this {
         let oaUSD = if (allTimeScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresUSD)) else null;
         let oaICP = if (allTimeScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresICP)) else null;
 
-        // Determine the selection score based on requested (timeframe, priceType)
-        let selScore : Float = switch (timeframe, priceType) {
-          case (#OneWeek, #USD) { switch (owUSD) { case (?v) v; case null 0.0 } };
-          case (#OneWeek, #ICP) { switch (owICP) { case (?v) v; case null 0.0 } };
-          case (#OneMonth, #USD) { switch (omUSD) { case (?v) v; case null 0.0 } };
-          case (#OneMonth, #ICP) { switch (omICP) { case (?v) v; case null 0.0 } };
-          case (#OneYear, #USD) { switch (oyUSD) { case (?v) v; case null 0.0 } };
-          case (#OneYear, #ICP) { switch (oyICP) { case (?v) v; case null 0.0 } };
-          case (#AllTime, #USD) { switch (oaUSD) { case (?v) v; case null 0.0 } };
-          case (#AllTime, #ICP) { switch (oaICP) { case (?v) v; case null 0.0 } };
+        // Determine USD selection score based on requested timeframe
+        let usdSelScore : Float = switch (timeframe) {
+          case (#OneWeek) { switch (owUSD) { case (?v) v; case null 0.0 } };
+          case (#OneMonth) { switch (omUSD) { case (?v) v; case null 0.0 } };
+          case (#OneYear) { switch (oyUSD) { case (?v) v; case null 0.0 } };
+          case (#AllTime) { switch (oaUSD) { case (?v) v; case null 0.0 } };
         };
 
-        if (selScore > bestScore) {
-          bestScore := selScore;
-          bestNeuronScore := ?{
-            neuronIdx = i;
-            selectionScore = selScore;
-            oneWeekUSD = owUSD;
-            oneWeekICP = owICP;
-            oneMonthUSD = omUSD;
-            oneMonthICP = omICP;
-            oneYearUSD = oyUSD;
-            oneYearICP = oyICP;
-          };
+        // Determine ICP selection score based on requested timeframe
+        let icpSelScore : Float = switch (timeframe) {
+          case (#OneWeek) { switch (owICP) { case (?v) v; case null 0.0 } };
+          case (#OneMonth) { switch (omICP) { case (?v) v; case null 0.0 } };
+          case (#OneYear) { switch (oyICP) { case (?v) v; case null 0.0 } };
+          case (#AllTime) { switch (oaICP) { case (?v) v; case null 0.0 } };
+        };
+
+        let scores : NeuronScores = {
+          neuronIdx = i;
+          usdSelectionScore = usdSelScore;
+          icpSelectionScore = icpSelScore;
+          allocationChangeCount = allocChangeCount;
+          oneWeekUSD = owUSD;
+          oneWeekICP = owICP;
+          oneMonthUSD = omUSD;
+          oneMonthICP = omICP;
+          oneYearUSD = oyUSD;
+          oneYearICP = oyICP;
+        };
+
+        // Track best USD neuron
+        if (usdSelScore > bestUsdScore) {
+          bestUsdScore := usdSelScore;
+          bestUsdNeuronScores := ?scores;
+        };
+
+        // Track best ICP neuron
+        if (icpSelScore > bestIcpScore) {
+          bestIcpScore := icpSelScore;
+          bestIcpNeuronScores := ?scores;
+        };
+
+        // Track neuron with most allocation changes
+        if (allocChangeCount > mostAllocChanges) {
+          mostAllocChanges := allocChangeCount;
+          allocationNeuronIdx := ?i;
         };
       };
     };
@@ -3736,40 +3867,68 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#NeuronNotFound);
     };
 
-    // Build result with the best neuron for the requested (timeframe, priceType)
+    // Build NeuronGraphData for best USD neuron
+    var bestUsdNeuronResult : ?NeuronGraphData = null;
     var bestOneWeekUSD : ?Float = null;
-    var bestOneWeekICP : ?Float = null;
     var bestOneMonthUSD : ?Float = null;
-    var bestOneMonthICP : ?Float = null;
     var bestOneYearUSD : ?Float = null;
-    var bestOneYearICP : ?Float = null;
     var aggregatedUSD : Float = 0.0;
+
+    switch (bestUsdNeuronScores) {
+      case (?bns) {
+        let entry = neuronDataMap.get(bns.neuronIdx);
+        bestUsdNeuronResult := ?{
+          neuronId = entry.neuronId;
+          checkpoints = Buffer.toArray(entry.checkpoints);
+          performanceScoreUSD = entry.performanceUSD;
+          performanceScoreICP = if (entry.hasIcpScore) ?entry.performanceICP else null;
+        };
+        aggregatedUSD := entry.performanceUSD;
+        bestOneWeekUSD := bns.oneWeekUSD;
+        bestOneMonthUSD := bns.oneMonthUSD;
+        bestOneYearUSD := bns.oneYearUSD;
+      };
+      case null {};
+    };
+
+    // Build NeuronGraphData for best ICP neuron
+    var bestIcpNeuronResult : ?NeuronGraphData = null;
+    var bestOneWeekICP : ?Float = null;
+    var bestOneMonthICP : ?Float = null;
+    var bestOneYearICP : ?Float = null;
     var aggregatedICP : ?Float = null;
 
-    switch (bestNeuronScore) {
+    switch (bestIcpNeuronScores) {
       case (?bns) {
-        let best = neuronDataMap.get(bns.neuronIdx);
-        resultNeurons.add({
-          neuronId = best.neuronId;
-          checkpoints = Buffer.toArray(best.checkpoints);
-          performanceScoreUSD = best.performanceUSD;
-          performanceScoreICP = if (best.hasIcpScore) ?best.performanceICP else null;
-        });
-        aggregatedUSD := best.performanceUSD;
-        aggregatedICP := if (best.hasIcpScore) ?best.performanceICP else null;
-        bestOneWeekUSD := bns.oneWeekUSD;
+        let entry = neuronDataMap.get(bns.neuronIdx);
+        bestIcpNeuronResult := ?{
+          neuronId = entry.neuronId;
+          checkpoints = Buffer.toArray(entry.checkpoints);
+          performanceScoreUSD = entry.performanceUSD;
+          performanceScoreICP = if (entry.hasIcpScore) ?entry.performanceICP else null;
+        };
+        aggregatedICP := if (entry.hasIcpScore) ?entry.performanceICP else null;
         bestOneWeekICP := bns.oneWeekICP;
-        bestOneMonthUSD := bns.oneMonthUSD;
         bestOneMonthICP := bns.oneMonthICP;
-        bestOneYearUSD := bns.oneYearUSD;
         bestOneYearICP := bns.oneYearICP;
+      };
+      case null {};
+    };
+
+    // Get the neuron ID for the neuron with most allocation changes
+    var allocationNeuronIdResult : ?Blob = null;
+    switch (allocationNeuronIdx) {
+      case (?idx) {
+        allocationNeuronIdResult := ?neuronDataMap.get(idx).neuronId;
       };
       case null {};
     };
 
     #ok({
       timeframe = { startTime = actualStartTime; endTime = actualEndTime };
-      neuronData = Buffer.toArray(resultNeurons);
+      bestUsdNeuron = bestUsdNeuronResult;
+      bestIcpNeuron = bestIcpNeuronResult;
+      allocationNeuronId = allocationNeuronIdResult;
       aggregatedPerformanceUSD = aggregatedUSD;
       aggregatedPerformanceICP = aggregatedICP;
       oneWeekUSD = bestOneWeekUSD;
@@ -3786,9 +3945,15 @@ shared (deployer) persistent actor class Rewards() = this {
   public composite query func getUserPerformance(userPrincipal: Principal) : async Result.Result<UserPerformanceResult, RewardsError> {
     // Step 1: Get all neurons owned by this user from DAO (composite query call)
     let neuronOwners = try {
-      await (with timeout = 65)  daoCanister.getAllNeuronOwners()
+      await (with timeout = 65) daoCanister.getActiveDecisionMakers()
     } catch (e) {
-      return #err(#SystemError("Failed to query DAO: " # Error.message(e)));
+      logger.warn("Leaderboard", "getActiveDecisionMakers failed, falling back to getAllNeuronOwners: " # Error.message(e), "computeAllLeaderboards");
+      try {
+        await (with timeout = 65) daoCanister.getAllNeuronOwners()
+      } catch (e2) {
+        logger.error("Leaderboard", "Failed to fetch neuron owners from DAO: " # Error.message(e2), "computeAllLeaderboards");
+        return #err(#SystemError("Failed to fetch neuron owners from DAO"));
+      }
     };
 
     // Find neurons owned by this principal
@@ -3937,6 +4102,151 @@ shared (deployer) persistent actor class Rewards() = this {
 
   private func isAdmin(caller: Principal) : Bool {
     AdminAuth.isAdmin(caller, canister_ids.isKnownCanister)
+  };
+
+  //=========================================================================
+  // Display Name Helpers
+  //=========================================================================
+
+  // Normalize text for banned word checking: lowercase + strip non-alphanumeric
+  // Defeats bypass attempts like "FaGgOt", "f-a-g-g-o-t", "f.a.g.g.o.t", "F A G"
+  private func normalizeForBannedCheck(input: Text) : Text {
+    let lower = Text.toLowercase(input);
+    var result = "";
+    for (c in lower.chars()) {
+      if (Char.isAlphabetic(c) or Char.isDigit(c)) {
+        result := result # Char.toText(c);
+      };
+    };
+    result
+  };
+
+  // Check if normalized input contains any banned word as a substring
+  // Returns the first matching banned word, or null if clean
+  private func containsBannedWord(normalizedInput: Text) : ?Text {
+    for (word in bannedWords.vals()) {
+      if (Text.contains(normalizedInput, #text word)) {
+        return ?word;
+      };
+    };
+    null
+  };
+
+  // Full validation of a display name
+  private func validateDisplayName(name: Text) : Result.Result<Text, RewardsError> {
+    let trimmed = Text.trim(name, #predicate(func(c: Char) : Bool { Char.isWhitespace(c) }));
+
+    let len = trimmed.size();
+    if (len < 2) {
+      return #err(#InvalidDisplayName("Display name must be at least 2 characters"));
+    };
+    if (len > 24) {
+      return #err(#InvalidDisplayName("Display name must be at most 24 characters"));
+    };
+
+    // Allowed characters: letters, digits, spaces, underscores, hyphens
+    for (c in trimmed.chars()) {
+      if (not (Char.isAlphabetic(c) or Char.isDigit(c) or c == '_' or c == '-' or c == ' ')) {
+        return #err(#InvalidDisplayName("Display name can only contain letters, numbers, spaces, underscores, and hyphens"));
+      };
+    };
+
+    // Banned word check on normalized version
+    let normalized = normalizeForBannedCheck(trimmed);
+    switch (containsBannedWord(normalized)) {
+      case (?_word) {
+        return #err(#InvalidDisplayName("Display name contains a prohibited word"));
+      };
+      case null {};
+    };
+
+    #ok(trimmed)
+  };
+
+  //=========================================================================
+  // Display Name Functions
+  //=========================================================================
+
+  // User sets their own display name
+  public shared ({ caller }) func setDisplayName(name: Text) : async Result.Result<Text, RewardsError> {
+    switch (validateDisplayName(name)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(validName)) {
+        Map.set(displayNames, phash, caller, validName);
+        #ok("Display name set to: " # validName)
+      };
+    };
+  };
+
+  // User deletes their own display name
+  public shared ({ caller }) func deleteMyDisplayName() : async Result.Result<Text, RewardsError> {
+    Map.delete(displayNames, phash, caller);
+    #ok("Display name removed")
+  };
+
+  // Admin deletes any user's display name
+  public shared ({ caller }) func adminDeleteDisplayName(target: Principal) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) { return #err(#NotAuthorized) };
+    Map.delete(displayNames, phash, target);
+    #ok("Display name removed for " # Principal.toText(target))
+  };
+
+  // Query a single user's display name
+  public query func getDisplayName(user: Principal) : async ?Text {
+    Map.get(displayNames, phash, user)
+  };
+
+  // Batch query display names for multiple principals
+  public query func getDisplayNames(users: [Principal]) : async [(Principal, ?Text)] {
+    Array.map<Principal, (Principal, ?Text)>(users, func (p) {
+      (p, Map.get(displayNames, phash, p))
+    })
+  };
+
+  // Admin adds banned words (normalized: lowercase, alpha-only, deduplicated)
+  public shared ({ caller }) func addBannedWords(words: [Text]) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) { return #err(#NotAuthorized) };
+
+    let newWords = Buffer.Buffer<Text>(bannedWords.size() + words.size());
+    for (w in bannedWords.vals()) { newWords.add(w) };
+
+    var added : Nat = 0;
+    for (word in words.vals()) {
+      let normalized = normalizeForBannedCheck(word);
+      if (normalized.size() > 0) {
+        var exists = false;
+        for (existing in bannedWords.vals()) {
+          if (existing == normalized) { exists := true };
+        };
+        if (not exists) {
+          newWords.add(normalized);
+          added += 1;
+        };
+      };
+    };
+
+    bannedWords := Buffer.toArray(newWords);
+    #ok("Added " # Nat.toText(added) # " banned words. Total: " # Nat.toText(bannedWords.size()))
+  };
+
+  // Admin removes banned words
+  public shared ({ caller }) func removeBannedWords(words: [Text]) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) { return #err(#NotAuthorized) };
+
+    let normalizedToRemove = Array.map<Text, Text>(words, normalizeForBannedCheck);
+    bannedWords := Array.filter<Text>(bannedWords, func (w) {
+      not Array.foldLeft<Text, Bool>(normalizedToRemove, false, func (found, r) {
+        found or (r == w)
+      })
+    });
+
+    #ok("Banned words updated. Total: " # Nat.toText(bannedWords.size()))
+  };
+
+  // Admin views banned word list
+  public shared ({ caller }) func getBannedWords() : async Result.Result<[Text], RewardsError> {
+    if (not isAdmin(caller)) { return #err(#NotAuthorized) };
+    #ok(bannedWords)
   };
 
   //=========================================================================
