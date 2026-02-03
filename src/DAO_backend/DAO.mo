@@ -464,7 +464,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
         };
       } else {
         let ledger = actor (Principal.toText(token)) : ICRC1.FullInterface;
-        let metadata = await ledger.icrc1_metadata();
+        let metadata = await (with timeout = 65) ledger.icrc1_metadata();
 
         // Initialize with defaults
         var name = "";
@@ -541,7 +541,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       };
 
       try {
-        ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+        ignore await (with timeout = 65)treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
       } catch (e) {
         // Don't fail the whole operation for sync issues, just log
         logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "addTokenWithReason");
@@ -603,7 +603,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       };
       
       try {
-        ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+        ignore await (with timeout = 65)treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
       } catch (e) {
         // Don't fail the whole operation for sync issues, just log
         logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "removeToken");
@@ -657,7 +657,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       };
       
       try {
-        ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+        ignore await (with timeout = 65) treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
       } catch (e) {
         // Don't fail the whole operation for sync issues, just log
         logger.warn("Admin", "Failed to sync token details with treasury: " # Error.message(e), "deleteToken");
@@ -707,7 +707,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     };
 
     try {
-      ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+      ignore await (with timeout = 65) treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
       logger.info("Admin", "Synced token details with treasury", "pauseToken");
       logAdminAction(caller, #TokenPause({token}), reason, true, null);
     } catch (e) {
@@ -752,7 +752,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
         logger.info("Admin", "Token " # Principal.toText(token) # " unpaused", "unpauseToken");
 
         try {
-          ignore await treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
+          ignore await (with timeout = 65) treasury.syncTokenDetailsFromDAO(Iter.toArray(Map.entries(tokenDetailsMap)));
           logger.info("Admin", "Synced token details with treasury", "unpauseToken");
           logAdminAction(caller, #TokenUnpause({token}), reason, true, null);
         } catch (e) {
@@ -1495,13 +1495,13 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     logger.info("Snapshot", "Starting scheduled snapshot update", "updateSnapshot");
 
     try {
-      let status = await neuronSnapshot.get_neuron_snapshot_status();
+      let status = await (with timeout = 65) neuronSnapshot.get_neuron_snapshot_status();
       logger.info("Snapshot", "Current snapshot status: " # debug_show (status), "updateSnapshot");
 
       switch (status) {
         case (#Ready) {
           logger.info("Snapshot", "Neuron snapshot canister is ready, taking new snapshot", "updateSnapshot");
-          let result = await neuronSnapshot.take_neuron_snapshot();
+          let result = await (with timeout = 65) neuronSnapshot.take_neuron_snapshot();
 
           switch (result) {
             case (#Ok(id)) {
@@ -1532,13 +1532,13 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     logger.info("Snapshot", "Polling status for snapshot ID: " # Nat.toText(id), "pollSnapshotStatus");
 
     try {
-      let status = await neuronSnapshot.get_neuron_snapshot_status();
+      let status = await (with timeout = 65) neuronSnapshot.get_neuron_snapshot_status();
       logger.info("Snapshot", "Current status: " # debug_show (status), "pollSnapshotStatus");
 
       switch (status) {
         case (#Ready) {
           // Snapshot complete, verify it was successful
-          switch (await neuronSnapshot.get_neuron_snapshot_info(id)) {
+          switch (await (with timeout = 65) neuronSnapshot.get_neuron_snapshot_info(id)) {
             case (?info) {
               switch (info.result) {
                 case (#Ok) {
@@ -1646,7 +1646,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
     // Call rewards canister to perform the backfill
     let result = try {
-      await rewardsCanister.admin_backfillDistributionHistory(config)
+      await (with timeout = 65) rewardsCanister.admin_backfillDistributionHistory(config)
     } catch (e) {
       logger.error("Admin", "Failed to call rewards canister: " # Error.message(e), "admin_backfillPerformanceData");
       return #err(#UnexpectedError("Failed to call rewards canister: " # Error.message(e)));
@@ -1754,7 +1754,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     // Archive allocation changes in batch
     if (allocationsBuffer.size() > 0) {
       let archiveResult = try {
-        await neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(allocationsBuffer))
+        await (with timeout = 65) neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(allocationsBuffer))
       } catch (e) {
         errorsBuffer.add("Failed to archive allocations: " # Error.message(e));
         #err(#SystemError(Error.message(e)))
@@ -1818,7 +1818,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       let batch = Array.tabulate<PriceBlockData>(batchSize, func(i) { pricesArray[priceOffset + i] });
 
       let archiveResult = try {
-        await priceArchive.archivePriceBlockBatch(batch)
+        await (with timeout = 65)priceArchive.archivePriceBlockBatch(batch)
       } catch (e) {
         errorsBuffer.add("Failed to archive prices batch at offset " # Nat.toText(priceOffset) # ": " # Error.message(e));
         #err(#SystemError(Error.message(e)))
@@ -2017,7 +2017,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
       // Check if neuron already has records in archive
       try {
-        let existingRecords = await neuronAllocationArchive.getNeuronAllocationChangesByNeuron(neuronId, 1);
+        let existingRecords = await (with timeout = 65) neuronAllocationArchive.getNeuronAllocationChangesByNeuron(neuronId, 1);
         switch (existingRecords) {
           case (#ok(records)) {
             if (records.size() > 0) {
@@ -2075,7 +2075,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       // When batch is full, archive it
       if (batchBuffer.size() >= BATCH_SIZE) {
         try {
-          let result = await neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(batchBuffer));
+          let result = await (with timeout = 65) neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(batchBuffer));
           switch (result) {
             case (#ok(r)) {
               totalArchived += r.archived;
@@ -2098,7 +2098,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     // Archive remaining records
     if (batchBuffer.size() > 0) {
       try {
-        let result = await neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(batchBuffer));
+        let result = await (with timeout = 65) neuronAllocationArchive.archiveNeuronAllocationChangeBatch(Buffer.toArray(batchBuffer));
         switch (result) {
           case (#ok(r)) {
             totalArchived += r.archived;
@@ -2269,7 +2269,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
     try {
       // Get cumulative voting power from snapshot
-      let cumulativeVP = switch (await neuronSnapshot.getCumulativeValuesAtSnapshot(?lastSnapshotId)) {
+      let cumulativeVP = switch (await (with timeout = 65) neuronSnapshot.getCumulativeValuesAtSnapshot(?lastSnapshotId)) {
         case (?vp) {
           logger.info("Snapshot", "Received cumulative voting power: " # Nat.toText(vp.total_staked_vp), "recalculateAllVotingPower");
           vp;
@@ -2285,7 +2285,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
       // Get first page to determine total entries
       logger.info("Snapshot", "Fetching first page of neuron data", "recalculateAllVotingPower");
-      switch (await neuronSnapshot.getNeuronDataForDAO(lastSnapshotId, 0, 39000)) {
+      switch (await (with timeout = 65)neuronSnapshot.getNeuronDataForDAO(lastSnapshotId, 0, 39000)) {
         case (?{ entries; total_entries; stopped_at }) {
           logger.info("Snapshot", "Received " # Nat.toText(entries.size()) # " entries out of " # Nat.toText(total_entries), "recalculateAllVotingPower");
           Vector.addFromIter(principalNeuronsVec, entries.vals());
@@ -2306,7 +2306,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
               while isMoreData {
                 logger.info("Snapshot", "Fetching additional page " # Nat.toText(pageCount) # " starting at index: " # Nat.toText(currentIndex), "recalculateAllVotingPower");
 
-                switch (await neuronSnapshot.getNeuronDataForDAO(lastSnapshotId, currentIndex, pageSize)) {
+                switch (await (with timeout = 65) neuronSnapshot.getNeuronDataForDAO(lastSnapshotId, currentIndex, pageSize)) {
                   case (?{ entries; stopped_at }) {
                     logger.info("Snapshot", "Received " # Nat.toText(entries.size()) # " entries in page " # Nat.toText(pageCount), "recalculateAllVotingPower");
                     Vector.addFromIter(principalNeuronsVec, entries.vals());
@@ -2760,7 +2760,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       // Fetch user's neurons from SNS governance
       logger.info("VotingPower", "Refreshing voting power for user: " # Principal.toText(caller), "refreshUserVotingPower");
       
-      let neuronsResult = await snsGov.list_neurons({
+      let neuronsResult = await (with timeout = 65) snsGov.list_neurons({
         of_principal = ?caller;
         limit = 1000; // Should be enough for most users
         start_page_at = null;
@@ -2772,7 +2772,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       };
 
       // Get nervous system parameters for voting power calculation
-      let params = await snsGov.get_nervous_system_parameters();
+      let params = await (with timeout = 65)snsGov.get_nervous_system_parameters();
       
       // Create voting power calculator (reuse from neuron snapshot)
       let vpCalc = calcHelp.vp_calc();
@@ -3228,7 +3228,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
         logAdminAction(caller, #ParameterUpdate({parameter = param; oldValue = Principal.toText(oldValue); newValue = Principal.toText(newLogAdmin)}), reasonText, true, null);
         logger.info("Admin", "Log admin updated to " # Principal.toText(newLogAdmin), "updateSystemParameter");
         try {
-          await neuronSnapshot.setLogAdmin(newLogAdmin);
+          await (with timeout = 65) neuronSnapshot.setLogAdmin(newLogAdmin);
         } catch (e) {
           logger.error("Admin", "Error setting log admin: " # Error.message(e), "updateSystemParameter");
         };
@@ -3394,7 +3394,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     let treasury = actor (Principal.toText(treasuryPrincipal)) : TreasuryTypes.Self;
 
     try {
-      let result = await treasury.updateRebalanceConfig(updates, rebalanceState, reason);
+      let result = await (with timeout = 65)treasury.updateRebalanceConfig(updates, rebalanceState, reason);
 
       switch (result) {
         case (#ok(message)) {
@@ -3643,7 +3643,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
         config.maxSlippageBasisPoints != null or config.PRICE_HISTORY_WINDOW != null
       ) {
 
-        let configResult = await mintingVault.updateConfiguration({
+        let configResult = await (with timeout = 65) mintingVault.updateConfiguration({
           minPremium = config.minPremium;
           maxPremium = config.maxPremium;
           balanceUpdateInterval = config.balanceUpdateInterval;
@@ -3662,7 +3662,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       // Update swapping state if provided
       switch (config.swappingEnabled) {
         case (?enabled) {
-          let swapResult = await mintingVault.setSwappingEnabled(enabled);
+          let swapResult = await (with timeout = 65) mintingVault.setSwappingEnabled(enabled);
           switch (swapResult) {
             case (#ok(_)) {};
             case (#err(e)) { return #err(#UnexpectedError(e)) };

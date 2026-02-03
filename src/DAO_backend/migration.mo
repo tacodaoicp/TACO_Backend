@@ -118,7 +118,6 @@ module {
           newMap[i] := ?(keys, newValues, indexes, bounds);
         };
         case null {
-          ignore 1-3;
           newMap[i] := null;
         };
       };

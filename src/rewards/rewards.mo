@@ -355,6 +355,8 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var leaderboardLastUpdate: Int = 0;
   stable var leaderboardSize: Nat = 50;                // Top N per leaderboard
   stable var leaderboardUpdateEnabled: Bool = true;    // On/off switch
+  stable var leaderboardTimerId: ?Nat = null;          // Timer ID for recurring leaderboard updates
+  let LEADERBOARD_REFRESH_INTERVAL_NS: Nat = 2 * 60 * 60 * 1_000_000_000; // 2 hours in nanoseconds
 
   // Display name system
   stable var displayNames = Map.new<Principal, Text>();       // principal -> display name
@@ -444,7 +446,7 @@ shared (deployer) persistent actor class Rewards() = this {
   type DAOCanister = actor {
     admin_getNeuronAllocations: () -> async [(Blob, NeuronAllocation)];
     getAllNeuronOwners: query () -> async [(Blob, [Principal])];
-    getActiveDecisionMakers: query () -> async [(Blob, [Principal])];  // Only active makers + followers, excludes passive hotkeys
+    getActiveDecisionMakers: query () -> async [(Blob, [Principal])];  // Only active makers, excludes passive hotkeys
     admin_getAllActiveNeuronIds: query () -> async [Blob];
     getNeuronAllocation: query (Blob) -> async ?NeuronAllocation;
   };
@@ -1870,7 +1872,7 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Leaderboard configuration updated")
   };
 
-  // Manual refresh of all leaderboards (for testing/emergency)
+  // Manual refresh of all leaderboards and start the 2-hour recurring timer
   public shared ({ caller }) func refreshLeaderboards() : async Result.Result<Text, RewardsError> {
     if (not isAdmin(caller)) {
       return #err(#NotAuthorized);
@@ -1878,10 +1880,66 @@ shared (deployer) persistent actor class Rewards() = this {
 
     try {
       await* computeAllLeaderboards<system>();
-      #ok("All leaderboards refreshed successfully")
+      // Start the recurring timer after successful refresh
+      startLeaderboardTimer<system>();
+      #ok("All leaderboards refreshed successfully. Recurring 2-hour timer started.")
     } catch (error) {
       #err(#SystemError("Failed to refresh leaderboards: " # Error.message(error)))
     };
+  };
+
+  // Start the recurring leaderboard refresh timer (2 hours)
+  private func startLeaderboardTimer<system>() {
+    // Cancel existing timer if any
+    switch (leaderboardTimerId) {
+      case (?id) { Timer.cancelTimer(id); };
+      case null {};
+    };
+
+    // Set up recurring timer
+    leaderboardTimerId := ?Timer.setTimer<system>(
+      #nanoseconds(LEADERBOARD_REFRESH_INTERVAL_NS),
+      func() : async () {
+        if (leaderboardUpdateEnabled) {
+          try {
+            await* computeAllLeaderboards<system>();
+            logger.info("Leaderboard", "Scheduled leaderboard refresh completed", "leaderboardTimer");
+          } catch (error) {
+            logger.error("Leaderboard", "Scheduled leaderboard refresh failed: " # Error.message(error), "leaderboardTimer");
+          };
+        };
+        // Reschedule the timer for the next interval
+        startLeaderboardTimer<system>();
+      }
+    );
+    logger.info("Leaderboard", "Leaderboard refresh timer started (2-hour interval)", "startLeaderboardTimer");
+  };
+
+  // Stop the recurring leaderboard refresh timer
+  public shared ({ caller }) func stopLeaderboardTimer() : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    switch (leaderboardTimerId) {
+      case (?id) {
+        Timer.cancelTimer(id);
+        leaderboardTimerId := null;
+        logger.info("Leaderboard", "Leaderboard refresh timer stopped", "stopLeaderboardTimer");
+        #ok("Leaderboard refresh timer stopped")
+      };
+      case null {
+        #ok("No active leaderboard timer to stop")
+      };
+    };
+  };
+
+  // Get leaderboard timer status
+  public query func getLeaderboardTimerStatus() : async { active: Bool; intervalHours: Nat } {
+    {
+      active = Option.isSome(leaderboardTimerId);
+      intervalHours = 2;
+    }
   };
 
   //=========================================================================
@@ -3669,11 +3727,26 @@ shared (deployer) persistent actor class Rewards() = this {
                 // Linear interpolation: how much of this distribution's USD return is at this checkpoint
                 let rawCP = checkpoint.totalPortfolioValue; // raw value before cumulative scaling
                 let scaledICP : Float = if (Float.abs(distUsdScore - 1.0) > 1e-10) {
+                  // Interpolate ICP based on how far through the USD return this checkpoint is
                   let fraction = (rawCP - 1.0) / (distUsdScore - 1.0);
                   priorIcpPerformance * (1.0 + fraction * (distIcpScore - 1.0))
                 } else {
-                  // No USD change in this distribution — ICP stays at prior level
-                  priorIcpPerformance
+                  // USD barely changed — use raw checkpoint progress to interpolate ICP directly
+                  // This handles the case where ICP moved significantly even though USD didn't
+                  let checkpointCount = reward.checkpoints.size();
+                  if (checkpointCount > 1) {
+                    // Use position within checkpoints as fraction of distribution progress
+                    var cpIdx : Nat = 0;
+                    label findIdx for (cp in reward.checkpoints.vals()) {
+                      if (cp.timestamp == checkpoint.timestamp) { break findIdx };
+                      cpIdx += 1;
+                    };
+                    let fraction = Float.fromInt(cpIdx) / Float.fromInt(checkpointCount - 1);
+                    priorIcpPerformance * (1.0 + fraction * (distIcpScore - 1.0))
+                  } else {
+                    // Single checkpoint — apply full ICP score
+                    priorIcpPerformance * distIcpScore
+                  }
                 };
 
                 entry.checkpoints.add({
@@ -3775,9 +3848,8 @@ shared (deployer) persistent actor class Rewards() = this {
                 let currentAlloc = cp.allocations;
                 switch (prevAllocations) {
                   case null {
-                    // First allocation seen
+                    // First allocation seen — record as baseline, not a change
                     prevAllocations := ?currentAlloc;
-                    allocChangeCount += 1;
                   };
                   case (?prev) {
                     // Compare with previous allocation
