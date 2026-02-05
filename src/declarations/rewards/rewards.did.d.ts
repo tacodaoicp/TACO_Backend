@@ -322,6 +322,10 @@ export interface Rewards {
       'maxSize' : bigint,
     }
   >,
+  'getLeaderboardTimerStatus' : ActorMethod<
+    [],
+    { 'active' : boolean, 'intervalHours' : bigint }
+  >,
   /**
    * / * Get the last N log entries
    */
@@ -381,6 +385,7 @@ export interface Rewards {
   'startDistributionTimer' : ActorMethod<[], Result__1>,
   'startDistributionTimerAt' : ActorMethod<[bigint], Result__1>,
   'stopDistributionTimer' : ActorMethod<[], Result__1>,
+  'stopLeaderboardTimer' : ActorMethod<[], Result__1>,
   'triggerDistribution' : ActorMethod<[], Result__1>,
   'triggerDistributionCustom' : ActorMethod<
     [bigint, bigint, PriceType],

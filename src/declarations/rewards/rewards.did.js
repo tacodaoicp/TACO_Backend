@@ -452,6 +452,11 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getLeaderboardTimerStatus' : IDL.Func(
+        [],
+        [IDL.Record({ 'active' : IDL.Bool, 'intervalHours' : IDL.Nat })],
+        ['query'],
+      ),
     'getLogs' : IDL.Func([IDL.Nat], [IDL.Vec(LogEntry)], ['query']),
     'getLogsByContext' : IDL.Func(
         [IDL.Text, IDL.Nat],
@@ -552,6 +557,7 @@ export const idlFactory = ({ IDL }) => {
     'startDistributionTimer' : IDL.Func([], [Result__1], []),
     'startDistributionTimerAt' : IDL.Func([IDL.Int], [Result__1], []),
     'stopDistributionTimer' : IDL.Func([], [Result__1], []),
+    'stopLeaderboardTimer' : IDL.Func([], [Result__1], []),
     'triggerDistribution' : IDL.Func([], [Result__1], []),
     'triggerDistributionCustom' : IDL.Func(
         [IDL.Int, IDL.Int, PriceType],

@@ -874,7 +874,7 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     // Get allocation data from the neuron allocation archive
-    let allocationResult = await (with timeout = 65)  neuronAllocationArchive.getNeuronAllocationChangesWithContext(
+    let allocationResult = await (with timeout = 30)  neuronAllocationArchive.getNeuronAllocationChangesWithContext(
       neuronId, startTime, endTime, 100
     );
 
@@ -945,7 +945,7 @@ shared (deployer) persistent actor class Rewards() = this {
       let allTokens = Buffer.toArray(allTokensBuffer);
 
       // Get prices for all tokens at once
-      let batchPriceResult = await (with timeout = 65)  priceArchive.getPricesAtTime(allTokens, timestamp);
+      let batchPriceResult = await (with timeout = 30)  priceArchive.getPricesAtTime(allTokens, timestamp);
       let tokenPrices = switch (batchPriceResult) {
         case (#ok(prices)) { prices };
         case (#err(_)) {
@@ -988,7 +988,7 @@ shared (deployer) persistent actor class Rewards() = this {
             case (?oldPrice) {
               var priceInfoOpt : ?PriceInfo = findPrice(token);
               if (priceInfoOpt == null) {
-                let futureResStep1 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                let futureResStep1 = await (with timeout = 30)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
                 switch (futureResStep1) {
                   case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
                   case _ {};
@@ -1009,7 +1009,7 @@ shared (deployer) persistent actor class Rewards() = this {
             case null {
               var priceInfoOpt2 : ?PriceInfo = findPrice(token);
               if (priceInfoOpt2 == null) {
-                let futureResNew = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                let futureResNew = await (with timeout = 30)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
                 switch (futureResNew) {
                   case (#ok(?futurePrice)) { priceInfoOpt2 := ?futurePrice; };
                   case _ {};
@@ -1047,7 +1047,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
         var priceInfoOpt : ?PriceInfo = findPrice(allocation.token);
         if (priceInfoOpt == null) {
-          let futureRes2 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+          let futureRes2 = await (with timeout = 30)  priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
           switch (futureRes2) {
             case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
             case _ {};
@@ -1502,7 +1502,7 @@ shared (deployer) persistent actor class Rewards() = this {
       Vector.put(distributionHistory, Vector.size(distributionHistory) - 1, updatedRecord);
 
       // Start processing neurons one by one (with initial skipped neurons in failed list)
-      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, ([] : [NeuronReward]), initialSkippedNeurons, 0.0, startTime, endTime, priceType);
+      await* processNeuronsSequentially<system>(distributionCounter, neurons, 0, ([] : [NeuronReward]), initialSkippedNeurons, 0.0, startTime, endTime, priceType, 0);
       
     } catch (error) {
       logger.error("Distribution", "Failed to get neurons: " # "Error occurred", "runPeriodicDistribution");
@@ -1520,7 +1520,8 @@ shared (deployer) persistent actor class Rewards() = this {
     totalRewardScore: Float,
     startTime: Int,
     endTime: Int,
-    priceType: PriceType
+    priceType: PriceType,
+    retryCount: Nat
   ) : async* () {
     
     // Check if this distribution was cancelled
@@ -1619,7 +1620,8 @@ shared (deployer) persistent actor class Rewards() = this {
                 updatedTotalScore,
                 startTime,
                 endTime,
-                priceType
+                priceType,
+                0
               );
             }
           );
@@ -1648,7 +1650,8 @@ shared (deployer) persistent actor class Rewards() = this {
                 totalRewardScore,
                 startTime,
                 endTime,
-                priceType
+                priceType,
+                0
               );
             }
           );
@@ -1656,29 +1659,45 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     } catch (error) {
       let errorMsg = Error.message(error);
-      logger.error("Distribution", "Error processing neuron: " # errorMsg, "processNeuronsSequentially");
-      
-      // Add this neuron to the failed list
-      let failedNeuron : FailedNeuron = {
-        neuronId = neuronId;
-        errorMessage = "System error: " # errorMsg;
+      let isTimeout = Text.contains(errorMsg, #text "deadline") or Text.contains(errorMsg, #text "timeout");
+      let maxRetries = 3;
+
+      // Determine next index and retry count
+      let (nextIndex, nextRetryCount, shouldAddToFailed) = if (isTimeout and retryCount < maxRetries) {
+        // Retry same neuron
+        logger.warn("Distribution", "Timeout processing neuron, will retry (" # Nat.toText(retryCount + 1) # "/" # Nat.toText(maxRetries) # "): " # errorMsg, "processNeuronsSequentially");
+        (currentIndex, retryCount + 1, false)
+      } else {
+        // Move to next neuron
+        logger.error("Distribution", "Error processing neuron: " # errorMsg, "processNeuronsSequentially");
+        (currentIndex + 1, 0, true)
       };
-      let updatedFailedNeurons = Array.flatten([failedNeurons, [failedNeuron]]);
-      
-      // Continue with next neuron
+
+      let updatedFailedNeurons = if (shouldAddToFailed) {
+        let failedNeuron : FailedNeuron = {
+          neuronId = neuronId;
+          errorMessage = "System error: " # errorMsg # (if isTimeout  " (after " # Nat.toText(maxRetries) # " retries)" else "");
+        };
+        Array.flatten([failedNeurons, [failedNeuron]])
+      } else {
+        failedNeurons
+      };
+
+      // Use existing timer pattern
       ignore Timer.setTimer<system>(
         #nanoseconds(0),
         func() : async () {
           await* processNeuronsSequentially<system>(
             distributionId,
             neurons,
-            currentIndex + 1,
+            nextIndex,
             neuronRewards,
             updatedFailedNeurons,
             totalRewardScore,
             startTime,
             endTime,
-            priceType
+            priceType,
+            nextRetryCount
           );
         }
       );

@@ -191,6 +191,11 @@ type Rewards =
        totalDistributions: nat;
        updateEnabled: bool;
      }) query;
+   getLeaderboardTimerStatus: () ->
+    (record {
+       active: bool;
+       intervalHours: nat;
+     }) query;
    /// * Get the last N log entries
    getLogs: (count: nat) -> (vec LogEntry) query;
    /// * Get the last N log entries for a specific context
@@ -244,6 +249,7 @@ type Rewards =
    startDistributionTimer: () -> (Result__1);
    startDistributionTimerAt: (targetTime: int) -> (Result__1);
    stopDistributionTimer: () -> (Result__1);
+   stopLeaderboardTimer: () -> (Result__1);
    triggerDistribution: () -> (Result__1);
    triggerDistributionCustom: (startTime: int, endTime: int, priceType:
     PriceType) -> (Result__1);
