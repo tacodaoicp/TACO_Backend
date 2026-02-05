@@ -276,6 +276,7 @@ shared (deployer) persistent actor class Rewards() = this {
     oneYearUSD: ?Float;
     oneYearICP: ?Float;
     allocationChangeCount: Nat;
+    votingPower: Nat;
   };
 
   public type UserPerformanceGraphData = {
@@ -3881,6 +3882,7 @@ shared (deployer) persistent actor class Rewards() = this {
         // Count allocation changes across distributions
         var allocChangeCount : Nat = 0;
         var prevAllocations : ?[{ token: Principal; basisPoints: Nat }] = null;
+        var latestVotingPower : Nat = 0;
 
         // Calendar-based timeframe cutoffs (matching leaderboard calculation)
         let now = Time.now();
@@ -3903,6 +3905,9 @@ shared (deployer) persistent actor class Rewards() = this {
                   case (?s) { s };
                   case null { reward.performanceScore };
                 };
+
+                // Track the latest voting power (from the most recent distribution)
+                latestVotingPower := reward.votingPower;
 
                 // Calendar-based timeframe inclusion
                 if (dist.endTime >= weekCutoff) { Vector.add(weekScoresUSD, usdScore); Vector.add(weekScoresICP, icpScoreVal); };
@@ -3967,6 +3972,7 @@ shared (deployer) persistent actor class Rewards() = this {
           oneYearUSD = oyUSD;
           oneYearICP = oyICP;
           allocationChangeCount = allocChangeCount;
+          votingPower = latestVotingPower;
         });
 
         // Track aggregated performance

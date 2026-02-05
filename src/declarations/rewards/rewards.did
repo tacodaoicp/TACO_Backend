@@ -388,6 +388,7 @@ type NeuronGraphDataExtended =
    oneYearUSD: opt float64;
    performanceScoreICP: opt float64;
    performanceScoreUSD: float64;
+   votingPower: nat;
  };
 type NeuronAllocationChangeBlockData = 
  record {

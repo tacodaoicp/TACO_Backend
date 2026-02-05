@@ -248,6 +248,7 @@ export const idlFactory = ({ IDL }) => {
   const NeuronGraphDataExtended = IDL.Record({
     'oneMonthICP' : IDL.Opt(IDL.Float64),
     'oneMonthUSD' : IDL.Opt(IDL.Float64),
+    'votingPower' : IDL.Nat,
     'allocationChangeCount' : IDL.Nat,
     'oneWeekICP' : IDL.Opt(IDL.Float64),
     'oneWeekUSD' : IDL.Opt(IDL.Float64),

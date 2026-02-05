@@ -113,6 +113,7 @@ export interface NeuronAllocationChangeBlockData {
 export interface NeuronGraphDataExtended {
   'oneMonthICP' : [] | [number],
   'oneMonthUSD' : [] | [number],
+  'votingPower' : bigint,
   'allocationChangeCount' : bigint,
   'oneWeekICP' : [] | [number],
   'oneWeekUSD' : [] | [number],
