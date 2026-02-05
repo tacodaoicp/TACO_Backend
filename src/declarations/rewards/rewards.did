@@ -37,14 +37,7 @@ type UserPerformanceGraphData =
    aggregatedPerformanceICP: opt float64;
    aggregatedPerformanceUSD: float64;
    allocationNeuronId: opt blob;
-   bestIcpNeuron: opt NeuronGraphData;
-   bestUsdNeuron: opt NeuronGraphData;
-   oneMonthICP: opt float64;
-   oneMonthUSD: opt float64;
-   oneWeekICP: opt float64;
-   oneWeekUSD: opt float64;
-   oneYearICP: opt float64;
-   oneYearUSD: opt float64;
+   neurons: vec NeuronGraphDataExtended;
    timeframe: record {
                 endTime: int;
                 startTime: int;
@@ -173,6 +166,7 @@ type Rewards =
    getLeaderboard: (timeframe: LeaderboardTimeframe, priceType:
     LeaderboardPriceType, limit: opt nat, offset: opt nat) ->
     (vec LeaderboardEntry) query;
+   getLeaderboardCutoffDate: () -> (int) query;
    getLeaderboardInfo: () ->
     (record {
        lastUpdate: int;
@@ -217,8 +211,7 @@ type Rewards =
    getUserPerformance: (userPrincipal: principal) ->
     (Result__1_4) composite_query;
    getUserPerformanceGraphData: (userPrincipal: principal, startTime: 
-    int, endTime: int, timeframe: LeaderboardTimeframe) ->
-    (Result__1_3) composite_query;
+    int, endTime: int) -> (Result__1_3) composite_query;
    getUserWithdrawalHistory: (limit: opt nat) -> (Result__1_2);
    getWithdrawalStats: () ->
     (record {
@@ -236,6 +229,7 @@ type Rewards =
    setDisplayName: (name: text) -> (Result__1);
    setDistributionEnabled: (enabled: bool) -> (Result__1);
    setDistributionPeriod: (periodNS: nat) -> (Result__1);
+   setLeaderboardCutoffDate: (cutoffTime: int) -> (Result__1);
    setMaxDistributionHistory: (max: nat) -> (Result__1);
    setPerformanceScorePower: (power: float64) -> (Result__1);
    setPeriodicRewardPot: (amount: nat) -> (Result__1);
@@ -381,10 +375,17 @@ type NeuronPerformanceDetail =
     };
    votingPower: nat;
  };
-type NeuronGraphData = 
+type NeuronGraphDataExtended = 
  record {
+   allocationChangeCount: nat;
    checkpoints: vec GraphCheckpointData;
    neuronId: blob;
+   oneMonthICP: opt float64;
+   oneMonthUSD: opt float64;
+   oneWeekICP: opt float64;
+   oneWeekUSD: opt float64;
+   oneYearICP: opt float64;
+   oneYearUSD: opt float64;
    performanceScoreICP: opt float64;
    performanceScoreUSD: float64;
  };

@@ -25,9 +25,9 @@ import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
 import Char "mo:base/Char";
 import Service "mo:icrc3-mo/service";
-import Migration "migration";
+//import Migration "migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
@@ -263,20 +263,27 @@ shared (deployer) persistent actor class Rewards() = this {
     performanceScoreICP: ?Float;
   };
 
-  public type UserPerformanceGraphData = {
-    timeframe: { startTime: Int; endTime: Int };
-    bestUsdNeuron: ?NeuronGraphData;   // Best neuron for USD performance
-    bestIcpNeuron: ?NeuronGraphData;   // Best neuron for ICP performance
-    allocationNeuronId: ?Blob;         // Neuron with most allocation changes (for tooltip display)
-    aggregatedPerformanceUSD: Float;   // Compound performance across all neurons (AllTime)
-    aggregatedPerformanceICP: ?Float;
-    // Timeframe-specific performance for the best neuron (matches leaderboard calculation)
+  // Extended graph data type with per-timeframe scores for each neuron
+  public type NeuronGraphDataExtended = {
+    neuronId: Blob;
+    checkpoints: [GraphCheckpointData];
+    performanceScoreUSD: Float;
+    performanceScoreICP: ?Float;
     oneWeekUSD: ?Float;
     oneWeekICP: ?Float;
     oneMonthUSD: ?Float;
     oneMonthICP: ?Float;
     oneYearUSD: ?Float;
     oneYearICP: ?Float;
+    allocationChangeCount: Nat;
+  };
+
+  public type UserPerformanceGraphData = {
+    timeframe: { startTime: Int; endTime: Int };  // Earliest & latest checkpoint timestamps across all neurons
+    allocationNeuronId: ?Blob;         // Neuron with most allocation changes (for tooltip display)
+    aggregatedPerformanceUSD: Float;   // Compound performance across all neurons
+    aggregatedPerformanceICP: ?Float;
+    neurons: [NeuronGraphDataExtended];  // All neurons with full data
   };
 
   // Configuration
@@ -356,6 +363,7 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var leaderboardSize: Nat = 50;                // Top N per leaderboard
   stable var leaderboardUpdateEnabled: Bool = true;    // On/off switch
   stable var leaderboardTimerId: ?Nat = null;          // Timer ID for recurring leaderboard updates
+  stable var leaderboardCutoffDate: Int = 1767225600000000000;  // Cutoff date: Jan 1, 2026 00:00:00 UTC (in nanoseconds)
   let LEADERBOARD_REFRESH_INTERVAL_NS: Nat = 2 * 60 * 60 * 1_000_000_000; // 2 hours in nanoseconds
 
   // Display name system
@@ -2903,6 +2911,22 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Max distribution history updated");
   };
 
+  // Set leaderboard cutoff date (distributions before this date are excluded from leaderboards and graph data)
+  public shared ({ caller }) func setLeaderboardCutoffDate(cutoffTime: Int) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    leaderboardCutoffDate := cutoffTime;
+    logger.info("Config", "Leaderboard cutoff date set to " # Int.toText(cutoffTime), "setLeaderboardCutoffDate");
+    #ok("Leaderboard cutoff date updated")
+  };
+
+  // Get current leaderboard cutoff date
+  public query func getLeaderboardCutoffDate() : async Int {
+    leaderboardCutoffDate
+  };
+
   //=========================================================================
   // Reward Penalty Management Functions
   //=========================================================================
@@ -3460,8 +3484,14 @@ shared (deployer) persistent actor class Rewards() = this {
           for (principal in principals.vals()) {
             switch (Map.get(userPerformances, phash, principal)) {
               case (?existing) {
-                // Keep neuron with highest aggregate score for this user
-                if (scored.aggregateScore > existing.bestNeuron.aggregateScore) {
+                // Keep neuron with most distributions (longest running)
+                // Tie-breaker: higher performance score
+                let shouldReplace =
+                  scored.distributionCount > existing.bestNeuron.distributionCount or
+                  (scored.distributionCount == existing.bestNeuron.distributionCount and
+                   scored.aggregateScore > existing.bestNeuron.aggregateScore);
+
+                if (shouldReplace) {
                   Map.set(userPerformances, phash, principal, {
                     principal;
                     bestNeuron = scored;
@@ -3518,23 +3548,31 @@ shared (deployer) persistent actor class Rewards() = this {
     allDistributions: Vector.Vector<DistributionRecord>,
     timeframe: LeaderboardTimeframe
   ) : [DistributionRecord] {
+    let now = Time.now();
     let count = Vector.size(allDistributions);
 
-    let periodsToInclude = switch (timeframe) {
-      case (#OneWeek) { 1 };     // Latest period only
-      case (#OneMonth) { 4 };    // Last ~4 weeks
-      case (#OneYear) { 52 };    // Last 52 weeks
-      case (#AllTime) { count }; // All available
+    // Calculate cutoff time based on timeframe (calendar-based)
+    let timeframeCutoff : Int = switch (timeframe) {
+      case (#OneWeek) { now - 7 * 24 * 60 * 60 * 1_000_000_000 };      // 7 days in ns
+      case (#OneMonth) { now - 31 * 24 * 60 * 60 * 1_000_000_000 };    // 31 days in ns
+      case (#OneYear) { now - 365 * 24 * 60 * 60 * 1_000_000_000 };    // 365 days in ns
+      case (#AllTime) { 0 };  // No time-based cutoff for AllTime
     };
 
-    let startIdx = if (count > periodsToInclude) {
-      count - periodsToInclude
-    } else { 0 };
+    // Use the later of timeframe cutoff and global cutoff date
+    // This means cutoff affects ALL timeframes (week, month, year, allTime)
+    let effectiveCutoff = Int.max(timeframeCutoff, leaderboardCutoffDate);
 
-    Array.tabulate<DistributionRecord>(
-      Nat.min(periodsToInclude, count),
-      func (i) { Vector.get(allDistributions, startIdx + i) }
-    )
+    // Filter distributions that end after the cutoff
+    let filtered = Vector.new<DistributionRecord>();
+    for (i in Iter.range(0, count - 1)) {
+      let dist = Vector.get(allDistributions, i);
+      if (dist.endTime >= effectiveCutoff) {
+        Vector.add(filtered, dist);
+      };
+    };
+
+    Vector.toArray(filtered)
   };
 
   private func calculateAverage(scores: [Float]) : Float {
@@ -3643,11 +3681,11 @@ shared (deployer) persistent actor class Rewards() = this {
   // This is much more efficient than calculateNeuronPerformanceQuery as it reads stored data
   // Use this for performance visualization graphs
   // Takes userPrincipal and looks up their neurons from DAO, then reads checkpoints locally
+  // Returns all neurons owned by the principal with full checkpoint data and per-timeframe scores
   public composite query func getUserPerformanceGraphData(
     userPrincipal: Principal, // User to get graph data for
     startTime: Int,           // Start of time range (nanoseconds)
-    endTime: Int,             // End of time range (nanoseconds)
-    timeframe: LeaderboardTimeframe // Which timeframe to optimize best neuron selection for
+    endTime: Int              // End of time range (nanoseconds)
   ) : async Result.Result<UserPerformanceGraphData, RewardsError> {
     if (startTime >= endTime) {
       return #err(#InvalidTimeRange);
@@ -3716,8 +3754,8 @@ shared (deployer) persistent actor class Rewards() = this {
     for (distIndex in Iter.range(0, totalDistributions - 1)) {
       let dist = Vector.get(distributionHistory, distIndex);
 
-      // Skip distributions outside our time range
-      if (dist.endTime < startTime or dist.startTime > endTime) {
+      // Skip distributions outside our time range OR before cutoff date
+      if (dist.endTime < startTime or dist.startTime > endTime or dist.endTime < leaderboardCutoffDate) {
         // Skip this distribution
       } else {
         // Track actual time bounds
@@ -3801,92 +3839,103 @@ shared (deployer) persistent actor class Rewards() = this {
       };
     };
 
-    // Build the result - select best neuron for USD and best neuron for ICP separately
+    // Build the result - collect all neurons with their scores
     var foundAny = false;
     let distCount = Vector.size(distributionHistory);
 
-    // Per-neuron computed scores
-    type NeuronScores = {
-      neuronIdx: Nat;
-      usdSelectionScore: Float;  // Score for (timeframe, USD)
-      icpSelectionScore: Float;  // Score for (timeframe, ICP)
-      allocationChangeCount: Nat; // Number of distinct allocation changes across distributions
-      oneWeekUSD: ?Float;
-      oneWeekICP: ?Float;
-      oneMonthUSD: ?Float;
-      oneMonthICP: ?Float;
-      oneYearUSD: ?Float;
-      oneYearICP: ?Float;
-    };
-
-    var bestUsdScore : Float = -999999.0;
-    var bestIcpScore : Float = -999999.0;
+    // Track aggregated performance and allocation neuron
+    var totalAggregatedUSD : Float = 0.0;
+    var totalAggregatedICP : Float = 0.0;
+    var hasAnyIcp = false;
     var mostAllocChanges : Nat = 0;
-    var bestUsdNeuronScores : ?NeuronScores = null;
-    var bestIcpNeuronScores : ?NeuronScores = null;
-    var allocationNeuronIdx : ?Nat = null;
+    var allocationNeuronId : ?Blob = null;
+
+    // Track earliest and latest checkpoint timestamps across all neurons
+    var earliestCheckpoint : Int = 9223372036854775807; // Max Int
+    var latestCheckpoint : Int = 0;
+
+    // Build neurons array with all data
+    let neuronsVec = Vector.new<NeuronGraphDataExtended>();
 
     for (i in Iter.range(0, neuronDataMap.size() - 1)) {
       let entry = neuronDataMap.get(i);
       if (entry.found) {
         foundAny := true;
 
+        // Track min/max checkpoint timestamps
+        for (cp in entry.checkpoints.vals()) {
+          if (cp.timestamp < earliestCheckpoint) { earliestCheckpoint := cp.timestamp };
+          if (cp.timestamp > latestCheckpoint) { latestCheckpoint := cp.timestamp };
+        };
+
         // Collect per-distribution scores for this neuron
-        var weekScoresUSD = Buffer.Buffer<Float>(1);
-        var weekScoresICP = Buffer.Buffer<Float>(1);
-        var monthScoresUSD = Buffer.Buffer<Float>(4);
-        var monthScoresICP = Buffer.Buffer<Float>(4);
-        var yearScoresUSD = Buffer.Buffer<Float>(52);
-        var yearScoresICP = Buffer.Buffer<Float>(52);
-        var allTimeScoresUSD = Buffer.Buffer<Float>(500);
-        var allTimeScoresICP = Buffer.Buffer<Float>(100);
+        var weekScoresUSD = Vector.new<Float>();
+        var weekScoresICP = Vector.new<Float>();
+        var monthScoresUSD = Vector.new<Float>();
+        var monthScoresICP = Vector.new<Float>();
+        var yearScoresUSD = Vector.new<Float>();
+        var yearScoresICP = Vector.new<Float>();
+        var allTimeScoresUSD = Vector.new<Float>();
+        var allTimeScoresICP = Vector.new<Float>();
 
         // Count allocation changes across distributions
         var allocChangeCount : Nat = 0;
         var prevAllocations : ?[{ token: Principal; basisPoints: Nat }] = null;
 
+        // Calendar-based timeframe cutoffs (matching leaderboard calculation)
+        let now = Time.now();
+        let weekCutoff = Int.max(now - 7 * 24 * 60 * 60 * 1_000_000_000, leaderboardCutoffDate);
+        let monthCutoff = Int.max(now - 31 * 24 * 60 * 60 * 1_000_000_000, leaderboardCutoffDate);
+        let yearCutoff = Int.max(now - 365 * 24 * 60 * 60 * 1_000_000_000, leaderboardCutoffDate);
+        let allTimeCutoff = leaderboardCutoffDate;
+
         for (di in Iter.range(0, distCount - 1)) {
           let dist = Vector.get(distributionHistory, di);
-          for (reward in dist.neuronRewards.vals()) {
-            if (reward.neuronId == entry.neuronId) {
-              let distIdx : Nat = distCount - 1 - di; // 0 = newest
-              let usdScore = reward.performanceScore;
-              let icpScoreVal = switch (reward.performanceScoreICP) {
-                case (?s) { s };
-                case null { reward.performanceScore };
-              };
 
-              if (distIdx == 0) { weekScoresUSD.add(usdScore); weekScoresICP.add(icpScoreVal); };
-              if (distIdx < 4) { monthScoresUSD.add(usdScore); monthScoresICP.add(icpScoreVal); };
-              if (distIdx < 52) { yearScoresUSD.add(usdScore); yearScoresICP.add(icpScoreVal); };
-              allTimeScoresUSD.add(usdScore);
-              allTimeScoresICP.add(icpScoreVal);
+          // Skip distributions before cutoff date
+          if (dist.endTime < leaderboardCutoffDate) {
+            // Skip this distribution
+          } else {
+            for (reward in dist.neuronRewards.vals()) {
+              if (reward.neuronId == entry.neuronId) {
+                let usdScore = reward.performanceScore;
+                let icpScoreVal = switch (reward.performanceScoreICP) {
+                  case (?s) { s };
+                  case null { reward.performanceScore };
+                };
 
-              // Count allocation changes by comparing checkpoint allocations
-              for (cp in reward.checkpoints.vals()) {
-                let currentAlloc = cp.allocations;
-                switch (prevAllocations) {
-                  case null {
-                    // First allocation seen — record as baseline, not a change
-                    prevAllocations := ?currentAlloc;
-                  };
-                  case (?prev) {
-                    // Compare with previous allocation
-                    var changed = false;
-                    if (prev.size() != currentAlloc.size()) {
-                      changed := true;
-                    } else {
-                      label checkAlloc for (j in Iter.range(0, prev.size() - 1)) {
-                        if (prev[j].basisPoints != currentAlloc[j].basisPoints or
-                            Principal.notEqual(prev[j].token, currentAlloc[j].token)) {
-                          changed := true;
-                          break checkAlloc;
+                // Calendar-based timeframe inclusion
+                if (dist.endTime >= weekCutoff) { Vector.add(weekScoresUSD, usdScore); Vector.add(weekScoresICP, icpScoreVal); };
+                if (dist.endTime >= monthCutoff) { Vector.add(monthScoresUSD, usdScore); Vector.add(monthScoresICP, icpScoreVal); };
+                if (dist.endTime >= yearCutoff) { Vector.add(yearScoresUSD, usdScore); Vector.add(yearScoresICP, icpScoreVal); };
+                if (dist.endTime >= allTimeCutoff) { Vector.add(allTimeScoresUSD, usdScore); Vector.add(allTimeScoresICP, icpScoreVal); };
+
+                // Count allocation changes by comparing checkpoint allocations
+                for (cp in reward.checkpoints.vals()) {
+                  let currentAlloc = cp.allocations;
+                  switch (prevAllocations) {
+                    case null {
+                      // First allocation seen — record as baseline, not a change
+                      prevAllocations := ?currentAlloc;
+                    };
+                    case (?prev) {
+                      // Compare with previous allocation
+                      var changed = false;
+                      if (prev.size() != currentAlloc.size()) {
+                        changed := true;
+                      } else {
+                        label checkAlloc for (j in Iter.range(0, prev.size() - 1)) {
+                          if (prev[j].basisPoints != currentAlloc[j].basisPoints or
+                              Principal.notEqual(prev[j].token, currentAlloc[j].token)) {
+                            changed := true;
+                            break checkAlloc;
+                          };
                         };
                       };
-                    };
-                    if (changed) {
-                      allocChangeCount += 1;
-                      prevAllocations := ?currentAlloc;
+                      if (changed) {
+                        allocChangeCount += 1;
+                        prevAllocations := ?currentAlloc;
+                      };
                     };
                   };
                 };
@@ -3896,60 +3945,41 @@ shared (deployer) persistent actor class Rewards() = this {
         };
 
         // Compute all timeframe scores
-        let owUSD = if (weekScoresUSD.size() > 0) ?weekScoresUSD.get(0) else null;
-        let owICP = if (weekScoresICP.size() > 0) ?weekScoresICP.get(0) else null;
-        let omUSD = if (monthScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(monthScoresUSD)) else null;
-        let omICP = if (monthScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(monthScoresICP)) else null;
-        let oyUSD = if (yearScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(yearScoresUSD)) else null;
-        let oyICP = if (yearScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(yearScoresICP)) else null;
-        let oaUSD = if (allTimeScoresUSD.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresUSD)) else null;
-        let oaICP = if (allTimeScoresICP.size() > 0) ?calculateCompoundReturn(Buffer.toArray(allTimeScoresICP)) else null;
+        let owUSD = if (Vector.size(weekScoresUSD) > 0) ?Vector.get(weekScoresUSD, 0) else null;
+        let owICP = if (Vector.size(weekScoresICP) > 0) ?Vector.get(weekScoresICP, 0) else null;
+        let omUSD = if (Vector.size(monthScoresUSD) > 0) ?calculateCompoundReturn(Vector.toArray(monthScoresUSD)) else null;
+        let omICP = if (Vector.size(monthScoresICP) > 0) ?calculateCompoundReturn(Vector.toArray(monthScoresICP)) else null;
+        let oyUSD = if (Vector.size(yearScoresUSD) > 0) ?calculateCompoundReturn(Vector.toArray(yearScoresUSD)) else null;
+        let oyICP = if (Vector.size(yearScoresICP) > 0) ?calculateCompoundReturn(Vector.toArray(yearScoresICP)) else null;
+        let oaUSD = if (Vector.size(allTimeScoresUSD) > 0) ?calculateCompoundReturn(Vector.toArray(allTimeScoresUSD)) else null;
+        let oaICP = if (Vector.size(allTimeScoresICP) > 0) ?calculateCompoundReturn(Vector.toArray(allTimeScoresICP)) else null;
 
-        // Determine USD selection score based on requested timeframe
-        let usdSelScore : Float = switch (timeframe) {
-          case (#OneWeek) { switch (owUSD) { case (?v) v; case null 0.0 } };
-          case (#OneMonth) { switch (omUSD) { case (?v) v; case null 0.0 } };
-          case (#OneYear) { switch (oyUSD) { case (?v) v; case null 0.0 } };
-          case (#AllTime) { switch (oaUSD) { case (?v) v; case null 0.0 } };
-        };
-
-        // Determine ICP selection score based on requested timeframe
-        let icpSelScore : Float = switch (timeframe) {
-          case (#OneWeek) { switch (owICP) { case (?v) v; case null 0.0 } };
-          case (#OneMonth) { switch (omICP) { case (?v) v; case null 0.0 } };
-          case (#OneYear) { switch (oyICP) { case (?v) v; case null 0.0 } };
-          case (#AllTime) { switch (oaICP) { case (?v) v; case null 0.0 } };
-        };
-
-        let scores : NeuronScores = {
-          neuronIdx = i;
-          usdSelectionScore = usdSelScore;
-          icpSelectionScore = icpSelScore;
-          allocationChangeCount = allocChangeCount;
+        // Add neuron to the result array
+        Vector.add(neuronsVec, {
+          neuronId = entry.neuronId;
+          checkpoints = Buffer.toArray(entry.checkpoints);
+          performanceScoreUSD = entry.performanceUSD;
+          performanceScoreICP = if (entry.hasIcpScore) ?entry.performanceICP else null;
           oneWeekUSD = owUSD;
           oneWeekICP = owICP;
           oneMonthUSD = omUSD;
           oneMonthICP = omICP;
           oneYearUSD = oyUSD;
           oneYearICP = oyICP;
-        };
+          allocationChangeCount = allocChangeCount;
+        });
 
-        // Track best USD neuron
-        if (usdSelScore > bestUsdScore) {
-          bestUsdScore := usdSelScore;
-          bestUsdNeuronScores := ?scores;
-        };
-
-        // Track best ICP neuron
-        if (icpSelScore > bestIcpScore) {
-          bestIcpScore := icpSelScore;
-          bestIcpNeuronScores := ?scores;
+        // Track aggregated performance
+        totalAggregatedUSD += entry.performanceUSD;
+        if (entry.hasIcpScore) {
+          totalAggregatedICP += entry.performanceICP;
+          hasAnyIcp := true;
         };
 
         // Track neuron with most allocation changes
         if (allocChangeCount > mostAllocChanges) {
           mostAllocChanges := allocChangeCount;
-          allocationNeuronIdx := ?i;
+          allocationNeuronId := ?entry.neuronId;
         };
       };
     };
@@ -3958,76 +3988,12 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#NeuronNotFound);
     };
 
-    // Build NeuronGraphData for best USD neuron
-    var bestUsdNeuronResult : ?NeuronGraphData = null;
-    var bestOneWeekUSD : ?Float = null;
-    var bestOneMonthUSD : ?Float = null;
-    var bestOneYearUSD : ?Float = null;
-    var aggregatedUSD : Float = 0.0;
-
-    switch (bestUsdNeuronScores) {
-      case (?bns) {
-        let entry = neuronDataMap.get(bns.neuronIdx);
-        bestUsdNeuronResult := ?{
-          neuronId = entry.neuronId;
-          checkpoints = Buffer.toArray(entry.checkpoints);
-          performanceScoreUSD = entry.performanceUSD;
-          performanceScoreICP = if (entry.hasIcpScore) ?entry.performanceICP else null;
-        };
-        aggregatedUSD := entry.performanceUSD;
-        bestOneWeekUSD := bns.oneWeekUSD;
-        bestOneMonthUSD := bns.oneMonthUSD;
-        bestOneYearUSD := bns.oneYearUSD;
-      };
-      case null {};
-    };
-
-    // Build NeuronGraphData for best ICP neuron
-    var bestIcpNeuronResult : ?NeuronGraphData = null;
-    var bestOneWeekICP : ?Float = null;
-    var bestOneMonthICP : ?Float = null;
-    var bestOneYearICP : ?Float = null;
-    var aggregatedICP : ?Float = null;
-
-    switch (bestIcpNeuronScores) {
-      case (?bns) {
-        let entry = neuronDataMap.get(bns.neuronIdx);
-        bestIcpNeuronResult := ?{
-          neuronId = entry.neuronId;
-          checkpoints = Buffer.toArray(entry.checkpoints);
-          performanceScoreUSD = entry.performanceUSD;
-          performanceScoreICP = if (entry.hasIcpScore) ?entry.performanceICP else null;
-        };
-        aggregatedICP := if (entry.hasIcpScore) ?entry.performanceICP else null;
-        bestOneWeekICP := bns.oneWeekICP;
-        bestOneMonthICP := bns.oneMonthICP;
-        bestOneYearICP := bns.oneYearICP;
-      };
-      case null {};
-    };
-
-    // Get the neuron ID for the neuron with most allocation changes
-    var allocationNeuronIdResult : ?Blob = null;
-    switch (allocationNeuronIdx) {
-      case (?idx) {
-        allocationNeuronIdResult := ?neuronDataMap.get(idx).neuronId;
-      };
-      case null {};
-    };
-
     #ok({
-      timeframe = { startTime = actualStartTime; endTime = actualEndTime };
-      bestUsdNeuron = bestUsdNeuronResult;
-      bestIcpNeuron = bestIcpNeuronResult;
-      allocationNeuronId = allocationNeuronIdResult;
-      aggregatedPerformanceUSD = aggregatedUSD;
-      aggregatedPerformanceICP = aggregatedICP;
-      oneWeekUSD = bestOneWeekUSD;
-      oneWeekICP = bestOneWeekICP;
-      oneMonthUSD = bestOneMonthUSD;
-      oneMonthICP = bestOneMonthICP;
-      oneYearUSD = bestOneYearUSD;
-      oneYearICP = bestOneYearICP;
+      timeframe = { startTime = earliestCheckpoint; endTime = latestCheckpoint };
+      allocationNeuronId = allocationNeuronId;
+      aggregatedPerformanceUSD = totalAggregatedUSD;
+      aggregatedPerformanceICP = if (hasAnyIcp) ?totalAggregatedICP else null;
+      neurons = Vector.toArray(neuronsVec);
     })
   };
 
