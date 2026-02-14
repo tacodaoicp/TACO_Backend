@@ -261,6 +261,57 @@ shared (deployer) persistent actor class treasury() = this {
     not Float.isNaN(x) and x < 9.0e18 and x > -9.0e18
   };
 
+  // Pair skip helpers: normalize key so (A,B) and (B,A) produce the same entry
+  private func normalizePair(tokenA : Principal, tokenB : Principal) : (Principal, Principal) {
+    if (Principal.toText(tokenA) <= Principal.toText(tokenB)) {
+      (tokenA, tokenB)
+    } else {
+      (tokenB, tokenA)
+    };
+  };
+
+  private func addSkipPair(tokenA : Principal, tokenB : Principal) {
+    let key = normalizePair(tokenA, tokenB);
+    Map.set(pairSkipMap, hashpp, key, now());
+    logger.info("PAIR_SKIP",
+      "Added pair to skip map - TokenA=" # Principal.toText(tokenA) #
+      " TokenB=" # Principal.toText(tokenB) #
+      " Expires_in=5_days",
+      "addSkipPair"
+    );
+  };
+
+  private func removeSkipPair(tokenA : Principal, tokenB : Principal) {
+    let key = normalizePair(tokenA, tokenB);
+    ignore Map.remove(pairSkipMap, hashpp, key);
+    logger.info("PAIR_SKIP",
+      "Removed expired pair from skip map - TokenA=" # Principal.toText(tokenA) #
+      " TokenB=" # Principal.toText(tokenB),
+      "removeSkipPair"
+    );
+  };
+
+  private func shouldSkipPair(tokenA : Principal, tokenB : Principal) : Bool {
+    let key = normalizePair(tokenA, tokenB);
+    switch (Map.get(pairSkipMap, hashpp, key)) {
+      case (?timestamp) {
+        if (now() - timestamp < PAIR_SKIP_EXPIRY_NS) {
+          logger.info("PAIR_SKIP",
+            "Skipping pair - going straight to ICP fallback - TokenA=" # Principal.toText(tokenA) #
+            " TokenB=" # Principal.toText(tokenB) #
+            " Skip_age_seconds=" # Int.toText((now() - timestamp) / 1_000_000_000),
+            "shouldSkipPair"
+          );
+          true
+        } else {
+          removeSkipPair(tokenA, tokenB);
+          false
+        }
+      };
+      case null { false };
+    };
+  };
+
   // Randomization
   // NOTE: Fuzz.fromSeed internally uses Nat64.fromNat, so seed must be < 2^64
   transient let fuzz = Fuzz.fromSeed((Fuzz.fromSeed(Int.abs(now()) % (2 ** 63)).nat.randomRange(45978345345987, 2 ** 63)) % (2 ** 63));
@@ -290,6 +341,15 @@ shared (deployer) persistent actor class treasury() = this {
   // Minimum allocation difference to trigger trade (basis points, e.g., 15 = 0.15%)
   // Note: This is a standalone stable var to avoid EOP migration issues
   stable var minAllocationDiffBasisPoints : Nat = 15;
+
+  // Pair skip: when a pair fails and falls to ICP fallback,
+  // skip direct trading for this pair for this duration (nanoseconds)
+  // 5 days = 5 * 24 * 3600 * 1_000_000_000
+  let PAIR_SKIP_EXPIRY_NS : Int = 432_000_000_000_000;
+
+  // Watchdog timer: checks every 2 hours if the trading timer has stalled
+  let WATCHDOG_INTERVAL_NS : Nat = 7_200_000_000_000; // 2 hours
+  let WATCHDOG_STALE_THRESHOLD_NS : Int = 300_000_000_000; // 5 minutes
 
   // Rebalancing state
   stable var rebalanceState : RebalanceState = {
@@ -339,13 +399,20 @@ shared (deployer) persistent actor class treasury() = this {
   stable let pendingTxs = Map.new<Nat, swaptypes.SwapTxRecord>();
   stable let failedTxs = Map.new<Nat, swaptypes.SwapTxRecord>();
 
+  // Pair skip map: (tokenA, tokenB) -> timestamp when pair was flagged
+  // Pairs that failed and fell to ICP fallback are stored here.
+  // Key is normalized (sorted) so order doesn't matter.
+  // Skipped pairs go directly to ICP fallback in do_executeTradingStep.
+  stable let pairSkipMap = Map.new<(Principal, Principal), Int>();
+
   // Note: Kong claims are now managed by Kong directly - no local tracking needed
   // Use KongSwap.getPendingClaims() to query and KongSwap.executeClaim() to recover
 
   // Timer IDs for scheduling
   var shortSyncTimerId : Nat = 0;
   var longSyncTimerId : Nat = 0;
-  
+  var watchdogTimerId : Nat = 0;
+
   // Long Sync Timer tracking
   stable var lastLongSyncTime : Int = 0;  // Last time the long sync timer executed
   var nextLongSyncTime : Int = 0;  // Next scheduled execution time
@@ -3702,6 +3769,64 @@ shared (deployer) persistent actor class treasury() = this {
   };
 
   /**
+   * Watchdog timer for the trading cycle
+   *
+   * Runs every 2 hours. If the trading timer appears to have stopped
+   * (lastRebalanceAttempt is more than 5 minutes stale) and the system
+   * is not idle, restart the trading timer automatically.
+   */
+  private func startWatchdogTimer<system>() {
+    if (watchdogTimerId != 0) {
+      cancelTimer(watchdogTimerId);
+    };
+
+    watchdogTimerId := setTimer<system>(
+      #nanoseconds(WATCHDOG_INTERVAL_NS),
+      func() : async () {
+        let staleness = now() - rebalanceState.metrics.lastRebalanceAttempt;
+
+        if (rebalanceState.status != #Idle and staleness > WATCHDOG_STALE_THRESHOLD_NS) {
+          logger.warn(
+            "WATCHDOG",
+            "Trading timer appears stalled - last attempt " #
+              Int.toText(staleness / 1_000_000_000) # "s ago. " #
+              "Status=" # debug_show(rebalanceState.status) # ". Restarting trading timer.",
+            "startWatchdogTimer"
+          );
+
+          rebalanceState := {
+            rebalanceState with
+            status = #Trading;
+            metrics = {
+              rebalanceState.metrics with
+              lastRebalanceAttempt = now();
+            };
+          };
+          startTradingTimer<system>();
+          logTreasuryAdminAction(
+            this_canister_id(),
+            #StartRebalancing,
+            "Watchdog auto-restart: trading timer was stale for " #
+              Int.toText(staleness / 1_000_000_000) # "s",
+            true,
+            null
+          );
+        } else {
+          logger.info(
+            "WATCHDOG",
+            "Trading timer healthy - last attempt " #
+              Int.toText(staleness / 1_000_000_000) # "s ago. " #
+              "Status=" # debug_show(rebalanceState.status),
+            "startWatchdogTimer"
+          );
+        };
+
+        startWatchdogTimer<system>();
+      },
+    );
+  };
+
+  /**
    * Execute a complete trading cycle
    *
    * Main trading loop that:
@@ -3966,6 +4091,133 @@ shared (deployer) persistent actor class treasury() = this {
             
             Debug.print("Selected pair: " # Principal.toText(sellToken) # " -> " # Principal.toText(buyToken) # " with size: " # Nat.toText(tradeSize));
 
+            // === PAIR SKIP CHECK: If this pair previously failed and fell to ICP fallback,
+            // skip the direct trade attempt and go straight to ICP fallback ===
+            if (shouldSkipPair(sellToken, buyToken) and
+                buyToken != ICPprincipal and
+                sellToken != ICPprincipal and
+                not isTokenPausedFromTrading(ICPprincipal)) {
+
+              let skipSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+                case (?details) { details.tokenSymbol };
+                case null { "UNKNOWN" };
+              };
+              let skipBuySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                case (?details) { details.tokenSymbol };
+                case null { "UNKNOWN" };
+              };
+
+              logger.info("PAIR_SKIP",
+                "Pair in skip map, going straight to ICP fallback - Original_pair=" # skipSellSymbol # "/" # skipBuySymbol #
+                " Fallback_pair=" # skipSellSymbol # "/ICP",
+                "do_executeTradingStep"
+              );
+
+              let skipFallbackExecution = await* findBestExecution(sellToken, ICPprincipal, tradeSize);
+
+              switch (skipFallbackExecution) {
+                case (#ok(#Single(icpExecution))) {
+                  let ourSlippageToleranceBP = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                  let idealOut : Nat = if (icpExecution.slippageBP < 9900) {
+                    (icpExecution.expectedOut * 10000) / (10000 - icpExecution.slippageBP)
+                  } else {
+                    icpExecution.expectedOut
+                  };
+
+                  let toleranceMultiplier : Nat = if (ourSlippageToleranceBP >= 10000) { 0 } else { 10000 - ourSlippageToleranceBP };
+                  let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
+
+                  let skipTradeResult = await* executeTrade(
+                    sellToken,
+                    ICPprincipal,
+                    tradeSize,
+                    icpExecution.exchange,
+                    minAmountOut,
+                    idealOut,
+                  );
+
+                  switch (skipTradeResult) {
+                    case (#ok(record)) {
+                      let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                      let fallbackRecord : TradeRecord = {
+                        record with
+                        error = ?("PAIR_SKIP_FALLBACK: Pair " # skipSellSymbol # "/" # skipBuySymbol # " in skip map, traded for ICP instead");
+                      };
+                      Vector.add(lastTrades, fallbackRecord);
+                      if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                        Vector.reverse(lastTrades);
+                        while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                          ignore Vector.removeLast(lastTrades);
+                        };
+                        Vector.reverse(lastTrades);
+                      };
+
+                      // Update ICP price from trade
+                      let deviationFromQuote : Float = if (icpExecution.expectedOut > 0) {
+                        Float.abs(Float.fromInt(record.amountBought) - Float.fromInt(icpExecution.expectedOut)) / Float.fromInt(icpExecution.expectedOut)
+                      } else { 1.0 };
+                      let shouldUpdatePrice = isFiniteFloat(deviationFromQuote) and deviationFromQuote <= 0.05;
+
+                      if (shouldUpdatePrice) {
+                        let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** tokenDetailsSell.tokenDecimals);
+                        let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
+                        if (actualICP > 0.0) {
+                          let priceRatio = (actualTokensSold / actualICP) * Float.fromInt(tokenDetailsSell.priceInICP);
+                          if (isFiniteFloat(priceRatio)) {
+                            let newICPPrice = Int.abs(Float.toInt(priceRatio));
+                            let newICPPriceUSD = tokenDetailsSell.priceInUSD * actualTokensSold / actualICP;
+                            updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+                          };
+                        };
+                      };
+
+                      rebalanceState := {
+                        rebalanceState with
+                        metrics = { rebalanceState.metrics with totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1 };
+                        lastTrades = lastTrades;
+                      };
+
+                      success := true;
+                      logger.info("PAIR_SKIP",
+                        "Pair skip ICP fallback SUCCESS - Sold=" # skipSellSymbol #
+                        " Amount_sold=" # Nat.toText(record.amountSold) #
+                        " ICP_received=" # Nat.toText(record.amountBought) #
+                        " Exchange=" # debug_show(record.exchange),
+                        "do_executeTradingStep"
+                      );
+
+                      await updateBalances();
+                      await takePortfolioSnapshot(#PostTrade);
+                      checkPortfolioCircuitBreakerConditions();
+                      await* logPortfolioState("Post-pair-skip-ICP-fallback completed");
+                    };
+                    case (#err(skipError)) {
+                      logger.warn("PAIR_SKIP",
+                        "Pair skip ICP fallback trade failed - Error=" # skipError,
+                        "do_executeTradingStep"
+                      );
+                      incrementSkipCounter(#noExecutionPath);
+                    };
+                  };
+                };
+                case (#ok(#Split(_))) {
+                  logger.info("PAIR_SKIP", "Split route found for pair skip fallback but not implemented", "do_executeTradingStep");
+                };
+                case (#ok(#Partial(_))) {
+                  logger.info("PAIR_SKIP", "Partial route found for pair skip fallback but not implemented", "do_executeTradingStep");
+                };
+                case (#err(skipRouteError)) {
+                  logger.warn("PAIR_SKIP",
+                    "No ICP fallback route available for skipped pair - Error=" # skipRouteError.reason,
+                    "do_executeTradingStep"
+                  );
+                  incrementSkipCounter(#noExecutionPath);
+                };
+              };
+              continue a;
+            };
+
             let bestExecution = await* findBestExecution(sellToken, buyToken, tradeSize);
 
             switch (bestExecution) {
@@ -4183,6 +4435,9 @@ shared (deployer) persistent actor class treasury() = this {
                             buyToken != ICPprincipal and
                             sellToken != ICPprincipal and
                             not isTokenPausedFromTrading(ICPprincipal)) {
+                          // Record this pair in the skip map so next time we go straight to ICP fallback
+                          addSkipPair(sellToken, buyToken);
+
                           logger.info("ICP_FALLBACK",
                             "Execution failed, attempting ICP fallback - Original_pair=" # sellSymbol # "/" # buySymbol #
                             " Fallback_pair=" # sellSymbol # "/ICP" #
@@ -4693,8 +4948,11 @@ shared (deployer) persistent actor class treasury() = this {
                 // This creates an ICP overweight that will be corrected in the next cycle
                 // Only attempt fallback if ICP itself is not paused
                 if (buyToken != ICPprincipal and sellToken != ICPprincipal and not isTokenPausedFromTrading(ICPprincipal)) {
+                  // Record this pair in the skip map so next time we go straight to ICP fallback
+                  addSkipPair(sellToken, buyToken);
+
                   Debug.print("Attempting ICP fallback route: " # Principal.toText(sellToken) # " -> ICP");
-                  
+
                   // VERBOSE LOGGING: ICP fallback attempt
                   let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
                     case (?details) { details.tokenSymbol };
@@ -8490,6 +8748,9 @@ public shared ({ caller }) func withdrawAllCyclesToSelf() : async Result.Result<
 
   // Initialize sync timer at system startup
   startAllSyncTimers<system>(true);
+
+  // Start watchdog timer to monitor trading cycle health
+  startWatchdogTimer<system>();
 
   // Auto-restart trading bot after upgrade if it was running before
   private func autoRestartTradingAfterUpgrade<system>() {
