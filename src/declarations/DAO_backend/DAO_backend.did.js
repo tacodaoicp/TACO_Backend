@@ -472,7 +472,6 @@ export const idlFactory = ({ IDL }) => {
           IDL.Opt(IDL.Int),
           IDL.Opt(IDL.Nat),
           IDL.Opt(IDL.Nat),
-          IDL.Opt(IDL.Bool),
         ],
         [Result_18],
         [],

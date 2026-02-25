@@ -135,7 +135,6 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     startTime: Int;
     periodDays: Nat;
     maxPeriods: Nat;
-    clearExisting: Bool;
   };
 
   type BackfillResult = {
@@ -1620,7 +1619,6 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     startTimestamp: ?Int,   // Optional, defaults to 30 days ago if null
     periodDays: ?Nat,       // Optional, defaults to 7 days
     maxPeriods: ?Nat,       // Optional, defaults to 52 (1 year of weekly periods)
-    clearExisting: ?Bool    // Optional, defaults to false
   ) : async Result.Result<BackfillResult, AuthorizationError> {
     if (not isAdmin(caller, #backfillPerformanceData)) {
       return #err(#NotAdmin);
@@ -1639,7 +1637,6 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       startTime = startTime;
       periodDays = switch (periodDays) { case (?p) p; case null 7 };
       maxPeriods = switch (maxPeriods) { case (?m) m; case null 52 };
-      clearExisting = switch (clearExisting) { case (?c) c; case null false };
     };
 
     logger.info("Admin", "Starting performance data backfill from " # Int.toText(config.startTime), "admin_backfillPerformanceData");

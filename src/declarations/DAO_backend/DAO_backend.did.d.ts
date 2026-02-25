@@ -122,7 +122,7 @@ export interface ContinuousDAO {
   >,
   'admin_backfillNeuronAllocationRecords' : ActorMethod<[], Result_19>,
   'admin_backfillPerformanceData' : ActorMethod<
-    [[] | [bigint], [] | [bigint], [] | [bigint], [] | [boolean]],
+    [[] | [bigint], [] | [bigint], [] | [bigint]],
     Result_18
   >,
   'admin_clearAllPastPrices' : ActorMethod<[], Result_1>,

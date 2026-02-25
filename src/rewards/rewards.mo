@@ -161,7 +161,6 @@ shared (deployer) persistent actor class Rewards() = this {
     startTime: Int;           // Earliest time to backfill from
     periodDays: Nat;          // Days per distribution period (default 7)
     maxPeriods: Nat;          // Max periods to backfill (default 52)
-    clearExisting: Bool;      // Whether to clear existing history first
     skipExistingPeriods: Bool; // Whether to skip periods that already exist in history
   };
 
@@ -797,6 +796,9 @@ shared (deployer) persistent actor class Rewards() = this {
         };
         
         // Step 3: Rebalance to new allocations using the updated total value
+        // Also build previousPrices for ALL tokens in the new allocation (fixes bug where
+        // newly-added tokens had no previous price, causing their price movements to be ignored)
+        let newPreviousPrices = Buffer.Buffer<(Principal, Float)>(allocations.size());
         for (allocation in allocations.vals()) {
           let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
           let tokenValue = totalValueAfterPriceChanges * allocationPercent;
@@ -815,13 +817,14 @@ shared (deployer) persistent actor class Rewards() = this {
             case (?priceInfo) {
               tokenPricesBuffer.add((allocation.token, priceInfo));
               tokenValuesBuffer.add((allocation.token, tokenValue));
+              newPreviousPrices.add((allocation.token, getPriceValue(priceInfo, priceType)));
             };
             case null {
               // Fallback 2: Skip this token if no price in past or future
             };
           };
         };
-        
+
         // Create checkpoint
         let checkpoint : CheckpointData = {
           timestamp = timestamp;
@@ -836,7 +839,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
         // Step 4: Update asset values for next iteration (rebalanced values)
         assetValues := Buffer.Buffer<(Principal, Float)>(allocations.size());
-        previousPrices := updatedPrices;
+        previousPrices := newPreviousPrices;
         
         for (allocation in allocations.vals()) {
           let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
@@ -1050,6 +1053,9 @@ shared (deployer) persistent actor class Rewards() = this {
       };
 
       // Rebalance to new allocations
+      // Also build previousPrices for ALL tokens in the new allocation (fixes bug where
+      // newly-added tokens had no previous price, causing their price movements to be ignored)
+      let newPreviousPrices = Buffer.Buffer<(Principal, Float)>(allocations.size());
       for (allocation in allocations.vals()) {
         let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
         let tokenValue = totalValueAfterPriceChanges * allocationPercent;
@@ -1067,6 +1073,7 @@ shared (deployer) persistent actor class Rewards() = this {
           case (?priceInfo) {
             tokenPricesBuffer.add((allocation.token, priceInfo));
             tokenValuesBuffer.add((allocation.token, tokenValue));
+            newPreviousPrices.add((allocation.token, getPriceValue(priceInfo, priceType)));
           };
           case null {};
         };
@@ -1086,7 +1093,7 @@ shared (deployer) persistent actor class Rewards() = this {
 
       // Update asset values for next iteration
       assetValues := Buffer.Buffer<(Principal, Float)>(allocations.size());
-      previousPrices := updatedPrices;
+      previousPrices := newPreviousPrices;
 
       for (allocation in allocations.vals()) {
         let allocationPercent = basisPointsToPercentage(allocation.basisPoints);
@@ -2014,15 +2021,6 @@ shared (deployer) persistent actor class Rewards() = this {
     backfillCurrentPeriodStart := config.startTime;
     backfillCurrentPeriodEnd := config.startTime;
 
-    // Clear existing history if requested
-    if (config.clearExisting) {
-      while (Vector.size(distributionHistory) > 0) {
-        ignore Vector.removeLast(distributionHistory);
-      };
-      distributionCounter := 0;
-      logger.info("Backfill", "Cleared existing distribution history", "admin_backfillDistributionHistory");
-    };
-
     // Calculate periods
     var periodsCreated : Nat = 0;
     var totalNeuronRewards : Nat = 0;
@@ -2454,9 +2452,7 @@ shared (deployer) persistent actor class Rewards() = this {
         return #err(#SystemError("Failed to get end prices: " # Error.message(e)));
       };
 
-      // Calculate segment return - skip tokens without prices and normalize weights
-      var startValue : Float = 0.0;
-      var endValue : Float = 0.0;
+      // Calculate segment return using per-token price ratios
       let tokenValuesBuffer = Buffer.Buffer<(Principal, Float)>(allocations.size());
       let pricesUsedBuffer = Buffer.Buffer<(Principal, PriceInfo)>(allocations.size());
 
@@ -2509,19 +2505,17 @@ shared (deployer) persistent actor class Rewards() = this {
         return #err(#PriceDataMissing({ token = allocations[0].token; timestamp = segmentStart }));
       };
 
-      // Second pass: calculate values with normalized weights
+      // Second pass: calculate portfolio return using per-token price ratios
+      // Correct formula: return = sum(weight × endPrice/startPrice)
+      // NOT: sum(weight × endPrice) / sum(weight × startPrice) which is a price-weighted index
+      var segmentReturn : Float = 0.0;
       for (validAlloc in validAllocsBuffer.vals()) {
-        // Normalize weight so remaining tokens sum to 100%
         let normalizedWeight = validAlloc.weight / totalValidWeight;
-
-        startValue += normalizedWeight * validAlloc.startPrice;
-        endValue += normalizedWeight * validAlloc.endPrice;
+        let tokenReturn = validAlloc.endPrice / validAlloc.startPrice;
+        segmentReturn += normalizedWeight * tokenReturn;
         tokenValuesBuffer.add((validAlloc.token, normalizedWeight * validAlloc.endPrice));
         pricesUsedBuffer.add((validAlloc.token, validAlloc.endPriceInfo));
       };
-
-      // Calculate segment return and compound it
-      let segmentReturn = if (startValue > 0.0) { endValue / startValue } else { 1.0 };
       cumulativeReturn *= segmentReturn;
 
       // Create checkpoint
@@ -4449,6 +4443,147 @@ shared (deployer) persistent actor class Rewards() = this {
       case null {
         #err(#SystemError("Distribution not found with ID: " # Nat.toText(distributionId)))
       };
+    };
+  };
+
+  // Recalculate USD and ICP performance scores for all distributions after a given timestamp
+  // This uses calculateNeuronPerformance (which includes Bug 1 fix) to recompute correct
+  // performanceScore, performanceScoreICP, and checkpoints while preserving reward data
+  public shared ({ caller }) func admin_recalculateDistributionPerformance(afterTimestamp: Int) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let totalDistributions = Vector.size(distributionHistory);
+    if (totalDistributions == 0) {
+      return #ok("No distributions found");
+    };
+
+    // Find the first distribution with startTime >= afterTimestamp
+    var startIndex : Nat = totalDistributions;
+    for (i in Iter.range(0, totalDistributions - 1)) {
+      let record = Vector.get(distributionHistory, i);
+      if (record.startTime >= afterTimestamp and i < startIndex) {
+        startIndex := i;
+      };
+    };
+
+    if (startIndex >= totalDistributions) {
+      return #ok("No distributions found after timestamp " # Int.toText(afterTimestamp));
+    };
+
+    let distributionsToProcess = totalDistributions - startIndex;
+    logger.info("Admin", "Starting performance recalculation for " # Nat.toText(distributionsToProcess) # " distributions (index " # Nat.toText(startIndex) # " to " # Nat.toText(totalDistributions - 1) # ")", "admin_recalculateDistributionPerformance");
+
+    // Kick off async recalculation via timer pattern (non-blocking)
+    ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+      await* recalculateDistributionsSequentially<system>(startIndex, totalDistributions, 0, ([] : [NeuronReward]), 0, startIndex);
+    });
+
+    #ok("Started recalculation of " # Nat.toText(distributionsToProcess) # " distributions (" # Nat.toText(startIndex) # " to " # Nat.toText(totalDistributions - 1) # ")")
+  };
+
+  // Process distributions and neurons sequentially using timer pattern to avoid IC timeouts
+  private func recalculateDistributionsSequentially<system>(
+    currentDistIndex: Nat,
+    totalDistributions: Nat,
+    currentNeuronIndex: Nat,
+    updatedRewards: [NeuronReward],
+    totalNeuronsProcessed: Nat,
+    startDistIndex: Nat
+  ) : async* () {
+
+    // All distributions processed
+    if (currentDistIndex >= totalDistributions) {
+      await* computeAllLeaderboards<system>();
+      logger.info("Admin", "Performance recalculation complete: " # Nat.toText(totalNeuronsProcessed) # " neurons across " # Nat.toText(totalDistributions - startDistIndex) # " distributions. Leaderboards recomputed.", "recalculateDistributionsSequentially");
+      return;
+    };
+
+    let existingRecord = Vector.get(distributionHistory, currentDistIndex);
+
+    // All neurons in this distribution processed — save and move to next
+    if (currentNeuronIndex >= existingRecord.neuronRewards.size()) {
+      let updatedRecord : DistributionRecord = {
+        id = existingRecord.id;
+        startTime = existingRecord.startTime;
+        endTime = existingRecord.endTime;
+        distributionTime = existingRecord.distributionTime;
+        totalRewardPot = existingRecord.totalRewardPot;
+        actualDistributed = existingRecord.actualDistributed;
+        totalRewardScore = existingRecord.totalRewardScore;
+        neuronsProcessed = existingRecord.neuronsProcessed;
+        neuronRewards = updatedRewards;
+        failedNeurons = existingRecord.failedNeurons;
+        status = existingRecord.status;
+      };
+      Vector.put(distributionHistory, currentDistIndex, updatedRecord);
+      logger.info("Admin", "Recalculated distribution #" # Nat.toText(existingRecord.id) # " (" # Nat.toText(existingRecord.neuronRewards.size()) # " neurons)", "recalculateDistributionsSequentially");
+
+      ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+        await* recalculateDistributionsSequentially<system>(currentDistIndex + 1, totalDistributions, 0, ([] : [NeuronReward]), totalNeuronsProcessed, startDistIndex);
+      });
+      return;
+    };
+
+    let neuronReward = existingRecord.neuronRewards[currentNeuronIndex];
+
+    try {
+      let performanceResult = await (with timeout = 65) calculateNeuronPerformance(
+        neuronReward.neuronId,
+        existingRecord.startTime,
+        existingRecord.endTime,
+        #USD
+      );
+
+      switch (performanceResult) {
+        case (#ok(performance)) {
+          let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
+            recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
+          } else {
+            null
+          };
+
+          let updatedReward : NeuronReward = {
+            neuronId = neuronReward.neuronId;
+            performanceScore = performance.performanceScore;
+            performanceScoreICP = performanceICP;
+            votingPower = neuronReward.votingPower;
+            rewardScore = neuronReward.rewardScore;
+            rewardAmount = neuronReward.rewardAmount;
+            checkpoints = performance.checkpoints;
+          };
+
+          let newUpdatedRewards = Array.flatten([updatedRewards, [updatedReward]]);
+
+          ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+            await* recalculateDistributionsSequentially<system>(
+              currentDistIndex, totalDistributions, currentNeuronIndex + 1, newUpdatedRewards, totalNeuronsProcessed + 1, startDistIndex
+            );
+          });
+        };
+        case (#err(error)) {
+          // Keep original reward if recalculation fails
+          logger.warn("Admin", "Failed to recalculate neuron in distribution #" # Nat.toText(existingRecord.id) # ": " # debug_show(error), "recalculateDistributionsSequentially");
+          let newUpdatedRewards = Array.flatten([updatedRewards, [neuronReward]]);
+
+          ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+            await* recalculateDistributionsSequentially<system>(
+              currentDistIndex, totalDistributions, currentNeuronIndex + 1, newUpdatedRewards, totalNeuronsProcessed + 1, startDistIndex
+            );
+          });
+        };
+      };
+    } catch (error) {
+      // Keep original reward on system error
+      logger.warn("Admin", "System error recalculating neuron in distribution #" # Nat.toText(existingRecord.id) # ": " # Error.message(error), "recalculateDistributionsSequentially");
+      let newUpdatedRewards = Array.flatten([updatedRewards, [neuronReward]]);
+
+      ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+        await* recalculateDistributionsSequentially<system>(
+          currentDistIndex, totalDistributions, currentNeuronIndex + 1, newUpdatedRewards, totalNeuronsProcessed + 1, startDistIndex
+        );
+      });
     };
   };
 

@@ -18,7 +18,6 @@ export const idlFactory = ({ IDL }) => {
     'periodDays' : IDL.Nat,
     'startTime' : IDL.Int,
     'skipExistingPeriods' : IDL.Bool,
-    'clearExisting' : IDL.Bool,
     'maxPeriods' : IDL.Nat,
   });
   const BackfillResult = IDL.Record({
@@ -300,6 +299,11 @@ export const idlFactory = ({ IDL }) => {
     'admin_recalculateAllIcpPerformance' : IDL.Func([], [Result__1], []),
     'admin_recalculateIcpPerformanceForDistribution' : IDL.Func(
         [IDL.Nat],
+        [Result__1],
+        [],
+      ),
+    'admin_recalculateDistributionPerformance' : IDL.Func(
+        [IDL.Int],
         [Result__1],
         [],
       ),

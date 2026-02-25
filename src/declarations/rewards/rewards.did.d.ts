@@ -17,7 +17,6 @@ export interface BackfillConfig {
   'periodDays' : bigint,
   'startTime' : bigint,
   'skipExistingPeriods' : boolean,
-  'clearExisting' : boolean,
   'maxPeriods' : bigint,
 }
 export interface BackfillResult {
@@ -210,6 +209,10 @@ export interface Rewards {
   >,
   'admin_recalculateAllIcpPerformance' : ActorMethod<[], Result__1>,
   'admin_recalculateIcpPerformanceForDistribution' : ActorMethod<
+    [bigint],
+    Result__1
+  >,
+  'admin_recalculateDistributionPerformance' : ActorMethod<
     [bigint],
     Result__1
   >,

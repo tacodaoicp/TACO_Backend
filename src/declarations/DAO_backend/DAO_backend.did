@@ -437,7 +437,7 @@ type ContinuousDAO =
    admin_addPenalizedNeuron: (neuronId: blob, multiplier: nat) -> (Result_20);
    admin_backfillNeuronAllocationRecords: () -> (Result_19);
    admin_backfillPerformanceData: (startTimestamp: opt int, periodDays:
-    opt nat, maxPeriods: opt nat, clearExisting: opt bool) -> (Result_18);
+    opt nat, maxPeriods: opt nat) -> (Result_18);
    admin_clearAllPastPrices: () -> (Result_1);
    admin_generateTestData: (config: opt TestDataConfig) -> (Result_17);
    admin_getAllActiveNeuronIds: () -> (vec blob) query;

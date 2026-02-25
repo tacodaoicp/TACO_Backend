@@ -328,7 +328,7 @@ shared (deployer) persistent actor class treasury() = this {
     maxSlippageBasisPoints = if test { 10000 } else { 450 }; // 0.5% incl fee
     maxTradesStored = 2000;
     maxKongswapAttempts = 1;
-    shortSyncIntervalNS = 900_000_000_000; // 15 minutes (for prices, balances)
+    shortSyncIntervalNS = 1_800_000_000_000; // 30 minutes (for prices, balances)
     longSyncIntervalNS = 5 * 3600_000_000_000; // 5 hours (for metadata, pools)
     tokenSyncTimeoutNS = 21_600_000_000_000; // 6 hours
     //minAllocationDiffBasisPoints = 15;
@@ -347,9 +347,12 @@ shared (deployer) persistent actor class treasury() = this {
   // 5 days = 5 * 24 * 3600 * 1_000_000_000
   let PAIR_SKIP_EXPIRY_NS : Int = 432_000_000_000_000;
 
+  // Trading cycle backoff: exponential backoff when all trade attempts fail
+  let MAX_TRADING_BACKOFF : Nat = 3; // Cap at 2^3 = 8x base interval
+
   // Watchdog timer: checks every 2 hours if the trading timer has stalled
   let WATCHDOG_INTERVAL_NS : Nat = 7_200_000_000_000; // 2 hours
-  let WATCHDOG_STALE_THRESHOLD_NS : Int = 300_000_000_000; // 5 minutes
+  let WATCHDOG_STALE_THRESHOLD_NS : Int = 300_000_000_000; // 5 minutes (base buffer, added to backoff interval dynamically)
 
   // Rebalancing state
   stable var rebalanceState : RebalanceState = {
@@ -412,6 +415,10 @@ shared (deployer) persistent actor class treasury() = this {
   var shortSyncTimerId : Nat = 0;
   var longSyncTimerId : Nat = 0;
   var watchdogTimerId : Nat = 0;
+
+  // Trading cycle backoff level (0 = base interval, capped at MAX_TRADING_BACKOFF)
+  // Transient: resets to 0 on upgrade
+  transient var tradingBackoffLevel : Nat = 0;
 
   // Long Sync Timer tracking
   stable var lastLongSyncTime : Int = 0;  // Last time the long sync timer executed
@@ -710,9 +717,10 @@ shared (deployer) persistent actor class treasury() = this {
     };
 
     try {
+      tradingBackoffLevel := 0;
       startTradingTimer<system>();
-      
-      
+
+
       Debug.print("Rebalancing started");
       
       // Log the successful admin action
@@ -3751,8 +3759,20 @@ shared (deployer) persistent actor class treasury() = this {
       case null {};
     };
 
+    let backoffMultiplier = 2 ** tradingBackoffLevel;
+    let effectiveInterval = rebalanceConfig.rebalanceIntervalNS * backoffMultiplier;
+
+    if (tradingBackoffLevel > 0) {
+      logger.info("TRADING_TIMER",
+        "Scheduling next trading cycle with backoff - Level=" # Nat.toText(tradingBackoffLevel) #
+        " Multiplier=" # Nat.toText(backoffMultiplier) #
+        " Interval=" # Nat.toText(effectiveInterval / 1_000_000_000) # "s",
+        "startTradingTimer"
+      );
+    };
+
     let newTimerId = setTimer<system>(
-      #nanoseconds(rebalanceConfig.rebalanceIntervalNS),
+      #nanoseconds(effectiveInterval),
       func() : async () {
         await* executeTradingCycle();
         // Recursively set next timer if still active
@@ -3785,15 +3805,24 @@ shared (deployer) persistent actor class treasury() = this {
       func() : async () {
         let staleness = now() - rebalanceState.metrics.lastRebalanceAttempt;
 
-        if (rebalanceState.status != #Idle and staleness > WATCHDOG_STALE_THRESHOLD_NS) {
+        // Dynamic threshold: base buffer + current backoff interval
+        let backoffMultiplier : Int = 2 ** tradingBackoffLevel;
+        let effectiveInterval : Int = rebalanceConfig.rebalanceIntervalNS * backoffMultiplier;
+        let effectiveThreshold = effectiveInterval + WATCHDOG_STALE_THRESHOLD_NS;
+
+        if (rebalanceState.status != #Idle and staleness > effectiveThreshold) {
           logger.warn(
             "WATCHDOG",
             "Trading timer appears stalled - last attempt " #
               Int.toText(staleness / 1_000_000_000) # "s ago. " #
-              "Status=" # debug_show(rebalanceState.status) # ". Restarting trading timer.",
+              "Status=" # debug_show(rebalanceState.status) #
+              " Backoff_level=" # Nat.toText(tradingBackoffLevel) #
+              " Threshold=" # Int.toText(effectiveThreshold / 1_000_000_000) # "s" #
+              ". Restarting trading timer.",
             "startWatchdogTimer"
           );
 
+          tradingBackoffLevel := 0;
           rebalanceState := {
             rebalanceState with
             status = #Trading;
@@ -4179,6 +4208,7 @@ shared (deployer) persistent actor class treasury() = this {
                       };
 
                       success := true;
+                      tradingBackoffLevel := 0;
                       logger.info("PAIR_SKIP",
                         "Pair skip ICP fallback SUCCESS - Sold=" # skipSellSymbol #
                         " Amount_sold=" # Nat.toText(record.amountSold) #
@@ -4384,6 +4414,7 @@ shared (deployer) persistent actor class treasury() = this {
                           lastTrades = lastTrades;
                         };
                         success := true;
+                        tradingBackoffLevel := 0;
                         Debug.print("Single trade executed successfully");
                         await updateBalances();
                         await takePortfolioSnapshot(#PostTrade);
@@ -4512,6 +4543,7 @@ shared (deployer) persistent actor class treasury() = this {
                                   };
 
                                   success := true;
+                                  tradingBackoffLevel := 0;
                                   fallbackSucceeded := true;
 
                                   logger.info("ICP_FALLBACK",
@@ -4685,6 +4717,7 @@ shared (deployer) persistent actor class treasury() = this {
                     // At least one leg succeeded
                     if (kongSuccess or icpSuccess) {
                       success := true;
+                      tradingBackoffLevel := 0;
                       Debug.print("Split trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
                       await updateBalances();
                       await takePortfolioSnapshot(#PostTrade);
@@ -4817,6 +4850,7 @@ shared (deployer) persistent actor class treasury() = this {
                     // At least one leg succeeded = overall success
                     if (kongSuccess or icpSuccess) {
                       success := true;
+                      tradingBackoffLevel := 0;
                       Debug.print("Partial trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
                       await updateBalances();
                       await takePortfolioSnapshot(#PostTrade);
@@ -4914,6 +4948,7 @@ shared (deployer) persistent actor class treasury() = this {
                         };
 
                         success := true;
+                        tradingBackoffLevel := 0;
                         logger.info("REDUCED_TRADE",
                           "REDUCED trade SUCCESS - Sold=" # Nat.toText(record.amountSold) #
                           " Bought=" # Nat.toText(record.amountBought) #
@@ -5067,6 +5102,7 @@ shared (deployer) persistent actor class treasury() = this {
                           };
                           
                           success := true;
+                          tradingBackoffLevel := 0;
                           Debug.print("ICP fallback trade executed successfully");
                           
                           // VERBOSE LOGGING: ICP fallback success
@@ -5247,6 +5283,7 @@ shared (deployer) persistent actor class treasury() = this {
                       // At least one leg succeeded
                       if (kongSuccess or icpSuccess) {
                         success := true;
+                        tradingBackoffLevel := 0;
                         Debug.print("ICP fallback split trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
                         await updateBalances();
                         await takePortfolioSnapshot(#PostTrade);
@@ -5383,6 +5420,7 @@ shared (deployer) persistent actor class treasury() = this {
                       // At least one leg succeeded
                       if (kongSuccess or icpSuccess) {
                         success := true;
+                        tradingBackoffLevel := 0;
                         Debug.print("ICP fallback partial trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
                         await updateBalances();
                         await takePortfolioSnapshot(#PostTrade);
@@ -5458,6 +5496,7 @@ shared (deployer) persistent actor class treasury() = this {
                               };
 
                               success := true;
+                              tradingBackoffLevel := 0;
                               logger.info("REDUCED_ICP_FALLBACK",
                                 "REDUCED ICP fallback SUCCESS - Sold=" # Nat.toText(record.amountSold) #
                                 " ICP_received=" # Nat.toText(record.amountBought),
@@ -5581,6 +5620,12 @@ shared (deployer) persistent actor class treasury() = this {
       };
       if (not success) {
         Debug.print("All trade attempts exhausted without success");
+
+        // Exponential backoff: double interval each failure, cap at MAX_TRADING_BACKOFF
+        if (tradingBackoffLevel < MAX_TRADING_BACKOFF) {
+          tradingBackoffLevel += 1;
+        };
+
         rebalanceState := {
           rebalanceState with
           status = #Trading;
@@ -5589,11 +5634,12 @@ shared (deployer) persistent actor class treasury() = this {
             currentStatus = #Trading;
           };
         };
-        
+
         // VERBOSE LOGGING: All attempts failed
-        logger.warn("REBALANCE_CYCLE", 
+        logger.warn("REBALANCE_CYCLE",
           "All " # Nat.toText(rebalanceConfig.maxTradeAttemptsPerInterval) # " trade attempts failed" #
-          " - Will retry in next cycle" #
+          " - Backoff_level=" # Nat.toText(tradingBackoffLevel) #
+          " Next_interval=" # Nat.toText(rebalanceConfig.rebalanceIntervalNS * (2 ** tradingBackoffLevel) / 1_000_000_000) # "s" #
           " Total_Executed=" # Nat.toText(rebalanceState.metrics.totalTradesExecuted) #
           " Total_Failed=" # Nat.toText(rebalanceState.metrics.totalTradesFailed + attempts),
           "do_executeTradingStep"
