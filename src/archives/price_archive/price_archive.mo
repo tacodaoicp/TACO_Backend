@@ -9,6 +9,7 @@ import Nat "mo:base/Nat";
 import Bool "mo:base/Bool";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
+import Timer "mo:base/Timer";
 
 import ICRC3 "mo:icrc3-mo";                    // ← THE FIX: Use the actual library, not just types
 import ICRC3Service "mo:icrc3-mo/service";        // ← Keep service types for API
@@ -61,6 +62,7 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
 
   // Tracking state for batch imports
   private stable var lastImportedPriceTime : Int = 0;
+  private stable var batchImportShouldRun : Bool = false;
 
   // Treasury interface for batch imports
   transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
@@ -71,6 +73,31 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
   private func getPriceRangeBucket(priceICP : Nat) : Nat {
     // Group prices into buckets (e.g., every 1000 ICP units)
     priceICP / 1000;
+  };
+
+  // Internal synchronous price archival — no auth check, no logging, no await.
+  // Used by public methods and batch import to avoid inter-canister self-call overhead.
+  private func archivePriceBlockInternal<system>(price : PriceBlockData) : Nat {
+    let timestamp = price.timestamp;
+    let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
+
+    let blockIndex = base.storeBlock<system>(
+      blockValue,
+      "3price",
+      [price.token],
+      timestamp
+    );
+
+    base.addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, Map.nhash);
+
+    totalPriceUpdates += 1;
+    Map.set(lastKnownPrices, Map.phash, price.token, {
+      icpPrice = price.priceICP;
+      usdPrice = price.priceUSD;
+      timestamp = timestamp;
+    });
+
+    blockIndex;
   };
 
   //=========================================================================
@@ -103,29 +130,7 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
       return #err(#NotAuthorized);
     };
 
-    // Use original event timestamp from PriceBlockData, not import time!
-    let timestamp = price.timestamp;
-    let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
-
-    // Use base class to store the block
-    let blockIndex = base.storeBlock<system>(
-      blockValue,
-      "3price",
-      [price.token],
-      timestamp
-    );
-
-    // Update price-specific indexes
-    base.addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, Map.nhash);
-
-    // Update price-specific statistics and tracking
-    totalPriceUpdates += 1;
-    let priceInfo = {
-      icpPrice = price.priceICP;
-      usdPrice = price.priceUSD;
-      timestamp = timestamp;
-    };
-    Map.set(lastKnownPrices, Map.phash, price.token, priceInfo);
+    let blockIndex = archivePriceBlockInternal<system>(price);
 
     base.logger.info("Archive", "Archived price block at index: " # Nat.toText(blockIndex) #
       " Token: " # Principal.toText(price.token) #
@@ -134,7 +139,7 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
     #ok(blockIndex);
   };
 
-  // Bulk archive function for test data generation - archives multiple price records at once
+  // Bulk archive function - archives multiple price records at once (max 1000)
   public shared ({ caller }) func archivePriceBlockBatch<system>(
     prices: [PriceBlockData]
   ) : async Result.Result<{ archived: Nat; failed: Nat }, ArchiveError> {
@@ -146,38 +151,13 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
       return #err(#InvalidData); // Limit batch size
     };
 
-    var archived : Nat = 0;
-    var failed : Nat = 0;
-
     for (price in prices.vals()) {
-      let timestamp = price.timestamp;
-      let blockValue = ArchiveTypes.priceToValue(price, timestamp, null);
-
-      let blockIndex = base.storeBlock<system>(
-        blockValue,
-        "3price",
-        [price.token],
-        timestamp
-      );
-
-      // Update price-specific indexes
-      base.addToIndex(priceRangeIndex, getPriceRangeBucket(price.priceICP), blockIndex, Map.nhash);
-
-      // Update price-specific statistics and tracking
-      totalPriceUpdates += 1;
-      let priceInfo = {
-        icpPrice = price.priceICP;
-        usdPrice = price.priceUSD;
-        timestamp = timestamp;
-      };
-      Map.set(lastKnownPrices, Map.phash, price.token, priceInfo);
-
-      archived += 1;
+      ignore archivePriceBlockInternal<system>(price);
     };
 
-    base.logger.info("Archive", "Batch archived " # Nat.toText(archived) # " price blocks", "archivePriceBlockBatch");
+    base.logger.info("Archive", "Batch archived " # Nat.toText(prices.size()) # " price blocks", "archivePriceBlockBatch");
 
-    #ok({ archived = archived; failed = failed });
+    #ok({ archived = prices.size(); failed = 0 });
   };
 
   //=========================================================================
@@ -608,35 +588,42 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
           Int.compare(a.time, b.time)
         });
         
-        // Import each new price point from historical data
-        for (pricePoint in sortedPricePoints.vals()) {
-          let priceData : PriceBlockData = {
+        // Build batch of PriceBlockData for this token
+        let batchData = Array.map<TreasuryTypes.PricePoint, PriceBlockData>(sortedPricePoints, func(pricePoint) : PriceBlockData {
+          {
             token = token;
             priceICP = pricePoint.icpPrice;
             priceUSD = pricePoint.usdPrice;
             source = #NTN;
             volume24h = null;
             change24h = null;
-            timestamp = pricePoint.time; // Use original event timestamp!
-          };
-          
-          let result = await archivePriceBlock(priceData);
+            timestamp = pricePoint.time;
+          }
+        });
+
+        // Archive in chunks of 1000 (archivePriceBlockBatch limit)
+        let BATCH_SIZE = 1000;
+        var offset = 0;
+        while (offset < batchData.size()) {
+          let chunkSize = Nat.min(BATCH_SIZE, batchData.size() - offset);
+          let chunk = Array.subArray<PriceBlockData>(batchData, offset, chunkSize);
+
+          let result = await archivePriceBlockBatch(chunk);
           switch (result) {
-            case (#ok(_)) { 
-              imported += 1;
-              // Update last known price for this token
-              Map.set(lastKnownPrices, Map.phash, token, {
-                icpPrice = pricePoint.icpPrice;
-                usdPrice = pricePoint.usdPrice;
-                timestamp = pricePoint.time;
-              });
-              lastImportedPriceTime := Int.max(lastImportedPriceTime, pricePoint.time);
+            case (#ok({ archived })) {
+              imported += archived;
+              // Update lastImportedPriceTime to the latest timestamp in this chunk
+              if (chunk.size() > 0) {
+                let lastInChunk = chunk[chunk.size() - 1];
+                lastImportedPriceTime := Int.max(lastImportedPriceTime, lastInChunk.timestamp);
+              };
             };
-            case (#err(e)) { 
-              failed += 1;
-              base.logger.error("Batch Import", "Failed to import price for " # Principal.toText(token) # " at time " # Int.toText(pricePoint.time) # ": " # debug_show(e), "importPriceHistoryBatch");
+            case (#err(e)) {
+              failed += chunkSize;
+              base.logger.error("Batch Import", "Failed to batch import " # Nat.toText(chunkSize) # " prices for " # Principal.toText(token) # ": " # debug_show(e), "importPriceHistoryBatch");
             };
           };
+          offset += BATCH_SIZE;
         };
       };
       
@@ -685,21 +672,29 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
 
   // Advanced batch import using three-tier timer system
   public shared ({ caller }) func startBatchImportSystem() : async Result.Result<Text, Text> {
-    await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importPriceOnly);
+    let result = await base.startAdvancedBatchImportSystem<system>(caller, null, null, ?importPriceOnly);
+    switch (result) { case (#ok(_)) { batchImportShouldRun := true }; case _ {} };
+    result;
   };
-  
+
   // Legacy compatibility - combined import
   public shared ({ caller }) func startLegacyBatchImportSystem() : async Result.Result<Text, Text> {
-    await base.startBatchImportSystem<system>(caller, runPriceBatchImport);
+    let result = await base.startBatchImportSystem<system>(caller, runPriceBatchImport);
+    switch (result) { case (#ok(_)) { batchImportShouldRun := true }; case _ {} };
+    result;
   };
 
   public shared ({ caller }) func stopBatchImportSystem() : async Result.Result<Text, Text> {
-    base.stopBatchImportSystem(caller);
+    let result = base.stopBatchImportSystem(caller);
+    switch (result) { case (#ok(_)) { batchImportShouldRun := false }; case _ {} };
+    result;
   };
   
   // Emergency stop all timers
   public shared ({ caller }) func stopAllTimers() : async Result.Result<Text, Text> {
-    base.stopAllTimers(caller);
+    let result = base.stopAllTimers(caller);
+    switch (result) { case (#ok(_)) { batchImportShouldRun := false }; case _ {} };
+    result;
   };
 
   // Emergency force reset for stuck middle loop
@@ -1005,7 +1000,17 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
 
   system func postupgrade() {
     icrc3StateRef.value := icrc3State;
-    base.postupgrade<system>(func() : async () { /* no-op */ });
+    base.postupgrade<system>(func() : async () { /* no-op for base compat */ });
+
+    // Auto-restart batch import timer if it was running before the upgrade
+    if (batchImportShouldRun) {
+      ignore Timer.setTimer<system>(
+        #nanoseconds(15_000_000_000), // 15 second delay after upgrade
+        func() : async () {
+          ignore await startBatchImportSystem();
+        }
+      );
+    };
   };
 
   public query func get_canister_cycles() : async { cycles : Nat } {
