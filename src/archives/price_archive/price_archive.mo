@@ -1030,6 +1030,145 @@ shared (deployer) persistent actor class PriceArchiveV2() = this {
     #ok(Array.freeze(results));
   };
 
+  // Batch query for multiple (token, timestamp) pairs — finds nearest price at or after each timestamp
+  public query func getPricesAtOrAfterTimes(queries : [{token: Principal; timestamp: Int}]) : async Result.Result<[?{icpPrice: Nat; usdPrice: Float; timestamp: Int}], ArchiveError> {
+    if (queries.size() > 500) return #err(#InvalidData);
+    if (queries.size() == 0) return #ok([]);
+
+    let sampleResult = base.icrc3_get_blocks([{ start = 0; length = 1 }]);
+    let totalBlocks = sampleResult.log_length;
+
+    if (totalBlocks == 0) {
+      return #ok(Array.tabulate<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}>(queries.size(), func(_ : Nat) : ?{icpPrice: Nat; usdPrice: Float; timestamp: Int} { null }));
+    };
+
+    // Group queries by timestamp
+    let timestampGroups = Map.new<Int, Vector.Vector<(Nat, Principal)>>();
+    for (i in queries.keys()) {
+      let q = queries[i];
+      let group = switch (Map.get(timestampGroups, Map.ihash, q.timestamp)) {
+        case (?v) v;
+        case null {
+          let v = Vector.new<(Nat, Principal)>();
+          Map.set(timestampGroups, Map.ihash, q.timestamp, v);
+          v;
+        };
+      };
+      Vector.add(group, (i, q.token));
+    };
+
+    let results = Array.init<?{icpPrice: Nat; usdPrice: Float; timestamp: Int}>(queries.size(), null);
+
+    for ((timestamp, group) in Map.entries(timestampGroups)) {
+      let targetBlock = findBlockIndexNearTimestamp(timestamp, totalBlocks);
+      // Forward-biased window (same as getPriceAtOrAfterTime)
+      let WINDOW_SIZE : Nat = 2000;
+      let searchStart = if (targetBlock > WINDOW_SIZE / 4) { targetBlock - WINDOW_SIZE / 4 } else { 0 };
+      let searchLength = Nat.min(WINDOW_SIZE, totalBlocks - searchStart);
+      let icrc3Result = base.icrc3_get_blocks([{ start = searchStart; length = searchLength }]);
+
+      // Build lookup set of tokens in this group
+      let groupTokens = Map.new<Principal, Vector.Vector<Nat>>();
+      for ((queryIndex, token) in Vector.vals(group)) {
+        let indices = switch (Map.get(groupTokens, Map.phash, token)) {
+          case (?v) v;
+          case null {
+            let v = Vector.new<Nat>();
+            Map.set(groupTokens, Map.phash, token, v);
+            v;
+          };
+        };
+        Vector.add(indices, queryIndex);
+      };
+
+      // Track closest future price per token (smallest timestamp >= target)
+      let tokenBestPrices = Map.new<Principal, {price: {icpPrice: Nat; usdPrice: Float; timestamp: Int}; bestTs: Int}>();
+
+      for (block in icrc3Result.blocks.vals()) {
+        switch (block.block) {
+          case (#Map(entries)) {
+            for ((key, value) in entries.vals()) {
+              switch (key, value) {
+                case ("tx", #Map(txEntries)) {
+                  var isPrice = false;
+                  var txTimestamp : Int = 0;
+
+                  for ((txKey, txValue) in txEntries.vals()) {
+                    switch (txKey, txValue) {
+                      case ("operation", #Text("3price")) { isPrice := true };
+                      case ("timestamp", #Int(t)) { txTimestamp := t };
+                      case ("data", #Map(dataEntries)) {
+                        if (isPrice) {
+                          var blockToken : ?Principal = null;
+                          var blockTimestamp : Int = txTimestamp;
+                          var blockPriceICP : ?Nat = null;
+                          var blockPriceUSD : ?Text = null;
+
+                          for ((dataKey, dataValue) in dataEntries.vals()) {
+                            switch (dataKey, dataValue) {
+                              case ("token", #Blob(b)) { if (b.size() <= 29 and b.size() > 0) { blockToken := ?Principal.fromBlob(b) } };
+                              case ("ts", #Int(t)) { blockTimestamp := t };
+                              case ("price_icp", #Nat(p)) { blockPriceICP := ?p };
+                              case ("price_usd", #Text(p)) { blockPriceUSD := ?p };
+                              case _ {};
+                            };
+                          };
+
+                          switch (blockToken, blockPriceICP, blockPriceUSD) {
+                            case (?bToken, ?icp, ?usdText) {
+                              switch (Map.get(groupTokens, Map.phash, bToken)) {
+                                case (?_) {
+                                  if (blockTimestamp >= timestamp) {
+                                    let currentBest = switch (Map.get(tokenBestPrices, Map.phash, bToken)) {
+                                      case (?entry) entry.bestTs;
+                                      case null 9_223_372_036_854_775_807;
+                                    };
+                                    if (blockTimestamp < currentBest) {
+                                      switch (textToFloat(usdText)) {
+                                        case (?usd) {
+                                          Map.set(tokenBestPrices, Map.phash, bToken, {
+                                            price = { icpPrice = icp; usdPrice = usd; timestamp = blockTimestamp };
+                                            bestTs = blockTimestamp;
+                                          });
+                                        };
+                                        case null {};
+                                      };
+                                    };
+                                  };
+                                };
+                                case null {};
+                              };
+                            };
+                            case _ {};
+                          };
+                        };
+                      };
+                      case _ {};
+                    };
+                  };
+                };
+                case _ {};
+              };
+            };
+          };
+          case _ {};
+        };
+      };
+
+      for ((token, indices) in Map.entries(groupTokens)) {
+        let price = switch (Map.get(tokenBestPrices, Map.phash, token)) {
+          case (?entry) ?entry.price;
+          case null null;
+        };
+        for (queryIndex in Vector.vals(indices)) {
+          results[queryIndex] := price;
+        };
+      };
+    };
+
+    #ok(Array.freeze(results));
+  };
+
   //=========================================================================
   // Lifecycle Functions (delegated to base class)
   //=========================================================================
