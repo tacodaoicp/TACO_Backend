@@ -71,12 +71,12 @@ export type LogLevel = { 'INFO' : null } |
   { 'WARN' : null } |
   { 'ERROR' : null };
 export interface PriceArchiveV2 {
-  'archivePriceBlock' : ActorMethod<[PriceBlockData], Result_10>,
-  'archivePriceBlockBatch' : ActorMethod<[Array<PriceBlockData>], Result_9>,
+  'archivePriceBlock' : ActorMethod<[PriceBlockData], Result_12>,
+  'archivePriceBlockBatch' : ActorMethod<[Array<PriceBlockData>], Result_11>,
   'catchUpImport' : ActorMethod<[], Result_1>,
   'forceResetMiddleLoop' : ActorMethod<[], Result_1>,
   'getArchiveStats' : ActorMethod<[], ArchiveStatus>,
-  'getArchiveStatus' : ActorMethod<[], Result_8>,
+  'getArchiveStatus' : ActorMethod<[], Result_10>,
   'getBatchImportStatus' : ActorMethod<
     [],
     {
@@ -85,12 +85,17 @@ export interface PriceArchiveV2 {
       'isRunning' : boolean,
     }
   >,
-  'getLatestPrice' : ActorMethod<[Principal], Result_5>,
+  'getLatestPrice' : ActorMethod<[Principal], Result_6>,
+  'getLatestPrices' : ActorMethod<[Array<Principal>], Result_4>,
   'getLogs' : ActorMethod<[bigint], Array<LogEntry>>,
-  'getPriceAtOrAfterTime' : ActorMethod<[Principal, bigint], Result_5>,
-  'getPriceAtTime' : ActorMethod<[Principal, bigint], Result_5>,
-  'getPriceHistory' : ActorMethod<[Principal, bigint, bigint], Result_4>,
-  'getPricesAtTime' : ActorMethod<[Array<Principal>, bigint], Result_3>,
+  'getPriceAtOrAfterTime' : ActorMethod<[Principal, bigint], Result_6>,
+  'getPriceAtTime' : ActorMethod<[Principal, bigint], Result_6>,
+  'getPriceHistory' : ActorMethod<[Principal, bigint, bigint], Result_5>,
+  'getPricesAtTime' : ActorMethod<[Array<Principal>, bigint], Result_4>,
+  'getPricesAtTimes' : ActorMethod<
+    [Array<{ 'token' : Principal, 'timestamp' : bigint }>],
+    Result_3
+  >,
   'getTimerStatus' : ActorMethod<[], TimerStatus>,
   'get_canister_cycles' : ActorMethod<[], { 'cycles' : bigint }>,
   'icrc3_get_archives' : ActorMethod<[GetArchivesArgs], GetArchivesResult>,
@@ -125,11 +130,21 @@ export type Result = { 'ok' : string } |
   { 'err' : ArchiveError };
 export type Result_1 = { 'ok' : string } |
   { 'err' : string };
-export type Result_10 = { 'ok' : bigint } |
+export type Result_10 = { 'ok' : ArchiveStatus } |
+  { 'err' : ArchiveError };
+export type Result_11 = { 'ok' : { 'failed' : bigint, 'archived' : bigint } } |
+  { 'err' : ArchiveError };
+export type Result_12 = { 'ok' : bigint } |
   { 'err' : ArchiveError };
 export type Result_2 = { 'ok' : ArchiveQueryResult } |
   { 'err' : ArchiveError };
 export type Result_3 = {
+    'ok' : Array<
+      [] | [{ 'usdPrice' : number, 'timestamp' : bigint, 'icpPrice' : bigint }]
+    >
+  } |
+  { 'err' : ArchiveError };
+export type Result_4 = {
     'ok' : Array<
       [
         Principal,
@@ -140,17 +155,13 @@ export type Result_3 = {
     >
   } |
   { 'err' : ArchiveError };
-export type Result_4 = { 'ok' : Array<PriceBlockData> } |
+export type Result_5 = { 'ok' : Array<PriceBlockData> } |
   { 'err' : ArchiveError };
-export type Result_5 = {
+export type Result_6 = {
     'ok' : [] | [
       { 'usdPrice' : number, 'timestamp' : bigint, 'icpPrice' : bigint }
     ]
   } |
-  { 'err' : ArchiveError };
-export type Result_8 = { 'ok' : ArchiveStatus } |
-  { 'err' : ArchiveError };
-export type Result_9 = { 'ok' : { 'failed' : bigint, 'archived' : bigint } } |
   { 'err' : ArchiveError };
 export type TacoBlockType = { 'NeuronUpdate' : null } |
   { 'VotingPower' : null } |

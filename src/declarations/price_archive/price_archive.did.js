@@ -29,8 +29,8 @@ export const idlFactory = ({ IDL }) => {
     'InvalidBlockType' : IDL.Null,
     'InvalidTimeRange' : IDL.Null,
   });
-  const Result_10 = IDL.Variant({ 'ok' : IDL.Nat, 'err' : ArchiveError });
-  const Result_9 = IDL.Variant({
+  const Result_12 = IDL.Variant({ 'ok' : IDL.Nat, 'err' : ArchiveError });
+  const Result_11 = IDL.Variant({
     'ok' : IDL.Record({ 'failed' : IDL.Nat, 'archived' : IDL.Nat }),
     'err' : ArchiveError,
   });
@@ -43,14 +43,29 @@ export const idlFactory = ({ IDL }) => {
     'totalBlocks' : IDL.Nat,
     'lastArchiveTime' : IDL.Int,
   });
-  const Result_8 = IDL.Variant({ 'ok' : ArchiveStatus, 'err' : ArchiveError });
-  const Result_5 = IDL.Variant({
+  const Result_10 = IDL.Variant({ 'ok' : ArchiveStatus, 'err' : ArchiveError });
+  const Result_6 = IDL.Variant({
     'ok' : IDL.Opt(
       IDL.Record({
         'usdPrice' : IDL.Float64,
         'timestamp' : IDL.Int,
         'icpPrice' : IDL.Nat,
       })
+    ),
+    'err' : ArchiveError,
+  });
+  const Result_4 = IDL.Variant({
+    'ok' : IDL.Vec(
+      IDL.Tuple(
+        IDL.Principal,
+        IDL.Opt(
+          IDL.Record({
+            'usdPrice' : IDL.Float64,
+            'timestamp' : IDL.Int,
+            'icpPrice' : IDL.Nat,
+          })
+        ),
+      )
     ),
     'err' : ArchiveError,
   });
@@ -66,21 +81,18 @@ export const idlFactory = ({ IDL }) => {
     'message' : IDL.Text,
     'timestamp' : IDL.Int,
   });
-  const Result_4 = IDL.Variant({
+  const Result_5 = IDL.Variant({
     'ok' : IDL.Vec(PriceBlockData),
     'err' : ArchiveError,
   });
   const Result_3 = IDL.Variant({
     'ok' : IDL.Vec(
-      IDL.Tuple(
-        IDL.Principal,
-        IDL.Opt(
-          IDL.Record({
-            'usdPrice' : IDL.Float64,
-            'timestamp' : IDL.Int,
-            'icpPrice' : IDL.Nat,
-          })
-        ),
+      IDL.Opt(
+        IDL.Record({
+          'usdPrice' : IDL.Float64,
+          'timestamp' : IDL.Int,
+          'icpPrice' : IDL.Nat,
+        })
       )
     ),
     'err' : ArchiveError,
@@ -184,16 +196,16 @@ export const idlFactory = ({ IDL }) => {
   });
   const Result = IDL.Variant({ 'ok' : IDL.Text, 'err' : ArchiveError });
   const PriceArchiveV2 = IDL.Service({
-    'archivePriceBlock' : IDL.Func([PriceBlockData], [Result_10], []),
+    'archivePriceBlock' : IDL.Func([PriceBlockData], [Result_12], []),
     'archivePriceBlockBatch' : IDL.Func(
         [IDL.Vec(PriceBlockData)],
-        [Result_9],
+        [Result_11],
         [],
       ),
     'catchUpImport' : IDL.Func([], [Result_1], []),
     'forceResetMiddleLoop' : IDL.Func([], [Result_1], []),
     'getArchiveStats' : IDL.Func([], [ArchiveStatus], ['query']),
-    'getArchiveStatus' : IDL.Func([], [Result_8], ['query']),
+    'getArchiveStatus' : IDL.Func([], [Result_10], ['query']),
     'getBatchImportStatus' : IDL.Func(
         [],
         [
@@ -205,25 +217,39 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
-    'getLatestPrice' : IDL.Func([IDL.Principal], [Result_5], ['query']),
+    'getLatestPrice' : IDL.Func([IDL.Principal], [Result_6], ['query']),
+    'getLatestPrices' : IDL.Func(
+        [IDL.Vec(IDL.Principal)],
+        [Result_4],
+        ['query'],
+      ),
     'getLogs' : IDL.Func([IDL.Nat], [IDL.Vec(LogEntry)], ['query']),
     'getPriceAtOrAfterTime' : IDL.Func(
         [IDL.Principal, IDL.Int],
-        [Result_5],
+        [Result_6],
         ['query'],
       ),
     'getPriceAtTime' : IDL.Func(
         [IDL.Principal, IDL.Int],
-        [Result_5],
+        [Result_6],
         ['query'],
       ),
     'getPriceHistory' : IDL.Func(
         [IDL.Principal, IDL.Int, IDL.Int],
-        [Result_4],
+        [Result_5],
         ['query'],
       ),
     'getPricesAtTime' : IDL.Func(
         [IDL.Vec(IDL.Principal), IDL.Int],
+        [Result_4],
+        ['query'],
+      ),
+    'getPricesAtTimes' : IDL.Func(
+        [
+          IDL.Vec(
+            IDL.Record({ 'token' : IDL.Principal, 'timestamp' : IDL.Int })
+          ),
+        ],
         [Result_3],
         ['query'],
       ),

@@ -4891,6 +4891,17 @@ shared (deployer) persistent actor class treasury() = this {
                   // estimateMaxTradeableAmount already checked both exchanges and returns idealOut/minAmountOut
                   label reducedDirect switch (estimateMaxTradeableAmount(e.kongQuotes, e.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, buyToken)) {
                   case (?reduced) {
+                    // Skip if reduced trade is too small to be worthwhile
+                    if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
+                      logger.info("SKIP_REDUCED",
+                        "Reduced trade ICP worth (" # Nat.toText(reduced.icpWorth) #
+                        ") < minTradeValueICP/3 (" # Nat.toText(rebalanceConfig.minTradeValueICP / 3) #
+                        ") - skipping to ICP fallback",
+                        "do_executeTradingStep"
+                      );
+                      break reducedDirect;
+                    };
+
                     // Get symbols for logging
                     let reducedSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
                       case (?details) { details.tokenSymbol };
@@ -4907,7 +4918,8 @@ shared (deployer) persistent actor class treasury() = this {
                       " Exchange=" # debug_show(reduced.exchange) #
                       " Pair=" # reducedSellSymbol # "/" # reducedBuySymbol #
                       " IdealOut=" # Nat.toText(reduced.idealOut) #
-                      " MinAmountOut=" # Nat.toText(reduced.minAmountOut),
+                      " MinAmountOut=" # Nat.toText(reduced.minAmountOut) #
+                      " IcpWorth=" # Nat.toText(reduced.icpWorth),
                       "do_executeTradingStep"
                     );
 
@@ -5442,10 +5454,21 @@ shared (deployer) persistent actor class treasury() = this {
                     case (#err(icpRouteError)) {
                       Debug.print("ICP fallback route also not available: " # icpRouteError.reason);
 
-                      // NEW: Try REDUCED amount for ICP fallback (ICP is always valuable - no min check)
+                      // NEW: Try REDUCED amount for ICP fallback
                       // estimateMaxTradeableAmount already checked both exchanges and returns idealOut/minAmountOut
                       label reducedIcpFallback switch (estimateMaxTradeableAmount(icpRouteError.kongQuotes, icpRouteError.icpQuotes, tradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal)) {
                         case (?reduced) {
+                          // Skip if reduced trade is too small to be worthwhile
+                          if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
+                            logger.info("SKIP_REDUCED",
+                              "Reduced ICP fallback worth (" # Nat.toText(reduced.icpWorth) #
+                              ") < minTradeValueICP/3 (" # Nat.toText(rebalanceConfig.minTradeValueICP / 3) #
+                              ") - skipping",
+                              "do_executeTradingStep"
+                            );
+                            break reducedIcpFallback;
+                          };
+
                           let reducedSellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
                             case (?details) { details.tokenSymbol };
                             case null { break reducedIcpFallback };
@@ -5456,7 +5479,8 @@ shared (deployer) persistent actor class treasury() = this {
                             " Reduced=" # Nat.toText(reduced.amount) #
                             " Exchange=" # debug_show(reduced.exchange) #
                             " IdealOut=" # Nat.toText(reduced.idealOut) #
-                            " MinAmountOut=" # Nat.toText(reduced.minAmountOut),
+                            " MinAmountOut=" # Nat.toText(reduced.minAmountOut) #
+                            " IcpWorth=" # Nat.toText(reduced.icpWorth),
                             "do_executeTradingStep"
                           );
 
@@ -7010,7 +7034,7 @@ shared (deployer) persistent actor class treasury() = this {
     maxSlippageBP : Nat,
     sellToken : Principal,
     buyToken : Principal
-  ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap }; idealOut : Nat; minAmountOut : Nat } {
+  ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap }; idealOut : Nat; minAmountOut : Nat; icpWorth : Nat } {
     // Need at least one quote at 10% (index 0)
     if (kongQuotes.size() == 0 or icpQuotes.size() == 0) { return null };
 
@@ -7052,6 +7076,18 @@ shared (deployer) persistent actor class treasury() = this {
       (idealOut, minAmountOut)
     };
 
+    // Helper: calculate ICP worth of a sell-token amount
+    func icpWorthOf(tokenAmount : Nat) : Nat {
+      switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?d) {
+          if (d.tokenDecimals <= 18 and d.priceInICP > 0) {
+            (tokenAmount * d.priceInICP) / (10 ** d.tokenDecimals)
+          } else { 0 }
+        };
+        case null { 0 };
+      }
+    };
+
     // If no valid quotes at all, return null to trigger ICP fallback
     // DO NOT attempt reduced trade with idealOut=0/minAmountOut=0 - Kong will reject with "Receive amount is zero"
     if (bestSlip >= 99999) {
@@ -7084,7 +7120,7 @@ shared (deployer) persistent actor class treasury() = this {
         let amountIn10 = amountIn / 10;
         let expectedOut = if (amountIn10 > 0) { (best10Out * minAmount) / amountIn10 } else { 0 };
         let (idealOut, minAmountOut) = calcOutputs(expectedOut, bestSlip);
-        return ?{ amount = minAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut };
+        return ?{ amount = minAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut; icpWorth = icpWorthOf(minAmount) };
       };
       return null;
     };
@@ -7095,7 +7131,7 @@ shared (deployer) persistent actor class treasury() = this {
     let expectedOut = if (amountIn10 > 0) { (best10Out * maxAmount) / amountIn10 } else { 0 };
     let (idealOut, minAmountOut) = calcOutputs(expectedOut, bestSlip);
 
-    ?{ amount = maxAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut }
+    ?{ amount = maxAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut; icpWorth = icpWorthOf(maxAmount) }
   };
 
   /**
