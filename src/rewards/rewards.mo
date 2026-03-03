@@ -323,7 +323,7 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var rewardPenalties = Map.new<Blob, Nat>(); // neuronId -> multiplier (0-100)
   
   // Reward tracking
-  private transient let { phash; bhash } = Map;
+  private transient let { phash; bhash; thash } = Map;
   stable var neuronRewardBalances = Map.new<Blob, Nat>(); // neuronId -> accumulated rewards in TACO satoshis
   stable var totalDistributed : Nat = 0; // Total amount distributed to users in TACO satoshis (for balance validation)
   
@@ -365,6 +365,45 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var leaderboardTimerId: ?Nat = null;          // Timer ID for recurring leaderboard updates
   stable var leaderboardCutoffDate: Int = 1767225600000000000;  // Cutoff date: Jan 1, 2026 00:00:00 UTC (in nanoseconds)
   let LEADERBOARD_REFRESH_INTERVAL_NS: Nat = 2 * 60 * 60 * 1_000_000_000; // 2 hours in nanoseconds
+
+  // Batch recalculation price caches (transient — cleared between distributions)
+  private type PriceCacheEntry = { #found: PriceInfo; #notFound };
+  private transient var recalcAtOrAfterCache = Map.new<Text, PriceCacheEntry>();
+  private transient var recalcAtTimeCache = Map.new<Text, PriceCacheEntry>();
+  private transient var recalcCacheActive : Bool = false;
+
+  private func priceCacheKey(token: Principal, ts: Int) : Text {
+    Principal.toText(token) # ":" # Int.toText(ts)
+  };
+
+  private func getCachedAtOrAfter(token: Principal, timestamp: Int) : ??PriceInfo {
+    if (not recalcCacheActive) return null;
+    let key = priceCacheKey(token, timestamp);
+    switch (Map.get(recalcAtOrAfterCache, thash, key)) {
+      case (?#found(p)) { ??p };
+      case (?#notFound) { ?null };
+      case null { null };
+    };
+  };
+
+  private func clearRecalcCaches() {
+    recalcAtOrAfterCache := Map.new<Text, PriceCacheEntry>();
+    recalcAtTimeCache := Map.new<Text, PriceCacheEntry>();
+    recalcCacheActive := false;
+    recalcAllocationCache := Map.new<Blob, AllocationCacheEntry>();
+    recalcAllocationCacheActive := false;
+    recalcDAOAllocationCache := Map.new<Blob, [Allocation]>();
+  };
+
+  // Batch recalculation allocation cache (transient — cleared between distributions)
+  private type AllocationCacheEntry = {
+    preTimespanAllocation: ?NeuronAllocationChangeBlockData;
+    inTimespanChanges: [NeuronAllocationChangeBlockData];
+  };
+  private transient var recalcAllocationCache = Map.new<Blob, AllocationCacheEntry>();
+  private transient var recalcAllocationCacheActive : Bool = false;
+  private transient var recalcInProgress : Bool = false;
+  private transient var recalcDAOAllocationCache = Map.new<Blob, [Allocation]>();
 
   // Display name system
   stable var displayNames = Map.new<Principal, Text>();       // principal -> display name
@@ -442,6 +481,8 @@ shared (deployer) persistent actor class Rewards() = this {
     getPriceAtTime: query (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
     getPricesAtTime: query ([Principal], Int) -> async Result.Result<[(Principal, ?PriceInfo)], ArchiveError>;
     getPriceAtOrAfterTime: query (Principal, Int) -> async Result.Result<?PriceInfo, ArchiveError>;
+    getPricesAtOrAfterTimes: query ([{token: Principal; timestamp: Int}]) -> async Result.Result<[?PriceInfo], ArchiveError>;
+    getPricesAtTimes: query ([{token: Principal; timestamp: Int}]) -> async Result.Result<[?PriceInfo], ArchiveError>;
   };
 
   type NeuronAllocation = {
@@ -484,10 +525,21 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#InvalidTimeRange);
     };
 
-    // Get allocation data from the neuron allocation archive
-    let allocationResult = await (with timeout = 65)  neuronAllocationArchive.getNeuronAllocationChangesWithContext(
-      neuronId, startTime, endTime, 100
-    );
+    // Get allocation data from the neuron allocation archive (cache-first during recalculation)
+    let allocationResult = if (recalcAllocationCacheActive) {
+      switch (Map.get(recalcAllocationCache, bhash, neuronId)) {
+        case (?cached) { #ok(cached) };
+        case null {
+          await (with timeout = 65) neuronAllocationArchive.getNeuronAllocationChangesWithContext(
+            neuronId, startTime, endTime, 100
+          );
+        };
+      };
+    } else {
+      await (with timeout = 65) neuronAllocationArchive.getNeuronAllocationChangesWithContext(
+        neuronId, startTime, endTime, 100
+      );
+    };
 
     let allocationData = switch (allocationResult) {
       case (#ok(data)) { data };
@@ -506,17 +558,25 @@ shared (deployer) persistent actor class Rewards() = this {
         })) {
           case (?exactChange) { exactChange.oldAllocations };
           case (null) {
-            // No archive allocation data found - fallback to current DAO allocation
-            let currentAlloc = await (with timeout = 65)  daoCanister.getNeuronAllocation(neuronId);
-            switch (currentAlloc) {
-              case (?alloc) {
-                if (alloc.allocations.size() > 0) {
-                  alloc.allocations  // Use current allocation as baseline
-                } else {
-                  return #err(#NeuronNotFound);
-                }
+            if (recalcAllocationCacheActive) {
+              // Check batch DAO allocation cache for neurons without archive records
+              switch (Map.get(recalcDAOAllocationCache, bhash, neuronId)) {
+                case (?daoAllocs) { daoAllocs };
+                case (null) { return #err(#NeuronNotFound) };
               };
-              case (null) { return #err(#NeuronNotFound); };
+            } else {
+              // No archive allocation data found - fallback to current DAO allocation
+              let currentAlloc = await (with timeout = 65)  daoCanister.getNeuronAllocation(neuronId);
+              switch (currentAlloc) {
+                case (?alloc) {
+                  if (alloc.allocations.size() > 0) {
+                    alloc.allocations  // Use current allocation as baseline
+                  } else {
+                    return #err(#NeuronNotFound);
+                  }
+                };
+                case (null) { return #err(#NeuronNotFound); };
+              };
             };
           };
         };
@@ -606,15 +666,33 @@ shared (deployer) persistent actor class Rewards() = this {
         // Collect all tokens for batch price request
         let tokens = Array.map<Allocation, Principal>(allocations, func(allocation) { allocation.token });
         
-        // Get prices for all tokens at once
-        let batchPriceResult = await (with timeout = 65)  priceArchive.getPricesAtTime(tokens, timestamp);
-        let tokenPrices = switch (batchPriceResult) {
-          case (#ok(prices)) { prices };
-          case (#err(_)) {
-            return #err(#SystemError("Failed to get price data"));
+        // Get prices for all tokens at once (cache-aware)
+        let tokenPrices : [(Principal, ?PriceInfo)] = if (recalcCacheActive) {
+          let cachedBuf = Buffer.Buffer<(Principal, ?PriceInfo)>(tokens.size());
+          var allCached = true;
+          for (t in tokens.vals()) {
+            let key = priceCacheKey(t, timestamp);
+            switch (Map.get(recalcAtTimeCache, thash, key)) {
+              case (?#found(p)) { cachedBuf.add((t, ?p)); };
+              case (?#notFound) { cachedBuf.add((t, null)); };
+              case null { allCached := false; };
+            };
+          };
+          if (allCached) {
+            Buffer.toArray(cachedBuf);
+          } else {
+            switch (await (with timeout = 65) priceArchive.getPricesAtTime(tokens, timestamp)) {
+              case (#ok(prices)) { prices };
+              case (#err(_)) { return #err(#SystemError("Failed to get price data")); };
+            };
+          };
+        } else {
+          switch (await (with timeout = 65) priceArchive.getPricesAtTime(tokens, timestamp)) {
+            case (#ok(prices)) { prices };
+            case (#err(_)) { return #err(#SystemError("Failed to get price data")); };
           };
         };
-        
+
         // Process each allocation with its corresponding price, with fallback behavior
         for (allocation in allocations.vals()) {
           // Find the price for this token in batch result
@@ -626,8 +704,14 @@ shared (deployer) persistent actor class Rewards() = this {
           switch (priceEntry) {
             case (?( _, ?pi)) { priceOpt := ?pi; };
             case _ {
-              // Fallback 1: try to find closest price after timestamp
-              let futureRes = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+              // Fallback 1: try cache, then archive for closest price after timestamp
+              var futureRes : Result.Result<?PriceInfo, ArchiveError> = #ok(null);
+              switch (getCachedAtOrAfter(allocation.token, timestamp)) {
+                case (?cached) { futureRes := #ok(cached); };
+                case null {
+                  futureRes := await (with timeout = 65) priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+                };
+              };
               switch (futureRes) {
                 case (#ok(?futurePrice)) { priceOpt := ?futurePrice; };
                 case _ { priceOpt := null; };
@@ -688,15 +772,33 @@ shared (deployer) persistent actor class Rewards() = this {
         };
         let allTokens = Buffer.toArray(allTokensBuffer);
         
-        // Get prices for all tokens at once
-        let batchPriceResult = await (with timeout = 65)  priceArchive.getPricesAtTime(allTokens, timestamp);
-        let tokenPrices = switch (batchPriceResult) {
-          case (#ok(prices)) { prices };
-          case (#err(_)) {
-            return #err(#SystemError("Failed to get price data"));
+        // Get prices for all tokens at once (cache-aware)
+        let tokenPrices : [(Principal, ?PriceInfo)] = if (recalcCacheActive) {
+          let cachedBuf = Buffer.Buffer<(Principal, ?PriceInfo)>(allTokens.size());
+          var allCached = true;
+          for (t in allTokens.vals()) {
+            let key = priceCacheKey(t, timestamp);
+            switch (Map.get(recalcAtTimeCache, thash, key)) {
+              case (?#found(p)) { cachedBuf.add((t, ?p)); };
+              case (?#notFound) { cachedBuf.add((t, null)); };
+              case null { allCached := false; };
+            };
+          };
+          if (allCached) {
+            Buffer.toArray(cachedBuf);
+          } else {
+            switch (await (with timeout = 65) priceArchive.getPricesAtTime(allTokens, timestamp)) {
+              case (#ok(prices)) { prices };
+              case (#err(_)) { return #err(#SystemError("Failed to get price data")); };
+            };
+          };
+        } else {
+          switch (await (with timeout = 65) priceArchive.getPricesAtTime(allTokens, timestamp)) {
+            case (#ok(prices)) { prices };
+            case (#err(_)) { return #err(#SystemError("Failed to get price data")); };
           };
         };
-        
+
         // Helper function to find price for a token
         let findPrice = func(token: Principal) : ?PriceInfo {
           let priceEntry = Array.find<(Principal, ?PriceInfo)>(tokenPrices, func((t, _)) {
@@ -735,7 +837,13 @@ shared (deployer) persistent actor class Rewards() = this {
                 // Get new price for this token from batch result, with fallback to future
                 var priceInfoOpt : ?PriceInfo = findPrice(token);
                 if (priceInfoOpt == null) {
-                  let futureResStep1 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                  var futureResStep1 : Result.Result<?PriceInfo, ArchiveError> = #ok(null);
+                  switch (getCachedAtOrAfter(token, timestamp)) {
+                    case (?cached) { futureResStep1 := #ok(cached); };
+                    case null {
+                      futureResStep1 := await (with timeout = 65) priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                    };
+                  };
                   switch (futureResStep1) {
                     case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
                     case _ {};
@@ -761,7 +869,13 @@ shared (deployer) persistent actor class Rewards() = this {
                 // using the price at this checkpoint to populate updatedPrices.
                 var priceInfoOpt2 : ?PriceInfo = findPrice(token);
                 if (priceInfoOpt2 == null) {
-                  let futureResNew = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                  var futureResNew : Result.Result<?PriceInfo, ArchiveError> = #ok(null);
+                  switch (getCachedAtOrAfter(token, timestamp)) {
+                    case (?cached) { futureResNew := #ok(cached); };
+                    case null {
+                      futureResNew := await (with timeout = 65) priceArchive.getPriceAtOrAfterTime(token, timestamp);
+                    };
+                  };
                   switch (futureResNew) {
                     case (#ok(?futurePrice)) { priceInfoOpt2 := ?futurePrice; };
                     case _ {};
@@ -806,7 +920,13 @@ shared (deployer) persistent actor class Rewards() = this {
           // Get price info for this token from batch result, with same fallback rules
           var priceInfoOpt : ?PriceInfo = findPrice(allocation.token);
           if (priceInfoOpt == null) {
-            let futureRes2 = await (with timeout = 65)  priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+            var futureRes2 : Result.Result<?PriceInfo, ArchiveError> = #ok(null);
+            switch (getCachedAtOrAfter(allocation.token, timestamp)) {
+              case (?cached) { futureRes2 := #ok(cached); };
+              case null {
+                futureRes2 := await (with timeout = 65) priceArchive.getPriceAtOrAfterTime(allocation.token, timestamp);
+              };
+            };
             switch (futureRes2) {
               case (#ok(?futurePrice)) { priceInfoOpt := ?futurePrice; };
               case _ {};
@@ -1381,6 +1501,12 @@ shared (deployer) persistent actor class Rewards() = this {
         return;
       };
       case null { };
+    };
+
+    // Check if a performance recalculation is in progress (cache state would conflict)
+    if (recalcInProgress) {
+      logger.warn("Distribution", "Performance recalculation in progress, skipping distribution", "runPeriodicDistribution");
+      return;
     };
 
     let now = Time.now();
@@ -4454,8 +4580,14 @@ shared (deployer) persistent actor class Rewards() = this {
       return #err(#NotAuthorized);
     };
 
+    if (recalcInProgress) {
+      return #err(#SystemError("Recalculation already in progress"));
+    };
+    recalcInProgress := true;
+
     let totalDistributions = Vector.size(distributionHistory);
     if (totalDistributions == 0) {
+      recalcInProgress := false;
       return #ok("No distributions found");
     };
 
@@ -4469,6 +4601,7 @@ shared (deployer) persistent actor class Rewards() = this {
     };
 
     if (startIndex >= totalDistributions) {
+      recalcInProgress := false;
       return #ok("No distributions found after timestamp " # Int.toText(afterTimestamp));
     };
 
@@ -4477,10 +4610,161 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Kick off async recalculation via timer pattern (non-blocking)
     ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
-      await* recalculateDistributionsSequentially<system>(startIndex, totalDistributions, 0, ([] : [NeuronReward]), 0, startIndex);
+      await* recalculateDistributionsSequentially<system>(startIndex, totalDistributions, 0, Buffer.Buffer<NeuronReward>(0), 0, startIndex);
     });
 
     #ok("Started recalculation of " # Nat.toText(distributionsToProcess) # " distributions (" # Nat.toText(startIndex) # " to " # Nat.toText(totalDistributions - 1) # ")")
+  };
+
+  // Pre-fetch all prices for a distribution into transient caches
+  // Uses batch functions to minimize inter-canister calls
+  private func prefetchPricesForDistribution(record: DistributionRecord) : async* () {
+    // Collect all unique (token, timestamp) pairs from all neuron checkpoints
+    let pairsMap = Map.new<Text, {token: Principal; timestamp: Int}>();
+
+    for (neuronReward in record.neuronRewards.vals()) {
+      for (checkpoint in neuronReward.checkpoints.vals()) {
+        for ((token, _) in checkpoint.pricesUsed.vals()) {
+          let key = priceCacheKey(token, checkpoint.timestamp);
+          ignore Map.put(pairsMap, thash, key, {token = token; timestamp = checkpoint.timestamp});
+        };
+        for (alloc in checkpoint.allocations.vals()) {
+          let key = priceCacheKey(alloc.token, checkpoint.timestamp);
+          ignore Map.put(pairsMap, thash, key, {token = alloc.token; timestamp = checkpoint.timestamp});
+        };
+      };
+    };
+
+    let pairs = Iter.toArray(Map.vals(pairsMap));
+    if (pairs.size() == 0) return;
+
+    let BATCH_SIZE = 500;
+
+    // Batch 1: getPricesAtOrAfterTimes (primary)
+    var offset : Nat = 0;
+    while (offset < pairs.size()) {
+      let batchLen = Nat.min(BATCH_SIZE, pairs.size() - offset);
+      let batch = Array.subArray(pairs, offset, batchLen);
+      try {
+        let result = await priceArchive.getPricesAtOrAfterTimes(batch);
+        switch (result) {
+          case (#ok(prices)) {
+            for (i in prices.keys()) {
+              let key = priceCacheKey(batch[i].token, batch[i].timestamp);
+              let entry : PriceCacheEntry = switch (prices[i]) {
+                case (?p) { #found(p) };
+                case null { #notFound };
+              };
+              Map.set(recalcAtOrAfterCache, thash, key, entry);
+            };
+          };
+          case (#err(_)) {};
+        };
+      } catch (_) {};
+      offset += batchLen;
+    };
+
+    // Batch 2: getPricesAtTimes — only for pairs where getPricesAtOrAfterTimes found nothing
+    let missingPairs = Buffer.Buffer<{token: Principal; timestamp: Int}>(0);
+    for (pair in pairs.vals()) {
+      let key = priceCacheKey(pair.token, pair.timestamp);
+      switch (Map.get(recalcAtOrAfterCache, thash, key)) {
+        case (?#notFound) { missingPairs.add(pair); };
+        case null { missingPairs.add(pair); }; // shouldn't happen, but be safe
+        case _ {}; // found — skip
+      };
+    };
+
+    let missingArr = Buffer.toArray(missingPairs);
+    if (missingArr.size() > 0) {
+      offset := 0;
+      while (offset < missingArr.size()) {
+        let batchLen = Nat.min(BATCH_SIZE, missingArr.size() - offset);
+        let batch = Array.subArray(missingArr, offset, batchLen);
+        try {
+          let result = await priceArchive.getPricesAtTimes(batch);
+          switch (result) {
+            case (#ok(prices)) {
+              for (i in prices.keys()) {
+                let key = priceCacheKey(batch[i].token, batch[i].timestamp);
+                let entry : PriceCacheEntry = switch (prices[i]) {
+                  case (?p) { #found(p) };
+                  case null { #notFound };
+                };
+                Map.set(recalcAtTimeCache, thash, key, entry);
+              };
+            };
+            case (#err(_)) {};
+          };
+        } catch (_) {};
+        offset += batchLen;
+      };
+    };
+
+    recalcCacheActive := true;
+    logger.info("Admin", "Pre-fetched " # Nat.toText(pairs.size()) # " price pairs for distribution", "prefetchPricesForDistribution");
+  };
+
+  // Pre-fetch all allocation data for a distribution into transient cache
+  private func prefetchAllocationsForDistribution(record: DistributionRecord) : async* () {
+    recalcAllocationCache := Map.new<Blob, AllocationCacheEntry>();
+    recalcAllocationCacheActive := false;
+
+    let startTime = record.startTime;
+    let endTime = record.endTime;
+    let ALLOC_BATCH_SIZE : Nat = 100;
+    var offset : Nat = 0;
+    var hasMore = true;
+    var totalFetched : Nat = 0;
+
+    while (hasMore) {
+      try {
+        let result = await neuronAllocationArchive.getAllNeuronsAllocationChangesInTimeRange(
+          startTime, endTime, offset, ALLOC_BATCH_SIZE
+        );
+        switch (result) {
+          case (#ok(data)) {
+            for ((neuronId, allocData) in data.neurons.vals()) {
+              Map.set(recalcAllocationCache, bhash, neuronId, {
+                preTimespanAllocation = allocData.preTimespanAllocation;
+                inTimespanChanges = allocData.inTimespanChanges;
+              });
+            };
+            totalFetched += data.neurons.size();
+            hasMore := data.hasMore;
+            offset += ALLOC_BATCH_SIZE;
+          };
+          case (#err(error)) {
+            logger.warn("Admin", "Failed to prefetch allocations at offset " # Nat.toText(offset) # ": " # debug_show(error), "prefetchAllocationsForDistribution");
+            hasMore := false;
+          };
+        };
+      } catch (e) {
+        logger.warn("Admin", "System error prefetching allocations: " # Error.message(e), "prefetchAllocationsForDistribution");
+        hasMore := false;
+      };
+    };
+
+    // Prefetch DAO allocations for neurons not in the allocation archive
+    try {
+      let allDAOAllocations = await daoCanister.admin_getNeuronAllocations();
+      var daoCount : Nat = 0;
+      for ((neuronId, neuronAlloc) in allDAOAllocations.vals()) {
+        // Only cache if not already in allocation archive cache
+        if (Option.isNull(Map.get(recalcAllocationCache, bhash, neuronId))) {
+          if (neuronAlloc.allocations.size() > 0) {
+            Map.set(recalcDAOAllocationCache, bhash, neuronId, neuronAlloc.allocations);
+            daoCount += 1;
+          };
+        };
+      };
+      logger.info("Admin", "Pre-fetched DAO allocations for " # Nat.toText(daoCount) # " neurons not in archive", "prefetchAllocationsForDistribution");
+    } catch (e) {
+      logger.warn("Admin", "Failed to prefetch DAO allocations: " # Error.message(e), "prefetchAllocationsForDistribution");
+    };
+
+    recalcAllocationCacheActive := true;
+    logger.info("Admin", "Pre-fetched allocations for " # Nat.toText(totalFetched) # " neurons", "prefetchAllocationsForDistribution");
   };
 
   // Process distributions and neurons sequentially using timer pattern to avoid IC timeouts
@@ -4488,22 +4772,32 @@ shared (deployer) persistent actor class Rewards() = this {
     currentDistIndex: Nat,
     totalDistributions: Nat,
     currentNeuronIndex: Nat,
-    updatedRewards: [NeuronReward],
+    updatedRewardsBuffer: Buffer.Buffer<NeuronReward>,
     totalNeuronsProcessed: Nat,
     startDistIndex: Nat
   ) : async* () {
 
     // All distributions processed
     if (currentDistIndex >= totalDistributions) {
+      recalcInProgress := false;
+      clearRecalcCaches();
       await* computeAllLeaderboards<system>();
+      startLeaderboardTimer<system>();
       logger.info("Admin", "Performance recalculation complete: " # Nat.toText(totalNeuronsProcessed) # " neurons across " # Nat.toText(totalDistributions - startDistIndex) # " distributions. Leaderboards recomputed.", "recalculateDistributionsSequentially");
       return;
     };
 
     let existingRecord = Vector.get(distributionHistory, currentDistIndex);
 
+    // Pre-fetch prices and allocations when starting a new distribution
+    if (currentNeuronIndex == 0 and existingRecord.neuronRewards.size() > 0) {
+      await* prefetchPricesForDistribution(existingRecord);
+      await* prefetchAllocationsForDistribution(existingRecord);
+    };
+
     // All neurons in this distribution processed — save and move to next
     if (currentNeuronIndex >= existingRecord.neuronRewards.size()) {
+      clearRecalcCaches();
       let updatedRecord : DistributionRecord = {
         id = existingRecord.id;
         startTime = existingRecord.startTime;
@@ -4513,7 +4807,7 @@ shared (deployer) persistent actor class Rewards() = this {
         actualDistributed = existingRecord.actualDistributed;
         totalRewardScore = existingRecord.totalRewardScore;
         neuronsProcessed = existingRecord.neuronsProcessed;
-        neuronRewards = updatedRewards;
+        neuronRewards = Buffer.toArray(updatedRewardsBuffer);
         failedNeurons = existingRecord.failedNeurons;
         status = existingRecord.status;
       };
@@ -4521,70 +4815,134 @@ shared (deployer) persistent actor class Rewards() = this {
       logger.info("Admin", "Recalculated distribution #" # Nat.toText(existingRecord.id) # " (" # Nat.toText(existingRecord.neuronRewards.size()) # " neurons)", "recalculateDistributionsSequentially");
 
       ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
-        await* recalculateDistributionsSequentially<system>(currentDistIndex + 1, totalDistributions, 0, ([] : [NeuronReward]), totalNeuronsProcessed, startDistIndex);
+        await* recalculateDistributionsSequentially<system>(currentDistIndex + 1, totalDistributions, 0, Buffer.Buffer<NeuronReward>(0), totalNeuronsProcessed, startDistIndex);
       });
       return;
     };
 
-    let neuronReward = existingRecord.neuronRewards[currentNeuronIndex];
+    // Process a batch of neurons in parallel (same pattern as backfill code lines 2258-2322)
+    let RECALC_BATCH_SIZE : Nat = 10;
+    let endIdx = Nat.min(currentNeuronIndex + RECALC_BATCH_SIZE, existingRecord.neuronRewards.size());
+    let batchSize = endIdx - currentNeuronIndex;
 
-    try {
-      let performanceResult = await (with timeout = 65) calculateNeuronPerformance(
-        neuronReward.neuronId,
-        existingRecord.startTime,
-        existingRecord.endTime,
-        #USD
+    // Launch parallel futures
+    let perfFutures = Buffer.Buffer<async Result.Result<PerformanceResult, RewardsError>>(batchSize);
+    let batchNeurons = Buffer.Buffer<NeuronReward>(batchSize);
+
+    var idx = currentNeuronIndex;
+    while (idx < endIdx) {
+      let neuronReward = existingRecord.neuronRewards[idx];
+      batchNeurons.add(neuronReward);
+      perfFutures.add(
+        (with timeout = 65) calculateNeuronPerformance(
+          neuronReward.neuronId,
+          existingRecord.startTime,
+          existingRecord.endTime,
+          #USD
+        )
       );
+      idx += 1;
+    };
 
-      switch (performanceResult) {
-        case (#ok(performance)) {
-          let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
-            recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
-          } else {
-            null
+    // Await all futures and collect results
+    let retryNeurons = Buffer.Buffer<NeuronReward>(0);
+    var futureIdx : Nat = 0;
+    for (future in perfFutures.vals()) {
+      let neuronReward = batchNeurons.get(futureIdx);
+      try {
+        let performanceResult = await future;
+
+        switch (performanceResult) {
+          case (#ok(performance)) {
+            let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
+              recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
+            } else {
+              null
+            };
+
+            updatedRewardsBuffer.add({
+              neuronId = neuronReward.neuronId;
+              performanceScore = performance.performanceScore;
+              performanceScoreICP = performanceICP;
+              votingPower = neuronReward.votingPower;
+              rewardScore = neuronReward.rewardScore;
+              rewardAmount = neuronReward.rewardAmount;
+              checkpoints = performance.checkpoints;
+            });
           };
-
-          let updatedReward : NeuronReward = {
-            neuronId = neuronReward.neuronId;
-            performanceScore = performance.performanceScore;
-            performanceScoreICP = performanceICP;
-            votingPower = neuronReward.votingPower;
-            rewardScore = neuronReward.rewardScore;
-            rewardAmount = neuronReward.rewardAmount;
-            checkpoints = performance.checkpoints;
+          case (#err(error)) {
+            logger.warn("Admin", "Failed to recalculate neuron in distribution #" # Nat.toText(existingRecord.id) # ": " # debug_show(error), "recalculateDistributionsSequentially");
+            updatedRewardsBuffer.add(neuronReward);
           };
-
-          let newUpdatedRewards = Array.flatten([updatedRewards, [updatedReward]]);
-
-          ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
-            await* recalculateDistributionsSequentially<system>(
-              currentDistIndex, totalDistributions, currentNeuronIndex + 1, newUpdatedRewards, totalNeuronsProcessed + 1, startDistIndex
-            );
-          });
         };
-        case (#err(error)) {
-          // Keep original reward if recalculation fails
-          logger.warn("Admin", "Failed to recalculate neuron in distribution #" # Nat.toText(existingRecord.id) # ": " # debug_show(error), "recalculateDistributionsSequentially");
-          let newUpdatedRewards = Array.flatten([updatedRewards, [neuronReward]]);
-
-          ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
-            await* recalculateDistributionsSequentially<system>(
-              currentDistIndex, totalDistributions, currentNeuronIndex + 1, newUpdatedRewards, totalNeuronsProcessed + 1, startDistIndex
-            );
-          });
+      } catch (error) {
+        let errorMsg = Error.message(error);
+        let isTimeout = Text.contains(errorMsg, #text "deadline") or Text.contains(errorMsg, #text "timeout");
+        if (isTimeout) {
+          logger.warn("Admin", "Timeout recalculating neuron in distribution #" # Nat.toText(existingRecord.id) # ", will retry: " # errorMsg, "recalculateDistributionsSequentially");
+          retryNeurons.add(neuronReward);
+        } else {
+          logger.warn("Admin", "System error recalculating neuron in distribution #" # Nat.toText(existingRecord.id) # ": " # errorMsg, "recalculateDistributionsSequentially");
+          updatedRewardsBuffer.add(neuronReward);
         };
       };
-    } catch (error) {
-      // Keep original reward on system error
-      logger.warn("Admin", "System error recalculating neuron in distribution #" # Nat.toText(existingRecord.id) # ": " # Error.message(error), "recalculateDistributionsSequentially");
-      let newUpdatedRewards = Array.flatten([updatedRewards, [neuronReward]]);
-
-      ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
-        await* recalculateDistributionsSequentially<system>(
-          currentDistIndex, totalDistributions, currentNeuronIndex + 1, newUpdatedRewards, totalNeuronsProcessed + 1, startDistIndex
-        );
-      });
+      futureIdx += 1;
     };
+
+    // Retry timeout-failed neurons (up to 3 attempts, sequential — matches periodic flow)
+    let MAX_RETRIES : Nat = 3;
+    for (neuronReward in retryNeurons.vals()) {
+      var retried = false;
+      var retryAttempt : Nat = 1;
+      while (retryAttempt <= MAX_RETRIES and not retried) {
+        try {
+          let retryResult = await (with timeout = 65) calculateNeuronPerformance(
+            neuronReward.neuronId,
+            existingRecord.startTime,
+            existingRecord.endTime,
+            #USD
+          );
+          switch (retryResult) {
+            case (#ok(performance)) {
+              let performanceICP : ?Float = if (performance.checkpoints.size() >= 2) {
+                recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
+              } else {
+                null
+              };
+              updatedRewardsBuffer.add({
+                neuronId = neuronReward.neuronId;
+                performanceScore = performance.performanceScore;
+                performanceScoreICP = performanceICP;
+                votingPower = neuronReward.votingPower;
+                rewardScore = neuronReward.rewardScore;
+                rewardAmount = neuronReward.rewardAmount;
+                checkpoints = performance.checkpoints;
+              });
+              retried := true;
+            };
+            case (#err(error)) {
+              logger.warn("Admin", "Retry " # Nat.toText(retryAttempt) # "/" # Nat.toText(MAX_RETRIES) # " result error for neuron in dist #" # Nat.toText(existingRecord.id) # ": " # debug_show(error), "recalculateDistributionsSequentially");
+              updatedRewardsBuffer.add(neuronReward);
+              retried := true;
+            };
+          };
+        } catch (retryError) {
+          let retryMsg = Error.message(retryError);
+          logger.warn("Admin", "Retry " # Nat.toText(retryAttempt) # "/" # Nat.toText(MAX_RETRIES) # " timeout for neuron in dist #" # Nat.toText(existingRecord.id) # ": " # retryMsg, "recalculateDistributionsSequentially");
+          if (retryAttempt >= MAX_RETRIES) {
+            updatedRewardsBuffer.add(neuronReward);
+          };
+          retryAttempt += 1;
+        };
+      };
+    };
+
+    // Schedule next batch
+    ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+      await* recalculateDistributionsSequentially<system>(
+        currentDistIndex, totalDistributions, endIdx, updatedRewardsBuffer, totalNeuronsProcessed + batchSize, startDistIndex
+      );
+    });
   };
 
   //=========================================================================

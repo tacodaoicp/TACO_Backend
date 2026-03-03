@@ -97,10 +97,10 @@ module {
         maxRecordsInArchiveInstance = 10000000;  // 10M records per archive
         maxArchivePages = 62500;                 // Up to 500GB total
         archiveIndexType = #Stable;
-        maxActiveRecords = 2000;
-        maxRecordsToArchive = 1000;
+        maxActiveRecords = 1_000_000;              // ~2.3 years before archival triggers at 1200 blocks/day
+        maxRecordsToArchive = 3_000;               // Archive 3K blocks per batch (~1.2MB, safely under 2MB IC message limit)
         archiveCycles = 2000000000000;           // 2T cycles for archive creation
-        settleToRecords = 100;
+        settleToRecords = 900_000;                 // Keep 900K blocks locally after cleanup
         archiveControllers = ?null;
         supportedBlocks = Array.map<Text, ICRC3.BlockType>(supportedBlockTypes, func(blockType) : ICRC3.BlockType {
           { block_type = blockType; url = "https://github.com/ICRC-3/icrc3-mo" }
