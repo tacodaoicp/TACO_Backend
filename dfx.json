@@ -67,6 +67,11 @@
     "reward_withdrawal_archive": {
       "main": "src/archives/reward_withdrawal_archive/reward_withdrawal_archive.mo",
       "type": "motoko"
+    },
+    "nachos_vault": {
+      "main": "src/nachos_vault/nachos_vault.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     }
   },
   "networks": {

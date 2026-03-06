@@ -371,4 +371,80 @@ persistent actor validation {
       { cycles = Cycles.balance() };
     };
 
+// ==============================
+// nachos_vault.mo GNSF Admin functions
+// ==============================
+
+    public query func validate_updateNachosFees(mintFeeBP : ?Nat, burnFeeBP : ?Nat) : async ValidationResult {
+      #Ok("updateNachosFees called with mintFeeBP: " # debug_show(mintFeeBP) # " burnFeeBP: " # debug_show(burnFeeBP));
+    };
+
+    public query func validate_pauseNachosMinting(reason : Text) : async ValidationResult {
+      #Ok("pauseNachosMinting called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_unpauseNachosMinting(reason : Text) : async ValidationResult {
+      #Ok("unpauseNachosMinting called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_pauseNachosBurning(reason : Text) : async ValidationResult {
+      #Ok("pauseNachosBurning called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_unpauseNachosBurning(reason : Text) : async ValidationResult {
+      #Ok("unpauseNachosBurning called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_nachosEmergencyPause(reason : Text) : async ValidationResult {
+      #Ok("nachosEmergencyPause called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_nachosEmergencyUnpause(reason : Text) : async ValidationResult {
+      #Ok("nachosEmergencyUnpause called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_resetNachosCircuitBreaker(reason : Text) : async ValidationResult {
+      #Ok("resetNachosCircuitBreaker called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_addAcceptedMintToken(token : Principal) : async ValidationResult {
+      #Ok("addAcceptedMintToken called with token: " # Principal.toText(token));
+    };
+
+    public query func validate_removeAcceptedMintToken(token : Principal) : async ValidationResult {
+      #Ok("removeAcceptedMintToken called with token: " # Principal.toText(token));
+    };
+
+    public query func validate_setAcceptedMintTokenEnabled(token : Principal, enabled : Bool) : async ValidationResult {
+      #Ok("setAcceptedMintTokenEnabled called with token: " # Principal.toText(token) # " enabled: " # debug_show(enabled));
+    };
+
+    public query func validate_updateCancellationFeeMultiplier(multiplier : Nat) : async ValidationResult {
+      #Ok("updateCancellationFeeMultiplier called with multiplier: " # debug_show(multiplier));
+    };
+
+    public query func validate_addFeeExemptPrincipal(principal : Principal) : async ValidationResult {
+      #Ok("addFeeExemptPrincipal called with principal: " # Principal.toText(principal));
+    };
+
+    public query func validate_removeFeeExemptPrincipal(principal : Principal) : async ValidationResult {
+      #Ok("removeFeeExemptPrincipal called with principal: " # Principal.toText(principal));
+    };
+
+    public query func validate_addRateLimitExemptPrincipal(principal : Principal) : async ValidationResult {
+      #Ok("addRateLimitExemptPrincipal called with principal: " # Principal.toText(principal));
+    };
+
+    public query func validate_removeRateLimitExemptPrincipal(principal : Principal) : async ValidationResult {
+      #Ok("removeRateLimitExemptPrincipal called with principal: " # Principal.toText(principal));
+    };
+
+    public query func validate_recoverWronglySentTokens(tokenPrincipal : Principal, blockNumber : Nat, senderPrincipal : Principal) : async ValidationResult {
+      #Ok("recoverWronglySentTokens called with token: " # Principal.toText(tokenPrincipal) # " block: " # debug_show(blockNumber) # " sender: " # Principal.toText(senderPrincipal));
+    };
+
+    public query func validate_retryFailedTransfers() : async ValidationResult {
+      #Ok("retryFailedTransfers: Reset retry counts for all exhausted transfer tasks");
+    };
+
 }

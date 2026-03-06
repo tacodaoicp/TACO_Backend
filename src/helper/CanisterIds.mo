@@ -20,6 +20,7 @@ module CanisterId {
         #dao_neuron_allocation_archive;
         #reward_distribution_archive;
         #reward_withdrawal_archive;
+        #nachos_vault;
     };
     
     // Define the environments
@@ -47,6 +48,7 @@ module CanisterId {
             (#Staging, #dao_neuron_allocation_archive, Principal.fromText("cajb4-qqaaa-aaaan-qz5la-cai")), // Placeholder ID
             (#Staging, #reward_distribution_archive, Principal.fromText("ddfi2-eiaaa-aaaan-qz5nq-cai")),
             (#Staging, #reward_withdrawal_archive, Principal.fromText("dwczx-faaaa-aaaan-qz5oa-cai")),
+            (#Staging, #nachos_vault, Principal.fromText("dwczx-faaaa-aaaan-qz5oa-cai")), // Placeholder - update after deploy
 
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),
@@ -62,7 +64,8 @@ module CanisterId {
             (#Production, #rewards, Principal.fromText("dkgdg-saaaa-aaaan-qz5ma-cai")), // Placeholder ID
             (#Production, #dao_neuron_allocation_archive, Principal.fromText("dnhfs-7yaaa-aaaan-qz5mq-cai")), // Placeholder ID
             (#Production, #reward_distribution_archive, Principal.fromText("uqkap-jiaaa-aaaan-qz6tq-cai")),
-            (#Production, #reward_withdrawal_archive, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai"))
+            (#Production, #reward_withdrawal_archive, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai")),
+            (#Production, #nachos_vault, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai")) // Placeholder - update after deploy
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {

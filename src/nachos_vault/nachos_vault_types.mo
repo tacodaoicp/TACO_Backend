@@ -1,0 +1,300 @@
+import Principal "mo:base/Principal";
+
+module {
+
+  // ═══════════════════════════════════════════════════════
+  // ACCEPTED TOKEN TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type AcceptedTokenConfig = {
+    addedAt : Int;
+    addedBy : Principal;
+    enabled : Bool;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // MINT TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type MintMode = {
+    #ICP;
+    #SingleToken;
+    #PortfolioShare;
+  };
+
+  public type TokenDeposit = {
+    token : Principal;
+    amount : Nat;
+    priceUsed : Nat;
+    valueICP : Nat;
+  };
+
+  public type MintResult = {
+    success : Bool;
+    mintId : Nat;
+    mintMode : MintMode;
+    nachosReceived : Nat;
+    navUsed : Nat;
+    deposits : [TokenDeposit];
+    totalDepositValueICP : Nat;
+    excessReturned : [TokenDeposit];
+    feeValueICP : Nat;
+    netValueICP : Nat;
+    nachosLedgerTxId : ?Nat;
+  };
+
+  public type MintRecord = {
+    id : Nat;
+    timestamp : Int;
+    caller : Principal;
+    mintMode : MintMode;
+    deposits : [TokenDeposit];
+    excessReturned : [TokenDeposit];
+    nachosReceived : Nat;
+    navUsed : Nat;
+    totalDepositValueICP : Nat;
+    feeValueICP : Nat;
+    netValueICP : Nat;
+    nachosLedgerTxId : ?Nat;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // FEE EXEMPTION TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type FeeExemptConfig = {
+    addedAt : Int;
+    addedBy : Principal;
+    reason : Text;
+    enabled : Bool;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // TRANSFER QUEUE TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type TransferOperationType = {
+    #MintReturn;
+    #BurnPayout;
+    #ExcessReturn;
+    #CancelReturn;
+    #Recovery;
+  };
+
+  public type TransferStatus = {
+    #Pending;
+    #Sent;
+    #Confirmed : Nat64;
+    #Failed : Text;
+  };
+
+  public type TransferRecipient = {
+    #principal : Principal;
+    #accountId : { owner : Principal; subaccount : ?Blob };
+  };
+
+  public type VaultTransferTask = {
+    id : Nat;
+    caller : Principal;
+    recipient : TransferRecipient;
+    amount : Nat;
+    tokenPrincipal : Principal;
+    fromSubaccount : Nat8;
+    operationType : TransferOperationType;
+    operationId : Nat;
+    status : TransferStatus;
+    createdAt : Int;
+    updatedAt : Int;
+    retryCount : Nat;
+    actualAmountSent : ?Nat;
+    blockIndex : ?Nat64;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // DEPOSIT TRACKING TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type DepositStatus = {
+    #Verified;
+    #Processing;
+    #Consumed;
+    #Cancelled;
+    #Expired;
+  };
+
+  public type ActiveDeposit = {
+    blockKey : Text;
+    caller : Principal;
+    tokenPrincipal : Principal;
+    amount : Nat;
+    blockNumber : Nat;
+    timestamp : Int;
+    status : DepositStatus;
+    mintBurnId : ?Nat;
+    cancellationTxId : ?Nat64;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // DEPOSIT STATISTICS TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type DepositEntry = {
+    timestamp : Int;
+    amount : Nat;
+    caller : Principal;
+    blockNumber : Nat;
+    valueICP : Nat;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // BURN TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type TokenTransferResult = {
+    token : Principal;
+    amount : Nat;
+    txId : ?Nat;
+  };
+
+  public type FailedTokenTransfer = {
+    token : Principal;
+    requestedAmount : Nat;
+    error : Text;
+  };
+
+  public type BurnResult = {
+    success : Bool;
+    burnId : Nat;
+    nachosBurned : Nat;
+    navUsed : Nat;
+    redemptionValueICP : Nat;
+    feeValueICP : Nat;
+    netValueICP : Nat;
+    tokensReceived : [TokenTransferResult];
+    skippedDustTokens : [Principal];
+    nachosLedgerTxId : ?Nat;
+    partialFailure : Bool;
+    failedTokens : [FailedTokenTransfer];
+  };
+
+  public type BurnRecord = {
+    id : Nat;
+    timestamp : Int;
+    caller : Principal;
+    nachosBurned : Nat;
+    navUsed : Nat;
+    redemptionValueICP : Nat;
+    feeValueICP : Nat;
+    netValueICP : Nat;
+    tokensReceived : [TokenTransferResult];
+    skippedDustTokens : [Principal];
+    nachosLedgerTxId : ?Nat;
+    partialFailure : Bool;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // NAV TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type CachedNAV = {
+    navPerTokenE8s : Nat;
+    portfolioValueICP : Nat;
+    nachosSupply : Nat;
+    timestamp : Int;
+  };
+
+  public type NavSnapshotReason = {
+    #Mint;
+    #Burn;
+    #Scheduled;
+    #Manual;
+  };
+
+  public type NavSnapshot = {
+    timestamp : Int;
+    navPerTokenE8s : Nat;
+    portfolioValueICP : Nat;
+    nachosSupply : Nat;
+    reason : NavSnapshotReason;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // FEE TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type FeeRecord = {
+    timestamp : Int;
+    feeType : { #Mint; #Burn };
+    feeAmountICP : Nat;
+    userPrincipal : Principal;
+    operationId : Nat;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // ERROR TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type NachosError = {
+    #SystemPaused;
+    #MintingDisabled;
+    #BurningDisabled;
+    #PriceStale;
+    #InsufficientBalance;
+    #BelowMinimumValue;
+    #RateLimitExceeded;
+    #OperationInProgress;
+    #BlockAlreadyProcessed;
+    #BlockVerificationFailed : Text;
+    #TokenNotActive;
+    #TokenPaused;
+    #TokenNotAccepted;
+    #AllocationExceeded;
+    #InvalidAllocation;
+    #SlippageExceeded;
+    #InvalidPrice;
+    #InsufficientLiquidity : { token : Principal; available : Nat; requested : Nat };
+    #CircuitBreakerActive;
+    #BurnLimitExceeded : { maxPer4Hours : Nat; recentBurns : Nat; requested : Nat };
+    #MintLimitExceeded : { maxPer4Hours : Nat; recentMints : Nat; requested : Nat };
+    #PortfolioShareMismatch : {
+      expected : [{ token : Principal; basisPoints : Nat }];
+      received : [{ token : Principal; basisPoints : Nat }];
+    };
+    #GenesisNotComplete;
+    #GenesisAlreadyDone;
+    #TransferError : Text;
+    #DepositNotFound;
+    #DepositAlreadyCancelled;
+    #DepositAlreadyConsumed;
+    #DepositExpired;
+    #NotDepositor;
+    #RollbackFailed : Text;
+    #NotAuthorized;
+    #UnexpectedError : Text;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  // CONFIGURATION UPDATE TYPE
+  // ═══════════════════════════════════════════════════════
+
+  public type NachosUpdateConfig = {
+    mintFeeBasisPoints : ?Nat;
+    burnFeeBasisPoints : ?Nat;
+    minMintValueICP : ?Nat;
+    minBurnValueICP : ?Nat;
+    MAX_PRICE_STALENESS_NS : ?Int;
+    PRICE_HISTORY_WINDOW : ?Int;
+    maxSlippageBasisPoints : ?Nat;
+    maxNachosBurnPer4Hours : ?Nat;
+    maxMintICPWorthPer4Hours : ?Nat;
+    maxMintOpsPerUser4Hours : ?Nat;
+    maxBurnOpsPerUser4Hours : ?Nat;
+    navDropThresholdPercent : ?Float;
+    navDropTimeWindowNS : ?Nat;
+    portfolioShareMaxDeviationBP : ?Nat;
+    cancellationFeeMultiplier : ?Nat;
+    mintingEnabled : ?Bool;
+    burningEnabled : ?Bool;
+  };
+
+};

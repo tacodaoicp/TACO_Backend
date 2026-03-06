@@ -8729,6 +8729,56 @@ shared (deployer) persistent actor class treasury() = this {
     };
   };
 
+  // Combined price refresh + token details fetch (saves 1 inter-canister call for nachos vault)
+  public shared ({ caller }) func refreshPricesAndGetDetails() : async Result.Result<{
+    tokensRefreshed : Nat;
+    timestamp : Int;
+    icpPriceUSD : Float;
+    tokenDetails : [(Principal, TokenDetails)];
+  }, Text> {
+    if (
+      caller != DAOPrincipal and
+      caller != NachosVaultPrincipal and
+      not isMasterAdmin(caller) and
+      not Principal.isController(caller)
+    ) {
+      return #err("Not authorized");
+    };
+
+    // Rate limiting: minimum 30 seconds between refreshes
+    if (now() - lastPriceRefreshTime < MIN_PRICE_REFRESH_INTERVAL_NS) {
+      let icpPrice : Float = switch (Map.get(tokenDetailsMap, phash, ICPprincipal)) {
+        case (?details) { details.priceInUSD };
+        case null { 0.0 };
+      };
+      return #ok({
+        tokensRefreshed = Map.size(tokenDetailsMap);
+        timestamp = lastPriceRefreshTime;
+        icpPriceUSD = icpPrice;
+        tokenDetails = Iter.toArray(Map.entries(tokenDetailsMap));
+      });
+    };
+
+    try {
+      await* syncPriceWithDEX();
+      lastPriceRefreshTime := now();
+
+      let icpPrice : Float = switch (Map.get(tokenDetailsMap, phash, ICPprincipal)) {
+        case (?details) { details.priceInUSD };
+        case null { 0.0 };
+      };
+
+      #ok({
+        tokensRefreshed = Map.size(tokenDetailsMap);
+        timestamp = now();
+        icpPriceUSD = icpPrice;
+        tokenDetails = Iter.toArray(Map.entries(tokenDetailsMap));
+      });
+    } catch (e) {
+      #err("Price refresh failed: " # Error.message(e));
+    };
+  };
+
   /**
    * Update token metadata (name, symbol, decimals, fees)
    *

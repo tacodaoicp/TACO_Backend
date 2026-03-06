@@ -20,7 +20,6 @@ import ICRC1 "mo:icrc1/ICRC1";
 import Treasury "../treasury/treasury_types";
 import BTree "mo:stableheapbtreemap/BTree";
 import Float "mo:base/Float";
-import MintingVault "../minting_vault/minting_vault_types";
 import TreasuryTypes "../treasury/treasury_types";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
@@ -29,9 +28,9 @@ import Buffer "mo:base/Buffer";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
 import Char "mo:base/Char";
-import Migration "./migration";
+//import Migration "./migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 
 shared (deployer) persistent actor class ContinuousDAO() = this {
 
@@ -330,8 +329,6 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   //let treasury = actor ("z4is7-giaaa-aaaad-qg6uq-cai") : Treasury.Self;
   transient let treasury = actor (Principal.toText(TREASURY_ID)) : Treasury.Self;
   //let nachos = actor (Principal.toText(NACHOS_ID)) : Treasury.Self;
-  //let mintingVault = actor ("ywhqf-eyaaa-aaaad-qg6tq-cai") : MintingVault.Self;
-  transient let mintingVault = actor (Principal.toText(this_canister_id())) : MintingVault.Self;
   //let treasuryPrincipal = Principal.fromText("z4is7-giaaa-aaaad-qg6uq-cai");
   transient let treasuryPrincipal = TREASURY_ID;
   // Timer IDs
@@ -3593,60 +3590,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     };
   };
 
-  /**
- * Update Minting Vault configuration
- *
- * Allows configuration of premium rates, update intervals, and enabling/disabling swapping
- * Only callable by admins with the updateMintingVaultConfig permission.
- */
-  public shared ({ caller }) func updateMintingVaultConfig(
-    config : MintingVault.UpdateConfig
-  ) : async Result.Result<Text, AuthorizationError> {
-    if (not isAdmin(caller, #updateMintingVaultConfig)) {
-      return #err(#NotAdmin);
-    };
 
-    try {
-      // Update configuration if any parameter is specified
-      if (
-        config.minPremium != null or config.maxPremium != null or
-        config.balanceUpdateInterval != null or config.blockCleanupInterval != null or
-        config.maxSlippageBasisPoints != null or config.PRICE_HISTORY_WINDOW != null
-      ) {
-
-        let configResult = await (with timeout = 65) mintingVault.updateConfiguration({
-          minPremium = config.minPremium;
-          maxPremium = config.maxPremium;
-          balanceUpdateInterval = config.balanceUpdateInterval;
-          blockCleanupInterval = config.blockCleanupInterval;
-          maxSlippageBasisPoints = config.maxSlippageBasisPoints;
-          PRICE_HISTORY_WINDOW = config.PRICE_HISTORY_WINDOW;
-          swappingEnabled = config.swappingEnabled;
-        });
-
-        switch (configResult) {
-          case (#ok()) {};
-          case (#err(e)) { return #err(#UnexpectedError(e)) };
-        };
-      };
-
-      // Update swapping state if provided
-      switch (config.swappingEnabled) {
-        case (?enabled) {
-          let swapResult = await (with timeout = 65) mintingVault.setSwappingEnabled(enabled);
-          switch (swapResult) {
-            case (#ok(_)) {};
-            case (#err(e)) { return #err(#UnexpectedError(e)) };
-          };
-        };
-        case null {};
-      };
-
-      #ok("Minting vault configuration updated successfully");
-    } catch (e) {
-      #err(#UnexpectedError("Error updating minting vault configuration: " # Error.message(e)));
-    };
-  };
 
   // Function to get logs - restricted to controllers only
   // Public query - allows anyone to view logs (read-only transparency)
