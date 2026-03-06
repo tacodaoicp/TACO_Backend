@@ -148,8 +148,13 @@ shared (deployer) persistent actor class treasury() = this {
   transient let DAOPrincipal = DAO_BACKEND_ID;
   //stable var MintVaultPrincipal = Principal.fromText("z3jul-lqaaa-aaaad-qg6ua-cai");
   stable var MintVaultPrincipal = DAO_BACKEND_ID;
+  transient let NachosVaultPrincipal = canister_ids.getCanisterId(#nachos_vault);
 
   transient let taco_dao_sns_governance_canister_id : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
+
+  // Price refresh rate limiting for nachos_vault
+  stable var lastPriceRefreshTime : Int = 0;
+  let MIN_PRICE_REFRESH_INTERVAL_NS : Int = 30_000_000_000; // 30 seconds
 
 
 
@@ -271,6 +276,8 @@ shared (deployer) persistent actor class treasury() = this {
   };
 
   private func addSkipPair(tokenA : Principal, tokenB : Principal) {
+    // Never skip ICP pairs - ICP is the fallback route itself
+    if (tokenA == ICPprincipal or tokenB == ICPprincipal) { return };
     let key = normalizePair(tokenA, tokenB);
     Map.set(pairSkipMap, hashpp, key, now());
     logger.info("PAIR_SKIP",
@@ -3429,7 +3436,7 @@ shared (deployer) persistent actor class treasury() = this {
    *
    */
   public shared ({ caller }) func receiveTransferTasks(tempTransferQueue : [(TransferRecipient, Nat, Principal, Nat8)], Immediate : Bool) : async (Bool, ?[(Principal, Nat64)]) {
-    assert (caller == DAOPrincipal or caller == MintVaultPrincipal);
+    assert (caller == DAOPrincipal or caller == MintVaultPrincipal or caller == NachosVaultPrincipal);
 
     if (Immediate) {
       let blocks = Vector.new<(Principal, Nat64)>();
@@ -4723,6 +4730,129 @@ shared (deployer) persistent actor class treasury() = this {
                       await takePortfolioSnapshot(#PostTrade);
                       checkPortfolioCircuitBreakerConditions();
                       await* logPortfolioState("Post-trade completed (split)");
+                    } else {
+                      // Both split legs failed - attempt ICP fallback
+                      if (buyToken != ICPprincipal and sellToken != ICPprincipal and not isTokenPausedFromTrading(ICPprincipal)) {
+                        addSkipPair(sellToken, buyToken);
+
+                        let splitSellSymbol = tokenDetailsSell.tokenSymbol;
+                        let splitBuySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                          case (?details) { details.tokenSymbol };
+                          case null { "UNKNOWN" };
+                        };
+
+                        logger.info("ICP_FALLBACK",
+                          "Both split legs failed, attempting ICP fallback - Original_pair=" # splitSellSymbol # "/" # splitBuySymbol #
+                          " Fallback_pair=" # splitSellSymbol # "/ICP",
+                          "do_executeTradingStep"
+                        );
+
+                        // Use original tradeSize - both legs failed so no tokens consumed by DEXes
+                        let splitFallbackExecution = await* findBestExecution(sellToken, ICPprincipal, tradeSize);
+
+                        switch (splitFallbackExecution) {
+                          case (#ok(#Single(icpExecution))) {
+                            let ourSlippageToleranceBP = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                            let idealOut : Nat = if (icpExecution.slippageBP < 9900) {
+                              (icpExecution.expectedOut * 10000) / (10000 - icpExecution.slippageBP)
+                            } else {
+                              icpExecution.expectedOut
+                            };
+
+                            let toleranceMultiplier : Nat = if (ourSlippageToleranceBP >= 10000) { 0 } else { 10000 - ourSlippageToleranceBP };
+                            let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
+
+                            let icpTradeResult = await* executeTrade(
+                              sellToken,
+                              ICPprincipal,
+                              tradeSize,
+                              icpExecution.exchange,
+                              minAmountOut,
+                              idealOut,
+                            );
+
+                            switch (icpTradeResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK: Both split legs failed for " # splitBuySymbol # ", sold for ICP instead");
+                                };
+
+                                Vector.add(lastTrades, fallbackRecord);
+                                if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                  Vector.reverse(lastTrades);
+                                  while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                    ignore Vector.removeLast(lastTrades);
+                                  };
+                                  Vector.reverse(lastTrades);
+                                };
+
+                                // Update price if deviation acceptable
+                                let deviationFromQuote : Float = if (icpExecution.expectedOut > 0) {
+                                  Float.abs(Float.fromInt(record.amountBought) - Float.fromInt(icpExecution.expectedOut)) / Float.fromInt(icpExecution.expectedOut)
+                                } else { 1.0 };
+                                let shouldUpdatePrice = isFiniteFloat(deviationFromQuote) and deviationFromQuote <= 0.05;
+
+                                if (shouldUpdatePrice) {
+                                  let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** tokenDetailsSell.tokenDecimals);
+                                  let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
+                                  if (actualICP > 0.0) {
+                                    let priceRatio = (actualTokensSold / actualICP) * Float.fromInt(tokenDetailsSell.priceInICP);
+                                    if (isFiniteFloat(priceRatio)) {
+                                      let newICPPrice = Int.abs(Float.toInt(priceRatio));
+                                      let newICPPriceUSD = tokenDetailsSell.priceInUSD * actualTokensSold / actualICP;
+                                      updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+                                    };
+                                  };
+                                };
+
+                                rebalanceState := {
+                                  rebalanceState with
+                                  metrics = { rebalanceState.metrics with totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1 };
+                                  lastTrades = lastTrades;
+                                };
+
+                                success := true;
+                                tradingBackoffLevel := 0;
+
+                                logger.info("ICP_FALLBACK",
+                                  "ICP fallback SUCCESS after split failure - Sold=" # splitSellSymbol #
+                                  " Amount_sold=" # Nat.toText(record.amountSold) #
+                                  " ICP_received=" # Nat.toText(record.amountBought) #
+                                  " Exchange=" # debug_show(record.exchange),
+                                  "do_executeTradingStep"
+                                );
+
+                                await updateBalances();
+                                await takePortfolioSnapshot(#PostTrade);
+                                checkPortfolioCircuitBreakerConditions();
+                                await* logPortfolioState("Post-ICP-fallback (after split failure)");
+                              };
+                              case (#err(icpError)) {
+                                logger.warn("ICP_FALLBACK",
+                                  "ICP fallback also failed after split failure - Error=" # icpError,
+                                  "do_executeTradingStep"
+                                );
+                                incrementSkipCounter(#noExecutionPath);
+                              };
+                            };
+                          };
+                          case (#ok(#Split(_))) {
+                            logger.info("ICP_FALLBACK", "Split ICP fallback route found but not implemented for split-failure path", "do_executeTradingStep");
+                          };
+                          case (#ok(#Partial(_))) {
+                            logger.info("ICP_FALLBACK", "Partial ICP fallback route found but not implemented for split-failure path", "do_executeTradingStep");
+                          };
+                          case (#err(icpRouteError)) {
+                            logger.warn("ICP_FALLBACK",
+                              "No ICP fallback route available after split failure - Error=" # icpRouteError.reason,
+                              "do_executeTradingStep"
+                            );
+                            incrementSkipCounter(#noExecutionPath);
+                          };
+                        };
+                      };
                     };
                   };
 
@@ -4857,7 +4987,132 @@ shared (deployer) persistent actor class treasury() = this {
                       checkPortfolioCircuitBreakerConditions();
                       await* logPortfolioState("Post-partial-split completed");
                     } else {
-                      await* recoverFromFailure();
+                      // Both partial legs failed - attempt ICP fallback before recovery
+                      if (buyToken != ICPprincipal and sellToken != ICPprincipal and not isTokenPausedFromTrading(ICPprincipal)) {
+                        addSkipPair(sellToken, buyToken);
+
+                        let partialSellSymbol = tokenDetailsSell.tokenSymbol;
+                        let partialBuySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+                          case (?details) { details.tokenSymbol };
+                          case null { "UNKNOWN" };
+                        };
+
+                        logger.info("ICP_FALLBACK",
+                          "Both partial legs failed, attempting ICP fallback - Original_pair=" # partialSellSymbol # "/" # partialBuySymbol #
+                          " Fallback_pair=" # partialSellSymbol # "/ICP",
+                          "do_executeTradingStep"
+                        );
+
+                        let partialFallbackExecution = await* findBestExecution(sellToken, ICPprincipal, tradeSize);
+
+                        switch (partialFallbackExecution) {
+                          case (#ok(#Single(icpExecution))) {
+                            let ourSlippageToleranceBP = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                            let idealOut : Nat = if (icpExecution.slippageBP < 9900) {
+                              (icpExecution.expectedOut * 10000) / (10000 - icpExecution.slippageBP)
+                            } else {
+                              icpExecution.expectedOut
+                            };
+
+                            let toleranceMultiplier : Nat = if (ourSlippageToleranceBP >= 10000) { 0 } else { 10000 - ourSlippageToleranceBP };
+                            let minAmountOut : Nat = (idealOut * toleranceMultiplier) / 10000;
+
+                            let icpTradeResult = await* executeTrade(
+                              sellToken,
+                              ICPprincipal,
+                              tradeSize,
+                              icpExecution.exchange,
+                              minAmountOut,
+                              idealOut,
+                            );
+
+                            switch (icpTradeResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK: Both partial legs failed for " # partialBuySymbol # ", sold for ICP instead");
+                                };
+
+                                Vector.add(lastTrades, fallbackRecord);
+                                if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                  Vector.reverse(lastTrades);
+                                  while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                    ignore Vector.removeLast(lastTrades);
+                                  };
+                                  Vector.reverse(lastTrades);
+                                };
+
+                                // Update price if deviation acceptable
+                                let deviationFromQuote : Float = if (icpExecution.expectedOut > 0) {
+                                  Float.abs(Float.fromInt(record.amountBought) - Float.fromInt(icpExecution.expectedOut)) / Float.fromInt(icpExecution.expectedOut)
+                                } else { 1.0 };
+                                let shouldUpdatePrice = isFiniteFloat(deviationFromQuote) and deviationFromQuote <= 0.05;
+
+                                if (shouldUpdatePrice) {
+                                  let actualTokensSold = Float.fromInt(record.amountSold) / Float.fromInt(10 ** tokenDetailsSell.tokenDecimals);
+                                  let actualICP = Float.fromInt(record.amountBought) / Float.fromInt(100000000);
+                                  if (actualICP > 0.0) {
+                                    let priceRatio = (actualTokensSold / actualICP) * Float.fromInt(tokenDetailsSell.priceInICP);
+                                    if (isFiniteFloat(priceRatio)) {
+                                      let newICPPrice = Int.abs(Float.toInt(priceRatio));
+                                      let newICPPriceUSD = tokenDetailsSell.priceInUSD * actualTokensSold / actualICP;
+                                      updateTokenPriceWithHistory(ICPprincipal, newICPPrice, newICPPriceUSD);
+                                    };
+                                  };
+                                };
+
+                                rebalanceState := {
+                                  rebalanceState with
+                                  metrics = { rebalanceState.metrics with totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1 };
+                                  lastTrades = lastTrades;
+                                };
+
+                                success := true;
+                                tradingBackoffLevel := 0;
+
+                                logger.info("ICP_FALLBACK",
+                                  "ICP fallback SUCCESS after partial failure - Sold=" # partialSellSymbol #
+                                  " Amount_sold=" # Nat.toText(record.amountSold) #
+                                  " ICP_received=" # Nat.toText(record.amountBought) #
+                                  " Exchange=" # debug_show(record.exchange),
+                                  "do_executeTradingStep"
+                                );
+
+                                await updateBalances();
+                                await takePortfolioSnapshot(#PostTrade);
+                                checkPortfolioCircuitBreakerConditions();
+                                await* logPortfolioState("Post-ICP-fallback (after partial failure)");
+                              };
+                              case (#err(icpError)) {
+                                logger.warn("ICP_FALLBACK",
+                                  "ICP fallback also failed after partial failure - Error=" # icpError,
+                                  "do_executeTradingStep"
+                                );
+                                incrementSkipCounter(#noExecutionPath);
+                              };
+                            };
+                          };
+                          case (#ok(#Split(_))) {
+                            logger.info("ICP_FALLBACK", "Split ICP fallback route found but not implemented for partial-failure path", "do_executeTradingStep");
+                          };
+                          case (#ok(#Partial(_))) {
+                            logger.info("ICP_FALLBACK", "Partial ICP fallback route found but not implemented for partial-failure path", "do_executeTradingStep");
+                          };
+                          case (#err(icpRouteError)) {
+                            logger.warn("ICP_FALLBACK",
+                              "No ICP fallback route available after partial failure - Error=" # icpRouteError.reason,
+                              "do_executeTradingStep"
+                            );
+                            incrementSkipCounter(#noExecutionPath);
+                          };
+                        };
+                      };
+
+                      // If ICP fallback didn't succeed, run recovery
+                      if (not success) {
+                        await* recoverFromFailure();
+                      };
                     };
                   };
                 };
@@ -8420,6 +8675,58 @@ shared (deployer) persistent actor class treasury() = this {
 
     // Check portfolio circuit breaker conditions after price updates and snapshot
     checkPortfolioCircuitBreakerConditions();
+  };
+
+  /**
+   * Public price refresh function for nachos_vault and authorized callers.
+   * Rate-limited to MIN_PRICE_REFRESH_INTERVAL_NS between calls.
+   * Wraps the private syncPriceWithDEX() function.
+   */
+  public shared ({ caller }) func refreshAllPrices() : async Result.Result<{
+    tokensRefreshed : Nat;
+    timestamp : Int;
+    icpPriceUSD : Float;
+  }, Text> {
+    if (
+      caller != DAOPrincipal and
+      caller != NachosVaultPrincipal and
+      not isMasterAdmin(caller) and
+      not Principal.isController(caller)
+    ) {
+      return #err("Not authorized to refresh prices");
+    };
+
+    // Rate limiting: minimum 30 seconds between refreshes
+    if (now() - lastPriceRefreshTime < MIN_PRICE_REFRESH_INTERVAL_NS) {
+      // Prices are recent enough, return cached info
+      let icpPrice : Float = switch (Map.get(tokenDetailsMap, phash, ICPprincipal)) {
+        case (?details) { details.priceInUSD };
+        case null { 0.0 };
+      };
+      return #ok({
+        tokensRefreshed = Map.size(tokenDetailsMap);
+        timestamp = lastPriceRefreshTime;
+        icpPriceUSD = icpPrice;
+      });
+    };
+
+    try {
+      await* syncPriceWithDEX();
+      lastPriceRefreshTime := now();
+
+      let icpPrice : Float = switch (Map.get(tokenDetailsMap, phash, ICPprincipal)) {
+        case (?details) { details.priceInUSD };
+        case null { 0.0 };
+      };
+
+      #ok({
+        tokensRefreshed = Map.size(tokenDetailsMap);
+        timestamp = now();
+        icpPriceUSD = icpPrice;
+      });
+    } catch (e) {
+      #err("Price refresh failed: " # Error.message(e));
+    };
   };
 
   /**
