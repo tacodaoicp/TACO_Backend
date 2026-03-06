@@ -2370,36 +2370,22 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
           principalVP += neuron.votingPower;
 
-          let hasAllocations = switch (Map.get(neuronAllocationMap, bhash, neuron.neuronId)) {
-            case (?existingAlloc) { existingAlloc.allocations.size() > 0 and existingAlloc.lastAllocationMaker == principal };
-            case null { false };
-          };
-
-          if (not hasAllocations or Map.has(neuronsSeen, bhash, neuron.neuronId)) {
+          // Dedup: skip neurons already processed (multi-hotkey scenario)
+          if (Map.has(neuronsSeen, bhash, neuron.neuronId)) {
             continue a;
           };
-
           Map.set(neuronsSeen, bhash, neuron.neuronId, null);
 
-          // Handle neuron allocation in the same loop
+          // Carry over or create neuron allocation
           switch (Map.get(neuronAllocationMap, bhash, neuron.neuronId)) {
             case (?existingAlloc) {
+              // Preserve existing allocation, update VP
+              Map.set(newNeuronAllocationMap, bhash, neuron.neuronId, {
+                existingAlloc with votingPower = neuron.votingPower;
+              });
+
+              // Count toward aggregate only if neuron has allocations
               if (existingAlloc.allocations.size() > 0) {
-
-                Debug.print("Adding Neuron ID: " # debug_show(neuron.neuronId) # ", Principal: " # debug_show(principal) # ", Existing allocations: " # debug_show(existingAlloc.allocations.size()) # ", Voting power: " # debug_show(neuron.votingPower));
-
-                // Update neuron allocation with new voting power
-                Map.set(
-                  newNeuronAllocationMap,
-                  bhash,
-                  neuron.neuronId,
-                  {
-                    existingAlloc with
-                    votingPower = neuron.votingPower;
-                  },
-                );
-
-                // Update aggregate allocation
                 for (alloc in existingAlloc.allocations.vals()) {
                   switch (Map.get(tokenDetailsMap, phash, alloc.token)) {
                     case (?details) {
@@ -2415,19 +2401,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
                     case null {};
                   };
                 };
-
                 allocatedVotingPower += neuron.votingPower;
-                
-              } else {
-                Map.set(
-                  newNeuronAllocationMap,
-                  bhash,
-                  neuron.neuronId,
-                  {
-                    existingAlloc with
-                    votingPower = neuron.votingPower;
-                  },
-                );
               };
             };
             case null {

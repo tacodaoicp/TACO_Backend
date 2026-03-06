@@ -1509,6 +1509,9 @@ shared (deployer) persistent actor class Rewards() = this {
       return;
     };
 
+    // Safety net: clear any stale recalc caches
+    clearRecalcCaches();
+
     let now = Time.now();
     let endTime = now;
     let startTime = now - distributionPeriodNS;
@@ -4610,7 +4613,13 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Kick off async recalculation via timer pattern (non-blocking)
     ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
-      await* recalculateDistributionsSequentially<system>(startIndex, totalDistributions, 0, Buffer.Buffer<NeuronReward>(0), 0, startIndex);
+      try {
+        await* recalculateDistributionsSequentially<system>(startIndex, totalDistributions, 0, Buffer.Buffer<NeuronReward>(0), 0, startIndex);
+      } catch (e) {
+        recalcInProgress := false;
+        clearRecalcCaches();
+        logger.error("Admin", "Recalculation failed: " # Error.message(e), "admin_recalculateDistributionPerformance");
+      };
     });
 
     #ok("Started recalculation of " # Nat.toText(distributionsToProcess) # " distributions (" # Nat.toText(startIndex) # " to " # Nat.toText(totalDistributions - 1) # ")")
@@ -4941,6 +4950,233 @@ shared (deployer) persistent actor class Rewards() = this {
     ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
       await* recalculateDistributionsSequentially<system>(
         currentDistIndex, totalDistributions, endIdx, updatedRewardsBuffer, totalNeuronsProcessed + batchSize, startDistIndex
+      );
+    });
+  };
+
+  //=========================================================================
+  // Backfill Missing Neurons in Past Distributions
+  //=========================================================================
+
+  // Admin function to backfill missing neurons into past distribution records.
+  // Calculates performance from archive data and inserts with rewardAmount=0
+  // (display/leaderboard only — no reward redistribution).
+  public shared ({ caller }) func admin_backfillMissingNeurons(
+    neuronIds: [Blob],
+    afterTimestamp: Int
+  ) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (recalcInProgress) {
+      return #err(#SystemError("Recalculation or backfill already in progress"));
+    };
+
+    switch (currentDistributionId) {
+      case (?_) { return #err(#SystemError("Distribution in progress, cannot start backfill")) };
+      case null {};
+    };
+
+    if (neuronIds.size() == 0) {
+      return #ok("No neuron IDs provided");
+    };
+
+    if (neuronIds.size() > 100) {
+      return #err(#SystemError("Too many neurons. Max 100 per call."));
+    };
+
+    recalcInProgress := true;
+
+    let totalDistributions = Vector.size(distributionHistory);
+    if (totalDistributions == 0) {
+      recalcInProgress := false;
+      return #ok("No distributions found");
+    };
+
+    var startIndex : Nat = totalDistributions;
+    for (i in Iter.range(0, totalDistributions - 1)) {
+      let record = Vector.get(distributionHistory, i);
+      if (record.startTime >= afterTimestamp and i < startIndex) {
+        startIndex := i;
+      };
+    };
+
+    if (startIndex >= totalDistributions) {
+      recalcInProgress := false;
+      return #ok("No distributions found after timestamp " # Int.toText(afterTimestamp));
+    };
+
+    let distributionsToProcess = totalDistributions - startIndex;
+    logger.info("Admin", "Starting backfill of " # Nat.toText(neuronIds.size()) # " neurons across " # Nat.toText(distributionsToProcess) # " distributions", "admin_backfillMissingNeurons");
+
+    ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+      try {
+        await* backfillDistributionsSequentially<system>(
+          startIndex, totalDistributions, neuronIds, 0, startIndex
+        );
+      } catch (e) {
+        recalcInProgress := false;
+        clearRecalcCaches();
+        logger.error("Admin", "Backfill failed: " # Error.message(e), "admin_backfillMissingNeurons");
+      };
+    });
+
+    #ok("Started backfill of " # Nat.toText(neuronIds.size()) # " neurons across " # Nat.toText(distributionsToProcess) # " distributions (" # Nat.toText(startIndex) # " to " # Nat.toText(totalDistributions - 1) # ")")
+  };
+
+  private func backfillDistributionsSequentially<system>(
+    currentDistIndex: Nat,
+    totalDistributions: Nat,
+    neuronIds: [Blob],
+    totalNeuronsAdded: Nat,
+    startDistIndex: Nat
+  ) : async* () {
+
+    if (currentDistIndex >= totalDistributions) {
+      recalcInProgress := false;
+      clearRecalcCaches();
+      await* computeAllLeaderboards<system>();
+      startLeaderboardTimer<system>();
+      logger.info("Admin", "Backfill complete: " # Nat.toText(totalNeuronsAdded) # " neurons added across " # Nat.toText(totalDistributions - startDistIndex) # " distributions. Leaderboards recomputed.", "backfillDistributionsSequentially");
+      return;
+    };
+
+    let existingRecord = Vector.get(distributionHistory, currentDistIndex);
+
+    // Prefetch allocation data for this distribution's time range
+    await* prefetchAllocationsForDistribution(existingRecord);
+
+    // Find which neurons are missing from this distribution
+    let existingNeuronIds = Map.new<Blob, Null>();
+    for (nr in existingRecord.neuronRewards.vals()) {
+      Map.set(existingNeuronIds, bhash, nr.neuronId, null);
+    };
+    for (fn in existingRecord.failedNeurons.vals()) {
+      Map.set(existingNeuronIds, bhash, fn.neuronId, null);
+    };
+
+    let missingNeurons = Buffer.Buffer<Blob>(neuronIds.size());
+    for (neuronId in neuronIds.vals()) {
+      if (not Map.has(existingNeuronIds, bhash, neuronId)) {
+        missingNeurons.add(neuronId);
+      };
+    };
+
+    if (missingNeurons.size() == 0) {
+      clearRecalcCaches();
+      logger.info("Admin", "Distribution #" # Nat.toText(existingRecord.id) # ": no missing neurons, skipping", "backfillDistributionsSequentially");
+      ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+        await* backfillDistributionsSequentially<system>(
+          currentDistIndex + 1, totalDistributions, neuronIds, totalNeuronsAdded, startDistIndex
+        );
+      });
+      return;
+    };
+
+    // Build updated rewards with existing + new neurons
+    let updatedRewardsBuffer = Buffer.Buffer<NeuronReward>(existingRecord.neuronRewards.size() + missingNeurons.size());
+    for (existing in existingRecord.neuronRewards.vals()) {
+      updatedRewardsBuffer.add(existing);
+    };
+
+    let failedBuffer = Buffer.Buffer<FailedNeuron>(existingRecord.failedNeurons.size());
+    for (existing in existingRecord.failedNeurons.vals()) {
+      failedBuffer.add(existing);
+    };
+
+    var neuronsAdded : Nat = 0;
+
+    // Process missing neurons in batches of 10 (parallel futures)
+    let BATCH_SIZE : Nat = 10;
+    var offset : Nat = 0;
+    let missingArr = Buffer.toArray(missingNeurons);
+
+    while (offset < missingArr.size()) {
+      let batchLen = Nat.min(BATCH_SIZE, missingArr.size() - offset);
+
+      // Launch parallel futures
+      let perfFutures = Buffer.Buffer<async Result.Result<PerformanceResult, RewardsError>>(batchLen);
+      let batchNeuronIds = Buffer.Buffer<Blob>(batchLen);
+
+      var idx = offset;
+      while (idx < offset + batchLen) {
+        let neuronId = missingArr[idx];
+        batchNeuronIds.add(neuronId);
+        perfFutures.add(
+          (with timeout = 65) calculateNeuronPerformance(
+            neuronId, existingRecord.startTime, existingRecord.endTime, #USD
+          )
+        );
+        idx += 1;
+      };
+
+      // Await all futures
+      var futureIdx : Nat = 0;
+      for (future in perfFutures.vals()) {
+        let neuronId = batchNeuronIds.get(futureIdx);
+        try {
+          let performanceResult = await future;
+          switch (performanceResult) {
+            case (#ok(performance)) {
+              let votingPower = getVotingPowerFromPerformance(performance);
+              let performanceICP = if (performance.checkpoints.size() >= 2) {
+                recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
+              } else { null };
+
+              updatedRewardsBuffer.add({
+                neuronId = neuronId;
+                performanceScore = performance.performanceScore;
+                performanceScoreICP = performanceICP;
+                votingPower = votingPower;
+                rewardScore = 0.0;
+                rewardAmount = 0;
+                checkpoints = performance.checkpoints;
+              });
+              neuronsAdded += 1;
+            };
+            case (#err(error)) {
+              failedBuffer.add({
+                neuronId = neuronId;
+                errorMessage = "Backfill: " # debug_show(error);
+              });
+            };
+          };
+        } catch (e) {
+          failedBuffer.add({
+            neuronId = neuronId;
+            errorMessage = "Backfill system error: " # Error.message(e);
+          });
+        };
+        futureIdx += 1;
+      };
+
+      offset += batchLen;
+    };
+
+    // Save updated distribution record
+    let updatedRecord : DistributionRecord = {
+      id = existingRecord.id;
+      startTime = existingRecord.startTime;
+      endTime = existingRecord.endTime;
+      distributionTime = existingRecord.distributionTime;
+      totalRewardPot = existingRecord.totalRewardPot;
+      actualDistributed = existingRecord.actualDistributed;
+      totalRewardScore = existingRecord.totalRewardScore;
+      neuronsProcessed = existingRecord.neuronsProcessed;
+      neuronRewards = Buffer.toArray(updatedRewardsBuffer);
+      failedNeurons = Buffer.toArray(failedBuffer);
+      status = existingRecord.status;
+    };
+    Vector.put(distributionHistory, currentDistIndex, updatedRecord);
+
+    clearRecalcCaches();
+    logger.info("Admin", "Backfilled distribution #" # Nat.toText(existingRecord.id) # ": added " # Nat.toText(neuronsAdded) # " neurons (" # Nat.toText(failedBuffer.size() - existingRecord.failedNeurons.size()) # " failed)", "backfillDistributionsSequentially");
+
+    // Move to next distribution
+    ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+      await* backfillDistributionsSequentially<system>(
+        currentDistIndex + 1, totalDistributions, neuronIds, totalNeuronsAdded + neuronsAdded, startDistIndex
       );
     });
   };
