@@ -157,7 +157,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable var cancellationFeeMultiplier : Nat = 3;
 
   // --- Subaccounts ---
-  let NachosTreasurySubaccount : Nat8 = 2; // Where users send tokens for minting
+  let NachosTreasurySubaccount : Nat8 = 2; // Subaccount on TREASURY where users send tokens for minting
   let NachosDepositSubaccount : Nat8 = 1; // Where users send NACHOS for burning
 
   // --- Fee/Rate-limit Exemptions ---
@@ -363,7 +363,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           switch (block.transaction.operation) {
             case (?#Transfer({ from; to; amount })) {
               let expectedFromAid = computeAccountIdentifier(expectedFrom, null);
-              let expectedToAid = computeAccountIdentifier(this_canister_id(), ?subaccountByteToBlob(expectedToSubaccount));
+              let expectedToAid = computeAccountIdentifier(TREASURY_ID, ?subaccountByteToBlob(expectedToSubaccount));
 
               if (from != expectedFromAid) return #err("Sender mismatch");
               if (to != expectedToAid) return #err("Recipient mismatch");
@@ -433,7 +433,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
               case (?sub) { if (not isAllZeros(Blob.fromArray(sub))) return #err("Sender used non-default subaccount") };
               case null {};
             };
-            if (xfer.to.owner != this_canister_id()) return #err("Recipient owner mismatch");
+            if (xfer.to.owner != TREASURY_ID) return #err("Recipient owner mismatch");
             if (not matchSubaccount(?Blob.fromArray(expectedToSub), xfer.to.subaccount)) return #err("Recipient subaccount mismatch");
             return #ok({ amount = xfer.amount; from = expectedFrom });
           };
@@ -455,7 +455,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                     case (?sub) { if (not isAllZeros(Blob.fromArray(sub))) return #err("Sender used non-default subaccount (archive)") };
                     case null {};
                   };
-                  if (xfer.to.owner != this_canister_id()) return #err("Recipient owner mismatch (archive)");
+                  if (xfer.to.owner != TREASURY_ID) return #err("Recipient owner mismatch (archive)");
                   if (not matchSubaccount(?Blob.fromArray(expectedToSub), xfer.to.subaccount)) return #err("Recipient subaccount mismatch (archive)");
                   return #ok({ amount = xfer.amount; from = expectedFrom });
                 };
@@ -615,7 +615,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                 case null { return #err("No to field") };
               };
 
-              if (toOwner != this_canister_id()) return #err("Recipient mismatch");
+              if (toOwner != TREASURY_ID) return #err("Recipient mismatch");
 
               // Verify subaccount
               let expectedToSub : Blob = subaccountByteToBlob(expectedToSubaccount);
@@ -2380,7 +2380,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Mark block done BEFORE await (safe async)
     Map.set(blocksDone, thash, blockKey, now());
 
-    // Try verifying against all subaccounts: default (0), deposit (1), treasury (2)
+    // Try verifying against treasury subaccounts: default (0), deposit (1), minting subaccount (2)
+    // Note: tokens sent to the vault canister itself cannot be recovered through this function
     let subaccountsToTry : [Nat8] = [0, NachosDepositSubaccount, NachosTreasurySubaccount];
     var verifiedAmount : Nat = 0;
     var verifiedSubaccount : Nat8 = 0;
