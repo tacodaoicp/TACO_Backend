@@ -19,13 +19,19 @@
     "ic": "dnhfs-7yaaa-aaaan-qz5mq-cai",
     "staging": "cajb4-qqaaa-aaaan-qz5la-cai"
   },
+  "nachos_ledger": {
+    "staging": "pabnq-2qaaa-aaaam-qhryq-cai"
+  },
+  "nachos_vault": {
+    "staging": "p4nog-baaaa-aaaad-qkwpa-cai"
+  },
   "neuronSnapshot": {
     "ic": "vzs3x-taaaa-aaaan-qzzjq-cai",
     "staging": "tgqd4-eqaaa-aaaai-atifa-cai"
   },
   "nns_neuron_controller": {
     "ic": "tpgtx-iqaaa-aaaar-qbugq-cai",
-    "staging": "4xmtl-yiaaa-aaaan-qz7fq-cai"    
+    "staging": "4xmtl-yiaaa-aaaan-qz7fq-cai"
   },
   "portfolio_archive": {
     "ic": "bl7x7-wiaaa-aaaan-qz5bq-cai",

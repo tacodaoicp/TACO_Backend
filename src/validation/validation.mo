@@ -447,4 +447,12 @@ persistent actor validation {
       #Ok("retryFailedTransfers: Reset retry counts for all exhausted transfer tasks");
     };
 
+    public query func validate_claimNachosMintFees(recipient : Principal, amount : Nat) : async ValidationResult {
+      #Ok("claimMintFees: Claim " # debug_show(amount) # " e8s ICP mint fees to " # Principal.toText(recipient));
+    };
+
+    public query func validate_claimNachosCancellationFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async ValidationResult {
+      #Ok("claimCancellationFees: Claim " # debug_show(amount) # " cancellation fees for token " # Principal.toText(tokenPrincipal) # " to " # Principal.toText(recipient));
+    };
+
 }

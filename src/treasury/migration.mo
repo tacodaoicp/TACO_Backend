@@ -1,5 +1,4 @@
 import Vector "mo:vector";
-import Principal "mo:base/Principal";
 
 module {
   // =========================================
@@ -50,7 +49,7 @@ module {
   };
 
   // =========================================
-  // OLD TYPES (without minAllocationDiffBasisPoints)
+  // OLD TYPES (staging had minAllocationDiffBasisPoints IN RebalanceConfig)
   // =========================================
 
   public type OldRebalanceConfig = {
@@ -65,6 +64,7 @@ module {
     shortSyncIntervalNS : Nat;
     longSyncIntervalNS : Nat;
     tokenSyncTimeoutNS : Nat;
+    minAllocationDiffBasisPoints : Nat;
   };
 
   public type OldRebalanceState = {
@@ -77,7 +77,7 @@ module {
   };
 
   // =========================================
-  // NEW TYPES (with minAllocationDiffBasisPoints)
+  // NEW TYPES (minAllocationDiffBasisPoints removed from config, now standalone var)
   // =========================================
 
   public type NewRebalanceConfig = {
@@ -92,7 +92,6 @@ module {
     shortSyncIntervalNS : Nat;
     longSyncIntervalNS : Nat;
     tokenSyncTimeoutNS : Nat;
-    minAllocationDiffBasisPoints : Nat;
   };
 
   public type NewRebalanceState = {
@@ -111,19 +110,22 @@ module {
   public type OldState = {
     rebalanceConfig : OldRebalanceConfig;
     rebalanceState : OldRebalanceState;
+    minAllocationDiffBasisPoints : Nat;
   };
 
   public type NewState = {
     rebalanceConfig : NewRebalanceConfig;
     rebalanceState : NewRebalanceState;
+    minAllocationDiffBasisPoints : Nat;
   };
 
   // =========================================
   // MIGRATION FUNCTION
+  // Staging-only: extracts minAllocationDiffBasisPoints from RebalanceConfig
+  // into a standalone stable var, removes it from the config record.
   // =========================================
 
   public func migrate(oldState : OldState) : NewState {
-    // Transform rebalanceConfig by adding new field with default value
     let newConfig : NewRebalanceConfig = {
       rebalanceIntervalNS = oldState.rebalanceConfig.rebalanceIntervalNS;
       maxTradeAttemptsPerInterval = oldState.rebalanceConfig.maxTradeAttemptsPerInterval;
@@ -136,10 +138,8 @@ module {
       shortSyncIntervalNS = oldState.rebalanceConfig.shortSyncIntervalNS;
       longSyncIntervalNS = oldState.rebalanceConfig.longSyncIntervalNS;
       tokenSyncTimeoutNS = oldState.rebalanceConfig.tokenSyncTimeoutNS;
-      minAllocationDiffBasisPoints = 15; // Default: 0.15%
     };
 
-    // Transform rebalanceState with updated config
     let newState : NewRebalanceState = {
       status = oldState.rebalanceState.status;
       config = newConfig;
@@ -152,6 +152,7 @@ module {
     {
       rebalanceConfig = newConfig;
       rebalanceState = newState;
+      minAllocationDiffBasisPoints = oldState.minAllocationDiffBasisPoints;
     };
   };
 };

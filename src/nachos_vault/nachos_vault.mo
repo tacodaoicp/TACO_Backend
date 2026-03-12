@@ -21,9 +21,7 @@ import NachosTypes "./nachos_vault_types";
 import Nat8 "mo:base/Nat8";
 import Float "mo:base/Float";
 import Array "mo:base/Array";
-import KongSwap "../swap/kong_swap";
-import ICPSwap "../swap/icp_swap";
-import swaptypes "../swap/swap_types";
+import SwapTypes "../swap/swap_types";
 import SpamProtection "../helper/spam_protection";
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
@@ -31,7 +29,9 @@ import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 import SHA224 "../helper/SHA224";
 import CRC32 "../helper/CRC32";
+// import Migration "migration"; // Migration already applied (ForwardToPortfolio variant)
 
+// (with migration = Migration.migrate)
 shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // ═══════════════════════════════════════════════════════════════════
@@ -94,8 +94,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     refreshPricesAndGetDetails : shared () -> async Result.Result<{ tokensRefreshed : Nat; timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)] }, Text>;
   };
 
+  // Query-typed actor refs for composite query calls (same canister, query interface)
+  transient let treasuryQuery = actor (Principal.toText(TREASURY_ID)) : actor {
+    getTokenDetails : shared query () -> async [(Principal, TokenDetails)];
+    getTokenDetailsCache : shared query () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)] };
+  };
+
   transient let dao = actor (Principal.toText(DAO_BACKEND_ID)) : actor {
     getAggregateAllocation : shared () -> async [(Principal, Nat)];
+  };
+
+  transient let daoQuery = actor (Principal.toText(DAO_BACKEND_ID)) : actor {
+    getAggregateAllocation : shared query () -> async [(Principal, Nat)];
   };
 
   // Nachos ledger actor ref (reconstructed from stable principal)
@@ -135,7 +145,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable var minBurnValueICP : Nat = 1_000_000; // 0.01 ICP
 
   // --- Price Config ---
-  stable var MAX_PRICE_STALENESS_NS : Int = 5 * 60 * 1_000_000_000; // 5 minutes
+  stable var MAX_PRICE_STALENESS_NS : Int = 30 * 1_000_000_000; // 30 seconds
   stable var PRICE_HISTORY_WINDOW : Int = 2 * 3600 * 1_000_000_000; // 2 hours
   stable var maxSlippageBasisPoints : Nat = 50; // 0.50%
 
@@ -144,6 +154,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable var maxMintICPWorthPer4Hours : Nat = 100_000_000_000; // 1000 ICP worth
   stable var maxMintOpsPerUser4Hours : Nat = 20;
   stable var maxBurnOpsPerUser4Hours : Nat = 20;
+  stable var maxMintICPPerUser4Hours : Nat = 100_000_000_000; // 1000 ICP per user per 4h
+  stable var maxBurnNachosPerUser4Hours : Nat = 100_000_000_000; // 1000 NACHOS per user per 4h
+  stable var maxMintAmountICP : Nat = 0; // 0 = no max per single mint (disabled)
+  stable var maxBurnAmountNachos : Nat = 0; // 0 = no max per single burn (disabled)
 
   // --- Circuit Breaker ---
   stable var circuitBreakerActive : Bool = false;
@@ -154,7 +168,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable var portfolioShareMaxDeviationBP : Nat = 500; // 5%
 
   // --- Cancellation Fee ---
-  stable var cancellationFeeMultiplier : Nat = 3;
+  stable var cancellationFeeMultiplier : Nat = 10;
 
   // --- Subaccounts ---
   let NachosTreasurySubaccount : Nat8 = 2; // Subaccount on TREASURY where users send tokens for minting
@@ -184,14 +198,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable let tokenDetailsMap = Map.new<Principal, TokenDetails>();
   stable let aggregateAllocation = Map.new<Principal, Nat>();
 
-  // --- ICPSwap Pool Cache ---
-  stable let ICPswapPools = Map.new<Principal, swaptypes.PoolData>();
-
   // --- Operation History ---
   stable let mintHistory = Vector.new<MintRecord>();
   stable let burnHistory = Vector.new<BurnRecord>();
   stable let navHistory = Vector.new<NavSnapshot>();
   stable let feeHistory = Vector.new<FeeRecord>();
+
+  // --- Claimable Fee Tracking ---
+  stable var accumulatedMintFeesICP : Nat = 0;
+  stable var claimedMintFeesICP : Nat = 0;
+  stable let accumulatedCancellationFees = Map.new<Principal, Nat>(); // token -> amount
+  stable let claimedCancellationFees = Map.new<Principal, Nat>(); // token -> amount
 
   // --- Operation Counters ---
   stable var nextMintId : Nat = 0;
@@ -199,6 +216,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // --- NAV Cache ---
   stable var cachedNAV : ?CachedNAV = null;
+  stable var cachedSupply : Nat = 0;
+  stable var cachedSupplyTime : Int = 0;
+  let SUPPLY_CACHE_TTL_NS : Int = 10_000_000_000; // 10 seconds
+
+  // --- Price Refresh Cache (skip redundant treasury calls within 30s) ---
+  stable var lastLocalPriceRefreshTime : Int = 0;
+
+  // --- ICPSwap Pool Cache (for vault-local price refresh fallback) ---
+  stable let icpSwapPoolCache = Map.new<Principal, Principal>(); // token principal -> pool canister ID
 
   // --- Concurrent Operation Locks ---
   stable let operationLocks = Map.new<Principal, Int>(); // caller -> lock timestamp
@@ -209,14 +235,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable let burnRateTracker = Vector.new<(Int, Nat)>(); // (timestamp, nachosAmount)
   stable let userMintOps = Map.new<Principal, Vector.Vector<Int>>(); // caller -> timestamps
   stable let userBurnOps = Map.new<Principal, Vector.Vector<Int>>(); // caller -> timestamps
+  stable let userMintValues = Map.new<Principal, Vector.Vector<(Int, Nat)>>(); // caller -> (timestamp, icpValue)
+  stable let userBurnValues = Map.new<Principal, Vector.Vector<(Int, Nat)>>(); // caller -> (timestamp, nachosAmount)
 
   // --- Timer IDs ---
-  transient var balanceUpdateTimerId : ?Nat = null;
-  transient var poolDiscoveryTimerId : ?Nat = null;
+  transient var periodicSyncTimerId : ?Nat = null;
   transient var blockCleanupTimerId : ?Nat = null;
-  transient var navSnapshotTimerId : ?Nat = null;
-  transient var circuitBreakerTimerId : ?Nat = null;
   transient var transferQueueTimerId : ?Nat = null;
+  transient var lastMintBurnTime : Int = 0; // skip periodic treasury sync when mint/burn just refreshed data
 
   // ═══════════════════════════════════════════════════════════════════
   // SECTION 4: CONSTANTS
@@ -330,7 +356,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- ICP Block Verifier ---
-  private func verifyICPBlock(blockNumber : Nat, expectedFrom : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyICPBlock(blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let icpLedger : actor {
       query_blocks : shared query { start : Nat64; length : Nat64 } -> async QueryBlocksResponse;
     } = actor (ICPprincipalText);
@@ -363,7 +389,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           switch (block.transaction.operation) {
             case (?#Transfer({ from; to; amount })) {
               let expectedFromAid = computeAccountIdentifier(expectedFrom, null);
-              let expectedToAid = computeAccountIdentifier(TREASURY_ID, ?subaccountByteToBlob(expectedToSubaccount));
+              let expectedToAid = computeAccountIdentifier(expectedRecipient, ?subaccountByteToBlob(expectedToSubaccount));
 
               if (from != expectedFromAid) return #err("Sender mismatch");
               if (to != expectedToAid) return #err("Recipient mismatch");
@@ -380,7 +406,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- ICRC-1/2 Block Verifier ---
-  private func verifyICRC1Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyICRC1Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let token : actor {
       get_transactions : shared query { start : Nat; length : Nat } -> async {
         first_index : Nat;
@@ -433,7 +459,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
               case (?sub) { if (not isAllZeros(Blob.fromArray(sub))) return #err("Sender used non-default subaccount") };
               case null {};
             };
-            if (xfer.to.owner != TREASURY_ID) return #err("Recipient owner mismatch");
+            if (xfer.to.owner != expectedRecipient) return #err("Recipient owner mismatch");
             if (not matchSubaccount(?Blob.fromArray(expectedToSub), xfer.to.subaccount)) return #err("Recipient subaccount mismatch");
             return #ok({ amount = xfer.amount; from = expectedFrom });
           };
@@ -473,7 +499,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- ICRC-3 Block Verifier ---
-  private func verifyICRC3Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyICRC3Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let token : actor {
       icrc3_get_blocks : shared query [{ start : Nat; length : Nat }] -> async {
         log_length : Nat;
@@ -615,7 +641,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                 case null { return #err("No to field") };
               };
 
-              if (toOwner != TREASURY_ID) return #err("Recipient mismatch");
+              if (toOwner != expectedRecipient) return #err("Recipient mismatch");
 
               // Verify subaccount
               let expectedToSub : Blob = subaccountByteToBlob(expectedToSubaccount);
@@ -654,20 +680,27 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- Unified Block Verification Dispatcher ---
-  private func verifyBlock(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyBlock(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let tokenType : ?TokenType = switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
       case (?details) { ?details.tokenType };
       case null {
         // ICP special case
-        if (tokenPrincipal == ICPprincipal) { ?#ICP } else { null };
+        if (tokenPrincipal == ICPprincipal) { ?#ICP }
+        else {
+          // NACHOS ledger special case (uses get_transactions / ICRC-1 format)
+          switch (nachosLedgerPrincipal) {
+            case (?nlp) { if (tokenPrincipal == nlp) { ?#ICRC12 } else { null } };
+            case null { null };
+          };
+        };
       };
     };
 
     switch (tokenType) {
       case null { #err("Unknown token") };
-      case (?#ICP) { await verifyICPBlock(blockNumber, expectedFrom, expectedToSubaccount) };
-      case (?#ICRC12) { await verifyICRC1Block(tokenPrincipal, blockNumber, expectedFrom, expectedToSubaccount) };
-      case (?#ICRC3) { await verifyICRC3Block(tokenPrincipal, blockNumber, expectedFrom, expectedToSubaccount) };
+      case (?#ICP) { await verifyICPBlock(blockNumber, expectedFrom, expectedRecipient, expectedToSubaccount) };
+      case (?#ICRC12) { await verifyICRC1Block(tokenPrincipal, blockNumber, expectedFrom, expectedRecipient, expectedToSubaccount) };
+      case (?#ICRC3) { await verifyICRC3Block(tokenPrincipal, blockNumber, expectedFrom, expectedRecipient, expectedToSubaccount) };
     };
   };
 
@@ -682,10 +715,53 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ExcessReturn) { "ExcessReturn" };
       case (#CancelReturn) { "CancelReturn" };
       case (#Recovery) { "Recovery" };
+      case (#ForwardToPortfolio) { "ForwardToPortfolio" };
     };
   };
 
-  private func createTransferTask(
+  // Forward net deposit amounts from treasury subaccount 2 to default subaccount (0)
+  // so that treasury balance queries include them in portfolio value.
+  // Fee portion stays in subaccount 2 for admin claiming.
+  private func forwardDepositsToPortfolio<system>(
+    caller : Principal,
+    deposits : [TokenDeposit],
+    netValueICP : Nat,
+    totalDepositValueICP : Nat,
+    mintId : Nat,
+  ) {
+    if (totalDepositValueICP == 0) return;
+    let netRatioE8s : Nat = (netValueICP * ONE_E8S) / totalDepositValueICP;
+
+    for (deposit in deposits.vals()) {
+      let netTokenAmount = (deposit.amount * netRatioE8s) / ONE_E8S;
+      // Only forward if amount exceeds the token's transfer fee
+      let tokenFee = switch (Map.get(tokenDetailsMap, phash, deposit.token)) {
+        case (?d) { d.tokenTransferFee };
+        case null { 10000 }; // conservative fallback
+      };
+      if (netTokenAmount > tokenFee) {
+        ignore createTransferTask(
+          caller,
+          #accountId({ owner = TREASURY_ID; subaccount = null }),
+          netTokenAmount,
+          deposit.token,
+          NachosTreasurySubaccount,
+          #ForwardToPortfolio,
+          mintId,
+        );
+        // Optimistic balance: reflect forwarded deposit in tokenDetailsMap
+        // so subsequent calculateNAV() sees the updated portfolio value
+        switch (Map.get(tokenDetailsMap, phash, deposit.token)) {
+          case (?details) {
+            Map.set(tokenDetailsMap, phash, deposit.token, { details with balance = details.balance + netTokenAmount });
+          };
+          case null {};
+        };
+      };
+    };
+  };
+
+  private func createTransferTask<system>(
     caller : Principal,
     recipient : TransferRecipient,
     amount : Nat,
@@ -724,6 +800,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     Vector.add(pendingTransfers, task);
     Map.set(transferTaskKeys, thash, dedupKey, taskId);
+    ensureTransferQueueRunning();
 
     logger.info("TRANSFER_QUEUE", "Created task #" # Nat.toText(taskId) # " type=" # operationTypeToText(opType) # " amount=" # Nat.toText(amount), "createTransferTask");
     taskId;
@@ -868,7 +945,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // Cancel deposit AND create refund task atomically — prevents double-refund via cancelDeposit()
-  private func cancelDepositAndRefund(blockKey : Text, caller : Principal, refundAmount : Nat, tokenPrincipal : Principal, fromSubaccount : Nat8, opType : TransferOperationType, opId : Nat) : Nat {
+  private func cancelDepositAndRefund<system>(blockKey : Text, caller : Principal, refundAmount : Nat, tokenPrincipal : Principal, fromSubaccount : Nat8, opType : TransferOperationType, opId : Nat) : Nat {
     switch (Map.get(activeDeposits, thash, blockKey)) {
       case (?deposit) { Map.set(activeDeposits, thash, blockKey, { deposit with status = #Cancelled }) };
       case null {};
@@ -910,6 +987,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (deposit.amount <= cancellationFee) return #err(#InsufficientBalance);
 
     let refundAmount = deposit.amount - cancellationFee;
+
+    // Track cancellation fee for admin claiming
+    let prevCancelFees = switch (Map.get(accumulatedCancellationFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    Map.set(accumulatedCancellationFees, phash, tokenPrincipal, prevCancelFees + cancellationFee);
 
     // Mark as cancelled BEFORE await (safe async)
     Map.set(activeDeposits, thash, blockKey, { deposit with status = #Cancelled });
@@ -999,7 +1080,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
 
     try {
-      let supply = await ledger.icrc1_total_supply();
+      let supply = if (now() - cachedSupplyTime < SUPPLY_CACHE_TTL_NS and cachedSupply > 0) {
+        cachedSupply;
+      } else {
+        let s = await ledger.icrc1_total_supply();
+        cachedSupply := s;
+        cachedSupplyTime := now();
+        s;
+      };
       let portfolioValue = calculatePortfolioValueICP();
 
       let navPerToken : Nat = if (supply == 0) {
@@ -1032,8 +1120,211 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     true;
   };
 
-  private func getHistoricalLowPrice(token : Principal) : Nat {
-    let cutoff = now() - PRICE_HISTORY_WINDOW;
+  // Direct DEX actor references — WITHOUT query keyword so calls go through update path
+  // (query calls from update contexts fail with "could not perform remote call" on IC)
+  transient let kong : actor {
+    swap_amounts : shared (Text, Nat, Text) -> async SwapTypes.SwapAmountsResult;
+  } = actor ("2ipq2-uqaaa-aaaar-qailq-cai");
+
+  transient let icpSwapFactory : actor {
+    getPools : shared () -> async { #ok : [SwapTypes.PoolData]; #err : Text };
+  } = actor ("4mmnk-kiaaa-aaaag-qbllq-cai");
+
+  // Discover ICPSwap pools that pair with ICP — populates icpSwapPoolCache
+  private func discoverICPSwapPools() : async () {
+    try {
+      let result = await icpSwapFactory.getPools();
+      switch (result) {
+        case (#ok(pools)) {
+          for (pool in pools.vals()) {
+            let t0 = Principal.fromText(pool.token0.address);
+            let t1 = Principal.fromText(pool.token1.address);
+            if (t0 == ICPprincipal) {
+              Map.set(icpSwapPoolCache, phash, t1, pool.canisterId);
+            } else if (t1 == ICPprincipal) {
+              Map.set(icpSwapPoolCache, phash, t0, pool.canisterId);
+            };
+          };
+          logger.info("POOLS", "Discovered " # Nat.toText(Map.size(icpSwapPoolCache)) # " ICPSwap ICP pools", "discoverICPSwapPools");
+        };
+        case (#err(e)) {
+          logger.warn("POOLS", "ICPSwap pool discovery failed: " # e, "discoverICPSwapPools");
+        };
+      };
+    } catch (e) {
+      logger.warn("POOLS", "ICPSwap pool discovery exception: " # Error.message(e), "discoverICPSwapPools");
+    };
+  };
+
+  // Vault-local price refresh: queries BOTH ICPSwap and KongSwap directly.
+  // Fires ALL futures upfront with (with timeout), then awaits — same pattern as treasury's syncPriceWithDEX.
+  private func refreshPricesLocally() : async Bool {
+    // Auto-discover pools on first use
+    if (Map.size(icpSwapPoolCache) == 0) { await discoverICPSwapPools() };
+
+    var anyUpdated = false;
+
+    // Snapshot tokens to refresh
+    let tokensToRefresh = Vector.new<(Principal, TokenDetails)>();
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (token != ICPprincipal and details.Active and not details.isPaused) {
+        Vector.add(tokensToRefresh, (token, details));
+      };
+    };
+
+    logger.info("PRICE", "Starting parallel refresh for " # Nat.toText(Vector.size(tokensToRefresh)) # " tokens, icpSwapPoolCache=" # Nat.toText(Map.size(icpSwapPoolCache)), "refreshPricesLocally");
+
+    // ── Fire ALL Kong + ICPSwap futures in parallel (same as treasury) ──
+    let kongFutures = Map.new<Principal, async SwapTypes.SwapAmountsResult>();
+    let icpSwapFutures = Map.new<Principal, async Result.Result<SwapTypes.PoolMetadata, SwapTypes.ICPSwapError>>();
+    var kongCount : Nat = 0;
+    var icpSwapCount : Nat = 0;
+
+    for ((token, details) in Vector.vals(tokensToRefresh)) {
+      let oneUnit = 10 ** details.tokenDecimals;
+      let kongFut = kong.swap_amounts("IC." # details.tokenSymbol, oneUnit, "IC.ICP");
+      Map.set(kongFutures, phash, token, kongFut);
+      kongCount += 1;
+
+      switch (Map.get(icpSwapPoolCache, phash, token)) {
+        case (?poolId) {
+          let pool : actor { metadata : shared () -> async Result.Result<SwapTypes.PoolMetadata, SwapTypes.ICPSwapError> } = actor (Principal.toText(poolId));
+          let icpFut = pool.metadata();
+          Map.set(icpSwapFutures, phash, token, icpFut);
+          icpSwapCount += 1;
+        };
+        case null {};
+      };
+    };
+
+    logger.info("PRICE", "Fired " # Nat.toText(kongCount) # " Kong + " # Nat.toText(icpSwapCount) # " ICPSwap futures", "refreshPricesLocally");
+
+    // ── Await all futures and process results per token ──
+    label tokenLoop for ((token, details) in Vector.vals(tokensToRefresh)) {
+      var kongPrice : ?Float = null;
+      var icpSwapPrice : ?Float = null;
+
+      // Await KongSwap
+      switch (Map.get(kongFutures, phash, token)) {
+        case (?kongFut) {
+          try {
+            let result = await kongFut;
+            switch (result) {
+              case (#Ok(quote)) {
+                if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0) {
+                  kongPrice := ?quote.mid_price;
+                };
+              };
+              case (#Err(_)) {};
+            };
+          } catch (e) {
+            logger.warn("PRICE", "Kong " # details.tokenSymbol # " error: " # Error.message(e), "refreshPricesLocally");
+          };
+        };
+        case null {};
+      };
+
+      // Await ICPSwap
+      switch (Map.get(icpSwapFutures, phash, token)) {
+        case (?icpFut) {
+          try {
+            let metaResult = await icpFut;
+            switch (metaResult) {
+              case (#ok(metadata)) {
+                let sqrtPriceX96_squared = metadata.sqrtPriceX96 * metadata.sqrtPriceX96;
+                let rawPrice = Float.fromInt(sqrtPriceX96_squared) / Float.fromInt(2 ** 192);
+
+                let tokenAddress = Principal.toText(token);
+                let icpDecimals : Int = 8;
+                let tokDecimals : Int = details.tokenDecimals;
+
+                // Determine direction and apply decimal adjustment (same as treasury)
+                let tokenICPPrice : Float = if (tokenAddress == metadata.token0.address and ICPprincipalText == metadata.token1.address) {
+                  let adjustment = Float.fromInt((10 : Nat) ** Int.abs(tokDecimals - icpDecimals));
+                  if (tokDecimals > icpDecimals) { rawPrice * adjustment }
+                  else if (tokDecimals < icpDecimals) { rawPrice / adjustment }
+                  else { rawPrice };
+                } else if (tokenAddress == metadata.token1.address and ICPprincipalText == metadata.token0.address) {
+                  let adjustment = Float.fromInt((10 : Nat) ** Int.abs(icpDecimals - tokDecimals));
+                  let adjusted = if (tokDecimals > icpDecimals) { rawPrice / adjustment }
+                    else if (tokDecimals < icpDecimals) { rawPrice * adjustment }
+                    else { rawPrice };
+                  if (adjusted > 0.0) { 1.0 / adjusted } else { 0.0 };
+                } else { 0.0 };
+
+                if (tokenICPPrice > 0.0 and tokenICPPrice >= 0.000001 and tokenICPPrice <= 100000.0) {
+                  icpSwapPrice := ?tokenICPPrice;
+                };
+              };
+              case (#err(_)) {};
+            };
+          } catch (e) {
+            logger.warn("PRICE", "ICPSwap " # details.tokenSymbol # " error: " # Error.message(e), "refreshPricesLocally");
+          };
+        };
+        case null {};
+      };
+
+      // Merge prices — same logic as treasury:
+      // Variance <1%: average; >=1%: closest to last known
+      let finalPrice : ?Float = switch (kongPrice, icpSwapPrice) {
+        case (?kp, ?ip) {
+          let maxP = Float.max(kp, ip);
+          let minP = Float.min(kp, ip);
+          let variance = if (maxP > 0.0) { (maxP - minP) / maxP } else { 1.0 };
+          if (variance <= 0.01) {
+            ?((kp + ip) / 2.0);
+          } else {
+            let lastPriceFloat = Float.fromInt(details.priceInICP) / 100_000_000.0;
+            let kongDiff = Float.abs(kp - lastPriceFloat);
+            let icpSwapDiff = Float.abs(ip - lastPriceFloat);
+            if (kongDiff <= icpSwapDiff) { ?kp } else { ?ip };
+          };
+        };
+        case (?kp, null) { if (kp > 0.0) { ?kp } else { null } };
+        case (null, ?ip) { if (ip > 0.0) { ?ip } else { null } };
+        case (null, null) { null };
+      };
+
+      switch (finalPrice) {
+        case (?price) {
+          let scaledPrice = price * 100_000_000.0;
+          if (price > 0.0 and not Float.isNaN(scaledPrice) and scaledPrice < 9.0e18) {
+            let priceE8s = Int.abs(Float.toInt(scaledPrice));
+            Map.set(tokenDetailsMap, phash, token, { details with priceInICP = priceE8s; lastTimeSynced = now() });
+            anyUpdated := true;
+          };
+        };
+        case null {};
+      };
+    };
+
+    // Update ICP's lastTimeSynced and cache timestamp
+    if (anyUpdated) {
+      let finalTime = now();
+      switch (Map.get(tokenDetailsMap, phash, ICPprincipal)) {
+        case (?icpDetails) {
+          Map.set(tokenDetailsMap, phash, ICPprincipal, { icpDetails with lastTimeSynced = finalTime });
+        };
+        case null {};
+      };
+      lastLocalPriceRefreshTime := finalTime;
+    };
+    anyUpdated;
+  };
+
+  private func getPausedPortfolioTokens() : [{ token : Principal; symbol : Text }] {
+    let paused = Vector.new<{ token : Principal; symbol : Text }>();
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and details.isPaused) {
+        Vector.add(paused, { token; symbol = details.tokenSymbol });
+      };
+    };
+    Vector.toArray(paused);
+  };
+
+  private func getHistoricalLowPrice(token : Principal, window : Int) : Nat {
+    let cutoff = now() - window;
     var lowest : Nat = 0;
     switch (Map.get(tokenDetailsMap, phash, token)) {
       case (?details) {
@@ -1051,27 +1342,19 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     lowest;
   };
 
-  // Find ICPSwap pool for a token paired with ICP
-  private func findICPSwapPoolForToken(token : Principal) : ?Principal {
-    let tokenText = Principal.toText(token);
-    for ((_, pool) in Map.entries(ICPswapPools)) {
-      if ((pool.token0.address == tokenText and pool.token1.address == ICPprincipalText) or (pool.token1.address == tokenText and pool.token0.address == ICPprincipalText)) {
-        return ?pool.canisterId;
-      };
-    };
-    null;
+  // Conservative price: min(treasury, historical low within window). Protects vault from overvalued deposits.
+  // Default window: PRICE_HISTORY_WINDOW (2h for single-token minting)
+  private func getConservativePrice(token : Principal) : Nat {
+    getConservativePriceWithWindow(token, PRICE_HISTORY_WINDOW);
   };
 
-  // Conservative price: uses treasury-cached prices (already refreshed by performSharedPreChecks
-  // via treasury.refreshAllPrices which queries both KongSwap + ICPSwap with variance-aware selection)
-  // plus the vault's own 2-hour historical low. Takes the minimum for deposit safety.
-  private func getConservativePrice(token : Principal) : Nat {
+  private func getConservativePriceWithWindow(token : Principal, window : Int) : Nat {
     let treasuryPrice = switch (Map.get(tokenDetailsMap, phash, token)) {
       case (?details) { details.priceInICP };
       case null { return 0 };
     };
 
-    let historicalLow = getHistoricalLowPrice(token);
+    let historicalLow = getHistoricalLowPrice(token, window);
 
     // Return the LOWEST valid price (conservative for deposits)
     if (historicalLow > 0 and historicalLow < treasuryPrice) historicalLow
@@ -1157,6 +1440,31 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
     while (Vector.size(burnRateTracker) > 0) { ignore Vector.removeLast(burnRateTracker) };
     for (entry in Vector.vals(newBurnTracker)) { Vector.add(burnRateTracker, entry) };
+
+    // Clean per-user value trackers
+    let mintKeysToRemove = Vector.new<Principal>();
+    for ((principal, vals) in Map.entries(userMintValues)) {
+      let fresh = Vector.new<(Int, Nat)>();
+      for ((ts, v) in Vector.vals(vals)) { if (ts >= cutoff) Vector.add(fresh, (ts, v)) };
+      if (Vector.size(fresh) == 0) { Vector.add(mintKeysToRemove, principal) }
+      else {
+        while (Vector.size(vals) > 0) { ignore Vector.removeLast(vals) };
+        for (e in Vector.vals(fresh)) { Vector.add(vals, e) };
+      };
+    };
+    for (k in Vector.vals(mintKeysToRemove)) { ignore Map.remove(userMintValues, phash, k) };
+
+    let burnKeysToRemove = Vector.new<Principal>();
+    for ((principal, vals) in Map.entries(userBurnValues)) {
+      let fresh = Vector.new<(Int, Nat)>();
+      for ((ts, v) in Vector.vals(vals)) { if (ts >= cutoff) Vector.add(fresh, (ts, v)) };
+      if (Vector.size(fresh) == 0) { Vector.add(burnKeysToRemove, principal) }
+      else {
+        while (Vector.size(vals) > 0) { ignore Vector.removeLast(vals) };
+        for (e in Vector.vals(fresh)) { Vector.add(vals, e) };
+      };
+    };
+    for (k in Vector.vals(burnKeysToRemove)) { ignore Map.remove(userBurnValues, phash, k) };
   };
 
   // Combined check + record: records optimistically BEFORE awaits to prevent
@@ -1165,19 +1473,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   private func checkAndRecordMintRateLimit(caller : Principal, valueICP : Nat) : Result.Result<(), NachosError> {
     if (isRateLimitExempt(caller)) return #ok(());
 
-    cleanRateLimitWindows();
+    let cutoff = now() - FOUR_HOURS_NS;
 
-    // Global ICP value limit
+    // Global ICP value limit (only count entries within 4h window)
     var totalMintValue : Nat = 0;
     for (entry in Vector.vals(mintRateTracker)) {
-      totalMintValue += entry.1;
+      if (entry.0 >= cutoff) totalMintValue += entry.1;
     };
     if (totalMintValue + valueICP > maxMintICPWorthPer4Hours) {
       return #err(#MintLimitExceeded({ maxPer4Hours = maxMintICPWorthPer4Hours; recentMints = totalMintValue; requested = valueICP }));
     };
 
     // Per-user ops limit
-    let cutoff = now() - FOUR_HOURS_NS;
     switch (Map.get(userMintOps, phash, caller)) {
       case (?ops) {
         var recentCount : Nat = 0;
@@ -1186,6 +1493,20 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         };
         if (recentCount >= maxMintOpsPerUser4Hours) {
           return #err(#RateLimitExceeded);
+        };
+      };
+      case null {};
+    };
+
+    // Per-user ICP value limit
+    switch (Map.get(userMintValues, phash, caller)) {
+      case (?vals) {
+        var recentValue : Nat = 0;
+        for ((ts, v) in Vector.vals(vals)) {
+          if (ts >= cutoff) recentValue += v;
+        };
+        if (recentValue + valueICP > maxMintICPPerUser4Hours) {
+          return #err(#UserMintLimitExceeded({ maxPer4Hours = maxMintICPPerUser4Hours; recentMints = recentValue; requested = valueICP }));
         };
       };
       case null {};
@@ -1201,6 +1522,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         Map.set(userMintOps, phash, caller, ops);
       };
     };
+    switch (Map.get(userMintValues, phash, caller)) {
+      case (?vals) { Vector.add(vals, (now(), valueICP)) };
+      case null {
+        let vals = Vector.new<(Int, Nat)>();
+        Vector.add(vals, (now(), valueICP));
+        Map.set(userMintValues, phash, caller, vals);
+      };
+    };
 
     #ok(());
   };
@@ -1209,19 +1538,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   private func checkAndRecordBurnRateLimit(caller : Principal, nachosAmount : Nat) : Result.Result<(), NachosError> {
     if (isRateLimitExempt(caller)) return #ok(());
 
-    cleanRateLimitWindows();
+    let cutoff = now() - FOUR_HOURS_NS;
 
-    // Global nachos burn limit
+    // Global nachos burn limit (only count entries within 4h window)
     var totalBurned : Nat = 0;
     for (entry in Vector.vals(burnRateTracker)) {
-      totalBurned += entry.1;
+      if (entry.0 >= cutoff) totalBurned += entry.1;
     };
     if (totalBurned + nachosAmount > maxNachosBurnPer4Hours) {
       return #err(#BurnLimitExceeded({ maxPer4Hours = maxNachosBurnPer4Hours; recentBurns = totalBurned; requested = nachosAmount }));
     };
 
     // Per-user ops limit
-    let cutoff = now() - FOUR_HOURS_NS;
     switch (Map.get(userBurnOps, phash, caller)) {
       case (?ops) {
         var recentCount : Nat = 0;
@@ -1235,6 +1563,20 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case null {};
     };
 
+    // Per-user NACHOS burn value limit
+    switch (Map.get(userBurnValues, phash, caller)) {
+      case (?vals) {
+        var recentValue : Nat = 0;
+        for ((ts, v) in Vector.vals(vals)) {
+          if (ts >= cutoff) recentValue += v;
+        };
+        if (recentValue + nachosAmount > maxBurnNachosPerUser4Hours) {
+          return #err(#UserBurnLimitExceeded({ maxPer4Hours = maxBurnNachosPerUser4Hours; recentBurns = recentValue; requested = nachosAmount }));
+        };
+      };
+      case null {};
+    };
+
     // Record immediately (before any await points)
     Vector.add(burnRateTracker, (now(), nachosAmount));
     switch (Map.get(userBurnOps, phash, caller)) {
@@ -1243,6 +1585,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         let ops = Vector.new<Int>();
         Vector.add(ops, now());
         Map.set(userBurnOps, phash, caller, ops);
+      };
+    };
+    switch (Map.get(userBurnValues, phash, caller)) {
+      case (?vals) { Vector.add(vals, (now(), nachosAmount)) };
+      case null {
+        let vals = Vector.new<(Int, Nat)>();
+        Vector.add(vals, (now(), nachosAmount));
+        Map.set(userBurnValues, phash, caller, vals);
       };
     };
 
@@ -1267,26 +1617,67 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ok(())) {};
     };
 
-    // Force price refresh + fetch token details in one call
-    try {
-      switch (await treasury.refreshPricesAndGetDetails()) {
-        case (#ok(result)) {
-          for ((token, detail) in result.tokenDetails.vals()) {
-            Map.set(tokenDetailsMap, phash, token, detail);
+    // Price refresh: skip if refreshed within 30s and still fresh
+    var priceRefreshOk = false;
+    if (now() - lastLocalPriceRefreshTime < 30_000_000_000 and arePricesFresh()) {
+      priceRefreshOk := true;
+    } else {
+      // Primary: refresh prices via treasury (parallel DEX calls with sufficient cycles)
+      try {
+        switch (await treasury.refreshPricesAndGetDetails()) {
+          case (#ok(result)) {
+            let refreshTime = now();
+            for ((token, detail) in result.tokenDetails.vals()) {
+              // Preserve optimistic balance — treasury doesn't know about in-flight deposits/withdrawals
+              let preservedBalance = switch (Map.get(tokenDetailsMap, phash, token)) {
+                case (?existing) { existing.balance };
+                case null { detail.balance };
+              };
+              Map.set(tokenDetailsMap, phash, token, { detail with balance = preservedBalance; lastTimeSynced = refreshTime });
+            };
+            lastLocalPriceRefreshTime := refreshTime;
+            priceRefreshOk := true;
+            logger.info("PRE_CHECK", "Refreshed prices via treasury", "performSharedPreChecks");
+          };
+          case (#err(msg)) {
+            logger.warn("PRE_CHECK", "Treasury price refresh failed: " # msg, "performSharedPreChecks");
           };
         };
-        case (#err(msg)) {
-          logger.warn("PRE_CHECK", "Price refresh failed: " # msg, "performSharedPreChecks");
+      } catch (e) {
+        logger.warn("PRE_CHECK", "Treasury price refresh exception: " # Error.message(e), "performSharedPreChecks");
+      };
+
+      // Fallback: refresh prices directly via ICPSwap + KongSwap if treasury failed
+      if (not priceRefreshOk) {
+        try {
+          let success = await refreshPricesLocally();
+          if (success) {
+            priceRefreshOk := true;
+            logger.info("PRE_CHECK", "Refreshed prices via direct DEX fallback (ICPSwap + KongSwap)", "performSharedPreChecks");
+          } else {
+            logger.warn("PRE_CHECK", "Direct DEX fallback returned no price updates", "performSharedPreChecks");
+          };
+        } catch (e) {
+          logger.warn("PRE_CHECK", "Direct DEX fallback failed: " # Error.message(e), "performSharedPreChecks");
         };
       };
-    } catch (e) {
-      logger.warn("PRE_CHECK", "Price refresh call failed: " # Error.message(e), "performSharedPreChecks");
     };
 
     // Check price staleness
     if (not arePricesFresh()) {
       releaseLock(caller);
       return #err(#PriceStale);
+    };
+
+    // Check for paused portfolio tokens — block MINTING (not burning) if any token paused
+    // Paused tokens have stale prices which would corrupt NAV for minting
+    // Burning is allowed: proportional share distribution works regardless of exact prices
+    if (isMint) {
+      let pausedTokens = getPausedPortfolioTokens();
+      if (pausedTokens.size() > 0) {
+        releaseLock(caller);
+        return #err(#PortfolioTokenPaused({ pausedTokens }));
+      };
     };
 
     #ok(());
@@ -1334,7 +1725,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify block
-    let verifyResult = await verifyICPBlock(blockNumber, caller, NachosTreasurySubaccount);
+    let verifyResult = await verifyICPBlock(blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
     let depositAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -1396,6 +1787,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       timestamp = now();
     };
     recordNavSnapshot(#Mint);
+    lastMintBurnTime := now();
+
+    // Forward full deposit to treasury default subaccount (no fee on genesis)
+    forwardDepositsToPortfolio(caller, deposits, depositAmount, depositAmount, 0);
 
     nextMintId := 1;
 
@@ -1434,7 +1829,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify block
-    let verifyResult = await verifyICPBlock(blockNumber, caller, NachosTreasurySubaccount);
+    let verifyResult = await verifyICPBlock(blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
     let depositAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -1452,6 +1847,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
+    };
+
+    // Check maximum value per operation
+    if (maxMintAmountICP > 0 and depositAmount > maxMintAmountICP) {
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      releaseLock(caller);
+      return #err(#AboveMaximumValue({ max = maxMintAmountICP; requested = depositAmount }));
     };
 
     // Rate limit check
@@ -1528,12 +1930,29 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Mint; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextMintId });
+      accumulatedMintFeesICP += feeValue;
     };
 
     let mintId = nextMintId;
     nextMintId += 1;
 
+    // Optimistic NAV: reflect net deposit before treasury sync (fee stays in sub2)
+    let optPortfolio = nav.portfolioValueICP + netValue;
+    let optSupply = nav.nachosSupply + nachosAmount;
+    cachedNAV := ?{
+      navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
+      portfolioValueICP = optPortfolio;
+      nachosSupply = optSupply;
+      timestamp = now();
+    };
+    cachedSupply := optSupply;
+    cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
+    lastMintBurnTime := now();
+
+    // Forward net deposit to treasury default subaccount (fee stays in sub2)
+    forwardDepositsToPortfolio(caller, deposits, netValue, depositAmount, mintId);
+
     releaseLock(caller);
 
     logger.info("MINT", "Mint #" # Nat.toText(mintId) # " " # Nat.toText(nachosAmount) # " NACHOS for " # Nat.toText(depositAmount) # " ICP", "mintNachos");
@@ -1582,7 +2001,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify block
-    let verifyResult = await verifyBlock(tokenPrincipal, blockNumber, caller, NachosTreasurySubaccount);
+    let verifyResult = await verifyBlock(tokenPrincipal, blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
     let depositAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -1613,6 +2032,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
+    };
+
+    if (maxMintAmountICP > 0 and depositValueICP > maxMintAmountICP) {
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      releaseLock(caller);
+      return #err(#AboveMaximumValue({ max = maxMintAmountICP; requested = depositValueICP }));
     };
 
     switch (checkAndRecordMintRateLimit(caller, depositValueICP)) {
@@ -1727,11 +2152,29 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Mint; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextMintId });
+      accumulatedMintFeesICP += feeValue;
     };
 
     let mintId = nextMintId;
     nextMintId += 1;
+
+    // Optimistic NAV: reflect net deposit before treasury sync (fee stays in sub2)
+    let optPortfolio = nav.portfolioValueICP + netValue;
+    let optSupply = nav.nachosSupply + nachosAmount;
+    cachedNAV := ?{
+      navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
+      portfolioValueICP = optPortfolio;
+      nachosSupply = optSupply;
+      timestamp = now();
+    };
+    cachedSupply := optSupply;
+    cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
+    lastMintBurnTime := now();
+
+    // Forward net deposit to treasury default subaccount (fee stays in sub2)
+    forwardDepositsToPortfolio(caller, deposits, netValue, usedValueICP, mintId);
+
     releaseLock(caller);
 
     logger.info("MINT", "Token mint #" # Nat.toText(mintId) # " " # Nat.toText(nachosAmount) # " NACHOS for " # Nat.toText(usedAmount) # " tokens", "mintNachosWithToken");
@@ -1781,7 +2224,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Verify each block
     var verifyIdx : Nat = 0;
     for (info in depositInfos.vals()) {
-      let verifyResult = await verifyBlock(info.token, info.blockNumber, caller, NachosTreasurySubaccount);
+      let verifyResult = await verifyBlock(info.token, info.blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
       switch (verifyResult) {
         case (#ok({ amount })) {
           let blockKey = makeBlockKey(info.token, info.blockNumber);
@@ -1807,12 +2250,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       verifyIdx += 1;
     };
 
-    // Calculate value per token with conservative prices
+    // Calculate value per token using 30-minute conservative prices (min of treasury + 30m low)
+    let THIRTY_MINUTES_NS : Int = 30 * 60 * 1_000_000_000;
     let tokenDeposits = Vector.new<TokenDeposit>();
     var totalValueICP : Nat = 0;
 
     for (vd in Vector.vals(verifiedDeposits)) {
-      let price = getConservativePrice(vd.token);
+      let price = getConservativePriceWithWindow(vd.token, THIRTY_MINUTES_NS);
       if (price == 0) {
         // Cancel all deposits and return everything
         for (vd2 in Vector.vals(verifiedDeposits)) {
@@ -1840,29 +2284,73 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       return #err(#BelowMinimumValue);
     };
 
+    if (maxMintAmountICP > 0 and totalValueICP > maxMintAmountICP) {
+      for (vd in Vector.vals(verifiedDeposits)) {
+        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+      };
+      releaseLock(caller);
+      return #err(#AboveMaximumValue({ max = maxMintAmountICP; requested = totalValueICP }));
+    };
+
     // Validate portfolio share proportions
+    // Uses treasury prices (not conservative) for both sides so proportions are consistent
     let portfolioValue = calculatePortfolioValueICP();
     if (portfolioValue > 0) {
-      for (td in Vector.vals(tokenDeposits)) {
-        let expectedBP = switch (Map.get(tokenDetailsMap, phash, td.token)) {
+      // Aggregate deposits by token (handles multiple blocks for same token)
+      let aggregatedByToken = Map.new<Principal, { valueICP : Nat }>();
+      var totalDepositValueTreasury : Nat = 0;
+      for (vd in Vector.vals(verifiedDeposits)) {
+        let treasuryPrice = switch (Map.get(tokenDetailsMap, phash, vd.token)) {
+          case (?d) { d.priceInICP };
+          case null { 0 };
+        };
+        let decimals = switch (Map.get(tokenDetailsMap, phash, vd.token)) {
+          case (?d) { d.tokenDecimals };
+          case null { 8 };
+        };
+        let valICP = (vd.amount * treasuryPrice) / (10 ** decimals);
+        totalDepositValueTreasury += valICP;
+        switch (Map.get(aggregatedByToken, phash, vd.token)) {
+          case (?existing) { Map.set(aggregatedByToken, phash, vd.token, { valueICP = existing.valueICP + valICP }) };
+          case null { Map.set(aggregatedByToken, phash, vd.token, { valueICP = valICP }) };
+        };
+      };
+
+      // Build expected proportions for error reporting
+      let expectedProportions = Vector.new<{ token : Principal; basisPoints : Nat }>();
+      for ((tok, det) in Map.entries(tokenDetailsMap)) {
+        if (det.Active and det.balance > 0 and det.priceInICP > 0) {
+          let tokVal = (det.balance * det.priceInICP) / (10 ** det.tokenDecimals);
+          let bp = (tokVal * 10_000) / portfolioValue;
+          if (bp > 0) Vector.add(expectedProportions, { token = tok; basisPoints = bp });
+        };
+      };
+
+      for ((tok, agg) in Map.entries(aggregatedByToken)) {
+        let expectedBP = switch (Map.get(tokenDetailsMap, phash, tok)) {
           case (?details) {
             let tokenValueInPortfolio = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-            if (portfolioValue > 0) { (tokenValueInPortfolio * 10_000) / portfolioValue } else { 0 };
+            (tokenValueInPortfolio * 10_000) / portfolioValue;
           };
           case null { 0 };
         };
 
-        let actualBP = if (totalValueICP > 0) { (td.valueICP * 10_000) / totalValueICP } else { 0 };
+        let actualBP = if (totalDepositValueTreasury > 0) { (agg.valueICP * 10_000) / totalDepositValueTreasury } else { 0 };
 
         let deviation = if (actualBP > expectedBP) { actualBP - expectedBP } else { expectedBP - actualBP };
         if (deviation > portfolioShareMaxDeviationBP) {
           for (vd in Vector.vals(verifiedDeposits)) {
             ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
           };
+          let receivedProportions = Vector.new<{ token : Principal; basisPoints : Nat }>();
+          for ((rTok, rAgg) in Map.entries(aggregatedByToken)) {
+            let bp = if (totalDepositValueTreasury > 0) { (rAgg.valueICP * 10_000) / totalDepositValueTreasury } else { 0 };
+            Vector.add(receivedProportions, { token = rTok; basisPoints = bp });
+          };
           releaseLock(caller);
           return #err(#PortfolioShareMismatch({
-            expected = [];
-            received = [];
+            expected = Vector.toArray(expectedProportions);
+            received = Vector.toArray(receivedProportions);
           }));
         };
       };
@@ -1950,11 +2438,29 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Mint; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextMintId });
+      accumulatedMintFeesICP += feeValue;
     };
 
     let mintId = nextMintId;
     nextMintId += 1;
+
+    // Optimistic NAV: reflect net deposit before treasury sync (fee stays in sub2)
+    let optPortfolio = nav.portfolioValueICP + netValue;
+    let optSupply = nav.nachosSupply + nachosAmount;
+    cachedNAV := ?{
+      navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
+      portfolioValueICP = optPortfolio;
+      nachosSupply = optSupply;
+      timestamp = now();
+    };
+    cachedSupply := optSupply;
+    cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
+    lastMintBurnTime := now();
+
+    // Forward net deposits to treasury default subaccount (fee stays in sub2)
+    forwardDepositsToPortfolio(caller, depositsArr, netValue, totalValueICP, mintId);
+
     releaseLock(caller);
 
     logger.info("MINT", "Portfolio mint #" # Nat.toText(mintId) # " " # Nat.toText(nachosAmount) # " NACHOS for " # Nat.toText(totalValueICP) # " ICP worth", "mintNachosWithPortfolioShare");
@@ -2046,7 +2552,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify NACHOS transfer to deposit subaccount
-    let verifyResult = await verifyBlock(nachosLedgerP, nachosBlockNumber, caller, NachosDepositSubaccount);
+    let verifyResult = await verifyBlock(nachosLedgerP, nachosBlockNumber, caller, Principal.fromActor(this), NachosDepositSubaccount);
     let nachosAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -2054,6 +2560,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         releaseLock(caller);
         return #err(#BlockVerificationFailed(e));
       };
+    };
+
+    // Check maximum burn amount per operation
+    if (maxBurnAmountNachos > 0 and nachosAmount > maxBurnAmountNachos) {
+      if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+      releaseLock(caller);
+      return #err(#AboveMaximumValue({ max = maxBurnAmountNachos; requested = nachosAmount }));
     };
 
     // Rate limit check
@@ -2174,6 +2687,19 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       Vector.add(tokensReceived, { token = ts.token; amount = ts.amount; txId = ?taskId });
     };
 
+    // Optimistic balance: reflect tokens leaving portfolio in tokenDetailsMap
+    // so subsequent calculateNAV() sees the reduced portfolio value
+    for (ts in Vector.vals(tokensToSend)) {
+      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
+        case (?details) {
+          let totalDebit = ts.amount + details.tokenTransferFee;
+          let newBalance = if (details.balance > totalDebit) { details.balance - totalDebit } else { 0 };
+          Map.set(tokenDetailsMap, phash, ts.token, { details with balance = newBalance });
+        };
+        case null {};
+      };
+    };
+
     let burnRecord : BurnRecord = {
       id = nextBurnId;
       timestamp = now();
@@ -2196,7 +2722,20 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     let burnId = nextBurnId;
     nextBurnId += 1;
+
+    // Optimistic NAV: reflect redemption leaving portfolio (fee stays in treasury)
+    let optPortfolio = if (nav.portfolioValueICP > netValueICP) { nav.portfolioValueICP - netValueICP } else { 0 };
+    let optSupply = if (nav.nachosSupply > nachosAmount) { nav.nachosSupply - nachosAmount } else { 0 };
+    cachedNAV := ?{
+      navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
+      portfolioValueICP = optPortfolio;
+      nachosSupply = optSupply;
+      timestamp = now();
+    };
+    cachedSupply := optSupply;
+    cachedSupplyTime := now();
     recordNavSnapshot(#Burn);
+    lastMintBurnTime := now();
     releaseLock(caller);
 
     logger.info("BURN", "Burn #" # Nat.toText(burnId) # " " # Nat.toText(nachosAmount) # " NACHOS redeemed for " # Nat.toText(netValueICP) # " ICP worth", "redeemNachos");
@@ -2249,6 +2788,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     switch (config.cancellationFeeMultiplier) { case (?v) { if (v >= 1 and v <= 100) cancellationFeeMultiplier := v }; case null {} };
     switch (config.mintingEnabled) { case (?v) { mintingEnabled := v }; case null {} };
     switch (config.burningEnabled) { case (?v) { burningEnabled := v }; case null {} };
+    switch (config.maxMintICPPerUser4Hours) { case (?v) { maxMintICPPerUser4Hours := v }; case null {} };
+    switch (config.maxBurnNachosPerUser4Hours) { case (?v) { maxBurnNachosPerUser4Hours := v }; case null {} };
+    switch (config.maxMintAmountICP) { case (?v) { maxMintAmountICP := v }; case null {} };
+    switch (config.maxBurnAmountNachos) { case (?v) { maxBurnAmountNachos := v }; case null {} };
 
     logger.info("ADMIN", "Config updated by " # Principal.toText(caller), "updateNachosConfig");
     #ok("Config updated");
@@ -2365,6 +2908,39 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     #ok("Removed rate limit exemption");
   };
 
+  // Claim accumulated mint fees (ICP) — admin sends to any recipient
+  public shared ({ caller }) func claimMintFees(recipient : Principal, amount : Nat) : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    let claimable = accumulatedMintFeesICP - claimedMintFeesICP;
+    if (amount == 0) return #err("Amount must be > 0");
+    if (amount > claimable) return #err("Insufficient claimable fees: " # Nat.toText(claimable) # " available, " # Nat.toText(amount) # " requested");
+
+    // Deduct before await (prevent double-claim across await points)
+    claimedMintFeesICP += amount;
+
+    let taskId = createTransferTask(caller, #principal(recipient), amount, ICPprincipal, NachosTreasurySubaccount, #Recovery, claimedMintFeesICP);
+
+    logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " ICP mint fees -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimMintFees");
+    #ok("Claimed " # Nat.toText(amount) # " e8s ICP, transfer task #" # Nat.toText(taskId));
+  };
+
+  // Claim accumulated cancellation/recovery fees (per-token) — admin sends to any recipient
+  public shared ({ caller }) func claimCancellationFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    let accumulated = switch (Map.get(accumulatedCancellationFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    let claimed = switch (Map.get(claimedCancellationFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    let claimable = accumulated - claimed;
+    if (amount == 0) return #err("Amount must be > 0");
+    if (amount > claimable) return #err("Insufficient claimable fees: " # Nat.toText(claimable) # " available, " # Nat.toText(amount) # " requested");
+
+    Map.set(claimedCancellationFees, phash, tokenPrincipal, claimed + amount);
+
+    let taskId = createTransferTask(caller, #principal(recipient), amount, tokenPrincipal, NachosTreasurySubaccount, #Recovery, claimed + amount);
+
+    logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " cancellation fees for " # Principal.toText(tokenPrincipal) # " -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimCancellationFees");
+    #ok("Claimed " # Nat.toText(amount) # " token fees, transfer task #" # Nat.toText(taskId));
+  };
+
   // Recover tokens accidentally sent to vault (wrong subaccount, wrong token, etc.)
   public shared ({ caller }) func recoverWronglySentTokens(
     tokenPrincipal : Principal,
@@ -2390,7 +2966,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     for (sub in subaccountsToTry.vals()) {
       if (not verified) {
         try {
-          let result = await verifyBlock(tokenPrincipal, blockNumber, senderPrincipal, sub);
+          let result = await verifyBlock(tokenPrincipal, blockNumber, senderPrincipal, TREASURY_ID, sub);
           switch (result) {
             case (#ok({ amount })) {
               verifiedAmount := amount;
@@ -2413,11 +2989,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (?details) { details.tokenTransferFee };
       case null { 10_000 };
     };
-    let recoveryFee = tokenFee * 3;
+    let recoveryFee = tokenFee * cancellationFeeMultiplier;
 
     if (verifiedAmount <= recoveryFee) return #err("Amount too small to recover after fee");
 
     let refundAmount = verifiedAmount - recoveryFee;
+
+    // Track recovery fee for admin claiming (same bucket as cancellation fees)
+    let prevRecoveryFees = switch (Map.get(accumulatedCancellationFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    Map.set(accumulatedCancellationFees, phash, tokenPrincipal, prevRecoveryFees + recoveryFee);
 
     ignore createTransferTask(
       senderPrincipal,
@@ -2454,7 +3034,35 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       i += 1;
     };
     logger.info("TRANSFER_QUEUE", "Admin reset " # Nat.toText(reset) # " exhausted transfer tasks", "retryFailedTransfers");
+    if (reset > 0) { ensureTransferQueueRunning() };
     #ok(reset);
+  };
+
+  public shared ({ caller }) func refreshICPSwapPools() : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    await discoverICPSwapPools();
+    #ok("ICPSwap pool cache refreshed. " # Nat.toText(Map.size(icpSwapPoolCache)) # " ICP pools found.");
+  };
+
+  // Debug: test direct DEX calls
+  public shared ({ caller }) func testRefreshPrices() : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) return #err("Not authorized");
+    // If tokenDetailsMap empty, populate from treasury first (query — no self-call issue)
+    if (Map.size(tokenDetailsMap) == 0) {
+      try {
+        let details = await treasury.getTokenDetails();
+        for ((token, detail) in details.vals()) {
+          Map.set(tokenDetailsMap, phash, token, detail);
+        };
+      } catch (e) { return #err("Treasury sync error: " # Error.message(e)) };
+    };
+    try {
+      let success = await refreshPricesLocally();
+      if (success) { #ok("Price refresh succeeded — " # Nat.toText(Map.size(tokenDetailsMap)) # " tokens") }
+      else { #err("No prices updated — " # Nat.toText(Map.size(tokenDetailsMap)) # " tokens in map") };
+    } catch (e) {
+      #err("Exception: " # Error.message(e));
+    };
   };
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2473,6 +3081,88 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       i += 1;
     };
     Vector.toArray(result);
+  };
+
+  // Adaptive NAV history for frontend charts — returns up to ~554 points
+  // with 6 resolution tiers: dense for recent data, sparse for old data.
+  public query func getNAVHistoryAdaptive() : async [{
+    timestamp : Int;
+    navPerTokenE8s : Nat;
+    reason : NavSnapshotReason;
+  }] {
+    let size = Vector.size(navHistory);
+    if (size == 0) return [];
+
+    let currentTime = now();
+    let NS : Int = 1_000_000_000;
+
+    // Tier boundaries and max points: [0-15m: 6, 15m-1h: 6, 1h-24h: 92, 1d-7d: 50, 7d-28d: 100, 28d-1y: 300]
+    let tierEdges : [Int] = [
+      15 * 60 * NS,
+      60 * 60 * NS,
+      24 * 60 * 60 * NS,
+      7 * 24 * 60 * 60 * NS,
+      28 * 24 * 60 * 60 * NS,
+      365 * 24 * 60 * 60 * NS,
+    ];
+    let tierMaxPoints : [Nat] = [6, 6, 92, 50, 100, 300];
+    let NUM_TIERS = 6;
+
+    func getTier(age : Int) : Nat {
+      var t = 0;
+      while (t < NUM_TIERS) {
+        if (age <= tierEdges[t]) return t;
+        t += 1;
+      };
+      NUM_TIERS - 1; // clamp to last tier
+    };
+
+    // Pass 1: count entries per tier
+    let tierCounts = Array.init<Nat>(NUM_TIERS, 0);
+    var i = size;
+    label pass1 while (i > 0) {
+      i -= 1;
+      let snap = Vector.get(navHistory, i);
+      let age = currentTime - snap.timestamp;
+      if (age > tierEdges[NUM_TIERS - 1]) break pass1;
+      tierCounts[getTier(age)] += 1;
+    };
+
+    // Compute step sizes: step = ceil(count / maxPoints)
+    let tierSteps = Array.init<Nat>(NUM_TIERS, 1);
+    var t = 0;
+    while (t < NUM_TIERS) {
+      if (tierCounts[t] > tierMaxPoints[t]) {
+        tierSteps[t] := (tierCounts[t] + tierMaxPoints[t] - 1) / tierMaxPoints[t];
+      };
+      t += 1;
+    };
+
+    // Pass 2: sample (walking backwards, collecting in reverse order)
+    let tierCounters = Array.init<Nat>(NUM_TIERS, 0);
+    let sampled = Vector.new<{ timestamp : Int; navPerTokenE8s : Nat; reason : NavSnapshotReason }>();
+    i := size;
+    label pass2 while (i > 0) {
+      i -= 1;
+      let snap = Vector.get(navHistory, i);
+      let age = currentTime - snap.timestamp;
+      if (age > tierEdges[NUM_TIERS - 1]) break pass2;
+      let tier = getTier(age);
+      tierCounters[tier] += 1;
+      if (tierCounters[tier] % tierSteps[tier] == 0) {
+        Vector.add(sampled, {
+          timestamp = snap.timestamp;
+          navPerTokenE8s = snap.navPerTokenE8s;
+          reason = snap.reason;
+        });
+      };
+    };
+
+    // Reverse to chronological order
+    let arr = Vector.toArray(sampled);
+    Array.tabulate(arr.size(), func(j : Nat) : { timestamp : Int; navPerTokenE8s : Nat; reason : NavSnapshotReason } {
+      arr[arr.size() - 1 - j];
+    });
   };
 
   public query func getAcceptedMintTokens() : async [(Principal, AcceptedTokenConfig)] {
@@ -2525,6 +3215,258 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     { redemptionValueICP = redemptionValue; feeEstimate = fee; netValueICP = redemptionValue - fee };
   };
 
+  // Per-token breakdown of what the user would receive when burning NACHOS.
+  // Replicates the proportional distribution logic from redeemNachos().
+  public query func estimateBurnTokens(estNachosAmount : Nat) : async {
+    nachosAmount : Nat;
+    navUsed : Nat;
+    redemptionValueICP : Nat;
+    feeEstimate : Nat;
+    netValueICP : Nat;
+    tokens : [{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      amount : Nat;
+      priceICP : Nat;
+      valueICP : Nat;
+      isDust : Bool;
+      tokenFee : Nat;
+    }];
+    portfolioValueICP : Nat;
+  } {
+    let nav = switch (cachedNAV) {
+      case (?n) { n.navPerTokenE8s };
+      case null { INITIAL_NAV_PER_TOKEN_E8S };
+    };
+    let redemptionValue = (estNachosAmount * nav) / ONE_E8S;
+    let fee = Nat.max((redemptionValue * burnFeeBasisPoints) / 10_000, minBurnFeeICP);
+    let netValue = if (redemptionValue > fee) { redemptionValue - fee } else { 0 };
+
+    let portfolioValue = calculatePortfolioValueICP();
+    let tokensResult = Vector.new<{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      amount : Nat;
+      priceICP : Nat;
+      valueICP : Nat;
+      isDust : Bool;
+      tokenFee : Nat;
+    }>();
+
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and details.balance > 0 and details.priceInICP > 0) {
+        let tokenValueICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        let tokenShareBP = if (portfolioValue > 0) { (tokenValueICP * 10_000) / portfolioValue } else { 0 };
+        let tokenEntitlementICP = (netValue * tokenShareBP) / 10_000;
+        let tokenAmount = if (details.priceInICP > 0) {
+          (tokenEntitlementICP * (10 ** details.tokenDecimals)) / details.priceInICP;
+        } else { 0 };
+        let isDust = tokenAmount <= details.tokenTransferFee * 3;
+        Vector.add(tokensResult, {
+          token;
+          symbol = details.tokenSymbol;
+          decimals = details.tokenDecimals;
+          amount = tokenAmount;
+          priceICP = details.priceInICP;
+          valueICP = tokenEntitlementICP;
+          isDust;
+          tokenFee = details.tokenTransferFee;
+        });
+      };
+    };
+
+    {
+      nachosAmount = estNachosAmount;
+      navUsed = nav;
+      redemptionValueICP = redemptionValue;
+      feeEstimate = fee;
+      netValueICP = netValue;
+      tokens = Vector.toArray(tokensResult);
+      portfolioValueICP = portfolioValue;
+    };
+  };
+
+  // Estimate minting with a specific token, including allocation enforcement preview.
+  // Shows how much would be accepted vs returned as excess.
+  public query func estimateMintWithToken(tokenPrincipal : Principal, tokenAmount : Nat) : async Result.Result<{
+    nachosEstimate : Nat;
+    feeEstimate : Nat;
+    navUsed : Nat;
+    tokenPriceICP : Nat;
+    depositValueICP : Nat;
+    usedAmount : Nat;
+    usedValueICP : Nat;
+    excessAmount : Nat;
+    excessValueICP : Nat;
+    allocation : {
+      currentBasisPoints : Nat;
+      targetBasisPoints : Nat;
+      afterDepositBasisPoints : Nat;
+      wouldExceed : Bool;
+      maxAcceptableAmount : Nat;
+    };
+  }, NachosError> {
+    // Validate token is accepted
+    switch (Map.get(acceptedMintTokens, phash, tokenPrincipal)) {
+      case (?config) { if (not config.enabled) return #err(#TokenNotAccepted) };
+      case null { return #err(#TokenNotAccepted) };
+    };
+
+    let details = switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
+      case (?d) { d };
+      case null { return #err(#TokenNotActive) };
+    };
+    if (not details.Active) return #err(#TokenNotActive);
+    if (details.isPaused) return #err(#TokenPaused);
+
+    let tokenPriceICP = getConservativePrice(tokenPrincipal);
+    if (tokenPriceICP == 0) return #err(#InvalidPrice);
+
+    let depositValueICP = (tokenAmount * tokenPriceICP) / (10 ** details.tokenDecimals);
+
+    // Allocation enforcement
+    let portfolioValue = calculatePortfolioValueICP();
+    var totalVP : Nat = 0;
+    for ((_, v) in Map.entries(aggregateAllocation)) { totalVP += v };
+    let targetBP = switch (Map.get(aggregateAllocation, phash, tokenPrincipal)) {
+      case (?vp) { if (totalVP > 0) { (vp * 10_000) / totalVP } else { 0 } };
+      case null { 0 };
+    };
+
+    let currentTokenValue = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+    let currentBP = if (portfolioValue > 0) { (currentTokenValue * 10_000) / portfolioValue } else { 0 };
+
+    var usedAmount = tokenAmount;
+    var excessAmount : Nat = 0;
+    var wouldExceed = false;
+    var maxAcceptableAmount = tokenAmount;
+
+    if (targetBP > 0 and portfolioValue > 0) {
+      let maxAllowedValue = (portfolioValue * targetBP) / 10_000;
+      if (currentTokenValue + depositValueICP > maxAllowedValue) {
+        wouldExceed := true;
+        if (currentTokenValue >= maxAllowedValue) {
+          return #err(#AllocationExceeded);
+        };
+        let allowedValueICP = maxAllowedValue - currentTokenValue;
+        usedAmount := (allowedValueICP * (10 ** details.tokenDecimals)) / tokenPriceICP;
+        if (usedAmount > tokenAmount) usedAmount := tokenAmount;
+        excessAmount := tokenAmount - usedAmount;
+        maxAcceptableAmount := usedAmount;
+      };
+    };
+
+    let usedValueICP = (usedAmount * tokenPriceICP) / (10 ** details.tokenDecimals);
+    let excessValueICP = (excessAmount * tokenPriceICP) / (10 ** details.tokenDecimals);
+
+    let afterDepositBP = if (portfolioValue + usedValueICP > 0) {
+      ((currentTokenValue + usedValueICP) * 10_000) / (portfolioValue + usedValueICP);
+    } else { 0 };
+
+    let nav = switch (cachedNAV) {
+      case (?n) { n.navPerTokenE8s };
+      case null { INITIAL_NAV_PER_TOKEN_E8S };
+    };
+
+    let feeValue = Nat.max((usedValueICP * mintFeeBasisPoints) / 10_000, minMintFeeICP);
+    let netValue = if (usedValueICP > feeValue) { usedValueICP - feeValue } else { 0 };
+    let nachosEstimate = if (nav > 0) { (netValue * ONE_E8S) / nav } else { 0 };
+
+    #ok({
+      nachosEstimate;
+      feeEstimate = feeValue;
+      navUsed = nav;
+      tokenPriceICP;
+      depositValueICP;
+      usedAmount;
+      usedValueICP;
+      excessAmount;
+      excessValueICP;
+      allocation = {
+        currentBasisPoints = currentBP;
+        targetBasisPoints = targetBP;
+        afterDepositBasisPoints = afterDepositBP;
+        wouldExceed;
+        maxAcceptableAmount;
+      };
+    });
+  };
+
+  // Calculate the required deposit amounts per token for portfolio-proportional minting.
+  // Tells the user exactly how much of each token to deposit for a given ICP-equivalent value.
+  public query func getRequiredPortfolioShares(totalValueICP : Nat) : async {
+    tokens : [{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      requiredAmount : Nat;
+      priceICP : Nat;
+      valueICP : Nat;
+      basisPoints : Nat;
+      tokenFee : Nat;
+    }];
+    nachosEstimate : Nat;
+    feeEstimate : Nat;
+    navUsed : Nat;
+    portfolioValueICP : Nat;
+  } {
+    let portfolioValue = calculatePortfolioValueICP();
+    let tokensResult = Vector.new<{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      requiredAmount : Nat;
+      priceICP : Nat;
+      valueICP : Nat;
+      basisPoints : Nat;
+      tokenFee : Nat;
+    }>();
+
+    let THIRTY_MINUTES_NS : Int = 30 * 60 * 1_000_000_000;
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and details.balance > 0 and details.priceInICP > 0) {
+        // Portfolio proportions use treasury prices (matches proportion validation)
+        let tokenValueICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        let tokenShareBP = if (portfolioValue > 0) { (tokenValueICP * 10_000) / portfolioValue } else { 0 };
+        let requiredValueICP = (totalValueICP * tokenShareBP) / 10_000;
+        // Required amounts use 30m conservative price (matches deposit valuation during minting)
+        let depositPrice = getConservativePriceWithWindow(token, THIRTY_MINUTES_NS);
+        let price = if (depositPrice > 0) { depositPrice } else { details.priceInICP };
+        let requiredAmount = if (price > 0) {
+          (requiredValueICP * (10 ** details.tokenDecimals)) / price;
+        } else { 0 };
+        Vector.add(tokensResult, {
+          token;
+          symbol = details.tokenSymbol;
+          decimals = details.tokenDecimals;
+          requiredAmount;
+          priceICP = price;
+          valueICP = requiredValueICP;
+          basisPoints = tokenShareBP;
+          tokenFee = details.tokenTransferFee;
+        });
+      };
+    };
+
+    let nav = switch (cachedNAV) {
+      case (?n) { n.navPerTokenE8s };
+      case null { INITIAL_NAV_PER_TOKEN_E8S };
+    };
+    let fee = Nat.max((totalValueICP * mintFeeBasisPoints) / 10_000, minMintFeeICP);
+    let netValue = if (totalValueICP > fee) { totalValueICP - fee } else { 0 };
+    let nachosEst = if (nav > 0) { (netValue * ONE_E8S) / nav } else { 0 };
+
+    {
+      tokens = Vector.toArray(tokensResult);
+      nachosEstimate = nachosEst;
+      feeEstimate = fee;
+      navUsed = nav;
+      portfolioValueICP = portfolioValue;
+    };
+  };
+
   public query func getSystemStatus() : async {
     genesisComplete : Bool;
     systemPaused : Bool;
@@ -2537,7 +3479,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     totalBurns : Nat;
     pendingTransferCount : Nat;
     activeDepositCount : Nat;
+    hasPausedTokens : Bool;
+    pausedTokens : [{ token : Principal; symbol : Text }];
   } {
+    let pt = getPausedPortfolioTokens();
     {
       genesisComplete;
       systemPaused;
@@ -2550,6 +3495,279 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       totalBurns = Vector.size(burnHistory);
       pendingTransferCount = Vector.size(pendingTransfers);
       activeDepositCount = Map.size(activeDeposits);
+      hasPausedTokens = pt.size() > 0;
+      pausedTokens = pt;
+    };
+  };
+
+  // All-in-one dashboard for the mint/burn UI.
+  // Composite query: fetches live data from treasury + DAO (same subnet on production).
+  // Falls back to local cached data on cross-subnet failures (staging).
+  public composite query func getVaultDashboard(
+    icpMintEstimateAmount : ?Nat,
+    burnEstimateAmount : ?Nat,
+  ) : async {
+    // System state
+    genesisComplete : Bool;
+    systemPaused : Bool;
+    mintingEnabled : Bool;
+    burningEnabled : Bool;
+    circuitBreakerActive : Bool;
+
+    // NAV
+    nav : ?CachedNAV;
+
+    // Portfolio with target allocations
+    portfolio : [{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      balance : Nat;
+      priceICP : Nat;
+      priceUSD : Float;
+      valueICP : Nat;
+      currentBasisPoints : Nat;
+      targetBasisPoints : Nat;
+    }];
+    portfolioValueICP : Nat;
+
+    // Config
+    mintFeeBasisPoints : Nat;
+    burnFeeBasisPoints : Nat;
+    minMintValueICP : Nat;
+    minBurnValueICP : Nat;
+
+    // Accepted mint tokens
+    acceptedTokens : [(Principal, AcceptedTokenConfig)];
+
+    // Optional estimates
+    mintEstimate : ?{ nachosEstimate : Nat; feeEstimate : Nat; navUsed : Nat };
+    burnEstimate : ?{ redemptionValueICP : Nat; feeEstimate : Nat; netValueICP : Nat };
+
+    // Paused token status
+    hasPausedTokens : Bool;
+    pausedTokens : [{ token : Principal; symbol : Text }];
+
+    // Data freshness
+    dataTimestamp : Int;
+    dataSource : Text;
+
+    // Analytics (merged from getVaultAnalytics — one call instead of two)
+    totalMintCount : Nat;
+    totalMintVolumeICP : Nat;
+    mintsByMode : { icp : Nat; singleToken : Nat; portfolioShare : Nat };
+    totalBurnCount : Nat;
+    totalBurnVolumeICP : Nat;
+    totalBurnVolumeNACHOS : Nat;
+    totalFeesCollectedICP : Nat;
+    mintFeesICP : Nat;
+    burnFeesICP : Nat;
+    feeCount : Nat;
+    navChangePercent : ?Float;
+    nachosSupply : Nat;
+    globalMintIn4h : Nat;
+    globalBurnIn4h : Nat;
+    maxMintPer4h : Nat;
+    maxBurnPer4h : Nat;
+  } {
+    // 1. Try to fetch fresh data from treasury + DAO via query calls
+    var tokenDetails : [(Principal, TokenDetails)] = [];
+    var allocations : [(Principal, Nat)] = [];
+    var source : Text = "cached";
+
+    try {
+      tokenDetails := await (with timeout = 5) treasuryQuery.getTokenDetails();
+      source := "live";
+    } catch (_) {
+      tokenDetails := Iter.toArray(Map.entries(tokenDetailsMap));
+    };
+
+    try {
+      allocations := await (with timeout = 5) daoQuery.getAggregateAllocation();
+    } catch (_) {
+      allocations := Iter.toArray(Map.entries(aggregateAllocation));
+    };
+
+    // 2. Build lookup maps
+    let detailsMap = Map.new<Principal, TokenDetails>();
+    for ((token, detail) in tokenDetails.vals()) {
+      Map.set(detailsMap, phash, token, detail);
+    };
+
+    let allocMap = Map.new<Principal, Nat>();
+    var totalAllocVP : Nat = 0;
+    for ((token, vp) in allocations.vals()) {
+      Map.set(allocMap, phash, token, vp);
+      totalAllocVP += vp;
+    };
+
+    // 3. Calculate portfolio breakdown with target allocations
+    var portfolioValue : Nat = 0;
+    let portfolioEntries = Vector.new<{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      balance : Nat;
+      priceICP : Nat;
+      priceUSD : Float;
+      valueICP : Nat;
+      currentBasisPoints : Nat;
+      targetBasisPoints : Nat;
+    }>();
+
+    // First pass: compute total portfolio value
+    for ((token, detail) in tokenDetails.vals()) {
+      if (detail.Active and detail.balance > 0 and detail.priceInICP > 0) {
+        let valueICP = (detail.balance * detail.priceInICP) / (10 ** detail.tokenDecimals);
+        portfolioValue += valueICP;
+      };
+    };
+
+    // Second pass: build portfolio entries with BP
+    for ((token, detail) in tokenDetails.vals()) {
+      if (detail.Active and detail.balance > 0) {
+        let valueICP = (detail.balance * detail.priceInICP) / (10 ** detail.tokenDecimals);
+        let currentBP = if (portfolioValue > 0) { (valueICP * 10_000) / portfolioValue } else { 0 };
+        let targetBP = switch (Map.get(allocMap, phash, token)) {
+          case (?vp) { if (totalAllocVP > 0) { (vp * 10_000) / totalAllocVP } else { 0 } };
+          case null { 0 };
+        };
+        Vector.add(portfolioEntries, {
+          token;
+          symbol = detail.tokenSymbol;
+          decimals = detail.tokenDecimals;
+          balance = detail.balance;
+          priceICP = detail.priceInICP;
+          priceUSD = detail.priceInUSD;
+          valueICP;
+          currentBasisPoints = currentBP;
+          targetBasisPoints = targetBP;
+        });
+      };
+    };
+
+    // 4. Compute optional estimates
+    let nav = switch (cachedNAV) {
+      case (?n) { n.navPerTokenE8s };
+      case null { INITIAL_NAV_PER_TOKEN_E8S };
+    };
+
+    let mintEst : ?{ nachosEstimate : Nat; feeEstimate : Nat; navUsed : Nat } = switch (icpMintEstimateAmount) {
+      case (?icpAmount) {
+        let fee = (icpAmount * mintFeeBasisPoints) / 10_000;
+        let netValue = if (icpAmount > fee) { icpAmount - fee } else { 0 };
+        let nachos = (netValue * ONE_E8S) / nav;
+        ?{ nachosEstimate = nachos; feeEstimate = fee; navUsed = nav };
+      };
+      case null { null };
+    };
+
+    let burnEst : ?{ redemptionValueICP : Nat; feeEstimate : Nat; netValueICP : Nat } = switch (burnEstimateAmount) {
+      case (?nachosAmount) {
+        let redemptionValue = (nachosAmount * nav) / ONE_E8S;
+        let fee = (redemptionValue * burnFeeBasisPoints) / 10_000;
+        let net = if (redemptionValue > fee) { redemptionValue - fee } else { 0 };
+        ?{ redemptionValueICP = redemptionValue; feeEstimate = fee; netValueICP = net };
+      };
+      case null { null };
+    };
+
+    // 5. Accepted tokens
+    let accepted = Vector.new<(Principal, AcceptedTokenConfig)>();
+    for ((token, config) in Map.entries(acceptedMintTokens)) {
+      Vector.add(accepted, (token, config));
+    };
+
+    // 6. Paused tokens
+    let pt = getPausedPortfolioTokens();
+
+    // 7. Analytics computation (avoids needing a separate getVaultAnalytics call)
+    var aMintVol : Nat = 0;
+    var aIcpMints : Nat = 0;
+    var aSingleMints : Nat = 0;
+    var aPortfolioMints : Nat = 0;
+    for (record in Vector.vals(mintHistory)) {
+      aMintVol += record.totalDepositValueICP;
+      switch (record.mintMode) {
+        case (#ICP) { aIcpMints += 1 };
+        case (#SingleToken) { aSingleMints += 1 };
+        case (#PortfolioShare) { aPortfolioMints += 1 };
+      };
+    };
+
+    var aBurnVol : Nat = 0;
+    var aBurnNachos : Nat = 0;
+    for (record in Vector.vals(burnHistory)) {
+      aBurnVol += record.redemptionValueICP;
+      aBurnNachos += record.nachosBurned;
+    };
+
+    var aTotalFees : Nat = 0;
+    var aMintFees : Nat = 0;
+    var aBurnFees : Nat = 0;
+    for (record in Vector.vals(feeHistory)) {
+      aTotalFees += record.feeAmountICP;
+      switch (record.feeType) {
+        case (#Mint) { aMintFees += record.feeAmountICP };
+        case (#Burn) { aBurnFees += record.feeAmountICP };
+      };
+    };
+
+    let aNavChange : ?Float = switch (cachedNAV) {
+      case (?n) {
+        if (INITIAL_NAV_PER_TOKEN_E8S > 0) {
+          ?(Float.fromInt(n.navPerTokenE8s - INITIAL_NAV_PER_TOKEN_E8S) / Float.fromInt(INITIAL_NAV_PER_TOKEN_E8S) * 100.0);
+        } else { null };
+      };
+      case null { null };
+    };
+
+    let aSupply = switch (cachedNAV) { case (?n) { n.nachosSupply }; case null { 0 } };
+
+    let aCutoff = now() - FOUR_HOURS_NS;
+    var aGMint : Nat = 0;
+    var aGBurn : Nat = 0;
+    for (entry in Vector.vals(mintRateTracker)) { if (entry.0 >= aCutoff) aGMint += entry.1 };
+    for (entry in Vector.vals(burnRateTracker)) { if (entry.0 >= aCutoff) aGBurn += entry.1 };
+
+    // 8. Return combined result
+    {
+      genesisComplete;
+      systemPaused;
+      mintingEnabled;
+      burningEnabled;
+      circuitBreakerActive;
+      nav = cachedNAV;
+      portfolio = Vector.toArray(portfolioEntries);
+      portfolioValueICP = portfolioValue;
+      mintFeeBasisPoints;
+      burnFeeBasisPoints;
+      minMintValueICP;
+      minBurnValueICP;
+      acceptedTokens = Vector.toArray(accepted);
+      mintEstimate = mintEst;
+      burnEstimate = burnEst;
+      hasPausedTokens = pt.size() > 0;
+      pausedTokens = pt;
+      dataTimestamp = now();
+      dataSource = source;
+      // Analytics
+      totalMintCount = Vector.size(mintHistory);
+      totalMintVolumeICP = aMintVol;
+      mintsByMode = { icp = aIcpMints; singleToken = aSingleMints; portfolioShare = aPortfolioMints };
+      totalBurnCount = Vector.size(burnHistory);
+      totalBurnVolumeICP = aBurnVol;
+      totalBurnVolumeNACHOS = aBurnNachos;
+      totalFeesCollectedICP = aTotalFees;
+      mintFeesICP = aMintFees;
+      burnFeesICP = aBurnFees;
+      feeCount = Vector.size(feeHistory);
+      navChangePercent = aNavChange;
+      nachosSupply = aSupply;
+      globalMintIn4h = aGMint;
+      globalBurnIn4h = aGBurn;
+      maxMintPer4h = maxMintICPWorthPer4Hours;
+      maxBurnPer4h = maxNachosBurnPer4Hours;
     };
   };
 
@@ -2609,9 +3827,471 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Vector.toArray(result);
   };
 
-  public shared query ({ caller }) func getTransferQueueStatus() : async { pending : Nat; completed : Nat; tasks : [VaultTransferTask] } {
-    if (not isMasterAdmin(caller)) return { pending = 0; completed = 0; tasks = [] };
-    { pending = Vector.size(pendingTransfers); completed = Map.size(completedTransfers); tasks = Vector.toArray(pendingTransfers) };
+  public shared query ({ caller }) func getClaimableMintFees() : async { accumulated : Nat; claimed : Nat; claimable : Nat } {
+    { accumulated = accumulatedMintFeesICP; claimed = claimedMintFeesICP; claimable = accumulatedMintFeesICP - claimedMintFeesICP };
+  };
+
+  public shared query ({ caller }) func getClaimableCancellationFees() : async [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] {
+    let result = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+    for ((token, acc) in Map.entries(accumulatedCancellationFees)) {
+      let cl = switch (Map.get(claimedCancellationFees, phash, token)) { case (?v) v; case null 0 };
+      if (acc > cl) Vector.add(result, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+    };
+    Vector.toArray(result);
+  };
+
+  public shared query ({ caller }) func getTransferQueueStatus() : async { pending : Nat; completed : Nat; exhausted : Nat; tasks : [VaultTransferTask] } {
+    if (not isMasterAdmin(caller)) return { pending = 0; completed = 0; exhausted = 0; tasks = [] };
+    var exhausted : Nat = 0;
+    for (task in Vector.vals(pendingTransfers)) {
+      if (task.retryCount >= 5) exhausted += 1;
+    };
+    { pending = Vector.size(pendingTransfers); completed = Map.size(completedTransfers); exhausted; tasks = Vector.toArray(pendingTransfers) };
+  };
+
+  // User-visible transfer task status for polling burn payouts, refunds, etc.
+  public shared query ({ caller }) func getUserTransferTasks(user : Principal) : async [{
+    id : Nat;
+    tokenPrincipal : Principal;
+    amount : Nat;
+    operationType : TransferOperationType;
+    operationId : Nat;
+    status : TransferStatus;
+    createdAt : Int;
+    updatedAt : Int;
+    blockIndex : ?Nat64;
+  }] {
+    if (caller != user and not isMasterAdmin(caller)) return [];
+
+    type TaskView = {
+      id : Nat;
+      tokenPrincipal : Principal;
+      amount : Nat;
+      operationType : TransferOperationType;
+      operationId : Nat;
+      status : TransferStatus;
+      createdAt : Int;
+      updatedAt : Int;
+      blockIndex : ?Nat64;
+    };
+    let result = Vector.new<TaskView>();
+
+    // Pending/in-flight tasks
+    for (task in Vector.vals(pendingTransfers)) {
+      if (task.caller == user) {
+        Vector.add(result, {
+          id = task.id;
+          tokenPrincipal = task.tokenPrincipal;
+          amount = task.amount;
+          operationType = task.operationType;
+          operationId = task.operationId;
+          status = task.status;
+          createdAt = task.createdAt;
+          updatedAt = task.updatedAt;
+          blockIndex = task.blockIndex;
+        });
+      };
+    };
+
+    // Recently completed tasks (last 24h)
+    let cutoff = now() - 24 * 3600 * 1_000_000_000;
+    for ((_, task) in Map.entries(completedTransfers)) {
+      if (task.caller == user and task.updatedAt >= cutoff) {
+        Vector.add(result, {
+          id = task.id;
+          tokenPrincipal = task.tokenPrincipal;
+          amount = task.amount;
+          operationType = task.operationType;
+          operationId = task.operationId;
+          status = task.status;
+          createdAt = task.createdAt;
+          updatedAt = task.updatedAt;
+          blockIndex = task.blockIndex;
+        });
+      };
+    };
+
+    Vector.toArray(result);
+  };
+
+  // Combined user activity — replaces 5 separate calls with 1 authenticated query.
+  // Returns: paginated mint/burn history (newest first), combined timeline, deposits, transfers, rate limits, totals.
+  public shared query ({ caller }) func getUserActivity(
+    user : Principal,
+    mintLimit : Nat,
+    mintOffset : Nat,
+    burnLimit : Nat,
+    burnOffset : Nat,
+  ) : async {
+    mints : [MintRecord];
+    totalMints : Nat;
+    burns : [BurnRecord];
+    totalBurns : Nat;
+    recentTransactions : [{
+      txType : { #Mint; #Burn };
+      id : Nat;
+      timestamp : Int;
+      nachosAmount : Nat;
+      valueICP : Nat;
+      feeICP : Nat;
+      mintMode : ?MintMode;
+    }];
+    activeDeposits : [ActiveDeposit];
+    transfers : [{
+      id : Nat;
+      tokenPrincipal : Principal;
+      amount : Nat;
+      operationType : TransferOperationType;
+      operationId : Nat;
+      status : TransferStatus;
+      createdAt : Int;
+      updatedAt : Int;
+      blockIndex : ?Nat64;
+    }];
+    rateLimits : {
+      mintOpsIn4h : Nat;
+      burnOpsIn4h : Nat;
+      mintValueIn4h : Nat;
+      burnValueIn4h : Nat;
+      maxMintOps : Nat;
+      maxBurnOps : Nat;
+      maxMintICPPerUser4Hours : Nat;
+      maxBurnNachosPerUser4Hours : Nat;
+    };
+    userTotalMintVolumeICP : Nat;
+    userTotalBurnVolumeICP : Nat;
+    userTotalFeesICP : Nat;
+  } {
+    // Auth check
+    if (caller != user and not isMasterAdmin(caller)) {
+      return {
+        mints = [];
+        totalMints = 0;
+        burns = [];
+        totalBurns = 0;
+        recentTransactions = [];
+        activeDeposits = [];
+        transfers = [];
+        rateLimits = { mintOpsIn4h = 0; burnOpsIn4h = 0; mintValueIn4h = 0; burnValueIn4h = 0; maxMintOps = maxMintOpsPerUser4Hours; maxBurnOps = maxBurnOpsPerUser4Hours; maxMintICPPerUser4Hours; maxBurnNachosPerUser4Hours };
+        userTotalMintVolumeICP = 0;
+        userTotalBurnVolumeICP = 0;
+        userTotalFeesICP = 0;
+      };
+    };
+
+    // --- Mint history (paginated, newest first) ---
+    let allUserMints = Vector.new<MintRecord>();
+    for (record in Vector.vals(mintHistory)) {
+      if (record.caller == user) Vector.add(allUserMints, record);
+    };
+    let uMintTotal = Vector.size(allUserMints);
+    let mintPage = Vector.new<MintRecord>();
+    if (uMintTotal > 0 and mintOffset < uMintTotal) {
+      let cappedLimit = Nat.min(mintLimit, 100);
+      var collected : Nat = 0;
+      var skipped : Nat = 0;
+      // Iterate backward for newest first
+      var idx = uMintTotal;
+      while (idx > 0 and collected < cappedLimit) {
+        idx -= 1;
+        if (skipped >= mintOffset) {
+          Vector.add(mintPage, Vector.get(allUserMints, idx));
+          collected += 1;
+        } else {
+          skipped += 1;
+        };
+      };
+    };
+
+    // --- Burn history (paginated, newest first) ---
+    let allUserBurns = Vector.new<BurnRecord>();
+    for (record in Vector.vals(burnHistory)) {
+      if (record.caller == user) Vector.add(allUserBurns, record);
+    };
+    let uBurnTotal = Vector.size(allUserBurns);
+    let burnPage = Vector.new<BurnRecord>();
+    if (uBurnTotal > 0 and burnOffset < uBurnTotal) {
+      let cappedLimit = Nat.min(burnLimit, 100);
+      var collected : Nat = 0;
+      var skipped : Nat = 0;
+      var idx = uBurnTotal;
+      while (idx > 0 and collected < cappedLimit) {
+        idx -= 1;
+        if (skipped >= burnOffset) {
+          Vector.add(burnPage, Vector.get(allUserBurns, idx));
+          collected += 1;
+        } else {
+          skipped += 1;
+        };
+      };
+    };
+
+    // --- Combined timeline (last 50, newest first via insertion sort by timestamp) ---
+    type TxEntry = {
+      txType : { #Mint; #Burn };
+      id : Nat;
+      timestamp : Int;
+      nachosAmount : Nat;
+      valueICP : Nat;
+      feeICP : Nat;
+      mintMode : ?MintMode;
+    };
+    let timeline = Vector.new<TxEntry>();
+    // Collect all user mints
+    for (record in Vector.vals(mintHistory)) {
+      if (record.caller == user) {
+        Vector.add(timeline, {
+          txType = #Mint;
+          id = record.id;
+          timestamp = record.timestamp;
+          nachosAmount = record.nachosReceived;
+          valueICP = record.totalDepositValueICP;
+          feeICP = record.feeValueICP;
+          mintMode = ?record.mintMode;
+        });
+      };
+    };
+    // Collect all user burns
+    for (record in Vector.vals(burnHistory)) {
+      if (record.caller == user) {
+        Vector.add(timeline, {
+          txType = #Burn;
+          id = record.id;
+          timestamp = record.timestamp;
+          nachosAmount = record.nachosBurned;
+          valueICP = record.redemptionValueICP;
+          feeICP = record.feeValueICP;
+          mintMode = null;
+        });
+      };
+    };
+    // Sort by timestamp descending (simple insertion sort — user tx count is small)
+    let tlSize = Vector.size(timeline);
+    let sorted = Array.tabulate<TxEntry>(tlSize, func(i) { Vector.get(timeline, i) });
+    let sortedBuf = Array.thaw<TxEntry>(sorted);
+    var si : Nat = 1;
+    while (si < tlSize) {
+      let key = sortedBuf[si];
+      var sj : Int = si - 1;
+      while (sj >= 0 and sortedBuf[Int.abs(sj)].timestamp < key.timestamp) {
+        sortedBuf[Int.abs(sj) + 1] := sortedBuf[Int.abs(sj)];
+        sj -= 1;
+      };
+      sortedBuf[Int.abs(sj) + 1] := key;
+      si += 1;
+    };
+    let recentTx = Vector.new<TxEntry>();
+    var ti : Nat = 0;
+    while (ti < Nat.min(tlSize, 50)) {
+      Vector.add(recentTx, sortedBuf[ti]);
+      ti += 1;
+    };
+
+    // --- Active deposits ---
+    let deps = Vector.new<ActiveDeposit>();
+    for ((_, deposit) in Map.entries(activeDeposits)) {
+      if (deposit.caller == user) Vector.add(deps, deposit);
+    };
+
+    // --- Transfers (pending + completed 24h) ---
+    type TaskView = {
+      id : Nat;
+      tokenPrincipal : Principal;
+      amount : Nat;
+      operationType : TransferOperationType;
+      operationId : Nat;
+      status : TransferStatus;
+      createdAt : Int;
+      updatedAt : Int;
+      blockIndex : ?Nat64;
+    };
+    let xfers = Vector.new<TaskView>();
+    for (task in Vector.vals(pendingTransfers)) {
+      if (task.caller == user) {
+        Vector.add(xfers, {
+          id = task.id;
+          tokenPrincipal = task.tokenPrincipal;
+          amount = task.amount;
+          operationType = task.operationType;
+          operationId = task.operationId;
+          status = task.status;
+          createdAt = task.createdAt;
+          updatedAt = task.updatedAt;
+          blockIndex = task.blockIndex;
+        });
+      };
+    };
+    let xferCutoff = now() - 24 * 3600 * 1_000_000_000;
+    for ((_, task) in Map.entries(completedTransfers)) {
+      if (task.caller == user and task.updatedAt >= xferCutoff) {
+        Vector.add(xfers, {
+          id = task.id;
+          tokenPrincipal = task.tokenPrincipal;
+          amount = task.amount;
+          operationType = task.operationType;
+          operationId = task.operationId;
+          status = task.status;
+          createdAt = task.createdAt;
+          updatedAt = task.updatedAt;
+          blockIndex = task.blockIndex;
+        });
+      };
+    };
+
+    // --- Rate limits ---
+    let rlCutoff = now() - FOUR_HOURS_NS;
+    var rlMintOps : Nat = 0;
+    var rlBurnOps : Nat = 0;
+    var rlMintValue : Nat = 0;
+    var rlBurnValue : Nat = 0;
+    switch (Map.get(userMintOps, phash, user)) {
+      case (?ops) { for (ts in Vector.vals(ops)) { if (ts >= rlCutoff) rlMintOps += 1 } };
+      case null {};
+    };
+    switch (Map.get(userBurnOps, phash, user)) {
+      case (?ops) { for (ts in Vector.vals(ops)) { if (ts >= rlCutoff) rlBurnOps += 1 } };
+      case null {};
+    };
+    switch (Map.get(userMintValues, phash, user)) {
+      case (?vals) { for ((ts, v) in Vector.vals(vals)) { if (ts >= rlCutoff) rlMintValue += v } };
+      case null {};
+    };
+    switch (Map.get(userBurnValues, phash, user)) {
+      case (?vals) { for ((ts, v) in Vector.vals(vals)) { if (ts >= rlCutoff) rlBurnValue += v } };
+      case null {};
+    };
+
+    // --- User totals ---
+    var uMintVol : Nat = 0;
+    for (i in Iter.range(0, if (uMintTotal > 0) { uMintTotal - 1 } else { 0 })) {
+      if (uMintTotal > 0) uMintVol += Vector.get(allUserMints, i).totalDepositValueICP;
+    };
+    var uBurnVol : Nat = 0;
+    for (i in Iter.range(0, if (uBurnTotal > 0) { uBurnTotal - 1 } else { 0 })) {
+      if (uBurnTotal > 0) uBurnVol += Vector.get(allUserBurns, i).redemptionValueICP;
+    };
+    var uFees : Nat = 0;
+    for (record in Vector.vals(feeHistory)) {
+      if (record.userPrincipal == user) uFees += record.feeAmountICP;
+    };
+
+    {
+      mints = Vector.toArray(mintPage);
+      totalMints = uMintTotal;
+      burns = Vector.toArray(burnPage);
+      totalBurns = uBurnTotal;
+      recentTransactions = Vector.toArray(recentTx);
+      activeDeposits = Vector.toArray(deps);
+      transfers = Vector.toArray(xfers);
+      rateLimits = {
+        mintOpsIn4h = rlMintOps;
+        burnOpsIn4h = rlBurnOps;
+        mintValueIn4h = rlMintValue;
+        burnValueIn4h = rlBurnValue;
+        maxMintOps = maxMintOpsPerUser4Hours;
+        maxBurnOps = maxBurnOpsPerUser4Hours;
+        maxMintICPPerUser4Hours;
+        maxBurnNachosPerUser4Hours;
+      };
+      userTotalMintVolumeICP = uMintVol;
+      userTotalBurnVolumeICP = uBurnVol;
+      userTotalFeesICP = uFees;
+    };
+  };
+
+  // Aggregated stats for analytics/infographics: volume, fees, counts, NAV performance.
+  public query func getVaultAnalytics() : async {
+    totalMintCount : Nat;
+    totalMintVolumeICP : Nat;
+    mintsByMode : { icp : Nat; singleToken : Nat; portfolioShare : Nat };
+    totalBurnCount : Nat;
+    totalBurnVolumeICP : Nat;
+    totalBurnVolumeNACHOS : Nat;
+    totalFeesCollectedICP : Nat;
+    mintFeesICP : Nat;
+    burnFeesICP : Nat;
+    feeCount : Nat;
+    currentNAV : ?CachedNAV;
+    initialNAVPerToken : Nat;
+    navChangePercent : ?Float;
+    nachosSupply : Nat;
+    portfolioValueICP : Nat;
+    globalMintIn4h : Nat;
+    globalBurnIn4h : Nat;
+    maxMintPer4h : Nat;
+    maxBurnPer4h : Nat;
+  } {
+    var totalMintVol : Nat = 0;
+    var icpMints : Nat = 0;
+    var singleTokenMints : Nat = 0;
+    var portfolioShareMints : Nat = 0;
+
+    for (record in Vector.vals(mintHistory)) {
+      totalMintVol += record.totalDepositValueICP;
+      switch (record.mintMode) {
+        case (#ICP) { icpMints += 1 };
+        case (#SingleToken) { singleTokenMints += 1 };
+        case (#PortfolioShare) { portfolioShareMints += 1 };
+      };
+    };
+
+    var totalBurnVol : Nat = 0;
+    var totalBurnNachos : Nat = 0;
+    for (record in Vector.vals(burnHistory)) {
+      totalBurnVol += record.redemptionValueICP;
+      totalBurnNachos += record.nachosBurned;
+    };
+
+    var totalFees : Nat = 0;
+    var mFees : Nat = 0;
+    var bFees : Nat = 0;
+    for (record in Vector.vals(feeHistory)) {
+      totalFees += record.feeAmountICP;
+      switch (record.feeType) {
+        case (#Mint) { mFees += record.feeAmountICP };
+        case (#Burn) { bFees += record.feeAmountICP };
+      };
+    };
+
+    let navChange : ?Float = switch (cachedNAV) {
+      case (?nav) {
+        if (INITIAL_NAV_PER_TOKEN_E8S > 0) {
+          ?(Float.fromInt(nav.navPerTokenE8s - INITIAL_NAV_PER_TOKEN_E8S) / Float.fromInt(INITIAL_NAV_PER_TOKEN_E8S) * 100.0);
+        } else { null };
+      };
+      case null { null };
+    };
+
+    let supply = switch (cachedNAV) { case (?n) { n.nachosSupply }; case null { 0 } };
+    let portfolioVal = switch (cachedNAV) { case (?n) { n.portfolioValueICP }; case null { 0 } };
+
+    let cutoff = now() - FOUR_HOURS_NS;
+    var gMint : Nat = 0;
+    var gBurn : Nat = 0;
+    for (entry in Vector.vals(mintRateTracker)) { if (entry.0 >= cutoff) gMint += entry.1 };
+    for (entry in Vector.vals(burnRateTracker)) { if (entry.0 >= cutoff) gBurn += entry.1 };
+
+    {
+      totalMintCount = Vector.size(mintHistory);
+      totalMintVolumeICP = totalMintVol;
+      mintsByMode = { icp = icpMints; singleToken = singleTokenMints; portfolioShare = portfolioShareMints };
+      totalBurnCount = Vector.size(burnHistory);
+      totalBurnVolumeICP = totalBurnVol;
+      totalBurnVolumeNACHOS = totalBurnNachos;
+      totalFeesCollectedICP = totalFees;
+      mintFeesICP = mFees;
+      burnFeesICP = bFees;
+      feeCount = Vector.size(feeHistory);
+      currentNAV = cachedNAV;
+      initialNAVPerToken = INITIAL_NAV_PER_TOKEN_E8S;
+      navChangePercent = navChange;
+      nachosSupply = supply;
+      portfolioValueICP = portfolioVal;
+      globalMintIn4h = gMint;
+      globalBurnIn4h = gBurn;
+      maxMintPer4h = maxMintICPWorthPer4Hours;
+      maxBurnPer4h = maxNachosBurnPer4Hours;
+    };
   };
 
   public shared query ({ caller }) func getUserDeposits(user : Principal) : async [ActiveDeposit] {
@@ -2642,6 +4322,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     navDropThresholdPercent : Float;
     portfolioShareMaxDeviationBP : Nat;
     cancellationFeeMultiplier : Nat;
+    maxMintICPPerUser4Hours : Nat;
+    maxBurnNachosPerUser4Hours : Nat;
+    maxMintAmountICP : Nat;
+    maxBurnAmountNachos : Nat;
   } {
     {
       mintFeeBasisPoints;
@@ -2656,14 +4340,22 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       navDropThresholdPercent;
       portfolioShareMaxDeviationBP;
       cancellationFeeMultiplier;
+      maxMintICPPerUser4Hours;
+      maxBurnNachosPerUser4Hours;
+      maxMintAmountICP;
+      maxBurnAmountNachos;
     };
   };
 
-  public shared query ({ caller }) func getUserRateLimitStatus(user : Principal) : async { mintOpsIn4h : Nat; burnOpsIn4h : Nat } {
-    if (caller != user and not isMasterAdmin(caller)) return { mintOpsIn4h = 0; burnOpsIn4h = 0 };
+  public shared query ({ caller }) func getUserRateLimitStatus(user : Principal) : async {
+    mintOpsIn4h : Nat; burnOpsIn4h : Nat; mintValueIn4h : Nat; burnValueIn4h : Nat;
+  } {
+    if (caller != user and not isMasterAdmin(caller)) return { mintOpsIn4h = 0; burnOpsIn4h = 0; mintValueIn4h = 0; burnValueIn4h = 0 };
     let cutoff = now() - FOUR_HOURS_NS;
     var mintOps : Nat = 0;
     var burnOps : Nat = 0;
+    var mintValue : Nat = 0;
+    var burnValue : Nat = 0;
 
     switch (Map.get(userMintOps, phash, user)) {
       case (?ops) { for (ts in Vector.vals(ops)) { if (ts >= cutoff) mintOps += 1 } };
@@ -2673,8 +4365,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (?ops) { for (ts in Vector.vals(ops)) { if (ts >= cutoff) burnOps += 1 } };
       case null {};
     };
+    switch (Map.get(userMintValues, phash, user)) {
+      case (?vals) { for ((ts, v) in Vector.vals(vals)) { if (ts >= cutoff) mintValue += v } };
+      case null {};
+    };
+    switch (Map.get(userBurnValues, phash, user)) {
+      case (?vals) { for ((ts, v) in Vector.vals(vals)) { if (ts >= cutoff) burnValue += v } };
+      case null {};
+    };
 
-    { mintOpsIn4h = mintOps; burnOpsIn4h = burnOps };
+    { mintOpsIn4h = mintOps; burnOpsIn4h = burnOps; mintValueIn4h = mintValue; burnValueIn4h = burnValue };
   };
 
   public query func getGlobalRateLimitStatus() : async { totalMintValueIn4h : Nat; totalBurnAmountIn4h : Nat } {
@@ -2712,22 +4412,30 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // SECTION 13: TIMER SYSTEM & LIFECYCLE
   // ═══════════════════════════════════════════════════════════════════
 
-  // --- Timer: Balance & Allocation Update (15 min) ---
-  private func startBalanceUpdateTimer<system>() {
-    switch (balanceUpdateTimerId) { case (?id) { cancelTimer(id) }; case null {} };
-    balanceUpdateTimerId := ?setTimer<system>(#nanoseconds(15 * 60 * 1_000_000_000), func() : async () {
-      try {
-        let details = await treasury.getTokenDetails();
-        for ((token, detail) in details.vals()) {
-          Map.set(tokenDetailsMap, phash, token, detail);
+  // --- Timer: Periodic Sync (15 min) — token details, allocations, NAV snapshot, circuit breaker ---
+  private func startPeriodicSyncTimer<system>() {
+    switch (periodicSyncTimerId) { case (?id) { cancelTimer(id) }; case null {} };
+    periodicSyncTimerId := ?setTimer<system>(#nanoseconds(15 * 60 * 1_000_000_000), func() : async () {
+      // 1. Sync token details from treasury (skip if mint/burn just refreshed data)
+      if (now() - lastMintBurnTime >= 15 * 60 * 1_000_000_000) {
+        try {
+          let details = await treasury.getTokenDetails();
+          for ((token, detail) in details.vals()) {
+            Map.set(tokenDetailsMap, phash, token, detail);
+          };
+        } catch (e) {
+          logger.warn("TIMER", "Token details sync failed: " # Error.message(e), "periodicSync");
         };
-      } catch (e) {
-        logger.warn("TIMER", "Balance update failed: " # Error.message(e), "balanceUpdate");
+      } else {
+        logger.info("TIMER", "Skipping treasury balance sync — mint/burn refreshed data recently", "periodicSync");
       };
 
+      // 2. Clean rate limit windows (moved here from per-operation for efficiency)
+      cleanRateLimitWindows();
+
+      // 3. Sync allocations from DAO
       try {
         let allocs = await dao.getAggregateAllocation();
-        // Clear and repopulate
         for ((token, _) in Map.entries(aggregateAllocation)) {
           ignore Map.remove(aggregateAllocation, phash, token);
         };
@@ -2735,34 +4443,42 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           Map.set(aggregateAllocation, phash, token, vp);
         };
       } catch (e) {
-        logger.warn("TIMER", "Allocation sync failed: " # Error.message(e), "balanceUpdate");
+        logger.warn("TIMER", "Allocation sync failed: " # Error.message(e), "periodicSync");
       };
 
-      startBalanceUpdateTimer();
-    });
-  };
+      // 4. Calculate NAV + record snapshot
+      ignore await calculateNAV();
+      recordNavSnapshot(#Scheduled);
 
-  // --- Timer: ICPSwap Pool Discovery (5 hours) ---
-  private func startPoolDiscoveryTimer<system>() {
-    switch (poolDiscoveryTimerId) { case (?id) { cancelTimer(id) }; case null {} };
-    poolDiscoveryTimerId := ?setTimer<system>(#nanoseconds(5 * 3600 * 1_000_000_000), func() : async () {
-      try {
-        let result = await ICPSwap.getAllPools();
-        switch (result) {
-          case (#ok(pools)) {
-            for (pool in pools.vals()) {
-              Map.set(ICPswapPools, phash, pool.canisterId, pool);
+      // 5. Circuit breaker check
+      if (not circuitBreakerActive and Vector.size(navHistory) >= 2) {
+        let currentNav = switch (cachedNAV) {
+          case (?n) { n.navPerTokenE8s };
+          case null { 0 };
+        };
+        if (currentNav > 0) {
+          let windowCutoff = now() - navDropTimeWindowNS;
+          var maxNavInWindow : Nat = currentNav;
+          var i = Vector.size(navHistory);
+          while (i > 0) {
+            i -= 1;
+            let snap = Vector.get(navHistory, i);
+            if (snap.timestamp < windowCutoff) { i := 0 }
+            else if (snap.navPerTokenE8s > maxNavInWindow) {
+              maxNavInWindow := snap.navPerTokenE8s;
             };
-            logger.info("TIMER", "Pool discovery: " # Nat.toText(pools.size()) # " pools", "poolDiscovery");
           };
-          case (#err(e)) {
-            logger.warn("TIMER", "Pool discovery failed: " # e, "poolDiscovery");
+          if (maxNavInWindow > currentNav) {
+            let dropPercent = Float.fromInt(maxNavInWindow - currentNav) / Float.fromInt(maxNavInWindow) * 100.0;
+            if (dropPercent >= navDropThresholdPercent) {
+              circuitBreakerActive := true;
+              logger.warn("CIRCUIT_BREAKER", "NAV drop detected: " # Float.toText(dropPercent) # "% (threshold: " # Float.toText(navDropThresholdPercent) # "%)", "periodicSync");
+            };
           };
         };
-      } catch (e) {
-        logger.warn("TIMER", "Pool discovery error: " # Error.message(e), "poolDiscovery");
       };
-      startPoolDiscoveryTimer();
+
+      startPeriodicSyncTimer();
     });
   };
 
@@ -2792,74 +4508,32 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     });
   };
 
-  // --- Timer: NAV Snapshot (15 min) ---
-  private func startNavSnapshotTimer<system>() {
-    switch (navSnapshotTimerId) { case (?id) { cancelTimer(id) }; case null {} };
-    navSnapshotTimerId := ?setTimer<system>(#nanoseconds(15 * 60 * 1_000_000_000), func() : async () {
-      ignore await calculateNAV();
-      recordNavSnapshot(#Scheduled);
-      startNavSnapshotTimer();
-    });
-  };
-
-  // --- Timer: Circuit Breaker Check (5 min) ---
-  private func startCircuitBreakerTimer<system>() {
-    switch (circuitBreakerTimerId) { case (?id) { cancelTimer(id) }; case null {} };
-    circuitBreakerTimerId := ?setTimer<system>(#nanoseconds(5 * 60 * 1_000_000_000), func() : async () {
-      if (not circuitBreakerActive and Vector.size(navHistory) >= 2) {
-        let currentNav = switch (cachedNAV) {
-          case (?n) { n.navPerTokenE8s };
-          case null { 0 };
-        };
-
-        if (currentNav > 0) {
-          let windowCutoff = now() - navDropTimeWindowNS;
-          var maxNavInWindow : Nat = currentNav;
-
-          var i = Vector.size(navHistory);
-          while (i > 0) {
-            i -= 1;
-            let snap = Vector.get(navHistory, i);
-            if (snap.timestamp < windowCutoff) { i := 0 } // break
-            else {
-              if (snap.navPerTokenE8s > maxNavInWindow) {
-                maxNavInWindow := snap.navPerTokenE8s;
-              };
-            };
-          };
-
-          if (maxNavInWindow > currentNav) {
-            let dropPercent = Float.fromInt(maxNavInWindow - currentNav) / Float.fromInt(maxNavInWindow) * 100.0;
-            if (dropPercent >= navDropThresholdPercent) {
-              circuitBreakerActive := true;
-              logger.warn("CIRCUIT_BREAKER", "NAV drop detected: " # Float.toText(dropPercent) # "% (threshold: " # Float.toText(navDropThresholdPercent) # "%)", "circuitBreakerCheck");
-            };
-          };
-        };
-      };
-      startCircuitBreakerTimer();
-    });
-  };
-
-  // --- Timer: Transfer Queue Processing (30 sec) ---
-  private func startTransferQueueTimer<system>() {
-    switch (transferQueueTimerId) { case (?id) { cancelTimer(id) }; case null {} };
-    transferQueueTimerId := ?setTimer<system>(#nanoseconds(30 * 1_000_000_000), func() : async () {
+  // --- Transfer Queue Processing (on-demand, 30 sec delay) ---
+  private func ensureTransferQueueRunning<system>() {
+    switch (transferQueueTimerId) {
+      case (?_) { return }; // already scheduled
+      case null {};
+    };
+    transferQueueTimerId := ?setTimer<system>(#nanoseconds(5 * 1_000_000_000), func() : async () {
+      transferQueueTimerId := null;
       if (Vector.size(pendingTransfers) > 0) {
         await processTransferQueue();
+        // Re-check: if still items remaining (retries), schedule again
+        if (Vector.size(pendingTransfers) > 0) {
+          ensureTransferQueueRunning();
+        };
       };
-      startTransferQueueTimer();
     });
   };
 
   // --- Start All Timers ---
   private func startAllTimers<system>() {
-    startBalanceUpdateTimer();
-    startPoolDiscoveryTimer();
+    startPeriodicSyncTimer();
     startBlockCleanupTimer();
-    startNavSnapshotTimer();
-    startCircuitBreakerTimer();
-    startTransferQueueTimer();
+    // Transfer queue is on-demand — check if pending transfers from before upgrade
+    if (Vector.size(pendingTransfers) > 0) {
+      ensureTransferQueueRunning();
+    };
   };
 
   // --- Lifecycle: Post-upgrade ---

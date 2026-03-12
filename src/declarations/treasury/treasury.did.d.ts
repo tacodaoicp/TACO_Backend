@@ -136,29 +136,9 @@ export type Result = { 'ok' : string } |
   { 'err' : string };
 export type Result_1 = { 'ok' : string } |
   { 'err' : PriceFailsafeError };
-export type Result_10 = { 'ok' : Array<[Principal, Array<PricePoint>]> } |
-  { 'err' : string };
-export type Result_11 = { 'ok' : PortfolioHistoryResponse } |
-  { 'err' : PortfolioSnapshotError };
-export type Result_12 = { 'ok' : Array<ClaimsReply> } |
-  { 'err' : string };
-export type Result_13 = { 'ok' : bigint } |
-  { 'err' : PriceFailsafeError };
-export type Result_14 = { 'ok' : bigint } |
-  { 'err' : PortfolioCircuitBreakerError };
-export type Result_2 = { 'ok' : string } |
-  { 'err' : RebalanceError };
-export type Result_3 = { 'ok' : string } |
-  { 'err' : PortfolioCircuitBreakerError };
-export type Result_4 = { 'ok' : string } |
-  { 'err' : PortfolioSnapshotError };
-export type Result_5 = { 'ok' : string } |
+export type Result_10 = { 'ok' : TreasuryAdminActionsSinceResponse } |
   { 'err' : TradingPauseError };
-export type Result_6 = { 'ok' : string } |
-  { 'err' : SyncErrorTreasury };
-export type Result_7 = { 'ok' : TreasuryAdminActionsSinceResponse } |
-  { 'err' : TradingPauseError };
-export type Result_8 = {
+export type Result_11 = {
     'ok' : {
       'executedTrades' : Array<TradeRecord>,
       'metrics' : {
@@ -187,7 +167,7 @@ export type Result_8 = {
     }
   } |
   { 'err' : string };
-export type Result_9 = {
+export type Result_12 = {
     'ok' : {
       'executedTrades' : Array<TradeRecord>,
       'metrics' : {
@@ -213,6 +193,75 @@ export type Result_9 = {
         'totalValueICP' : bigint,
         'totalValueUSD' : number,
         'targetAllocations' : Array<[Principal, bigint]>,
+      },
+    }
+  } |
+  { 'err' : string };
+export type Result_13 = { 'ok' : Array<[Principal, Array<PricePoint>]> } |
+  { 'err' : string };
+export type Result_14 = { 'ok' : PortfolioHistoryResponse } |
+  { 'err' : PortfolioSnapshotError };
+export type Result_15 = { 'ok' : Array<ClaimsReply> } |
+  { 'err' : string };
+export type Result_16 = { 'ok' : bigint } |
+  { 'err' : PriceFailsafeError };
+export type Result_17 = { 'ok' : bigint } |
+  { 'err' : PortfolioCircuitBreakerError };
+export type Result_2 = { 'ok' : string } |
+  { 'err' : RebalanceError };
+export type Result_3 = { 'ok' : string } |
+  { 'err' : PortfolioCircuitBreakerError };
+export type Result_4 = { 'ok' : string } |
+  { 'err' : PortfolioSnapshotError };
+export type Result_5 = { 'ok' : string } |
+  { 'err' : TradingPauseError };
+export type Result_6 = { 'ok' : string } |
+  { 'err' : SyncErrorTreasury };
+export type Result_7 = {
+    'ok' : {
+      'icpPriceUSD' : number,
+      'tokenDetails' : Array<[Principal, TokenDetails]>,
+      'tokensRefreshed' : bigint,
+      'timestamp' : bigint,
+    }
+  } |
+  { 'err' : string };
+export type Result_8 = {
+    'ok' : {
+      'icpPriceUSD' : number,
+      'tokensRefreshed' : bigint,
+      'timestamp' : bigint,
+    }
+  } |
+  { 'err' : string };
+export type Result_9 = {
+    'ok' : {
+      'tradingStatus' : {
+        'executedTrades' : Array<TradeRecord>,
+        'metrics' : {
+          'avgSlippage' : number,
+          'successRate' : number,
+          'lastUpdate' : bigint,
+          'totalTradesExecuted' : bigint,
+          'lastRebalanceAttempt' : bigint,
+          'skipBreakdown' : {
+            'tokensFiltered' : bigint,
+            'insufficientCandidates' : bigint,
+            'noExecutionPath' : bigint,
+            'noPairsFound' : bigint,
+            'pausedTokens' : bigint,
+          },
+          'skipRate' : number,
+          'totalTradesFailed' : bigint,
+          'totalTradesSkipped' : bigint,
+        },
+        'rebalanceStatus' : RebalanceStatus,
+        'portfolioState' : {
+          'currentAllocations' : Array<[Principal, bigint]>,
+          'totalValueICP' : bigint,
+          'totalValueUSD' : number,
+          'targetAllocations' : Array<[Principal, bigint]>,
+        },
       },
     }
   } |
@@ -437,7 +486,7 @@ export interface treasury {
    */
   'addPortfolioCircuitBreakerCondition' : ActorMethod<
     [string, PortfolioDirection, number, bigint, PortfolioValueType],
-    Result_14
+    Result_17
   >,
   /**
    * / * Add a new price trigger condition
@@ -449,7 +498,7 @@ export interface treasury {
    */
   'addTriggerCondition' : ActorMethod<
     [string, PriceDirection, number, bigint, Array<Principal>],
-    Result_13
+    Result_16
   >,
   /**
    * / * Execute all pending KongSwap claims to recover tokens
@@ -460,7 +509,7 @@ export interface treasury {
    * / * Query pending KongSwap claims for this treasury
    * /    * Returns list of claims that can be recovered
    */
-  'admin_getKongClaims' : ActorMethod<[], Result_12>,
+  'admin_getKongClaims' : ActorMethod<[], Result_15>,
   'admin_recoverPoolBalances' : ActorMethod<[], Result>,
   /**
    * / * Manually refresh ICPSwap pools from factory
@@ -598,13 +647,13 @@ export interface treasury {
    * /    * Returns recent portfolio snapshots for analysis and charting.
    * /    * Public query - allows anyone to view portfolio history (read-only transparency).
    */
-  'getPortfolioHistory' : ActorMethod<[bigint], Result_11>,
+  'getPortfolioHistory' : ActorMethod<[bigint], Result_14>,
   /**
    * / * Get portfolio history filtered by timestamp (for archive efficiency)
    * /    * Returns only snapshots newer than the specified timestamp
    * /    * Public query - allows anyone to view portfolio history (read-only transparency).
    */
-  'getPortfolioHistorySince' : ActorMethod<[bigint, bigint], Result_11>,
+  'getPortfolioHistorySince' : ActorMethod<[bigint, bigint], Result_14>,
   /**
    * / * Get portfolio snapshot status
    */
@@ -680,7 +729,7 @@ export interface treasury {
     [bigint],
     Array<[Principal, TokenDetails]>
   >,
-  'getTokenPriceHistory' : ActorMethod<[Array<Principal>], Result_10>,
+  'getTokenPriceHistory' : ActorMethod<[Array<Principal>], Result_13>,
   /**
    * / * Get trading pause record for a specific token
    * /    *
@@ -698,13 +747,14 @@ export interface treasury {
    * /    * - Current vs target allocations
    * /    * - Performance metrics
    */
-  'getTradingStatus' : ActorMethod<[], Result_9>,
+  'getTradingStatus' : ActorMethod<[], Result_12>,
   /**
    * / * Get trading status with trades filtered by timestamp (for archive efficiency)
    * /    * Returns only trades newer than the specified timestamp
    */
-  'getTradingStatusSince' : ActorMethod<[bigint], Result_8>,
-  'getTreasuryAdminActionsSince' : ActorMethod<[bigint, bigint], Result_7>,
+  'getTradingStatusSince' : ActorMethod<[bigint], Result_11>,
+  'getTreasuryAdminActionsSince' : ActorMethod<[bigint, bigint], Result_10>,
+  'getTreasuryDashboard' : ActorMethod<[], Result_9>,
   /**
    * / * Get a specific trigger condition by ID
    * /    *
@@ -772,6 +822,13 @@ export interface treasury {
     [Array<[TransferRecipient, bigint, Principal, number]>, boolean],
     [boolean, [] | [Array<[Principal, bigint]>]]
   >,
+  /**
+   * / * Public price refresh function for nachos_vault and authorized callers.
+   * /    * Rate-limited to MIN_PRICE_REFRESH_INTERVAL_NS between calls.
+   * /    * Wraps the private syncPriceWithDEX() function.
+   */
+  'refreshAllPrices' : ActorMethod<[], Result_8>,
+  'refreshPricesAndGetDetails' : ActorMethod<[], Result_7>,
   /**
    * / * Remove a portfolio circuit breaker condition
    */

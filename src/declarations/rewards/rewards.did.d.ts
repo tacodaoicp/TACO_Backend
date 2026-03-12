@@ -79,6 +79,7 @@ export interface LeaderboardEntry {
   'lastActivity' : bigint,
   'rank' : bigint,
   'distributionsCount' : bigint,
+  'totalRewardsEarned' : bigint,
   'neuronId' : Uint8Array | number[],
 }
 export type LeaderboardPriceType = { 'ICP' : null } |
@@ -207,12 +208,13 @@ export interface Rewards {
     [BackfillConfig],
     Result__1_12
   >,
-  'admin_recalculateAllIcpPerformance' : ActorMethod<[], Result__1>,
-  'admin_recalculateIcpPerformanceForDistribution' : ActorMethod<
-    [bigint],
+  'admin_backfillMissingNeurons' : ActorMethod<
+    [Array<Uint8Array | number[]>, bigint],
     Result__1
   >,
-  'admin_recalculateDistributionPerformance' : ActorMethod<
+  'admin_recalculateAllIcpPerformance' : ActorMethod<[], Result__1>,
+  'admin_recalculateDistributionPerformance' : ActorMethod<[bigint], Result__1>,
+  'admin_recalculateIcpPerformanceForDistribution' : ActorMethod<
     [bigint],
     Result__1
   >,
@@ -229,6 +231,19 @@ export interface Rewards {
    */
   'clearLogs' : ActorMethod<[], undefined>,
   'deleteMyDisplayName' : ActorMethod<[], Result__1>,
+  'getAllLeaderboards' : ActorMethod<
+    [[] | [bigint], [] | [bigint]],
+    {
+      'oneMonthICP' : Array<LeaderboardEntry>,
+      'oneMonthUSD' : Array<LeaderboardEntry>,
+      'oneWeekICP' : Array<LeaderboardEntry>,
+      'oneWeekUSD' : Array<LeaderboardEntry>,
+      'oneYearICP' : Array<LeaderboardEntry>,
+      'oneYearUSD' : Array<LeaderboardEntry>,
+      'allTimeICP' : Array<LeaderboardEntry>,
+      'allTimeUSD' : Array<LeaderboardEntry>,
+    }
+  >,
   'getAllNeuronRewardBalances' : ActorMethod<
     [],
     Array<[Uint8Array | number[], bigint]>

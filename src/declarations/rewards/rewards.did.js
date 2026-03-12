@@ -85,6 +85,16 @@ export const idlFactory = ({ IDL }) => {
     'ok' : PerformanceResult,
     'err' : RewardsError,
   });
+  const LeaderboardEntry = IDL.Record({
+    'principal' : IDL.Principal,
+    'displayName' : IDL.Opt(IDL.Text),
+    'performanceScore' : IDL.Float64,
+    'lastActivity' : IDL.Int,
+    'rank' : IDL.Nat,
+    'distributionsCount' : IDL.Nat,
+    'totalRewardsEarned' : IDL.Nat,
+    'neuronId' : IDL.Vec(IDL.Nat8),
+  });
   const Account = IDL.Record({
     'owner' : IDL.Principal,
     'subaccount' : IDL.Opt(IDL.Vec(IDL.Nat8)),
@@ -159,15 +169,6 @@ export const idlFactory = ({ IDL }) => {
   const LeaderboardPriceType = IDL.Variant({
     'ICP' : IDL.Null,
     'USD' : IDL.Null,
-  });
-  const LeaderboardEntry = IDL.Record({
-    'principal' : IDL.Principal,
-    'displayName' : IDL.Opt(IDL.Text),
-    'performanceScore' : IDL.Float64,
-    'lastActivity' : IDL.Int,
-    'rank' : IDL.Nat,
-    'distributionsCount' : IDL.Nat,
-    'neuronId' : IDL.Vec(IDL.Nat8),
   });
   const LogLevel = IDL.Variant({
     'INFO' : IDL.Null,
@@ -296,14 +297,19 @@ export const idlFactory = ({ IDL }) => {
         [Result__1_12],
         [],
       ),
-    'admin_recalculateAllIcpPerformance' : IDL.Func([], [Result__1], []),
-    'admin_recalculateIcpPerformanceForDistribution' : IDL.Func(
-        [IDL.Nat],
+    'admin_backfillMissingNeurons' : IDL.Func(
+        [IDL.Vec(IDL.Vec(IDL.Nat8)), IDL.Int],
         [Result__1],
         [],
       ),
+    'admin_recalculateAllIcpPerformance' : IDL.Func([], [Result__1], []),
     'admin_recalculateDistributionPerformance' : IDL.Func(
         [IDL.Int],
+        [Result__1],
+        [],
+      ),
+    'admin_recalculateIcpPerformanceForDistribution' : IDL.Func(
+        [IDL.Nat],
         [Result__1],
         [],
       ),
@@ -319,6 +325,22 @@ export const idlFactory = ({ IDL }) => {
       ),
     'clearLogs' : IDL.Func([], [], []),
     'deleteMyDisplayName' : IDL.Func([], [Result__1], []),
+    'getAllLeaderboards' : IDL.Func(
+        [IDL.Opt(IDL.Nat), IDL.Opt(IDL.Nat)],
+        [
+          IDL.Record({
+            'oneMonthICP' : IDL.Vec(LeaderboardEntry),
+            'oneMonthUSD' : IDL.Vec(LeaderboardEntry),
+            'oneWeekICP' : IDL.Vec(LeaderboardEntry),
+            'oneWeekUSD' : IDL.Vec(LeaderboardEntry),
+            'oneYearICP' : IDL.Vec(LeaderboardEntry),
+            'oneYearUSD' : IDL.Vec(LeaderboardEntry),
+            'allTimeICP' : IDL.Vec(LeaderboardEntry),
+            'allTimeUSD' : IDL.Vec(LeaderboardEntry),
+          }),
+        ],
+        ['query'],
+      ),
     'getAllNeuronRewardBalances' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat))],

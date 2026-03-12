@@ -79,6 +79,7 @@ module {
     #ExcessReturn;
     #CancelReturn;
     #Recovery;
+    #ForwardToPortfolio;
   };
 
   public type TransferStatus = {
@@ -247,6 +248,7 @@ module {
     #BlockVerificationFailed : Text;
     #TokenNotActive;
     #TokenPaused;
+    #PortfolioTokenPaused : { pausedTokens : [{ token : Principal; symbol : Text }] };
     #TokenNotAccepted;
     #AllocationExceeded;
     #InvalidAllocation;
@@ -256,6 +258,9 @@ module {
     #CircuitBreakerActive;
     #BurnLimitExceeded : { maxPer4Hours : Nat; recentBurns : Nat; requested : Nat };
     #MintLimitExceeded : { maxPer4Hours : Nat; recentMints : Nat; requested : Nat };
+    #UserMintLimitExceeded : { maxPer4Hours : Nat; recentMints : Nat; requested : Nat };
+    #UserBurnLimitExceeded : { maxPer4Hours : Nat; recentBurns : Nat; requested : Nat };
+    #AboveMaximumValue : { max : Nat; requested : Nat };
     #PortfolioShareMismatch : {
       expected : [{ token : Principal; basisPoints : Nat }];
       received : [{ token : Principal; basisPoints : Nat }];
@@ -295,6 +300,10 @@ module {
     cancellationFeeMultiplier : ?Nat;
     mintingEnabled : ?Bool;
     burningEnabled : ?Bool;
+    maxMintICPPerUser4Hours : ?Nat;
+    maxBurnNachosPerUser4Hours : ?Nat;
+    maxMintAmountICP : ?Nat;
+    maxBurnAmountNachos : ?Nat;
   };
 
 };

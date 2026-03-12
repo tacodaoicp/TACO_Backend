@@ -3457,6 +3457,79 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     };
   };  
 
+  // Consolidated dashboard query — replaces getTokenDetailsWithoutPastPrices + getAggregateAllocation + votingPowerMetrics + getSnapshotInfo
+  public query ({ caller }) func getDashboardData() : async ?{
+    tokenDetails : [PublicTokenDetailsEntry];
+    aggregateAllocation : [(Principal, Nat)];
+    votingPowerMetrics : {
+      allocatedVotingPower : Nat;
+      neuronCount : Nat;
+      principalCount : Nat;
+      totalVotingPower : Nat;
+      totalVotingPowerByHotkeySetters : Nat;
+    };
+    snapshotInfo : {
+      lastSnapshotId : Nat;
+      lastSnapshotTime : Int;
+      totalVotingPower : Nat;
+    };
+  } {
+    if (not isAllowedQuery(caller)) { return null };
+
+    // Token details (same as getTokenDetailsWithoutPastPrices)
+    let tokens = Iter.toArray(
+      Iter.map(
+        Map.entries(tokenDetailsMap),
+        func((principal : Principal, details : TokenDetails)) : PublicTokenDetailsEntry {
+          (principal, {
+            Active = details.Active;
+            isPaused = details.isPaused;
+            epochAdded = details.epochAdded;
+            tokenName = details.tokenName;
+            tokenSymbol = details.tokenSymbol;
+            tokenDecimals = details.tokenDecimals;
+            tokenTransferFee = details.tokenTransferFee;
+            balance = details.balance;
+            priceInICP = details.priceInICP;
+            priceInUSD = details.priceInUSD;
+            tokenType = details.tokenType;
+            lastTimeSynced = details.lastTimeSynced;
+            pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+          });
+        },
+      )
+    );
+
+    // Aggregate allocation (same as getAggregateAllocation)
+    var totalAllocatedVP : Nat = 0;
+    for (vp in Map.vals(aggregateAllocation)) {
+      totalAllocatedVP += vp;
+    };
+    let allocResults = Vector.new<(Principal, Nat)>();
+    if (totalAllocatedVP > 0) {
+      for ((token, vp) in Map.entries(aggregateAllocation)) {
+        Vector.add(allocResults, (token, (vp * 10000) / totalAllocatedVP));
+      };
+    };
+
+    ?{
+      tokenDetails = tokens;
+      aggregateAllocation = Vector.toArray(allocResults);
+      votingPowerMetrics = {
+        totalVotingPower;
+        totalVotingPowerByHotkeySetters;
+        allocatedVotingPower;
+        principalCount = Map.size(userStates);
+        neuronCount = Map.size(neuronAllocationMap);
+      };
+      snapshotInfo = {
+        lastSnapshotId;
+        lastSnapshotTime;
+        totalVotingPower;
+      };
+    };
+  };
+
   // Admin method to update spam parameters
   public shared ({ caller }) func updateSpamParameters(
     params : {

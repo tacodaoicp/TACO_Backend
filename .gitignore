@@ -39,3 +39,7 @@ trading_overview.md
 *.md
 sns_canister_source/
 
+
+# NACHOS ledger (cloned from icdevsorg/ICRC_fungible)
+nachos_ledger/
+

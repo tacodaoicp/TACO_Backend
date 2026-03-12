@@ -48,7 +48,7 @@ module CanisterId {
             (#Staging, #dao_neuron_allocation_archive, Principal.fromText("cajb4-qqaaa-aaaan-qz5la-cai")), // Placeholder ID
             (#Staging, #reward_distribution_archive, Principal.fromText("ddfi2-eiaaa-aaaan-qz5nq-cai")),
             (#Staging, #reward_withdrawal_archive, Principal.fromText("dwczx-faaaa-aaaan-qz5oa-cai")),
-            (#Staging, #nachos_vault, Principal.fromText("dwczx-faaaa-aaaan-qz5oa-cai")), // Placeholder - update after deploy
+            (#Staging, #nachos_vault, Principal.fromText("p4nog-baaaa-aaaad-qkwpa-cai")),
 
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),

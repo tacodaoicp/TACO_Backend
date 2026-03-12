@@ -25,9 +25,9 @@ import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
 import Char "mo:base/Char";
 import Service "mo:icrc3-mo/service";
-//import Migration "migration";
+import Migration "migration";
 
-//(with migration = Migration.migrate)
+(with migration = Migration.migrate)
 shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
@@ -207,6 +207,7 @@ shared (deployer) persistent actor class Rewards() = this {
     distributionsCount: Nat;            // How many distributions in this timeframe
     lastActivity: Int;                  // Timestamp of last allocation change
     displayName: ?Text;                 // Optional user-set display name
+    totalRewardsEarned: Nat;            // Total TACO satoshis earned across all neurons in this timeframe
   };
 
   // Individual neuron/user performance lookup types
@@ -3228,6 +3229,38 @@ shared (deployer) persistent actor class Rewards() = this {
     )
   };
 
+  // Consolidated leaderboard query — replaces 8 separate getLeaderboard calls
+  public query func getAllLeaderboards(limit : ?Nat, offset : ?Nat) : async {
+    allTimeUSD : [LeaderboardEntry];
+    allTimeICP : [LeaderboardEntry];
+    oneYearUSD : [LeaderboardEntry];
+    oneYearICP : [LeaderboardEntry];
+    oneMonthUSD : [LeaderboardEntry];
+    oneMonthICP : [LeaderboardEntry];
+    oneWeekUSD : [LeaderboardEntry];
+    oneWeekICP : [LeaderboardEntry];
+  } {
+    let start = switch (offset) { case (?o) o; case null 0 };
+    let count = switch (limit) { case (?l) l; case null leaderboardSize };
+
+    func slice(board : [LeaderboardEntry]) : [LeaderboardEntry] {
+      if (start >= board.size()) { return [] };
+      let end = Nat.min(start + count, board.size());
+      Array.tabulate<LeaderboardEntry>(end - start, func(i) { board[start + i] });
+    };
+
+    {
+      allTimeUSD = slice(leaderboards.allTimeUSD);
+      allTimeICP = slice(leaderboards.allTimeICP);
+      oneYearUSD = slice(leaderboards.oneYearUSD);
+      oneYearICP = slice(leaderboards.oneYearICP);
+      oneMonthUSD = slice(leaderboards.oneMonthUSD);
+      oneMonthICP = slice(leaderboards.oneMonthICP);
+      oneWeekUSD = slice(leaderboards.oneWeekUSD);
+      oneWeekICP = slice(leaderboards.oneWeekICP);
+    };
+  };
+
   // Get leaderboard metadata/info
   public query func getLeaderboardInfo() : async {
     lastUpdate: Int;
@@ -3509,6 +3542,7 @@ shared (deployer) persistent actor class Rewards() = this {
       performanceScores: [Float];  // One per distribution
       distributionCount: Nat;
       lastActivity: Int;
+      totalRewards: Nat;           // Sum of rewardAmount across distributions
     };
 
     let neuronPerformances = Map.new<Blob, NeuronPerformance>();
@@ -3537,6 +3571,7 @@ shared (deployer) persistent actor class Rewards() = this {
               performanceScores = updatedScores;
               distributionCount = existing.distributionCount + 1;
               lastActivity = Int.max(existing.lastActivity, distribution.endTime);
+              totalRewards = existing.totalRewards + neuronReward.rewardAmount;
             });
           };
           case null {
@@ -3546,6 +3581,7 @@ shared (deployer) persistent actor class Rewards() = this {
               performanceScores = [score];
               distributionCount = 1;
               lastActivity = distribution.endTime;
+              totalRewards = neuronReward.rewardAmount;
             });
           };
         };
@@ -3558,6 +3594,7 @@ shared (deployer) persistent actor class Rewards() = this {
       aggregateScore: Float;
       distributionCount: Nat;
       lastActivity: Int;
+      totalRewards: Nat;
     };
 
     let scoredNeurons = Array.map<(Blob, NeuronPerformance), ScoredNeuron>(
@@ -3589,6 +3626,7 @@ shared (deployer) persistent actor class Rewards() = this {
           aggregateScore;
           distributionCount = perf.distributionCount;
           lastActivity = perf.lastActivity;
+          totalRewards = perf.totalRewards;
         }
       }
     );
@@ -3597,6 +3635,7 @@ shared (deployer) persistent actor class Rewards() = this {
     type UserPerformance = {
       principal: Principal;
       bestNeuron: ScoredNeuron;
+      totalRewardsEarned: Nat;
     };
 
     let userPerformances = Map.new<Principal, UserPerformance>();
@@ -3615,10 +3654,18 @@ shared (deployer) persistent actor class Rewards() = this {
                   (scored.distributionCount == existing.bestNeuron.distributionCount and
                    scored.aggregateScore > existing.bestNeuron.aggregateScore);
 
+                // Always accumulate rewards from all neurons, update bestNeuron only if better
                 if (shouldReplace) {
                   Map.set(userPerformances, phash, principal, {
                     principal;
                     bestNeuron = scored;
+                    totalRewardsEarned = existing.totalRewardsEarned + scored.totalRewards;
+                  });
+                } else {
+                  Map.set(userPerformances, phash, principal, {
+                    principal;
+                    bestNeuron = existing.bestNeuron;
+                    totalRewardsEarned = existing.totalRewardsEarned + scored.totalRewards;
                   });
                 };
               };
@@ -3627,6 +3674,7 @@ shared (deployer) persistent actor class Rewards() = this {
                 Map.set(userPerformances, phash, principal, {
                   principal;
                   bestNeuron = scored;
+                  totalRewardsEarned = scored.totalRewards;
                 });
               };
             };
@@ -3657,6 +3705,7 @@ shared (deployer) persistent actor class Rewards() = this {
           distributionsCount = user.bestNeuron.distributionCount;
           lastActivity = user.bestNeuron.lastActivity;
           displayName = Map.get(displayNames, phash, user.principal);
+          totalRewardsEarned = user.totalRewardsEarned;
         }
       }
     );
