@@ -1323,6 +1323,20 @@ phase5_additional_queries() {
     assert_contains "$dashboard" "dataSource" "getVaultDashboard includes dataSource"
   fi
 
+  # ── getAdminDashboard (composite query — admin superset) ──
+  local admin_dashboard
+  admin_dashboard=$(call "$NACHOS_VAULT" getAdminDashboard)
+  assert_contains "$admin_dashboard" "fullConfig" "getAdminDashboard includes fullConfig"
+  assert_contains "$admin_dashboard" "circuitBreakerConditions" "getAdminDashboard includes CB conditions"
+  assert_contains "$admin_dashboard" "transferQueue" "getAdminDashboard includes transfer queue"
+  assert_contains "$admin_dashboard" "claimableMintFees" "getAdminDashboard includes claimable fees"
+  assert_contains "$admin_dashboard" "canisterCycles" "getAdminDashboard includes cycles"
+  assert_contains "$admin_dashboard" "feeExemptPrincipals" "getAdminDashboard includes fee exemptions"
+  assert_contains "$admin_dashboard" "rateLimitExemptPrincipals" "getAdminDashboard includes rate limit exemptions"
+  assert_contains "$admin_dashboard" "recentAlerts" "getAdminDashboard includes recent alerts"
+  assert_contains "$admin_dashboard" "nachosLedger" "getAdminDashboard includes nachosLedger"
+  assert_contains "$admin_dashboard" "mintingEnabled" "getAdminDashboard includes base dashboard fields"
+
   # ── minimumNachosReceive slippage protection ──
   if [ "$GENESIS_DONE" = "1" ]; then
     info "Testing minimumNachosReceive rejection..."

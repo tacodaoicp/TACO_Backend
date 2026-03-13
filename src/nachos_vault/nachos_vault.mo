@@ -4203,6 +4203,391 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
   };
 
+  // All-in-one admin dashboard — superset of getVaultDashboard with admin-only data.
+  // Returns full data only for master admins; returns zeroed admin fields for others.
+  public shared composite query ({ caller }) func getAdminDashboard() : async {
+    // ── System state (same as getVaultDashboard) ──
+    genesisComplete : Bool;
+    systemPaused : Bool;
+    mintingEnabled : Bool;
+    burningEnabled : Bool;
+    circuitBreakerActive : Bool;
+    mintPausedByCircuitBreaker : Bool;
+    burnPausedByCircuitBreaker : Bool;
+
+    // NAV
+    nav : ?CachedNAV;
+
+    // Portfolio with target allocations
+    portfolio : [{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      balance : Nat;
+      priceICP : Nat;
+      priceUSD : Float;
+      valueICP : Nat;
+      currentBasisPoints : Nat;
+      targetBasisPoints : Nat;
+    }];
+    portfolioValueICP : Nat;
+
+    // Config (partial — same 4 as getVaultDashboard)
+    mintFeeBasisPoints : Nat;
+    burnFeeBasisPoints : Nat;
+    minMintValueICP : Nat;
+    minBurnValueICP : Nat;
+
+    // Accepted mint tokens
+    acceptedTokens : [(Principal, AcceptedTokenConfig)];
+
+    // Paused token status
+    hasPausedTokens : Bool;
+    pausedTokens : [{ token : Principal; symbol : Text }];
+
+    // Data freshness
+    dataTimestamp : Int;
+    dataSource : Text;
+
+    // Analytics
+    totalMintCount : Nat;
+    totalMintVolumeICP : Nat;
+    mintsByMode : { icp : Nat; singleToken : Nat; portfolioShare : Nat };
+    totalBurnCount : Nat;
+    totalBurnVolumeICP : Nat;
+    totalBurnVolumeNACHOS : Nat;
+    totalFeesCollectedICP : Nat;
+    mintFeesICP : Nat;
+    burnFeesICP : Nat;
+    feeCount : Nat;
+    navChangePercent : ?Float;
+    nachosSupply : Nat;
+    globalMintIn4h : Nat;
+    globalBurnIn4h : Nat;
+    maxMintPer4h : Nat;
+    maxBurnPer4h : Nat;
+
+    // ── Admin-only fields ──
+
+    // Full configuration (12 fields NOT in getVaultDashboard)
+    fullConfig : {
+      maxSlippageBasisPoints : Nat;
+      maxNachosBurnPer4Hours : Nat;
+      maxMintICPWorthPer4Hours : Nat;
+      maxMintOpsPerUser4Hours : Nat;
+      maxBurnOpsPerUser4Hours : Nat;
+      navDropThresholdPercent : Float;
+      portfolioShareMaxDeviationBP : Nat;
+      cancellationFeeMultiplier : Nat;
+      maxMintICPPerUser4Hours : Nat;
+      maxBurnNachosPerUser4Hours : Nat;
+      maxMintAmountICP : Nat;
+      maxBurnAmountNachos : Nat;
+    };
+
+    // Circuit breaker state
+    circuitBreakerConditions : [CircuitBreakerCondition];
+    recentAlerts : [CircuitBreakerAlert];
+
+    // Exemption lists
+    feeExemptPrincipals : [(Principal, FeeExemptConfig)];
+    rateLimitExemptPrincipals : [(Principal, FeeExemptConfig)];
+
+    // Transfer queue
+    transferQueue : { pending : Nat; completed : Nat; exhausted : Nat; tasks : [VaultTransferTask] };
+
+    // Claimable fees
+    claimableMintFees : { accumulated : Nat; claimed : Nat; claimable : Nat };
+    claimableCancellationFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
+
+    // Operational metrics
+    pendingTransferCount : Nat;
+    activeDepositCount : Nat;
+    canisterCycles : Nat;
+    nachosLedger : ?Principal;
+  } {
+    let isAdmin = isMasterAdmin(caller);
+
+    // 1. Try to fetch fresh data from treasury + DAO via query calls
+    var tokenDetails : [(Principal, TokenDetails)] = [];
+    var allocations : [(Principal, Nat)] = [];
+    var source : Text = "cached";
+
+    try {
+      tokenDetails := await (with timeout = 5) treasuryQuery.getTokenDetails();
+      source := "live";
+    } catch (_) {
+      tokenDetails := Iter.toArray(Map.entries(tokenDetailsMap));
+    };
+
+    try {
+      allocations := await (with timeout = 5) daoQuery.getAggregateAllocation();
+    } catch (_) {
+      allocations := Iter.toArray(Map.entries(aggregateAllocation));
+    };
+
+    // 2. Build lookup maps
+    let detailsMap = Map.new<Principal, TokenDetails>();
+    for ((token, detail) in tokenDetails.vals()) {
+      Map.set(detailsMap, phash, token, detail);
+    };
+
+    let allocMap = Map.new<Principal, Nat>();
+    var totalAllocVP : Nat = 0;
+    for ((token, vp) in allocations.vals()) {
+      Map.set(allocMap, phash, token, vp);
+      totalAllocVP += vp;
+    };
+
+    // 3. Calculate portfolio breakdown
+    var portfolioValue : Nat = 0;
+    let portfolioEntries = Vector.new<{
+      token : Principal;
+      symbol : Text;
+      decimals : Nat;
+      balance : Nat;
+      priceICP : Nat;
+      priceUSD : Float;
+      valueICP : Nat;
+      currentBasisPoints : Nat;
+      targetBasisPoints : Nat;
+    }>();
+
+    for ((token, detail) in tokenDetails.vals()) {
+      if (detail.Active and detail.balance > 0 and detail.priceInICP > 0) {
+        let valueICP = (detail.balance * detail.priceInICP) / (10 ** detail.tokenDecimals);
+        portfolioValue += valueICP;
+      };
+    };
+
+    for ((token, detail) in tokenDetails.vals()) {
+      if (detail.Active and detail.balance > 0) {
+        let valueICP = (detail.balance * detail.priceInICP) / (10 ** detail.tokenDecimals);
+        let currentBP = if (portfolioValue > 0) { (valueICP * 10_000) / portfolioValue } else { 0 };
+        let targetBP = switch (Map.get(allocMap, phash, token)) {
+          case (?vp) { if (totalAllocVP > 0) { (vp * 10_000) / totalAllocVP } else { 0 } };
+          case null { 0 };
+        };
+        Vector.add(portfolioEntries, {
+          token;
+          symbol = detail.tokenSymbol;
+          decimals = detail.tokenDecimals;
+          balance = detail.balance;
+          priceICP = detail.priceInICP;
+          priceUSD = detail.priceInUSD;
+          valueICP;
+          currentBasisPoints = currentBP;
+          targetBasisPoints = targetBP;
+        });
+      };
+    };
+
+    // 4. Accepted tokens
+    let accepted = Vector.new<(Principal, AcceptedTokenConfig)>();
+    for ((token, config) in Map.entries(acceptedMintTokens)) {
+      Vector.add(accepted, (token, config));
+    };
+
+    // 5. Paused tokens
+    let pt = getPausedPortfolioTokens();
+
+    // 6. Analytics computation
+    var aMintVol : Nat = 0;
+    var aIcpMints : Nat = 0;
+    var aSingleMints : Nat = 0;
+    var aPortfolioMints : Nat = 0;
+    for (record in Vector.vals(mintHistory)) {
+      aMintVol += record.totalDepositValueICP;
+      switch (record.mintMode) {
+        case (#ICP) { aIcpMints += 1 };
+        case (#SingleToken) { aSingleMints += 1 };
+        case (#PortfolioShare) { aPortfolioMints += 1 };
+      };
+    };
+
+    var aBurnVol : Nat = 0;
+    var aBurnNachos : Nat = 0;
+    for (record in Vector.vals(burnHistory)) {
+      aBurnVol += record.redemptionValueICP;
+      aBurnNachos += record.nachosBurned;
+    };
+
+    var aTotalFees : Nat = 0;
+    var aMintFees : Nat = 0;
+    var aBurnFees : Nat = 0;
+    for (record in Vector.vals(feeHistory)) {
+      aTotalFees += record.feeAmountICP;
+      switch (record.feeType) {
+        case (#Mint) { aMintFees += record.feeAmountICP };
+        case (#Burn) { aBurnFees += record.feeAmountICP };
+      };
+    };
+
+    let aNavChange : ?Float = switch (cachedNAV) {
+      case (?n) {
+        if (INITIAL_NAV_PER_TOKEN_E8S > 0) {
+          ?(Float.fromInt(n.navPerTokenE8s - INITIAL_NAV_PER_TOKEN_E8S) / Float.fromInt(INITIAL_NAV_PER_TOKEN_E8S) * 100.0);
+        } else { null };
+      };
+      case null { null };
+    };
+
+    let aSupply = switch (cachedNAV) { case (?n) { n.nachosSupply }; case null { 0 } };
+
+    let aCutoff = now() - FOUR_HOURS_NS;
+    var aGMint : Nat = 0;
+    var aGBurn : Nat = 0;
+    for (entry in Vector.vals(mintRateTracker)) { if (entry.0 >= aCutoff) aGMint += entry.1 };
+    for (entry in Vector.vals(burnRateTracker)) { if (entry.0 >= aCutoff) aGBurn += entry.1 };
+
+    // 7. Admin-only data (gated by isMasterAdmin)
+    let adminConfig = if (isAdmin) {
+      {
+        maxSlippageBasisPoints;
+        maxNachosBurnPer4Hours;
+        maxMintICPWorthPer4Hours;
+        maxMintOpsPerUser4Hours;
+        maxBurnOpsPerUser4Hours;
+        navDropThresholdPercent;
+        portfolioShareMaxDeviationBP;
+        cancellationFeeMultiplier;
+        maxMintICPPerUser4Hours;
+        maxBurnNachosPerUser4Hours;
+        maxMintAmountICP;
+        maxBurnAmountNachos;
+      };
+    } else {
+      {
+        maxSlippageBasisPoints = 0 : Nat;
+        maxNachosBurnPer4Hours = 0 : Nat;
+        maxMintICPWorthPer4Hours = 0 : Nat;
+        maxMintOpsPerUser4Hours = 0 : Nat;
+        maxBurnOpsPerUser4Hours = 0 : Nat;
+        navDropThresholdPercent = 0.0 : Float;
+        portfolioShareMaxDeviationBP = 0 : Nat;
+        cancellationFeeMultiplier = 0 : Nat;
+        maxMintICPPerUser4Hours = 0 : Nat;
+        maxBurnNachosPerUser4Hours = 0 : Nat;
+        maxMintAmountICP = 0 : Nat;
+        maxBurnAmountNachos = 0 : Nat;
+      };
+    };
+
+    // Circuit breaker conditions
+    let cbConditions = if (isAdmin) {
+      let conds = Vector.new<CircuitBreakerCondition>();
+      for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+        Vector.add(conds, cond);
+      };
+      Vector.toArray(conds);
+    } else { [] : [CircuitBreakerCondition] };
+
+    // Recent alerts (last 50, newest first)
+    let cbAlerts = if (isAdmin) {
+      let alerts = Vector.new<CircuitBreakerAlert>();
+      let alertSize = Vector.size(circuitBreakerAlerts);
+      var alertIdx = alertSize;
+      var alertCount : Nat = 0;
+      while (alertIdx > 0 and alertCount < 50) {
+        alertIdx -= 1;
+        Vector.add(alerts, Vector.get(circuitBreakerAlerts, alertIdx));
+        alertCount += 1;
+      };
+      Vector.toArray(alerts);
+    } else { [] : [CircuitBreakerAlert] };
+
+    // Fee exemptions
+    let feeExempt = if (isAdmin) {
+      let fe = Vector.new<(Principal, FeeExemptConfig)>();
+      for ((p, c) in Map.entries(feeExemptPrincipals)) { Vector.add(fe, (p, c)) };
+      Vector.toArray(fe);
+    } else { [] : [(Principal, FeeExemptConfig)] };
+
+    // Rate limit exemptions
+    let rlExempt = if (isAdmin) {
+      let rl = Vector.new<(Principal, FeeExemptConfig)>();
+      for ((p, c) in Map.entries(rateLimitExemptPrincipals)) { Vector.add(rl, (p, c)) };
+      Vector.toArray(rl);
+    } else { [] : [(Principal, FeeExemptConfig)] };
+
+    // Transfer queue
+    let tq = if (isAdmin) {
+      var exhausted : Nat = 0;
+      for (task in Vector.vals(pendingTransfers)) {
+        if (task.retryCount >= 5) exhausted += 1;
+      };
+      { pending = Vector.size(pendingTransfers); completed = Map.size(completedTransfers); exhausted; tasks = Vector.toArray(pendingTransfers) };
+    } else { { pending = 0 : Nat; completed = 0 : Nat; exhausted = 0 : Nat; tasks = [] : [VaultTransferTask] } };
+
+    // Claimable fees
+    let claimMint = if (isAdmin) {
+      { accumulated = accumulatedMintFeesICP; claimed = claimedMintFeesICP; claimable = accumulatedMintFeesICP - claimedMintFeesICP };
+    } else { { accumulated = 0 : Nat; claimed = 0 : Nat; claimable = 0 : Nat } };
+
+    let claimCancel = if (isAdmin) {
+      let cc = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+      for ((token, acc) in Map.entries(accumulatedCancellationFees)) {
+        let cl = switch (Map.get(claimedCancellationFees, phash, token)) { case (?v) v; case null 0 };
+        if (acc > cl) Vector.add(cc, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+      };
+      Vector.toArray(cc);
+    } else { [] : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] };
+
+    // 8. Return combined result
+    {
+      // System state
+      genesisComplete;
+      systemPaused;
+      mintingEnabled;
+      burningEnabled;
+      circuitBreakerActive;
+      mintPausedByCircuitBreaker;
+      burnPausedByCircuitBreaker;
+      nav = cachedNAV;
+      portfolio = Vector.toArray(portfolioEntries);
+      portfolioValueICP = portfolioValue;
+      mintFeeBasisPoints;
+      burnFeeBasisPoints;
+      minMintValueICP;
+      minBurnValueICP;
+      acceptedTokens = Vector.toArray(accepted);
+      hasPausedTokens = pt.size() > 0;
+      pausedTokens = pt;
+      dataTimestamp = now();
+      dataSource = source;
+      // Analytics
+      totalMintCount = Vector.size(mintHistory);
+      totalMintVolumeICP = aMintVol;
+      mintsByMode = { icp = aIcpMints; singleToken = aSingleMints; portfolioShare = aPortfolioMints };
+      totalBurnCount = Vector.size(burnHistory);
+      totalBurnVolumeICP = aBurnVol;
+      totalBurnVolumeNACHOS = aBurnNachos;
+      totalFeesCollectedICP = aTotalFees;
+      mintFeesICP = aMintFees;
+      burnFeesICP = aBurnFees;
+      feeCount = Vector.size(feeHistory);
+      navChangePercent = aNavChange;
+      nachosSupply = aSupply;
+      globalMintIn4h = aGMint;
+      globalBurnIn4h = aGBurn;
+      maxMintPer4h = maxMintICPWorthPer4Hours;
+      maxBurnPer4h = maxNachosBurnPer4Hours;
+      // Admin-only
+      fullConfig = adminConfig;
+      circuitBreakerConditions = cbConditions;
+      recentAlerts = cbAlerts;
+      feeExemptPrincipals = feeExempt;
+      rateLimitExemptPrincipals = rlExempt;
+      transferQueue = tq;
+      claimableMintFees = claimMint;
+      claimableCancellationFees = claimCancel;
+      pendingTransferCount = if (isAdmin) { Vector.size(pendingTransfers) } else { 0 };
+      activeDepositCount = if (isAdmin) { Map.size(activeDeposits) } else { 0 };
+      canisterCycles = if (isAdmin) { Cycles.balance() } else { 0 };
+      nachosLedger = if (isAdmin) { nachosLedgerPrincipal } else { null };
+    };
+  };
+
   public query func getMintHistory(limit : Nat, offset : Nat) : async [MintRecord] {
     let size = Vector.size(mintHistory);
     if (offset >= size) return [];
