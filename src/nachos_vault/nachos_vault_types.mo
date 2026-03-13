@@ -279,6 +279,58 @@ module {
   };
 
   // ═══════════════════════════════════════════════════════
+  // CIRCUIT BREAKER TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type CircuitBreakerAction = {
+    #PauseMint;
+    #PauseBurn;
+    #PauseBoth;
+    #RejectOperation;
+  };
+
+  public type CircuitBreakerConditionType = {
+    #NavDrop;
+    #PriceChange;
+    #BalanceChange;
+    #DecimalChange;
+  };
+
+  public type CircuitBreakerCondition = {
+    id : Nat;
+    conditionType : CircuitBreakerConditionType;
+    thresholdPercent : Float;
+    timeWindowNS : Nat;
+    direction : { #Up; #Down; #Both };
+    action : CircuitBreakerAction;
+    applicableTokens : [Principal];
+    enabled : Bool;
+    createdAt : Int;
+    createdBy : Principal;
+  };
+
+  public type CircuitBreakerAlert = {
+    id : Nat;
+    conditionId : Nat;
+    conditionType : CircuitBreakerConditionType;
+    token : ?Principal;
+    tokenSymbol : Text;
+    timestamp : Int;
+    actionTaken : CircuitBreakerAction;
+    details : Text;
+  };
+
+  public type CircuitBreakerConditionInput = {
+    conditionType : CircuitBreakerConditionType;
+    thresholdPercent : Float;
+    timeWindowNS : Nat;
+    direction : { #Up; #Down; #Both };
+    action : CircuitBreakerAction;
+    applicableTokens : [Principal];
+    enabled : Bool;
+  };
+
+  // ═══════════════════════════════════════════════════════
   // CONFIGURATION UPDATE TYPE
   // ═══════════════════════════════════════════════════════
 

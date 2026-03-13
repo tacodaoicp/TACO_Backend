@@ -826,6 +826,70 @@ phase2_admin_controls() {
   result=$(call "$NACHOS_VAULT" resetCircuitBreaker)
   assert_contains "$result" "ok" "resetCircuitBreaker succeeds"
 
+  # ── Circuit Breaker Conditions CRUD ──
+  # Verify default NavDrop condition was seeded
+  local cb_conditions
+  cb_conditions=$(call "$NACHOS_VAULT" getCircuitBreakerConditions)
+  assert_contains "$cb_conditions" "NavDrop" "Default NavDrop condition exists"
+  assert_contains "$cb_conditions" "PauseBoth" "NavDrop action is PauseBoth"
+
+  # Add a test PriceChange condition
+  local cb_add_result
+  cb_add_result=$(call "$NACHOS_VAULT" addCircuitBreakerCondition "(record {
+    conditionType = variant { PriceChange };
+    thresholdPercent = 50.0 : float64;
+    timeWindowNS = 3_600_000_000_000 : nat;
+    direction = variant { Both };
+    action = variant { RejectOperation };
+    applicableTokens = vec {};
+    enabled = true;
+  })")
+  assert_contains "$cb_add_result" "ok" "addCircuitBreakerCondition succeeds"
+
+  # Extract condition ID from result
+  local cb_id
+  cb_id=$(echo "$cb_add_result" | grep -oP '[0-9]+' | head -1)
+  info "Added PriceChange condition with ID: $cb_id"
+
+  # Verify new condition appears in list
+  cb_conditions=$(call "$NACHOS_VAULT" getCircuitBreakerConditions)
+  assert_contains "$cb_conditions" "PriceChange" "PriceChange condition appears in list"
+  assert_contains "$cb_conditions" "RejectOperation" "PriceChange action is RejectOperation"
+
+  # Update the condition threshold
+  local cb_update_result
+  cb_update_result=$(call "$NACHOS_VAULT" updateCircuitBreakerCondition "($cb_id : nat, opt (75.0 : float64), null, null, null, null)")
+  assert_contains "$cb_update_result" "ok" "updateCircuitBreakerCondition succeeds"
+
+  # Disable the condition
+  local cb_enable_result
+  cb_enable_result=$(call "$NACHOS_VAULT" enableCircuitBreakerCondition "($cb_id : nat, false)")
+  assert_contains "$cb_enable_result" "ok" "enableCircuitBreakerCondition(false) succeeds"
+
+  # Re-enable it
+  cb_enable_result=$(call "$NACHOS_VAULT" enableCircuitBreakerCondition "($cb_id : nat, true)")
+  assert_contains "$cb_enable_result" "ok" "enableCircuitBreakerCondition(true) succeeds"
+
+  # Query alerts (should be empty or have entries)
+  local cb_alerts
+  cb_alerts=$(call "$NACHOS_VAULT" getCircuitBreakerAlerts "(10 : nat, 0 : nat)")
+  assert_not_contains "$cb_alerts" "Error" "getCircuitBreakerAlerts executes without error"
+
+  # Remove the test condition
+  local cb_remove_result
+  cb_remove_result=$(call "$NACHOS_VAULT" removeCircuitBreakerCondition "($cb_id : nat)")
+  assert_contains "$cb_remove_result" "ok" "removeCircuitBreakerCondition succeeds"
+
+  # Verify test condition is gone but default NavDrop remains
+  cb_conditions=$(call "$NACHOS_VAULT" getCircuitBreakerConditions)
+  assert_not_contains "$cb_conditions" "PriceChange" "PriceChange condition removed from list"
+  assert_contains "$cb_conditions" "NavDrop" "NavDrop condition still exists after removing PriceChange"
+
+  # Verify getSystemStatus shows new circuit breaker fields
+  status=$(call "$NACHOS_VAULT" getSystemStatus)
+  assert_contains "$status" "mintPausedByCircuitBreaker" "getSystemStatus includes mintPausedByCircuitBreaker"
+  assert_contains "$status" "burnPausedByCircuitBreaker" "getSystemStatus includes burnPausedByCircuitBreaker"
+
   # ── Config Update & Restore ──
   result=$(call "$NACHOS_VAULT" updateNachosConfig "(record {
     mintFeeBasisPoints = opt (100 : nat);

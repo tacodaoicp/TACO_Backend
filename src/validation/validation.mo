@@ -5,6 +5,8 @@ import Debug "mo:base/Debug";
 import Cycles "mo:base/ExperimentalCycles";
 import Treasury_types "../treasury/treasury_types";
 import DAO_types "../DAO_backend/dao_types";
+import NachosTypes "../nachos_vault/nachos_vault_types";
+import Nat "mo:base/Nat";
 
 persistent actor validation {
 
@@ -453,6 +455,31 @@ persistent actor validation {
 
     public query func validate_claimNachosCancellationFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async ValidationResult {
       #Ok("claimCancellationFees: Claim " # debug_show(amount) # " cancellation fees for token " # Principal.toText(tokenPrincipal) # " to " # Principal.toText(recipient));
+    };
+
+    // --- Circuit Breaker Condition Validation ---
+
+    public query func validate_addCircuitBreakerCondition(input : NachosTypes.CircuitBreakerConditionInput) : async ValidationResult {
+      #Ok("addCircuitBreakerCondition: type=" # debug_show(input.conditionType) # " threshold=" # debug_show(input.thresholdPercent) # "% action=" # debug_show(input.action));
+    };
+
+    public query func validate_removeCircuitBreakerCondition(conditionId : Nat) : async ValidationResult {
+      #Ok("removeCircuitBreakerCondition: id=" # Nat.toText(conditionId));
+    };
+
+    public query func validate_updateCircuitBreakerCondition(
+      conditionId : Nat,
+      thresholdPercent : ?Float,
+      timeWindowNS : ?Nat,
+      direction : ?{ #Up; #Down; #Both },
+      action : ?NachosTypes.CircuitBreakerAction,
+      applicableTokens : ?[Principal],
+    ) : async ValidationResult {
+      #Ok("updateCircuitBreakerCondition: id=" # Nat.toText(conditionId) # " threshold=" # debug_show(thresholdPercent) # " action=" # debug_show(action));
+    };
+
+    public query func validate_enableCircuitBreakerCondition(conditionId : Nat, enabled : Bool) : async ValidationResult {
+      #Ok("enableCircuitBreakerCondition: id=" # Nat.toText(conditionId) # " enabled=" # debug_show(enabled));
     };
 
 }

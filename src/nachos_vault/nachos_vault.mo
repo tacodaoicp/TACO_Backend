@@ -31,7 +31,6 @@ import SHA224 "../helper/SHA224";
 import CRC32 "../helper/CRC32";
 // import Migration "migration"; // Migration already applied (ForwardToPortfolio variant)
 
-// (with migration = Migration.migrate)
 shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // ═══════════════════════════════════════════════════════════════════
@@ -85,6 +84,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   type FeeRecord = NachosTypes.FeeRecord;
   type NachosError = NachosTypes.NachosError;
   type NachosUpdateConfig = NachosTypes.NachosUpdateConfig;
+  type CircuitBreakerAction = NachosTypes.CircuitBreakerAction;
+  type CircuitBreakerConditionType = NachosTypes.CircuitBreakerConditionType;
+  type CircuitBreakerCondition = NachosTypes.CircuitBreakerCondition;
+  type CircuitBreakerAlert = NachosTypes.CircuitBreakerAlert;
+  type CircuitBreakerConditionInput = NachosTypes.CircuitBreakerConditionInput;
 
   // Actor references
   transient let treasury = actor (Principal.toText(TREASURY_ID)) : actor {
@@ -160,9 +164,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable var maxBurnAmountNachos : Nat = 0; // 0 = no max per single burn (disabled)
 
   // --- Circuit Breaker ---
-  stable var circuitBreakerActive : Bool = false;
+  stable var circuitBreakerActive : Bool = false; // kept for backward compat — derived from mint/burnPausedByCircuitBreaker
+  stable var mintPausedByCircuitBreaker : Bool = false;
+  stable var burnPausedByCircuitBreaker : Bool = false;
   stable var navDropThresholdPercent : Float = 10.0;
-  stable var navDropTimeWindowNS : Nat = 3600 * 1_000_000_000; // 1 hour
+  stable var navDropTimeWindowNS : Nat = 3600 * 1_000_000_000;
 
   // --- Portfolio Share Config ---
   stable var portfolioShareMaxDeviationBP : Nat = 500; // 5%
@@ -243,6 +249,19 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   transient var blockCleanupTimerId : ?Nat = null;
   transient var transferQueueTimerId : ?Nat = null;
   transient var lastMintBurnTime : Int = 0; // skip periodic treasury sync when mint/burn just refreshed data
+
+  // --- Circuit Breaker Conditions ---
+  stable let circuitBreakerConditions = Map.new<Nat, CircuitBreakerCondition>();
+  stable var nextCircuitBreakerId : Nat = 0;
+  stable let circuitBreakerAlerts = Vector.new<CircuitBreakerAlert>();
+  stable var nextAlertId : Nat = 0;
+
+  // --- Per-Token History (vault-owned, not overwritten by treasury sync) ---
+  stable let tokenPriceHistory = Map.new<Principal, Vector.Vector<(Int, Nat)>>();
+  stable let tokenBalanceHistory = Map.new<Principal, Vector.Vector<(Int, Nat)>>();
+  stable let tokenDecimalsCache = Map.new<Principal, Nat>();
+  let MAX_HISTORY_PER_TOKEN : Nat = 100;
+  let MAX_ALERTS : Nat = 1000;
 
   // ═══════════════════════════════════════════════════════════════════
   // SECTION 4: CONSTANTS
@@ -1381,6 +1400,239 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // ═══════════════════════════════════════════════════════════════════
+  // SECTION 8B: CIRCUIT BREAKER DETECTION
+  // ═══════════════════════════════════════════════════════════════════
+
+  private func getOrCreateHistory(
+    historyMap : Map.Map<Principal, Vector.Vector<(Int, Nat)>>,
+    token : Principal,
+  ) : Vector.Vector<(Int, Nat)> {
+    switch (Map.get(historyMap, phash, token)) {
+      case (?v) { v };
+      case null {
+        let v = Vector.new<(Int, Nat)>();
+        Map.set(historyMap, phash, token, v);
+        v;
+      };
+    };
+  };
+
+  private func trimHistory(
+    historyMap : Map.Map<Principal, Vector.Vector<(Int, Nat)>>,
+    token : Principal,
+    vec : Vector.Vector<(Int, Nat)>,
+  ) {
+    if (Vector.size(vec) > MAX_HISTORY_PER_TOKEN) {
+      let newVec = Vector.new<(Int, Nat)>();
+      let startIdx = Vector.size(vec) - MAX_HISTORY_PER_TOKEN / 2;
+      var i = startIdx;
+      while (i < Vector.size(vec)) {
+        Vector.add(newVec, Vector.get(vec, i));
+        i += 1;
+      };
+      Map.set(historyMap, phash, token, newVec);
+    };
+  };
+
+  private func applyCircuitBreakerAction(action : CircuitBreakerAction) : Bool {
+    switch (action) {
+      case (#PauseMint) { mintPausedByCircuitBreaker := true; circuitBreakerActive := true; false };
+      case (#PauseBurn) { burnPausedByCircuitBreaker := true; circuitBreakerActive := true; false };
+      case (#PauseBoth) { mintPausedByCircuitBreaker := true; burnPausedByCircuitBreaker := true; circuitBreakerActive := true; false };
+      case (#RejectOperation) { true };
+    };
+  };
+
+  private func recordAlert(cond : CircuitBreakerCondition, token : ?Principal, changePercent : Float) {
+    let tokenSymbol = switch (token) {
+      case (?t) {
+        switch (Map.get(tokenDetailsMap, phash, t)) {
+          case (?d) { d.tokenSymbol };
+          case null { Principal.toText(t) };
+        };
+      };
+      case null { "NAV" };
+    };
+
+    let dirText = switch (cond.direction) { case (#Up) { "up" }; case (#Down) { "down" }; case (#Both) { "change" } };
+    let typeText = switch (cond.conditionType) {
+      case (#NavDrop) { "NAV drop" };
+      case (#PriceChange) { "Price " # dirText };
+      case (#BalanceChange) { "Balance " # dirText };
+      case (#DecimalChange) { "Decimal change" };
+    };
+    let details = typeText # " of " # Float.toText(changePercent) # "% on " # tokenSymbol # " (threshold: " # Float.toText(cond.thresholdPercent) # "%, condition #" # Nat.toText(cond.id) # ")";
+
+    let alertId = nextAlertId;
+    nextAlertId += 1;
+    Vector.add(circuitBreakerAlerts, {
+      id = alertId;
+      conditionId = cond.id;
+      conditionType = cond.conditionType;
+      token;
+      tokenSymbol;
+      timestamp = now();
+      actionTaken = cond.action;
+      details;
+    });
+
+    // Trim alerts to MAX_ALERTS
+    while (Vector.size(circuitBreakerAlerts) > MAX_ALERTS) {
+      ignore Vector.removeLast(circuitBreakerAlerts);
+    };
+
+    logger.warn("CIRCUIT_BREAKER", details, "circuitBreakerCheck");
+  };
+
+  private func isTokenApplicable(token : Principal, applicableTokens : [Principal]) : Bool {
+    if (applicableTokens.size() == 0) return true; // empty = all tokens
+    for (t in applicableTokens.vals()) {
+      if (Principal.equal(t, token)) return true;
+    };
+    false;
+  };
+
+  private func checkPerTokenConditions(
+    condType : CircuitBreakerConditionType,
+    token : Principal,
+    history : Vector.Vector<(Int, Nat)>,
+  ) : Bool {
+    var rejected = false;
+    let histSize = Vector.size(history);
+    if (histSize < 2) return false;
+
+    for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+      if (cond.enabled and cond.conditionType == condType and isTokenApplicable(token, cond.applicableTokens)) {
+        let currentVal = Vector.get(history, histSize - 1).1;
+        let windowCutoff = now() - cond.timeWindowNS;
+        var oldestInWindow : Nat = currentVal;
+        var foundOlder = false;
+        var i = histSize;
+        while (i > 0) {
+          i -= 1;
+          let (ts, val) = Vector.get(history, i);
+          if (ts < windowCutoff) { i := 0 } // stop
+          else { oldestInWindow := val; foundOlder := true };
+        };
+        if (foundOlder and oldestInWindow > 0) {
+          let changePercent = (Float.fromInt(currentVal) - Float.fromInt(oldestInWindow)) / Float.fromInt(oldestInWindow) * 100.0;
+          let triggered = switch (cond.direction) {
+            case (#Down) { changePercent <= -cond.thresholdPercent };
+            case (#Up) { changePercent >= cond.thresholdPercent };
+            case (#Both) { Float.abs(changePercent) >= cond.thresholdPercent };
+          };
+          if (triggered) {
+            if (applyCircuitBreakerAction(cond.action)) rejected := true;
+            recordAlert(cond, ?token, changePercent);
+          };
+        };
+      };
+    };
+    rejected;
+  };
+
+  private func fireDecimalChangeAlerts(token : Principal, oldDecimals : Nat, newDecimals : Nat) {
+    for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+      if (cond.enabled and cond.conditionType == #DecimalChange and isTokenApplicable(token, cond.applicableTokens)) {
+        // DecimalChange always forces PauseBoth regardless of configured action
+        mintPausedByCircuitBreaker := true;
+        burnPausedByCircuitBreaker := true;
+        circuitBreakerActive := true;
+
+        let tokenSymbol = switch (Map.get(tokenDetailsMap, phash, token)) {
+          case (?d) { d.tokenSymbol };
+          case null { Principal.toText(token) };
+        };
+        let details = "Decimal change on " # tokenSymbol # ": " # Nat.toText(oldDecimals) # " → " # Nat.toText(newDecimals) # " (condition #" # Nat.toText(cond.id) # ")";
+
+        let alertId = nextAlertId;
+        nextAlertId += 1;
+        Vector.add(circuitBreakerAlerts, {
+          id = alertId;
+          conditionId = cond.id;
+          conditionType = #DecimalChange;
+          token = ?token;
+          tokenSymbol;
+          timestamp = now();
+          actionTaken = #PauseBoth;
+          details;
+        });
+
+        while (Vector.size(circuitBreakerAlerts) > MAX_ALERTS) {
+          ignore Vector.removeLast(circuitBreakerAlerts);
+        };
+
+        logger.warn("CIRCUIT_BREAKER", details, "circuitBreakerCheck");
+      };
+    };
+  };
+
+  // Returns true if any #RejectOperation condition fired
+  private func recordAndCheckTokenSnapshot(token : Principal, priceE8s : Nat, treasuryBalance : Nat, decimals : Nat) : Bool {
+    var rejected = false;
+
+    // 1. Record price history
+    let priceVec = getOrCreateHistory(tokenPriceHistory, token);
+    Vector.add(priceVec, (now(), priceE8s));
+    trimHistory(tokenPriceHistory, token, priceVec);
+
+    // 2. Record balance history
+    let balVec = getOrCreateHistory(tokenBalanceHistory, token);
+    Vector.add(balVec, (now(), treasuryBalance));
+    trimHistory(tokenBalanceHistory, token, balVec);
+
+    // 3. Decimal change detection
+    switch (Map.get(tokenDecimalsCache, phash, token)) {
+      case (?cached) {
+        if (cached != decimals) {
+          fireDecimalChangeAlerts(token, cached, decimals);
+        };
+      };
+      case null {};
+    };
+    Map.set(tokenDecimalsCache, phash, token, decimals);
+
+    // 4. Check PriceChange conditions
+    if (checkPerTokenConditions(#PriceChange, token, getOrCreateHistory(tokenPriceHistory, token))) rejected := true;
+
+    // 5. Check BalanceChange conditions
+    if (checkPerTokenConditions(#BalanceChange, token, getOrCreateHistory(tokenBalanceHistory, token))) rejected := true;
+
+    rejected;
+  };
+
+  private func checkNavConditions() {
+    if (Vector.size(navHistory) < 2) return;
+    let currentNav = switch (cachedNAV) {
+      case (?n) { n.navPerTokenE8s };
+      case null { return };
+    };
+    if (currentNav == 0) return;
+
+    for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+      if (cond.enabled and cond.conditionType == #NavDrop) {
+        let windowCutoff = now() - cond.timeWindowNS;
+        var maxNavInWindow : Nat = currentNav;
+        var i = Vector.size(navHistory);
+        while (i > 0) {
+          i -= 1;
+          let snap = Vector.get(navHistory, i);
+          if (snap.timestamp < windowCutoff) { i := 0 } else if (snap.navPerTokenE8s > maxNavInWindow) {
+            maxNavInWindow := snap.navPerTokenE8s;
+          };
+        };
+        if (maxNavInWindow > currentNav) {
+          let dropPercent = Float.fromInt(maxNavInWindow - currentNav) / Float.fromInt(maxNavInWindow) * 100.0;
+          if (dropPercent >= cond.thresholdPercent) {
+            ignore applyCircuitBreakerAction(cond.action);
+            recordAlert(cond, null, -dropPercent);
+          };
+        };
+      };
+    };
+  };
+
+  // ═══════════════════════════════════════════════════════════════════
   // SECTION 9: SHARED PRE-CHECKS & RATE LIMITING
   // ═══════════════════════════════════════════════════════════════════
 
@@ -1609,7 +1861,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (isMint and not mintingEnabled) return #err(#MintingDisabled);
     if (not isMint and not burningEnabled) return #err(#BurningDisabled);
     if (not genesisComplete) return #err(#GenesisNotComplete);
-    if (circuitBreakerActive) return #err(#CircuitBreakerActive);
+    if (isMint and mintPausedByCircuitBreaker) return #err(#CircuitBreakerActive);
+    if (not isMint and burnPausedByCircuitBreaker) return #err(#CircuitBreakerActive);
 
     // Acquire lock
     switch (acquireLock(caller)) {
@@ -1638,6 +1891,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
             lastLocalPriceRefreshTime := refreshTime;
             priceRefreshOk := true;
             logger.info("PRE_CHECK", "Refreshed prices via treasury", "performSharedPreChecks");
+
+            // Record snapshots & check per-token circuit breaker conditions
+            var operationRejected = false;
+            for ((token, detail) in result.tokenDetails.vals()) {
+              if (recordAndCheckTokenSnapshot(token, detail.priceInICP, detail.balance, detail.tokenDecimals)) {
+                operationRejected := true;
+              };
+            };
+            if (operationRejected or (isMint and mintPausedByCircuitBreaker) or (not isMint and burnPausedByCircuitBreaker)) {
+              releaseLock(caller);
+              return #err(#CircuitBreakerActive);
+            };
           };
           case (#err(msg)) {
             logger.warn("PRE_CHECK", "Treasury price refresh failed: " # msg, "performSharedPreChecks");
@@ -2782,8 +3047,33 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     switch (config.maxMintICPWorthPer4Hours) { case (?v) { if (v > 0) maxMintICPWorthPer4Hours := v }; case null {} };
     switch (config.maxMintOpsPerUser4Hours) { case (?v) { if (v > 0) maxMintOpsPerUser4Hours := v }; case null {} };
     switch (config.maxBurnOpsPerUser4Hours) { case (?v) { if (v > 0) maxBurnOpsPerUser4Hours := v }; case null {} };
-    switch (config.navDropThresholdPercent) { case (?v) { if (v > 0.0 and v <= 100.0) navDropThresholdPercent := v }; case null {} };
-    switch (config.navDropTimeWindowNS) { case (?v) { if (v > 0) navDropTimeWindowNS := v }; case null {} };
+    switch (config.navDropThresholdPercent) {
+      case (?v) {
+        if (v > 0.0 and v <= 100.0) {
+          navDropThresholdPercent := v;
+          // Also update the first NavDrop condition in the condition system
+          for ((id, cond) in Map.entries(circuitBreakerConditions)) {
+            if (cond.conditionType == #NavDrop) {
+              Map.set(circuitBreakerConditions, Map.nhash, id, { cond with thresholdPercent = v });
+            };
+          };
+        };
+      };
+      case null {};
+    };
+    switch (config.navDropTimeWindowNS) {
+      case (?v) {
+        if (v > 0) {
+          navDropTimeWindowNS := v;
+          for ((id, cond) in Map.entries(circuitBreakerConditions)) {
+            if (cond.conditionType == #NavDrop) {
+              Map.set(circuitBreakerConditions, Map.nhash, id, { cond with timeWindowNS = v });
+            };
+          };
+        };
+      };
+      case null {};
+    };
     switch (config.portfolioShareMaxDeviationBP) { case (?v) { if (v > 0 and v <= 10_000) portfolioShareMaxDeviationBP := v }; case null {} };
     switch (config.cancellationFeeMultiplier) { case (?v) { if (v >= 1 and v <= 100) cancellationFeeMultiplier := v }; case null {} };
     switch (config.mintingEnabled) { case (?v) { mintingEnabled := v }; case null {} };
@@ -2851,8 +3141,142 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   public shared ({ caller }) func resetCircuitBreaker() : async Result.Result<Text, Text> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
     circuitBreakerActive := false;
+    mintPausedByCircuitBreaker := false;
+    burnPausedByCircuitBreaker := false;
     logger.info("ADMIN", "Circuit breaker reset by " # Principal.toText(caller), "resetCircuitBreaker");
     #ok("Circuit breaker reset");
+  };
+
+  // --- Circuit Breaker Condition CRUD ---
+
+  public shared ({ caller }) func addCircuitBreakerCondition(input : CircuitBreakerConditionInput) : async Result.Result<Nat, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    if (input.thresholdPercent <= 0.0 or input.thresholdPercent > 100.0) return #err("thresholdPercent must be 0-100");
+    if (input.timeWindowNS == 0 and input.conditionType != #DecimalChange) return #err("timeWindowNS must be > 0");
+
+    let id = nextCircuitBreakerId;
+    nextCircuitBreakerId += 1;
+
+    let action = switch (input.conditionType) {
+      case (#DecimalChange) { #PauseBoth }; // always PauseBoth
+      case _ { input.action };
+    };
+    let direction = switch (input.conditionType) {
+      case (#NavDrop) { #Down }; // always Down
+      case _ { input.direction };
+    };
+
+    Map.set(circuitBreakerConditions, Map.nhash, id, {
+      id;
+      conditionType = input.conditionType;
+      thresholdPercent = input.thresholdPercent;
+      timeWindowNS = input.timeWindowNS;
+      direction;
+      action;
+      applicableTokens = input.applicableTokens;
+      enabled = input.enabled;
+      createdAt = now();
+      createdBy = caller;
+    });
+
+    logger.info("ADMIN", "Circuit breaker condition #" # Nat.toText(id) # " added by " # Principal.toText(caller), "addCircuitBreakerCondition");
+    #ok(id);
+  };
+
+  public shared ({ caller }) func removeCircuitBreakerCondition(conditionId : Nat) : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    switch (Map.get(circuitBreakerConditions, Map.nhash, conditionId)) {
+      case null { return #err("Condition not found") };
+      case _ {};
+    };
+    ignore Map.remove(circuitBreakerConditions, Map.nhash, conditionId);
+    logger.info("ADMIN", "Circuit breaker condition #" # Nat.toText(conditionId) # " removed by " # Principal.toText(caller), "removeCircuitBreakerCondition");
+    #ok("Condition removed");
+  };
+
+  public shared ({ caller }) func updateCircuitBreakerCondition(
+    conditionId : Nat,
+    thresholdPercent : ?Float,
+    timeWindowNS : ?Nat,
+    direction : ?{ #Up; #Down; #Both },
+    action : ?CircuitBreakerAction,
+    applicableTokens : ?[Principal],
+  ) : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    let cond = switch (Map.get(circuitBreakerConditions, Map.nhash, conditionId)) {
+      case (?c) { c };
+      case null { return #err("Condition not found") };
+    };
+
+    let newThreshold = switch (thresholdPercent) { case (?v) { if (v > 0.0 and v <= 100.0) v else cond.thresholdPercent }; case null { cond.thresholdPercent } };
+    let newWindow = switch (timeWindowNS) { case (?v) { if (v > 0) v else cond.timeWindowNS }; case null { cond.timeWindowNS } };
+    let newDirection = switch (direction) {
+      case (?v) { if (cond.conditionType == #NavDrop) #Down else v }; // NavDrop always Down
+      case null { cond.direction };
+    };
+    let newAction = switch (action) {
+      case (?v) { if (cond.conditionType == #DecimalChange) #PauseBoth else v }; // DecimalChange always PauseBoth
+      case null { cond.action };
+    };
+    let newTokens = switch (applicableTokens) { case (?v) { v }; case null { cond.applicableTokens } };
+
+    Map.set(circuitBreakerConditions, Map.nhash, conditionId, {
+      cond with
+      thresholdPercent = newThreshold;
+      timeWindowNS = newWindow;
+      direction = newDirection;
+      action = newAction;
+      applicableTokens = newTokens;
+    });
+
+    // Sync navDrop config vars for backward compat
+    if (cond.conditionType == #NavDrop) {
+      navDropThresholdPercent := newThreshold;
+      navDropTimeWindowNS := newWindow;
+    };
+
+    logger.info("ADMIN", "Circuit breaker condition #" # Nat.toText(conditionId) # " updated by " # Principal.toText(caller), "updateCircuitBreakerCondition");
+    #ok("Condition updated");
+  };
+
+  public shared ({ caller }) func enableCircuitBreakerCondition(conditionId : Nat, enabled : Bool) : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    let cond = switch (Map.get(circuitBreakerConditions, Map.nhash, conditionId)) {
+      case (?c) { c };
+      case null { return #err("Condition not found") };
+    };
+    Map.set(circuitBreakerConditions, Map.nhash, conditionId, { cond with enabled });
+    logger.info("ADMIN", "Circuit breaker condition #" # Nat.toText(conditionId) # (if enabled " enabled" else " disabled") # " by " # Principal.toText(caller), "enableCircuitBreakerCondition");
+    #ok(if enabled "Condition enabled" else "Condition disabled");
+  };
+
+  public query func getCircuitBreakerConditions() : async [CircuitBreakerCondition] {
+    let result = Vector.new<CircuitBreakerCondition>();
+    for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+      Vector.add(result, cond);
+    };
+    Vector.toArray(result);
+  };
+
+  public query func getCircuitBreakerAlerts(limit : Nat, offset : Nat) : async [CircuitBreakerAlert] {
+    let size = Vector.size(circuitBreakerAlerts);
+    if (offset >= size) return [];
+    let end = Nat.min(offset + limit, size);
+    let result = Vector.new<CircuitBreakerAlert>();
+    // Return newest first
+    var i = size;
+    var count : Nat = 0;
+    var skipped : Nat = 0;
+    while (i > 0 and count < limit) {
+      i -= 1;
+      if (skipped >= offset) {
+        Vector.add(result, Vector.get(circuitBreakerAlerts, i));
+        count += 1;
+      } else {
+        skipped += 1;
+      };
+    };
+    Vector.toArray(result);
   };
 
   public shared ({ caller }) func addAcceptedMintToken(token : Principal) : async Result.Result<Text, Text> {
@@ -3473,6 +3897,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     mintingEnabled : Bool;
     burningEnabled : Bool;
     circuitBreakerActive : Bool;
+    mintPausedByCircuitBreaker : Bool;
+    burnPausedByCircuitBreaker : Bool;
     nachosLedger : ?Principal;
     cachedNAV : ?CachedNAV;
     totalMints : Nat;
@@ -3489,6 +3915,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       mintingEnabled;
       burningEnabled;
       circuitBreakerActive;
+      mintPausedByCircuitBreaker;
+      burnPausedByCircuitBreaker;
       nachosLedger = nachosLedgerPrincipal;
       cachedNAV;
       totalMints = Vector.size(mintHistory);
@@ -3513,6 +3941,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     mintingEnabled : Bool;
     burningEnabled : Bool;
     circuitBreakerActive : Bool;
+    mintPausedByCircuitBreaker : Bool;
+    burnPausedByCircuitBreaker : Bool;
 
     // NAV
     nav : ?CachedNAV;
@@ -3737,6 +4167,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       mintingEnabled;
       burningEnabled;
       circuitBreakerActive;
+      mintPausedByCircuitBreaker;
+      burnPausedByCircuitBreaker;
       nav = cachedNAV;
       portfolio = Vector.toArray(portfolioEntries);
       portfolioValueICP = portfolioValue;
@@ -4422,6 +4854,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           let details = await treasury.getTokenDetails();
           for ((token, detail) in details.vals()) {
             Map.set(tokenDetailsMap, phash, token, detail);
+            // Record snapshots & check per-token circuit breaker conditions
+            ignore recordAndCheckTokenSnapshot(token, detail.priceInICP, detail.balance, detail.tokenDecimals);
           };
         } catch (e) {
           logger.warn("TIMER", "Token details sync failed: " # Error.message(e), "periodicSync");
@@ -4450,33 +4884,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       ignore await calculateNAV();
       recordNavSnapshot(#Scheduled);
 
-      // 5. Circuit breaker check
-      if (not circuitBreakerActive and Vector.size(navHistory) >= 2) {
-        let currentNav = switch (cachedNAV) {
-          case (?n) { n.navPerTokenE8s };
-          case null { 0 };
-        };
-        if (currentNav > 0) {
-          let windowCutoff = now() - navDropTimeWindowNS;
-          var maxNavInWindow : Nat = currentNav;
-          var i = Vector.size(navHistory);
-          while (i > 0) {
-            i -= 1;
-            let snap = Vector.get(navHistory, i);
-            if (snap.timestamp < windowCutoff) { i := 0 }
-            else if (snap.navPerTokenE8s > maxNavInWindow) {
-              maxNavInWindow := snap.navPerTokenE8s;
-            };
-          };
-          if (maxNavInWindow > currentNav) {
-            let dropPercent = Float.fromInt(maxNavInWindow - currentNav) / Float.fromInt(maxNavInWindow) * 100.0;
-            if (dropPercent >= navDropThresholdPercent) {
-              circuitBreakerActive := true;
-              logger.warn("CIRCUIT_BREAKER", "NAV drop detected: " # Float.toText(dropPercent) # "% (threshold: " # Float.toText(navDropThresholdPercent) # "%)", "periodicSync");
-            };
-          };
-        };
-      };
+      // 5. Circuit breaker checks (NAV conditions + per-token already ran above)
+      checkNavConditions();
 
       startPeriodicSyncTimer();
     });
@@ -4526,8 +4935,34 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     });
   };
 
+  // --- Seed default circuit breaker conditions (idempotent) ---
+  private func seedDefaultCircuitBreakerConditions() {
+    var hasNavCondition = false;
+    for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+      if (cond.conditionType == #NavDrop) hasNavCondition := true;
+    };
+    if (not hasNavCondition) {
+      let id = nextCircuitBreakerId;
+      nextCircuitBreakerId += 1;
+      Map.set(circuitBreakerConditions, Map.nhash, id, {
+        id;
+        conditionType = #NavDrop;
+        thresholdPercent = navDropThresholdPercent;
+        timeWindowNS = navDropTimeWindowNS;
+        direction = #Down;
+        action = #PauseBoth : CircuitBreakerAction;
+        applicableTokens = [] : [Principal];
+        enabled = true;
+        createdAt = now();
+        createdBy = Principal.fromText("aaaaa-aa");
+      });
+      logger.info("LIFECYCLE", "Seeded default NavDrop circuit breaker condition", "seedDefaults");
+    };
+  };
+
   // --- Start All Timers ---
   private func startAllTimers<system>() {
+    seedDefaultCircuitBreakerConditions();
     startPeriodicSyncTimer();
     startBlockCleanupTimer();
     // Transfer queue is on-demand — check if pending transfers from before upgrade
