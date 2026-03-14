@@ -213,6 +213,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // --- Claimable Fee Tracking ---
   stable var accumulatedMintFeesICP : Nat = 0;
   stable var claimedMintFeesICP : Nat = 0;
+  stable var accumulatedBurnFeesICP : Nat = 0;
+  stable var claimedBurnFeesICP : Nat = 0;
   stable let accumulatedCancellationFees = Map.new<Principal, Nat>(); // token -> amount
   stable let claimedCancellationFees = Map.new<Principal, Nat>(); // token -> amount
 
@@ -255,6 +257,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable var nextCircuitBreakerId : Nat = 0;
   stable let circuitBreakerAlerts = Vector.new<CircuitBreakerAlert>();
   stable var nextAlertId : Nat = 0;
+
+  // --- Pending Mint Value Tracker (prevents cross-user allocation over-subscription) ---
+  transient let pendingMintValueByToken = Map.new<Principal, Nat>();
 
   // --- Per-Token History (vault-owned, not overwritten by treasury sync) ---
   stable let tokenPriceHistory = Map.new<Principal, Vector.Vector<(Int, Nat)>>();
@@ -982,6 +987,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (deposit.caller != caller) return #err(#NotDepositor);
 
+    // Reject cancellation if a mint/burn operation is in progress for this user
+    if (isLocked(caller)) return #err(#OperationInProgress);
+
     switch (deposit.status) {
       case (#Cancelled) { return #err(#DepositAlreadyCancelled) };
       case (#Consumed) { return #err(#DepositAlreadyConsumed) };
@@ -1088,6 +1096,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         let tokenValue = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
         totalValueE8s += tokenValue;
       };
+    };
+    // Include pending mint values for optimistic NAV accuracy during concurrent mints.
+    // pendingMintValueByToken stores ICP-denominated values of in-flight single-token deposits.
+    // This prevents stale NAV when multiple users mint simultaneously, without modifying
+    // tokenDetailsMap.balance (which is unsafe to rollback since treasury sync can overwrite it).
+    for ((_, pendingVal) in Map.entries(pendingMintValueByToken)) {
+      totalValueE8s += pendingVal;
     };
     totalValueE8s;
   };
@@ -1653,6 +1668,52 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     ignore Map.remove(operationLocks, phash, caller);
   };
 
+  private func isLocked(caller : Principal) : Bool {
+    switch (Map.get(operationLocks, phash, caller)) {
+      case (?lockTime) { (now() - lockTime) < LOCK_TIMEOUT_NS };
+      case null { false };
+    };
+  };
+
+  private func rollbackOptimisticBurnBalances(tokensToSend : Vector.Vector<{ token : Principal; amount : Nat; fromSubaccount : Nat8 }>) {
+    for (ts in Vector.vals(tokensToSend)) {
+      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
+        case (?details) {
+          Map.set(tokenDetailsMap, phash, ts.token, { details with balance = details.balance + ts.amount + details.tokenTransferFee });
+        };
+        case null {};
+      };
+    };
+  };
+
+  // --- Pending Mint Value Tracking (prevents cross-user allocation gaming) ---
+  private func reservePendingMintValue(token : Principal, valueICP : Nat) {
+    let current = switch (Map.get(pendingMintValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+    Map.set(pendingMintValueByToken, phash, token, current + valueICP);
+  };
+
+  private func releasePendingMintValue(token : Principal, valueICP : Nat) {
+    let current = switch (Map.get(pendingMintValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+    if (current > valueICP) {
+      Map.set(pendingMintValueByToken, phash, token, current - valueICP);
+    } else {
+      ignore Map.remove(pendingMintValueByToken, phash, token);
+    };
+  };
+
+  private func getPendingMintValue(token : Principal) : Nat {
+    switch (Map.get(pendingMintValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+  };
+
   private func isRateLimitExempt(caller : Principal) : Bool {
     switch (Map.get(rateLimitExemptPrincipals, phash, caller)) {
       case (?config) { config.enabled };
@@ -2131,10 +2192,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ok(())) {};
     };
 
+    // Reserve pending mint value for ICP deposit BEFORE any awaits.
+    // This ensures concurrent mints see this in-flight deposit in calculatePortfolioValueICP().
+    reservePendingMintValue(ICPprincipal, depositAmount);
+
     // Calculate NAV
     let nav = switch (await calculateNAV()) {
       case (#ok(n)) { n };
       case (#err(e)) {
+        releasePendingMintValue(ICPprincipal, depositAmount);
         ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
         releaseLock(caller);
         return #err(#UnexpectedError(e));
@@ -2144,6 +2210,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Calculate fee (guard against underflow if minFee > deposit)
     let feeValue = calculateFee(caller, depositAmount, mintFeeBasisPoints, minMintFeeICP);
     if (feeValue >= depositAmount) {
+      releasePendingMintValue(ICPprincipal, depositAmount);
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
@@ -2155,6 +2222,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     // Slippage check
     if (nachosAmount < minimumNachosReceive) {
+      releasePendingMintValue(ICPprincipal, depositAmount);
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
       return #err(#SlippageExceeded);
@@ -2165,6 +2233,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosLedgerTxId = switch (mintTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
+        releasePendingMintValue(ICPprincipal, depositAmount);
         ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
         releaseLock(caller);
         return #err(#TransferError(e));
@@ -2214,6 +2283,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
     lastMintBurnTime := now();
+
+    // Release pending reservation BEFORE forwarding to avoid double-counting window
+    releasePendingMintValue(ICPprincipal, depositAmount);
 
     // Forward net deposit to treasury default subaccount (fee stays in sub2)
     forwardDepositsToPortfolio(caller, deposits, netValue, depositAmount, mintId);
@@ -2278,8 +2350,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     recordDeposit(blockKey, caller, tokenPrincipal, depositAmount, blockNumber);
 
-    // Conservative price discovery
-    let tokenPriceICP = getConservativePrice(tokenPrincipal);
+    // Conservative price discovery — 30-minute window (matching portfolio share mode)
+    let THIRTY_MINUTES_NS : Int = 30 * 60 * 1_000_000_000;
+    let tokenPriceICP = getConservativePriceWithWindow(tokenPrincipal, THIRTY_MINUTES_NS);
     if (tokenPriceICP == 0) {
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
@@ -2291,7 +2364,21 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case null { 8 };
     };
 
+    // Decimal safety guard
+    if (tokenDecimals > 36) {
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      releaseLock(caller);
+      return #err(#UnexpectedError("Token decimals exceeds maximum supported (36)"));
+    };
+
     let depositValueICP = (depositAmount * tokenPriceICP) / (10 ** tokenDecimals);
+
+    // Spot price for allocation enforcement (consistent pricing with portfolio value)
+    let spotPriceICP = switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
+      case (?d) { d.priceInICP };
+      case null { tokenPriceICP };
+    };
+    let depositValueSpot = (depositAmount * spotPriceICP) / (10 ** tokenDecimals);
 
     if (depositValueICP < minMintValueICP) {
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
@@ -2314,8 +2401,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ok(())) {};
     };
 
-    // Allocation enforcement: check if this token is over its target
+    // Allocation enforcement: use SPOT prices for consistent allocation check,
+    // include pending mints from concurrent users to prevent over-subscription
     let portfolioValue = calculatePortfolioValueICP();
+    let pendingValue = getPendingMintValue(tokenPrincipal);
     let targetBP = switch (Map.get(aggregateAllocation, phash, tokenPrincipal)) {
       case (?vp) {
         var totalVP : Nat = 0;
@@ -2328,29 +2417,39 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Calculate how much we can accept before exceeding allocation
     var usedAmount = depositAmount;
     var excessAmount : Nat = 0;
+    var reservedValueSpot : Nat = 0;
 
     if (targetBP > 0 and portfolioValue > 0) {
       let currentTokenValue = switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
         case (?d) { (d.balance * d.priceInICP) / (10 ** d.tokenDecimals) };
         case null { 0 };
       };
+      // Include pending mints from other concurrent users
+      let effectiveCurrentValue = currentTokenValue + pendingValue;
       let maxAllowedValue = (portfolioValue * targetBP) / 10_000;
 
-      if (currentTokenValue + depositValueICP > maxAllowedValue) {
-        if (currentTokenValue >= maxAllowedValue) {
-          // Already at or over allocation
+      if (effectiveCurrentValue + depositValueSpot > maxAllowedValue) {
+        if (effectiveCurrentValue >= maxAllowedValue) {
+          // Already at or over allocation (including pending mints)
           ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
           releaseLock(caller);
           return #err(#AllocationExceeded);
         };
-        let allowedValueICP = maxAllowedValue - currentTokenValue;
-        usedAmount := (allowedValueICP * (10 ** tokenDecimals)) / tokenPriceICP;
+        let allowedValueICP = maxAllowedValue - effectiveCurrentValue;
+        usedAmount := (allowedValueICP * (10 ** tokenDecimals)) / spotPriceICP;
         if (usedAmount > depositAmount) usedAmount := depositAmount;
         excessAmount := depositAmount - usedAmount;
       };
     };
 
+    // NACHOS valuation uses conservative price (vault-protective)
     let usedValueICP = (usedAmount * tokenPriceICP) / (10 ** tokenDecimals);
+
+    // Reserve pending value BEFORE any await — prevents parallel over-subscription.
+    // Uses spot price so concurrent mints see accurate allocation headroom.
+    let usedValueSpot = (usedAmount * spotPriceICP) / (10 ** tokenDecimals);
+    reservePendingMintValue(tokenPrincipal, usedValueSpot);
+    reservedValueSpot := usedValueSpot;
 
     // Return excess
     let excessReturned = if (excessAmount > 0) {
@@ -2362,6 +2461,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nav = switch (await calculateNAV()) {
       case (#ok(n)) { n };
       case (#err(e)) {
+        releasePendingMintValue(tokenPrincipal, reservedValueSpot);
         ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
         releaseLock(caller);
         return #err(#UnexpectedError(e));
@@ -2370,6 +2470,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     let feeValue = calculateFee(caller, usedValueICP, mintFeeBasisPoints, minMintFeeICP);
     if (feeValue >= usedValueICP) {
+      releasePendingMintValue(tokenPrincipal, reservedValueSpot);
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
@@ -2378,6 +2479,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosAmount = (netValue * ONE_E8S) / nav.navPerTokenE8s;
 
     if (nachosAmount < minimumNachosReceive) {
+      releasePendingMintValue(tokenPrincipal, reservedValueSpot);
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
       return #err(#SlippageExceeded);
@@ -2388,6 +2490,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosLedgerTxId = switch (mintTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
+        releasePendingMintValue(tokenPrincipal, reservedValueSpot);
         ignore cancelDepositAndRefund(blockKey, caller, usedAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
         releaseLock(caller);
         return #err(#TransferError(e));
@@ -2436,6 +2539,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
     lastMintBurnTime := now();
+
+    // Release pending reservation BEFORE forwarding to avoid a double-counting window
+    // where concurrent mints see both the pending value AND the optimistic balance update.
+    releasePendingMintValue(tokenPrincipal, reservedValueSpot);
 
     // Forward net deposit to treasury default subaccount (fee stays in sub2)
     forwardDepositsToPortfolio(caller, deposits, netValue, usedValueICP, mintId);
@@ -2557,6 +2664,32 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       return #err(#AboveMaximumValue({ max = maxMintAmountICP; requested = totalValueICP }));
     };
 
+    // Reserve pending mint values per-token BEFORE allocation check and any awaits.
+    // This prevents cross-mode gaming (portfolio mint vs single-token mint concurrent).
+    let pendingReservations = Vector.new<{ token : Principal; valueICP : Nat }>();
+    for (vd in Vector.vals(verifiedDeposits)) {
+      let spotPrice = switch (Map.get(tokenDetailsMap, phash, vd.token)) {
+        case (?d) { d.priceInICP };
+        case null { 0 };
+      };
+      let decimals = switch (Map.get(tokenDetailsMap, phash, vd.token)) {
+        case (?d) { d.tokenDecimals };
+        case null { 8 };
+      };
+      let valSpot = if (spotPrice > 0) { (vd.amount * spotPrice) / (10 ** decimals) } else { 0 };
+      if (valSpot > 0) {
+        reservePendingMintValue(vd.token, valSpot);
+        Vector.add(pendingReservations, { token = vd.token; valueICP = valSpot });
+      };
+    };
+
+    // Helper to release all pending reservations on error
+    func releaseAllPendingReservations() {
+      for (pr in Vector.vals(pendingReservations)) {
+        releasePendingMintValue(pr.token, pr.valueICP);
+      };
+    };
+
     // Validate portfolio share proportions
     // Uses treasury prices (not conservative) for both sides so proportions are consistent
     let portfolioValue = calculatePortfolioValueICP();
@@ -2604,6 +2737,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
         let deviation = if (actualBP > expectedBP) { actualBP - expectedBP } else { expectedBP - actualBP };
         if (deviation > portfolioShareMaxDeviationBP) {
+          releaseAllPendingReservations();
           for (vd in Vector.vals(verifiedDeposits)) {
             ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
           };
@@ -2623,6 +2757,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     switch (checkAndRecordMintRateLimit(caller, totalValueICP)) {
       case (#err(e)) {
+        releaseAllPendingReservations();
         for (vd in Vector.vals(verifiedDeposits)) {
           ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
         };
@@ -2635,6 +2770,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nav = switch (await calculateNAV()) {
       case (#ok(n)) { n };
       case (#err(e)) {
+        releaseAllPendingReservations();
         for (vd in Vector.vals(verifiedDeposits)) {
           ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
         };
@@ -2645,6 +2781,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     let feeValue = calculateFee(caller, totalValueICP, mintFeeBasisPoints, minMintFeeICP);
     if (feeValue >= totalValueICP) {
+      releaseAllPendingReservations();
       for (vd in Vector.vals(verifiedDeposits)) {
         ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
       };
@@ -2655,6 +2792,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosAmount = (netValue * ONE_E8S) / nav.navPerTokenE8s;
 
     if (nachosAmount < minimumNachosReceive) {
+      releaseAllPendingReservations();
       for (vd in Vector.vals(verifiedDeposits)) {
         ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
       };
@@ -2666,6 +2804,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosLedgerTxId = switch (mintTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
+        releaseAllPendingReservations();
         for (vd in Vector.vals(verifiedDeposits)) {
           ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
         };
@@ -2722,6 +2861,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
     lastMintBurnTime := now();
+
+    // Release pending reservations BEFORE forwarding to avoid double-counting window
+    releaseAllPendingReservations();
 
     // Forward net deposits to treasury default subaccount (fee stays in sub2)
     forwardDepositsToPortfolio(caller, depositsArr, netValue, totalValueICP, mintId);
@@ -2829,7 +2971,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     // Check maximum burn amount per operation
     if (maxBurnAmountNachos > 0 and nachosAmount > maxBurnAmountNachos) {
-      if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+      if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
       releaseLock(caller);
       return #err(#AboveMaximumValue({ max = maxBurnAmountNachos; requested = nachosAmount }));
     };
@@ -2837,7 +2987,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Rate limit check
     switch (checkAndRecordBurnRateLimit(caller, nachosAmount)) {
       case (#err(e)) {
-        if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+        if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
         releaseLock(caller);
         return #err(e);
       };
@@ -2848,7 +3006,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nav = switch (await calculateNAV()) {
       case (#ok(n)) { n };
       case (#err(e)) {
-        if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+        if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
         releaseLock(caller);
         return #err(#UnexpectedError(e));
       };
@@ -2858,14 +3024,30 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let redemptionValueICP = (nachosAmount * nav.navPerTokenE8s) / ONE_E8S;
 
     if (redemptionValueICP < minBurnValueICP) {
-      if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+      if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
       releaseLock(caller);
       return #err(#BelowMinimumValue);
     };
 
     let feeValue = calculateFee(caller, redemptionValueICP, burnFeeBasisPoints, minBurnFeeICP);
     if (feeValue >= redemptionValueICP) {
-      if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+      if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
       releaseLock(caller);
       return #err(#BelowMinimumValue);
     };
@@ -2874,7 +3056,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Calculate proportional entitlements per token
     let portfolioValue = calculatePortfolioValueICP();
     if (portfolioValue == 0) {
-      if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+      if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
       releaseLock(caller);
       return #err(#UnexpectedError("Portfolio value is zero"));
     };
@@ -2896,7 +3086,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           Vector.add(skippedDust, token);
         } else if (tokenAmount > details.balance) {
           // Insufficient balance
-          if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+          if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
           releaseLock(caller);
           return #err(#InsufficientLiquidity({ token; available = details.balance; requested = tokenAmount }));
         } else {
@@ -2904,6 +3102,30 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         };
       };
     };
+
+    // IMMEDIATELY deduct optimistic balances so concurrent burns see reduced availability
+    for (ts in Vector.vals(tokensToSend)) {
+      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
+        case (?details) {
+          let totalDebit = ts.amount + details.tokenTransferFee;
+          let newBalance = if (details.balance > totalDebit) { details.balance - totalDebit } else { 0 };
+          Map.set(tokenDetailsMap, phash, ts.token, { details with balance = newBalance });
+        };
+        case null {};
+      };
+    };
+
+    // Optimistic NAV: immediately reflect the burn so concurrent operations see reduced portfolio + supply
+    let optPortfolio = if (nav.portfolioValueICP > netValueICP) { nav.portfolioValueICP - netValueICP } else { 0 };
+    let optSupply = if (nav.nachosSupply > nachosAmount) { nav.nachosSupply - nachosAmount } else { 0 };
+    cachedNAV := ?{
+      navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
+      portfolioValueICP = optPortfolio;
+      nachosSupply = optSupply;
+      timestamp = now();
+    };
+    cachedSupply := optSupply;
+    cachedSupplyTime := now();
 
     // Per-token slippage check
     switch (minimumValues) {
@@ -2913,7 +3135,19 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           for (ts in Vector.vals(tokensToSend)) {
             if (ts.token == minVal.token) {
               if (ts.amount < minVal.minAmount) {
-                if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+                rollbackOptimisticBurnBalances(tokensToSend);
+                cachedNAV := ?nav;
+                cachedSupply := nav.nachosSupply;
+                cachedSupplyTime := now();
+                if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
                 releaseLock(caller);
                 return #err(#SlippageExceeded);
               };
@@ -2930,7 +3164,19 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosLedgerTxId = switch (burnTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
-        if (nachosAmount > NACHOS_FEE) { ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE) };
+        rollbackOptimisticBurnBalances(tokensToSend);
+        cachedNAV := ?nav;
+        cachedSupply := nav.nachosSupply;
+        cachedSupplyTime := now();
+        if (nachosAmount > NACHOS_FEE) {
+          let returnAmount = nachosAmount - NACHOS_FEE;
+          switch (await returnNachosToUser(caller, returnAmount)) {
+            case (#ok(_)) {};
+            case (#err(msg)) {
+              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+            };
+          };
+        };
         releaseLock(caller);
         return #err(#TransferError(e));
       };
@@ -2952,19 +3198,6 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       Vector.add(tokensReceived, { token = ts.token; amount = ts.amount; txId = ?taskId });
     };
 
-    // Optimistic balance: reflect tokens leaving portfolio in tokenDetailsMap
-    // so subsequent calculateNAV() sees the reduced portfolio value
-    for (ts in Vector.vals(tokensToSend)) {
-      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
-        case (?details) {
-          let totalDebit = ts.amount + details.tokenTransferFee;
-          let newBalance = if (details.balance > totalDebit) { details.balance - totalDebit } else { 0 };
-          Map.set(tokenDetailsMap, phash, ts.token, { details with balance = newBalance });
-        };
-        case null {};
-      };
-    };
-
     let burnRecord : BurnRecord = {
       id = nextBurnId;
       timestamp = now();
@@ -2983,22 +3216,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Burn; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextBurnId });
+      accumulatedBurnFeesICP += feeValue;
     };
 
     let burnId = nextBurnId;
     nextBurnId += 1;
 
-    // Optimistic NAV: reflect redemption leaving portfolio (fee stays in treasury)
-    let optPortfolio = if (nav.portfolioValueICP > netValueICP) { nav.portfolioValueICP - netValueICP } else { 0 };
-    let optSupply = if (nav.nachosSupply > nachosAmount) { nav.nachosSupply - nachosAmount } else { 0 };
-    cachedNAV := ?{
-      navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
-      portfolioValueICP = optPortfolio;
-      nachosSupply = optSupply;
-      timestamp = now();
-    };
-    cachedSupply := optSupply;
-    cachedSupplyTime := now();
     recordNavSnapshot(#Burn);
     lastMintBurnTime := now();
     releaseLock(caller);
@@ -3339,13 +3562,29 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (amount == 0) return #err("Amount must be > 0");
     if (amount > claimable) return #err("Insufficient claimable fees: " # Nat.toText(claimable) # " available, " # Nat.toText(amount) # " requested");
 
-    // Deduct before await (prevent double-claim across await points)
+    // Deduct before creating transfer task (no awaits in this function — fully atomic on IC)
     claimedMintFeesICP += amount;
 
     let taskId = createTransferTask(caller, #principal(recipient), amount, ICPprincipal, NachosTreasurySubaccount, #Recovery, claimedMintFeesICP);
 
     logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " ICP mint fees -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimMintFees");
     #ok("Claimed " # Nat.toText(amount) # " e8s ICP, transfer task #" # Nat.toText(taskId));
+  };
+
+  // Claim accumulated burn fees (ICP-equivalent) — admin sends to any recipient
+  public shared ({ caller }) func claimBurnFees(recipient : Principal, amount : Nat) : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+    let claimable = accumulatedBurnFeesICP - claimedBurnFeesICP;
+    if (amount == 0) return #err("Amount must be > 0");
+    if (amount > claimable) return #err("Insufficient claimable burn fees: " # Nat.toText(claimable) # " available, " # Nat.toText(amount) # " requested");
+
+    // Deduct before creating transfer task (no awaits in this function — fully atomic on IC)
+    claimedBurnFeesICP += amount;
+
+    let taskId = createTransferTask(caller, #principal(recipient), amount, ICPprincipal, NachosTreasurySubaccount, #Recovery, claimedBurnFeesICP);
+
+    logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " ICP burn fees -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimBurnFees");
+    #ok("Claimed " # Nat.toText(amount) # " e8s ICP burn fees, transfer task #" # Nat.toText(taskId));
   };
 
   // Claim accumulated cancellation/recovery fees (per-token) — admin sends to any recipient
@@ -3460,6 +3699,29 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     logger.info("TRANSFER_QUEUE", "Admin reset " # Nat.toText(reset) # " exhausted transfer tasks", "retryFailedTransfers");
     if (reset > 0) { ensureTransferQueueRunning() };
     #ok(reset);
+  };
+
+  // Admin: recover NACHOS stuck in the deposit subaccount due to failed returnNachosToUser calls.
+  // This is the recovery path for the CRITICAL errors logged by redeemNachos.
+  public shared ({ caller }) func recoverStuckNachos(
+    recipient : Principal,
+    amount : Nat,
+  ) : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) {
+      return #err("Not authorized");
+    };
+    if (amount == 0) return #err("Amount must be greater than zero");
+
+    switch (await returnNachosToUser(recipient, amount)) {
+      case (#ok(txId)) {
+        logger.info("ADMIN", "Recovered " # Nat.toText(amount) # " stuck NACHOS to " # Principal.toText(recipient) # " tx=" # Nat.toText(txId), "recoverStuckNachos");
+        #ok("Recovered " # Nat.toText(amount) # " NACHOS to " # Principal.toText(recipient) # ", tx=" # Nat.toText(txId));
+      };
+      case (#err(msg)) {
+        logger.error("ADMIN", "recoverStuckNachos failed for " # Principal.toText(recipient) # " amount=" # Nat.toText(amount) # ": " # msg, "recoverStuckNachos");
+        #err("Recovery failed: " # msg);
+      };
+    };
   };
 
   public shared ({ caller }) func refreshICPSwapPools() : async Result.Result<Text, Text> {
@@ -3731,6 +3993,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       wouldExceed : Bool;
       maxAcceptableAmount : Nat;
     };
+    pendingMintValueICP : Nat;
   }, NachosError> {
     // Validate token is accepted
     switch (Map.get(acceptedMintTokens, phash, tokenPrincipal)) {
@@ -3745,13 +4008,21 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (not details.Active) return #err(#TokenNotActive);
     if (details.isPaused) return #err(#TokenPaused);
 
-    let tokenPriceICP = getConservativePrice(tokenPrincipal);
+    let THIRTY_MINUTES_NS : Int = 30 * 60 * 1_000_000_000;
+    let tokenPriceICP = getConservativePriceWithWindow(tokenPrincipal, THIRTY_MINUTES_NS);
     if (tokenPriceICP == 0) return #err(#InvalidPrice);
 
     let depositValueICP = (tokenAmount * tokenPriceICP) / (10 ** details.tokenDecimals);
 
-    // Allocation enforcement
+    // Spot price for allocation enforcement (consistent with portfolio valuation)
+    let spotPriceICP = details.priceInICP;
+    let depositValueSpot = if (spotPriceICP > 0) {
+      (tokenAmount * spotPriceICP) / (10 ** details.tokenDecimals);
+    } else { depositValueICP };
+
+    // Allocation enforcement (includes pending mint values)
     let portfolioValue = calculatePortfolioValueICP();
+    let pendingValue = getPendingMintValue(tokenPrincipal);
     var totalVP : Nat = 0;
     for ((_, v) in Map.entries(aggregateAllocation)) { totalVP += v };
     let targetBP = switch (Map.get(aggregateAllocation, phash, tokenPrincipal)) {
@@ -3759,8 +4030,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case null { 0 };
     };
 
-    let currentTokenValue = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-    let currentBP = if (portfolioValue > 0) { (currentTokenValue * 10_000) / portfolioValue } else { 0 };
+    let currentTokenValue = (details.balance * spotPriceICP) / (10 ** details.tokenDecimals);
+    let effectiveCurrentValue = currentTokenValue + pendingValue;
+    let currentBP = if (portfolioValue > 0) { (effectiveCurrentValue * 10_000) / portfolioValue } else { 0 };
 
     var usedAmount = tokenAmount;
     var excessAmount : Nat = 0;
@@ -3769,13 +4041,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (targetBP > 0 and portfolioValue > 0) {
       let maxAllowedValue = (portfolioValue * targetBP) / 10_000;
-      if (currentTokenValue + depositValueICP > maxAllowedValue) {
+      if (effectiveCurrentValue + depositValueSpot > maxAllowedValue) {
         wouldExceed := true;
-        if (currentTokenValue >= maxAllowedValue) {
+        if (effectiveCurrentValue >= maxAllowedValue) {
           return #err(#AllocationExceeded);
         };
-        let allowedValueICP = maxAllowedValue - currentTokenValue;
-        usedAmount := (allowedValueICP * (10 ** details.tokenDecimals)) / tokenPriceICP;
+        let allowedValueICP = maxAllowedValue - effectiveCurrentValue;
+        let priceForCalc = if (spotPriceICP > 0) { spotPriceICP } else { tokenPriceICP };
+        usedAmount := (allowedValueICP * (10 ** details.tokenDecimals)) / priceForCalc;
         if (usedAmount > tokenAmount) usedAmount := tokenAmount;
         excessAmount := tokenAmount - usedAmount;
         maxAcceptableAmount := usedAmount;
@@ -3783,10 +4056,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
 
     let usedValueICP = (usedAmount * tokenPriceICP) / (10 ** details.tokenDecimals);
+    let usedValueSpot = if (spotPriceICP > 0) {
+      (usedAmount * spotPriceICP) / (10 ** details.tokenDecimals);
+    } else { usedValueICP };
     let excessValueICP = (excessAmount * tokenPriceICP) / (10 ** details.tokenDecimals);
 
-    let afterDepositBP = if (portfolioValue + usedValueICP > 0) {
-      ((currentTokenValue + usedValueICP) * 10_000) / (portfolioValue + usedValueICP);
+    let afterDepositBP = if (portfolioValue + usedValueSpot > 0) {
+      ((effectiveCurrentValue + usedValueSpot) * 10_000) / (portfolioValue + usedValueSpot);
     } else { 0 };
 
     let nav = switch (cachedNAV) {
@@ -3815,6 +4091,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         wouldExceed;
         maxAcceptableAmount;
       };
+      pendingMintValueICP = pendingValue;
     });
   };
 
@@ -4298,6 +4575,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     // Claimable fees
     claimableMintFees : { accumulated : Nat; claimed : Nat; claimable : Nat };
+    claimableBurnFees : { accumulated : Nat; claimed : Nat; claimable : Nat };
     claimableCancellationFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
 
     // Operational metrics
@@ -4524,6 +4802,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       { accumulated = accumulatedMintFeesICP; claimed = claimedMintFeesICP; claimable = accumulatedMintFeesICP - claimedMintFeesICP };
     } else { { accumulated = 0 : Nat; claimed = 0 : Nat; claimable = 0 : Nat } };
 
+    let claimBurn = if (isAdmin) {
+      { accumulated = accumulatedBurnFeesICP; claimed = claimedBurnFeesICP; claimable = accumulatedBurnFeesICP - claimedBurnFeesICP };
+    } else { { accumulated = 0 : Nat; claimed = 0 : Nat; claimable = 0 : Nat } };
+
     let claimCancel = if (isAdmin) {
       let cc = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
       for ((token, acc) in Map.entries(accumulatedCancellationFees)) {
@@ -4580,6 +4862,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       rateLimitExemptPrincipals = rlExempt;
       transferQueue = tq;
       claimableMintFees = claimMint;
+      claimableBurnFees = claimBurn;
       claimableCancellationFees = claimCancel;
       pendingTransferCount = if (isAdmin) { Vector.size(pendingTransfers) } else { 0 };
       activeDepositCount = if (isAdmin) { Map.size(activeDeposits) } else { 0 };
@@ -4646,6 +4929,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   public shared query ({ caller }) func getClaimableMintFees() : async { accumulated : Nat; claimed : Nat; claimable : Nat } {
     { accumulated = accumulatedMintFeesICP; claimed = claimedMintFeesICP; claimable = accumulatedMintFeesICP - claimedMintFeesICP };
+  };
+
+  public shared query ({ caller }) func getClaimableBurnFees() : async { accumulated : Nat; claimed : Nat; claimable : Nat } {
+    { accumulated = accumulatedBurnFeesICP; claimed = claimedBurnFeesICP; claimable = accumulatedBurnFeesICP - claimedBurnFeesICP };
   };
 
   public shared query ({ caller }) func getClaimableCancellationFees() : async [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] {

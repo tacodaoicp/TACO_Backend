@@ -14,7 +14,8 @@
     },
     "validation": {
       "main": "src/validation/validation.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "neuronSnapshot": {
       "main": "src/neuron_snapshot/neuronSnapshot.mo",
