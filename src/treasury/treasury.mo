@@ -8451,8 +8451,42 @@ shared (deployer) persistent actor class treasury() = this {
    * 1. Get ICP/USD price via ICP/ckUSDC pair
    * 2. Get token/ICP prices for all tokens
    * 3. Calculate USD prices using ICP/USD rate
-   * 4. Average quotes when available from both DEXes
+   * 4. Liquidity-weighted merge when available from both DEXes
    */
+
+  // Kong confidence weight: derived from slippage on a 1-unit quote.
+  // Lower slippage = deeper liquidity = more reliable price.
+  private func kongSlippageToWeight(slippage : ?Float) : Float {
+    switch (slippage) {
+      case (?s) {
+        if (s == 0.001) { 1.0 }       // Effectively zero slippage
+        else if (s < 0.1) { 0.9 }     // <0.1%: excellent liquidity
+        else if (s < 0.35) { 0.7 }     // <0.5%: good
+        else if (s < 0.39) { 0.4 }     // <1%: moderate
+        else if (s < 0.45) { 0.15 }    // <3%: poor
+        else if (s < 0.55) { 0.05 } 
+        else if (s < 0.70) { 0.02 }
+        else { 0.0 };                  // ≥3%: too thin, ignore
+      };
+      case null { 0.5 };              // No data: neutral
+    };
+  };
+
+  // ICPSwap confidence weight: derived from concentrated liquidity (L value).
+  // Higher L = more capital at current tick = more reliable price.
+  private func icpSwapLiquidityToWeight(liquidity : ?Nat) : Float {
+    switch (liquidity) {
+      case (?liq) {
+        let l = Float.fromInt(liq);
+        if (l <= 0.0) { 0.0 }                   // No liquidity, ignore
+        else if (l < 1_000_000) { 0.0 }          // Near-zero: ignore
+        else if (l < 100_000_000) { 0.4 }        // Moderate
+        else if (l < 10_000_000_000) { 0.7 }     // Good
+        else { 1.0 };                             // Deep
+      };
+      case null { 0.5 };                          // No data: neutral
+    };
+  };
   private func syncPriceWithDEX() : async* () {
     Debug.print("Starting DEX price sync...");
     
@@ -8471,13 +8505,15 @@ shared (deployer) persistent actor class treasury() = this {
 
     // Await Kong ICP/ckUSDC result
     var kongICPPrice : ?Float = null;
+    var kongICPSlippage : ?Float = null;
     try {
       let kongResult = await kongICPFuture;
       switch (kongResult) {
         case (#ok(quote)) {
           if (quote.mid_price > 0.0) {
             kongICPPrice := ?quote.mid_price;
-            Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP");
+            kongICPSlippage := ?quote.slippage;
+            Debug.print("Kong ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " USD per ICP, slippage: " # Float.toText(quote.slippage) # "%");
           } else {
             Debug.print("Kong ICP/ckUSDC returned zero/invalid price; ignoring");
           };
@@ -8492,6 +8528,7 @@ shared (deployer) persistent actor class treasury() = this {
 
     // Await ICPSwap ICP/ckUSDC result
     var icpSwapICPPrice : ?Float = null;
+    var icpSwapICPLiquidity : ?Nat = null;
     try {
       let icpSwapResult = await icpSwapICPFuture;
       switch (icpSwapResult) {
@@ -8517,7 +8554,8 @@ shared (deployer) persistent actor class treasury() = this {
 
           if (icpPrice > 0.0) {
             icpSwapICPPrice := ?icpPrice;
-            Debug.print("ICPSwap ICP/ckUSDC price: " # Float.toText(icpPrice) # " (token0=" # priceInfo.token0.address # ", token1=" # priceInfo.token1.address # ")");
+            icpSwapICPLiquidity := ?priceInfo.liquidity;
+            Debug.print("ICPSwap ICP/ckUSDC price: " # Float.toText(icpPrice) # ", liquidity: " # Nat.toText(priceInfo.liquidity) # " (token0=" # priceInfo.token0.address # ", token1=" # priceInfo.token1.address # ")");
           } else {
             Debug.print("ICPSwap ICP/ckUSDC price calculation resulted in 0 or invalid");
           };
@@ -8529,13 +8567,22 @@ shared (deployer) persistent actor class treasury() = this {
     } catch (e) {
       Debug.print("ICPSwap ICP/ckUSDC exception: " # Error.message(e));
     };
-    
-    // Calculate final ICP/USD price
-      switch (kongICPPrice, icpSwapICPPrice) {
+
+    // Calculate final ICP/USD price (liquidity-weighted)
+    switch (kongICPPrice, icpSwapICPPrice) {
       case (?kong, ?icpSwap) {
-        // Average both prices
-        icpPriceUSD := ?((kong + icpSwap) / 2.0);
-        Debug.print("Using averaged ICP/USD price: " # Float.toText((kong + icpSwap) / 2.0));
+        // Derive confidence weights from liquidity signals
+        let kongW = kongSlippageToWeight(kongICPSlippage);
+        let icpW = icpSwapLiquidityToWeight(icpSwapICPLiquidity);
+        let totalW = kongW + icpW;
+        if (totalW > 0.0) {
+          let weighted = (kong * kongW + icpSwap * icpW) / totalW;
+          icpPriceUSD := ?weighted;
+          Debug.print("ICP/USD liquidity-weighted price: " # Float.toText(weighted) # " (Kong=" # Float.toText(kong) # " w=" # Float.toText(kongW) # ", ICPSwap=" # Float.toText(icpSwap) # " w=" # Float.toText(icpW) # ")");
+        } else {
+          icpPriceUSD := ?((kong + icpSwap) / 2.0);
+          Debug.print("ICP/USD both weights zero - simple average fallback: " # Float.toText((kong + icpSwap) / 2.0));
+        };
       };
       case (?kong, null) {
         if (kong > 0.0) {
@@ -8613,6 +8660,7 @@ shared (deployer) persistent actor class treasury() = this {
 
       // Await Kong result
       var kongTokenPrice : ?Float = null;
+      var kongTokenSlippage : ?Float = null;
       switch (Map.get(kongFutures, phash, principal)) {
         case (?kongFut) {
           try {
@@ -8621,7 +8669,8 @@ shared (deployer) persistent actor class treasury() = this {
               case (#ok(quote)) {
                 if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0) {
                   kongTokenPrice := ?quote.mid_price;
-                  Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol # " (ACCEPTED)");
+                  kongTokenSlippage := ?quote.slippage;
+                  Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol # ", slippage: " # Float.toText(quote.slippage) # "% (ACCEPTED)");
                 } else {
                   Debug.print("Kong " # tokenSymbol # "/ICP returned zero/unreasonable price (" # Float.toText(quote.mid_price) # "); ignoring");
                 };
@@ -8639,6 +8688,7 @@ shared (deployer) persistent actor class treasury() = this {
 
       // Await ICPSwap result
       var icpSwapTokenPrice : ?Float = null;
+      var icpSwapTokenLiquidity : ?Nat = null;
       switch (Map.get(icpSwapFutures, phash, principal)) {
         case (?icpFut) {
           try {
@@ -8684,7 +8734,8 @@ shared (deployer) persistent actor class treasury() = this {
                 if (tokenICPPrice > 0.0) {
                   if (tokenICPPrice >= 0.000001 and tokenICPPrice <= 100000.0) {
                     icpSwapTokenPrice := ?tokenICPPrice;
-                    Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(tokenICPPrice) # " (calculated from raw: " # Float.toText(priceInfo.price) # ") - ACCEPTED");
+                    icpSwapTokenLiquidity := ?priceInfo.liquidity;
+                    Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(tokenICPPrice) # ", liquidity: " # Nat.toText(priceInfo.liquidity) # " (raw: " # Float.toText(priceInfo.price) # ") - ACCEPTED");
                   } else {
                     Debug.print("ICPSwap " # tokenSymbol # "/ICP price: " # Float.toText(tokenICPPrice) # " seems unreasonable - REJECTED");
                   };
@@ -8703,28 +8754,28 @@ shared (deployer) persistent actor class treasury() = this {
         case null {};
       };
 
-      // Calculate final token price (same logic as before)
+      // Calculate final token price (liquidity-weighted)
       switch (kongTokenPrice, icpSwapTokenPrice) {
         case (?kong, ?icpSwap) {
           let maxPrice = Float.max(kong, icpSwap);
           let minPrice = Float.min(kong, icpSwap);
           let variance = if (maxPrice > 0.0) { (maxPrice - minPrice) / maxPrice } else { 1.0 };
 
-          let finalPrice : Float = if (variance <= 0.01) {
-            Debug.print(tokenSymbol # " DEX variance " # Float.toText(variance * 100.0) # "% < 1% - averaging prices");
-            (kong + icpSwap) / 2.0
-          } else {
-            let lastPriceFloat = Float.fromInt(details.priceInICP) / 100000000.0;
-            let kongDiff = Float.abs(kong - lastPriceFloat);
-            let icpSwapDiff = Float.abs(icpSwap - lastPriceFloat);
+          // Derive confidence weights from liquidity signals
+          let kongWeight = kongSlippageToWeight(kongTokenSlippage);
+          let icpSwapWeight = icpSwapLiquidityToWeight(icpSwapTokenLiquidity);
+          let totalWeight = kongWeight + icpSwapWeight;
 
-            if (kongDiff <= icpSwapDiff) {
-              Debug.print(tokenSymbol # " DEX variance " # Float.toText(variance * 100.0) # "% >= 1% - using Kong (closer to last price " # Float.toText(lastPriceFloat) # ")");
-              kong
-            } else {
-              Debug.print(tokenSymbol # " DEX variance " # Float.toText(variance * 100.0) # "% >= 1% - using ICPSwap (closer to last price " # Float.toText(lastPriceFloat) # ")");
-              icpSwap
-            }
+          let finalPrice : Float = if (totalWeight > 0.0) {
+            let weighted = (kong * kongWeight + icpSwap * icpSwapWeight) / totalWeight;
+            Debug.print(tokenSymbol # " DEX variance " # Float.toText(variance * 100.0) #
+              "% - liquidity-weighted: " # Float.toText(weighted) #
+              " (Kong=" # Float.toText(kong) # " w=" # Float.toText(kongWeight) #
+              ", ICPSwap=" # Float.toText(icpSwap) # " w=" # Float.toText(icpSwapWeight) # ")");
+            weighted
+          } else {
+            Debug.print(tokenSymbol # " DEX both weights zero - simple average fallback");
+            (kong + icpSwap) / 2.0
           };
 
           let scaledPrice = finalPrice * 100000000.0;
@@ -8859,7 +8910,10 @@ shared (deployer) persistent actor class treasury() = this {
         tokensRefreshed = Map.size(tokenDetailsMap);
         timestamp = lastPriceRefreshTime;
         icpPriceUSD = icpPrice;
-        tokenDetails = Iter.toArray(Map.entries(tokenDetailsMap));
+        tokenDetails = Array.map<(Principal, TokenDetails), (Principal, TokenDetails)>(
+          Iter.toArray(Map.entries(tokenDetailsMap)),
+          func((p, d)) { (p, { d with pastPrices = [] }) },
+        );
       });
     };
 
@@ -8876,7 +8930,10 @@ shared (deployer) persistent actor class treasury() = this {
         tokensRefreshed = Map.size(tokenDetailsMap);
         timestamp = now();
         icpPriceUSD = icpPrice;
-        tokenDetails = Iter.toArray(Map.entries(tokenDetailsMap));
+        tokenDetails = Array.map<(Principal, TokenDetails), (Principal, TokenDetails)>(
+          Iter.toArray(Map.entries(tokenDetailsMap)),
+          func((p, d)) { (p, { d with pastPrices = [] }) },
+        );
       });
     } catch (e) {
       #err("Price refresh failed: " # Error.message(e));
@@ -8889,6 +8946,7 @@ shared (deployer) persistent actor class treasury() = this {
     timestamp : Int;
     icpPriceUSD : Float;
     tokenDetails : [(Principal, TokenDetails)];
+    tradingPauses : [TradingPauseRecord];
   } {
     if (
       caller != DAOPrincipal and
@@ -8900,6 +8958,7 @@ shared (deployer) persistent actor class treasury() = this {
         timestamp = 0;
         icpPriceUSD = 0.0;
         tokenDetails = [];
+        tradingPauses = [];
       };
     };
     let icpPrice : Float = switch (Map.get(tokenDetailsMap, phash, ICPprincipal)) {
@@ -8909,7 +8968,11 @@ shared (deployer) persistent actor class treasury() = this {
     {
       timestamp = lastPriceRefreshTime;
       icpPriceUSD = icpPrice;
-      tokenDetails = Iter.toArray(Map.entries(tokenDetailsMap));
+      tokenDetails = Array.map<(Principal, TokenDetails), (Principal, TokenDetails)>(
+        Iter.toArray(Map.entries(tokenDetailsMap)),
+        func((p, d)) { (p, { d with pastPrices = [] }) },
+      );
+      tradingPauses = Iter.toArray(Map.vals(tradingPauses));
     };
   };
 

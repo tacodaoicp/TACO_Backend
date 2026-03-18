@@ -1,128 +1,184 @@
-import Principal "mo:base/Principal";
 import Array "mo:base/Array";
+import Principal "mo:base/Principal";
 
 module {
-  public type Allocation = {
-    token : Principal;
-    basisPoints : Nat;
+
+  //==========================================================================
+  // SHARED TYPES (unchanged between old and new)
+  //==========================================================================
+
+  type SystemState = {
+    #Active;
+    #Paused;
+    #Emergency;
   };
 
-  public type NeuronVP = {
-    neuronId : Blob;
-    votingPower : Nat;
+  type TokenType = {
+    #ICP;
+    #ICRC12;
+    #ICRC3;
   };
 
-  // Old UserState: pastAllocations without note
-  public type OldUserState = {
-    allocations : [Allocation];
-    votingPower : Nat;
-    lastVotingPowerUpdate : Int;
-    lastAllocationUpdate : Int;
-    lastAllocationMaker : Principal;
-    pastAllocations : [{
-      from : Int;
-      to : Int;
-      allocation : [Allocation];
-      allocationMaker : Principal;
-    }];
-    allocationFollows : [{ since : Int; follow : Principal }];
-    allocationFollowedBy : [{ since : Int; follow : Principal }];
-    followUnfollowActions : [Int];
-    neurons : [NeuronVP];
+  type SystemParameter = {
+    #FollowDepth : Nat;
+    #MaxFollowers : Nat;
+    #MaxPastAllocations : Nat;
+    #SnapshotInterval : Nat;
+    #MaxTotalUpdates : Nat;
+    #MaxAllocationsPerDay : Int;
+    #AllocationWindow : Nat;
+    #MaxFollowUnfollowActionsPerDay : Nat;
+    #MaxFollowed : Nat;
+    #LogAdmin : Principal;
   };
 
-  // New UserState: pastAllocations with note
-  public type NewUserState = {
-    allocations : [Allocation];
-    votingPower : Nat;
-    lastVotingPowerUpdate : Int;
-    lastAllocationUpdate : Int;
-    lastAllocationMaker : Principal;
-    pastAllocations : [{
-      from : Int;
-      to : Int;
-      allocation : [Allocation];
-      allocationMaker : Principal;
-      note : ?Text;
-    }];
-    allocationFollows : [{ since : Int; follow : Principal }];
-    allocationFollowedBy : [{ since : Int; follow : Principal }];
-    followUnfollowActions : [Int];
-    neurons : [NeuronVP];
+  //==========================================================================
+  // OLD TYPES (AdminActionType WITHOUT #TokenMaxAllocationUpdate)
+  //==========================================================================
+
+  type OldAdminActionType = {
+    #TokenAdd : { token : Principal; tokenType : TokenType; viaGovernance : Bool };
+    #TokenRemove : { token : Principal };
+    #TokenDelete : { token : Principal };
+    #TokenPause : { token : Principal };
+    #TokenUnpause : { token : Principal };
+    #SystemStateChange : { oldState : SystemState; newState : SystemState };
+    #ParameterUpdate : { parameter : SystemParameter; oldValue : Text; newValue : Text };
+    #AdminPermissionGrant : { targetAdmin : Principal; function : Text; durationDays : Nat };
+    #AdminAdd : { newAdmin : Principal };
+    #AdminRemove : { removedAdmin : Principal };
+    #CanisterStart;
+    #CanisterStop;
   };
 
-  // Raw Map type from mo:map
+  type OldAdminActionRecord = {
+    id : Nat;
+    timestamp : Int;
+    admin : Principal;
+    actionType : OldAdminActionType;
+    reason : Text;
+    success : Bool;
+    errorMessage : ?Text;
+  };
+
+  //==========================================================================
+  // NEW TYPES (AdminActionType WITH #TokenMaxAllocationUpdate)
+  //==========================================================================
+
+  type NewAdminActionType = {
+    #TokenAdd : { token : Principal; tokenType : TokenType; viaGovernance : Bool };
+    #TokenRemove : { token : Principal };
+    #TokenDelete : { token : Principal };
+    #TokenPause : { token : Principal };
+    #TokenUnpause : { token : Principal };
+    #SystemStateChange : { oldState : SystemState; newState : SystemState };
+    #ParameterUpdate : { parameter : SystemParameter; oldValue : Text; newValue : Text };
+    #AdminPermissionGrant : { targetAdmin : Principal; function : Text; durationDays : Nat };
+    #AdminAdd : { newAdmin : Principal };
+    #AdminRemove : { removedAdmin : Principal };
+    #CanisterStart;
+    #CanisterStop;
+    #TokenMaxAllocationUpdate : { token : Principal; oldMaxBP : ?Nat; newMaxBP : ?Nat };
+  };
+
+  type NewAdminActionRecord = {
+    id : Nat;
+    timestamp : Int;
+    admin : Principal;
+    actionType : NewAdminActionType;
+    reason : Text;
+    success : Bool;
+    errorMessage : ?Text;
+  };
+
+  //==========================================================================
+  // INTERNAL STRUCTURES
+  //==========================================================================
+
+  // Vector<AdminActionRecord> internal representation
+  type OldActionVector = {
+    var data_blocks : [var [var ?OldAdminActionRecord]];
+    var i_block : Nat;
+    var i_element : Nat;
+  };
+
+  type NewActionVector = {
+    var data_blocks : [var [var ?NewAdminActionRecord]];
+    var i_block : Nat;
+    var i_element : Nat;
+  };
+
+  //==========================================================================
+  // STATE TYPES
+  //==========================================================================
+
   public type OldState = {
-    userStates : [var ?(
-      keys : [var ?Principal],
-      values : [var ?OldUserState],
-      indexes : [var Nat],
-      bounds : [var Nat32],
-    )];
+    adminActions : OldActionVector;
   };
 
   public type NewState = {
-    userStates : [var ?(
-      keys : [var ?Principal],
-      values : [var ?NewUserState],
-      indexes : [var Nat],
-      bounds : [var Nat32],
-    )];
+    adminActions : NewActionVector;
   };
 
-  public func migrate(oldState : OldState) : NewState {
-    let oldMap = oldState.userStates;
-    let newMap : [var ?(
-      keys : [var ?Principal],
-      values : [var ?NewUserState],
-      indexes : [var Nat],
-      bounds : [var Nat32],
-    )] = Array.init(oldMap.size(), null);
+  //==========================================================================
+  // MIGRATION HELPERS
+  //==========================================================================
 
-    for (i in oldMap.keys()) {
-      switch (oldMap[i]) {
-        case (?(keys, values, indexes, bounds)) {
-          let newValues : [var ?NewUserState] = Array.init(values.size(), null);
-          for (j in values.keys()) {
-            switch (values[j]) {
-              case (?oldUser) {
-                newValues[j] := ?{
-                  allocations = oldUser.allocations;
-                  votingPower = oldUser.votingPower;
-                  lastVotingPowerUpdate = oldUser.lastVotingPowerUpdate;
-                  lastAllocationUpdate = oldUser.lastAllocationUpdate;
-                  lastAllocationMaker = oldUser.lastAllocationMaker;
-                  pastAllocations = Array.map<
-                    { from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal },
-                    { from : Int; to : Int; allocation : [Allocation]; allocationMaker : Principal; note : ?Text }
-                  >(oldUser.pastAllocations, func (pa) {
-                    {
-                      from = pa.from;
-                      to = pa.to;
-                      allocation = pa.allocation;
-                      allocationMaker = pa.allocationMaker;
-                      note = null;
-                    }
-                  });
-                  allocationFollows = oldUser.allocationFollows;
-                  allocationFollowedBy = oldUser.allocationFollowedBy;
-                  followUnfollowActions = oldUser.followUnfollowActions;
-                  neurons = oldUser.neurons;
-                };
-              };
-              case null {
-                newValues[j] := null;
-              };
-            };
-          };
-          newMap[i] := ?(keys, newValues, indexes, bounds);
-        };
-        case null {
-          newMap[i] := null;
+  func migrateActionType(old : OldAdminActionType) : NewAdminActionType {
+    switch (old) {
+      case (#TokenAdd(d)) { #TokenAdd(d) };
+      case (#TokenRemove(d)) { #TokenRemove(d) };
+      case (#TokenDelete(d)) { #TokenDelete(d) };
+      case (#TokenPause(d)) { #TokenPause(d) };
+      case (#TokenUnpause(d)) { #TokenUnpause(d) };
+      case (#SystemStateChange(d)) { #SystemStateChange(d) };
+      case (#ParameterUpdate(d)) { #ParameterUpdate(d) };
+      case (#AdminPermissionGrant(d)) { #AdminPermissionGrant(d) };
+      case (#AdminAdd(d)) { #AdminAdd(d) };
+      case (#AdminRemove(d)) { #AdminRemove(d) };
+      case (#CanisterStart) { #CanisterStart };
+      case (#CanisterStop) { #CanisterStop };
+    };
+  };
+
+  func migrateRecord(old : OldAdminActionRecord) : NewAdminActionRecord {
+    {
+      id = old.id;
+      timestamp = old.timestamp;
+      admin = old.admin;
+      actionType = migrateActionType(old.actionType);
+      reason = old.reason;
+      success = old.success;
+      errorMessage = old.errorMessage;
+    };
+  };
+
+  //==========================================================================
+  // MAIN MIGRATION FUNCTION
+  //==========================================================================
+
+  public func migrate(old : OldState) : NewState {
+    let oldBlocks = old.adminActions.data_blocks;
+    let newBlocks : [var [var ?NewAdminActionRecord]] = Array.init(oldBlocks.size(), [var] : [var ?NewAdminActionRecord]);
+
+    for (i in oldBlocks.keys()) {
+      let oldBlock = oldBlocks[i];
+      let newBlock : [var ?NewAdminActionRecord] = Array.init(oldBlock.size(), null);
+      for (j in oldBlock.keys()) {
+        newBlock[j] := switch (oldBlock[j]) {
+          case (?record) { ?migrateRecord(record) };
+          case null { null };
         };
       };
+      newBlocks[i] := newBlock;
     };
 
-    { userStates = newMap };
+    {
+      adminActions = {
+        var data_blocks = newBlocks;
+        var i_block = old.adminActions.i_block;
+        var i_element = old.adminActions.i_element;
+      };
+    };
   };
 };

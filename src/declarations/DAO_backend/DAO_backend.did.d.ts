@@ -31,6 +31,13 @@ export type AdminActionType = {
   { 'TokenPause' : { 'token' : Principal } } |
   { 'AdminRemove' : { 'removedAdmin' : Principal } } |
   {
+    'TokenMaxAllocationUpdate' : {
+      'token' : Principal,
+      'newMaxBP' : [] | [bigint],
+      'oldMaxBP' : [] | [bigint],
+    }
+  } |
+  {
     'SystemStateChange' : { 'oldState' : SystemState, 'newState' : SystemState }
   } |
   {
@@ -60,6 +67,7 @@ export type AdminFunction = { 'removeToken' : null } |
   { 'updateSystemParameter' : null } |
   { 'updateTreasuryConfig' : null } |
   { 'getFollowActions' : null } |
+  { 'setTokenMaxAllocation' : null } |
   { 'updateSpamParameters' : null } |
   { 'addToken' : null } |
   { 'getAdminActions' : null } |
@@ -194,6 +202,7 @@ export interface ContinuousDAO {
           'totalVotingPowerByHotkeySetters' : bigint,
           'neuronCount' : bigint,
         },
+        'tokenMaxAllocations' : Array<[Principal, bigint]>,
       }
     ]
   >,
@@ -241,6 +250,10 @@ export interface ContinuousDAO {
     [],
     Array<PublicTokenDetailsEntry>
   >,
+  'getTokenDetailsWithoutPastPricesMaxAllocations' : ActorMethod<
+    [],
+    Array<PublicTokenDetailsWithMaxAllocationEntry>
+  >,
   'getUserAllocation' : ActorMethod<[], [] | [UserState]>,
   'getUserNeurons' : ActorMethod<[Principal], Array<NeuronVP>>,
   'getUserRegisteredTokens' : ActorMethod<[], Array<Principal>>,
@@ -260,6 +273,10 @@ export interface ContinuousDAO {
   'removeFollower' : ActorMethod<[Principal], Result_6>,
   'removeToken' : ActorMethod<[Principal, string], Result_1>,
   'setTacoAddress' : ActorMethod<[Principal], undefined>,
+  'setTokenMaxAllocation' : ActorMethod<
+    [Principal, [] | [bigint], string],
+    Result_1
+  >,
   'set_sns_governance_canister_id' : ActorMethod<[Principal], undefined>,
   'syncTokenDetailsFromTreasury' : ActorMethod<
     [Array<[Principal, TokenDetails]>],
@@ -404,6 +421,26 @@ export interface PublicTokenDetails {
   'tokenType' : TokenType,
 }
 export type PublicTokenDetailsEntry = [Principal, PublicTokenDetails];
+export interface PublicTokenDetailsWithMaxAllocation {
+  'lastTimeSynced' : bigint,
+  'balance' : bigint,
+  'isPaused' : boolean,
+  'Active' : boolean,
+  'epochAdded' : bigint,
+  'priceInICP' : bigint,
+  'priceInUSD' : number,
+  'tokenTransferFee' : bigint,
+  'tokenDecimals' : bigint,
+  'tokenSymbol' : string,
+  'tokenName' : string,
+  'pausedDueToSyncFailure' : boolean,
+  'tokenType' : TokenType,
+  'maxAllocationBasisPoints' : [] | [bigint],
+}
+export type PublicTokenDetailsWithMaxAllocationEntry = [
+  Principal,
+  PublicTokenDetailsWithMaxAllocation,
+];
 export type RefreshError = { 'NotAllowed' : null } |
   { 'NoNeuronsFound' : null } |
   { 'SnsGovernanceError' : string } |

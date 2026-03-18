@@ -1,109 +1,118 @@
-import Nat8 "mo:base/Nat8";
-import Nat64 "mo:base/Nat64";
 import Array "mo:base/Array";
 
 module {
   //==========================================================================
-  // OLD TYPES (TransferOperationType WITHOUT #ForwardToPortfolio)
+  // SHARED TYPES (unchanged between old and new)
   //==========================================================================
 
-  type OldTransferOperationType = {
-    #MintReturn;
-    #BurnPayout;
-    #ExcessReturn;
-    #CancelReturn;
-    #Recovery;
+  type CircuitBreakerAction = {
+    #PauseMint;
+    #PauseBurn;
+    #PauseBoth;
+    #RejectOperation;
   };
 
-  type TransferStatus = {
-    #Pending;
-    #Sent;
-    #Confirmed : Nat64;
-    #Failed : Text;
+  //==========================================================================
+  // OLD TYPES (CircuitBreakerConditionType WITHOUT #TokenPaused)
+  //==========================================================================
+
+  type OldCircuitBreakerConditionType = {
+    #NavDrop;
+    #PriceChange;
+    #BalanceChange;
+    #DecimalChange;
   };
 
-  type TransferRecipient = {
-    #principal : Principal;
-    #accountId : { owner : Principal; subaccount : ?Blob };
-  };
-
-  type OldVaultTransferTask = {
+  type OldCircuitBreakerAlert = {
     id : Nat;
-    caller : Principal;
-    recipient : TransferRecipient;
-    amount : Nat;
-    tokenPrincipal : Principal;
-    fromSubaccount : Nat8;
-    operationType : OldTransferOperationType;
-    operationId : Nat;
-    status : TransferStatus;
-    createdAt : Int;
-    updatedAt : Int;
-    retryCount : Nat;
-    actualAmountSent : ?Nat;
-    blockIndex : ?Nat64;
+    conditionId : Nat;
+    conditionType : OldCircuitBreakerConditionType;
+    token : ?Principal;
+    tokenSymbol : Text;
+    timestamp : Int;
+    actionTaken : CircuitBreakerAction;
+    details : Text;
   };
 
-  //==========================================================================
-  // NEW TYPES (TransferOperationType WITH #ForwardToPortfolio)
-  //==========================================================================
-
-  type NewTransferOperationType = {
-    #MintReturn;
-    #BurnPayout;
-    #ExcessReturn;
-    #CancelReturn;
-    #Recovery;
-    #ForwardToPortfolio;
-  };
-
-  type NewVaultTransferTask = {
+  type OldCircuitBreakerCondition = {
     id : Nat;
-    caller : Principal;
-    recipient : TransferRecipient;
-    amount : Nat;
-    tokenPrincipal : Principal;
-    fromSubaccount : Nat8;
-    operationType : NewTransferOperationType;
-    operationId : Nat;
-    status : TransferStatus;
+    conditionType : OldCircuitBreakerConditionType;
+    thresholdPercent : Float;
+    timeWindowNS : Nat;
+    direction : { #Up; #Down; #Both };
+    action : CircuitBreakerAction;
+    applicableTokens : [Principal];
+    enabled : Bool;
     createdAt : Int;
-    updatedAt : Int;
-    retryCount : Nat;
-    actualAmountSent : ?Nat;
-    blockIndex : ?Nat64;
+    createdBy : Principal;
   };
 
   //==========================================================================
-  // INTERNAL STRUCTURES (Vector and Map representations)
+  // NEW TYPES (CircuitBreakerConditionType WITH #TokenPaused)
   //==========================================================================
 
-  // Vector<VaultTransferTask> internal representation
-  type OldVector = {
-    var data_blocks : [var [var ?OldVaultTransferTask]];
+  type NewCircuitBreakerConditionType = {
+    #NavDrop;
+    #PriceChange;
+    #BalanceChange;
+    #DecimalChange;
+    #TokenPaused;
+  };
+
+  type NewCircuitBreakerAlert = {
+    id : Nat;
+    conditionId : Nat;
+    conditionType : NewCircuitBreakerConditionType;
+    token : ?Principal;
+    tokenSymbol : Text;
+    timestamp : Int;
+    actionTaken : CircuitBreakerAction;
+    details : Text;
+  };
+
+  type NewCircuitBreakerCondition = {
+    id : Nat;
+    conditionType : NewCircuitBreakerConditionType;
+    thresholdPercent : Float;
+    timeWindowNS : Nat;
+    direction : { #Up; #Down; #Both };
+    action : CircuitBreakerAction;
+    applicableTokens : [Principal];
+    enabled : Bool;
+    createdAt : Int;
+    createdBy : Principal;
+  };
+
+  //==========================================================================
+  // INTERNAL STRUCTURES
+  //==========================================================================
+
+  // Vector<CircuitBreakerAlert> internal representation
+  type OldAlertVector = {
+    var data_blocks : [var [var ?OldCircuitBreakerAlert]];
     var i_block : Nat;
     var i_element : Nat;
   };
 
-  type NewVector = {
-    var data_blocks : [var [var ?NewVaultTransferTask]];
+  type NewAlertVector = {
+    var data_blocks : [var [var ?NewCircuitBreakerAlert]];
     var i_block : Nat;
     var i_element : Nat;
   };
 
-  // Map<Nat, VaultTransferTask> internal representation
-  type OldMapBucket = (
-    [var ?Nat],              // keys
-    [var ?OldVaultTransferTask], // values
-    [var Nat],               // indexes
-    [var Nat32],             // bounds
+  // Map<Nat, CircuitBreakerCondition> internal representation
+  type OldConditionMapBucket = (
+    [var ?Nat],
+    [var ?OldCircuitBreakerCondition],
+    [var Nat],
+    [var Nat32],
   );
 
-  type NewMapBucket = (
-    [var ?Nat],              // keys
-    [var ?NewVaultTransferTask], // values
-    [var Nat],               // indexes
-    [var Nat32],             // bounds
+  type NewConditionMapBucket = (
+    [var ?Nat],
+    [var ?NewCircuitBreakerCondition],
+    [var Nat],
+    [var Nat32],
   );
 
   //==========================================================================
@@ -111,45 +120,53 @@ module {
   //==========================================================================
 
   public type OldState = {
-    pendingTransfers : OldVector;
-    completedTransfers : [var ?OldMapBucket];
+    circuitBreakerAlerts : OldAlertVector;
+    circuitBreakerConditions : [var ?OldConditionMapBucket];
   };
 
   public type NewState = {
-    pendingTransfers : NewVector;
-    completedTransfers : [var ?NewMapBucket];
+    circuitBreakerAlerts : NewAlertVector;
+    circuitBreakerConditions : [var ?NewConditionMapBucket];
   };
 
   //==========================================================================
   // MIGRATION HELPERS
   //==========================================================================
 
-  func migrateOpType(old : OldTransferOperationType) : NewTransferOperationType {
+  func migrateConditionType(old : OldCircuitBreakerConditionType) : NewCircuitBreakerConditionType {
     switch (old) {
-      case (#MintReturn) { #MintReturn };
-      case (#BurnPayout) { #BurnPayout };
-      case (#ExcessReturn) { #ExcessReturn };
-      case (#CancelReturn) { #CancelReturn };
-      case (#Recovery) { #Recovery };
+      case (#NavDrop) { #NavDrop };
+      case (#PriceChange) { #PriceChange };
+      case (#BalanceChange) { #BalanceChange };
+      case (#DecimalChange) { #DecimalChange };
     };
   };
 
-  func migrateTask(old : OldVaultTransferTask) : NewVaultTransferTask {
+  func migrateAlert(old : OldCircuitBreakerAlert) : NewCircuitBreakerAlert {
     {
       id = old.id;
-      caller = old.caller;
-      recipient = old.recipient;
-      amount = old.amount;
-      tokenPrincipal = old.tokenPrincipal;
-      fromSubaccount = old.fromSubaccount;
-      operationType = migrateOpType(old.operationType);
-      operationId = old.operationId;
-      status = old.status;
+      conditionId = old.conditionId;
+      conditionType = migrateConditionType(old.conditionType);
+      token = old.token;
+      tokenSymbol = old.tokenSymbol;
+      timestamp = old.timestamp;
+      actionTaken = old.actionTaken;
+      details = old.details;
+    };
+  };
+
+  func migrateCondition(old : OldCircuitBreakerCondition) : NewCircuitBreakerCondition {
+    {
+      id = old.id;
+      conditionType = migrateConditionType(old.conditionType);
+      thresholdPercent = old.thresholdPercent;
+      timeWindowNS = old.timeWindowNS;
+      direction = old.direction;
+      action = old.action;
+      applicableTokens = old.applicableTokens;
+      enabled = old.enabled;
       createdAt = old.createdAt;
-      updatedAt = old.updatedAt;
-      retryCount = old.retryCount;
-      actualAmountSent = old.actualAmountSent;
-      blockIndex = old.blockIndex;
+      createdBy = old.createdBy;
     };
   };
 
@@ -158,25 +175,25 @@ module {
   //==========================================================================
 
   public func migrate(old : OldState) : NewState {
-    // Migrate pendingTransfers (Vector internals)
-    let oldBlocks = old.pendingTransfers.data_blocks;
-    let newBlocks : [var [var ?NewVaultTransferTask]] = Array.init(oldBlocks.size(), [var] : [var ?NewVaultTransferTask]);
+    // Migrate circuitBreakerAlerts (Vector internals)
+    let oldBlocks = old.circuitBreakerAlerts.data_blocks;
+    let newBlocks : [var [var ?NewCircuitBreakerAlert]] = Array.init(oldBlocks.size(), [var] : [var ?NewCircuitBreakerAlert]);
 
     for (i in oldBlocks.keys()) {
       let oldBlock = oldBlocks[i];
-      let newBlock : [var ?NewVaultTransferTask] = Array.init(oldBlock.size(), null);
+      let newBlock : [var ?NewCircuitBreakerAlert] = Array.init(oldBlock.size(), null);
       for (j in oldBlock.keys()) {
         newBlock[j] := switch (oldBlock[j]) {
-          case (?task) { ?migrateTask(task) };
+          case (?alert) { ?migrateAlert(alert) };
           case null { null };
         };
       };
       newBlocks[i] := newBlock;
     };
 
-    // Migrate completedTransfers (Map internals)
-    let oldMap = old.completedTransfers;
-    let newMap : [var ?NewMapBucket] = Array.init(oldMap.size(), null);
+    // Migrate circuitBreakerConditions (Map internals)
+    let oldMap = old.circuitBreakerConditions;
+    let newMap : [var ?NewConditionMapBucket] = Array.init(oldMap.size(), null);
 
     for (i in oldMap.keys()) {
       switch (oldMap[i]) {
@@ -186,10 +203,10 @@ module {
           let indexes = bucket.2;
           let bounds = bucket.3;
 
-          let newValues : [var ?NewVaultTransferTask] = Array.init(oldValues.size(), null);
+          let newValues : [var ?NewCircuitBreakerCondition] = Array.init(oldValues.size(), null);
           for (j in oldValues.keys()) {
             newValues[j] := switch (oldValues[j]) {
-              case (?task) { ?migrateTask(task) };
+              case (?cond) { ?migrateCondition(cond) };
               case null { null };
             };
           };
@@ -203,12 +220,12 @@ module {
     };
 
     {
-      pendingTransfers = {
+      circuitBreakerAlerts = {
         var data_blocks = newBlocks;
-        var i_block = old.pendingTransfers.i_block;
-        var i_element = old.pendingTransfers.i_element;
+        var i_block = old.circuitBreakerAlerts.i_block;
+        var i_element = old.circuitBreakerAlerts.i_element;
       };
-      completedTransfers = newMap;
+      circuitBreakerConditions = newMap;
     };
   };
 };

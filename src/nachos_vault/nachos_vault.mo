@@ -29,8 +29,9 @@ import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 import SHA224 "../helper/SHA224";
 import CRC32 "../helper/CRC32";
-// import Migration "migration"; // Migration already applied (ForwardToPortfolio variant)
+// import Migration "migration"; // Migration applied (TokenPaused CB variant)
 
+// (with migration = Migration.migrate)
 shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // ═══════════════════════════════════════════════════════════════════
@@ -93,6 +94,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // Actor references
   transient let treasury = actor (Principal.toText(TREASURY_ID)) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
+    getTokenDetailsCache : shared () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }] };
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Principal, Nat8)], Bool) -> async (Bool, ?[(Principal, Nat64)]);
     refreshAllPrices : shared () -> async Result.Result<{ tokensRefreshed : Nat; timestamp : Int; icpPriceUSD : Float }, Text>;
     refreshPricesAndGetDetails : shared () -> async Result.Result<{ tokensRefreshed : Nat; timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)] }, Text>;
@@ -101,7 +103,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // Query-typed actor refs for composite query calls (same canister, query interface)
   transient let treasuryQuery = actor (Principal.toText(TREASURY_ID)) : actor {
     getTokenDetails : shared query () -> async [(Principal, TokenDetails)];
-    getTokenDetailsCache : shared query () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)] };
+    getTokenDetailsCache : shared query () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }] };
   };
 
   transient let dao = actor (Principal.toText(DAO_BACKEND_ID)) : actor {
@@ -251,6 +253,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   transient var blockCleanupTimerId : ?Nat = null;
   transient var transferQueueTimerId : ?Nat = null;
   transient var lastMintBurnTime : Int = 0; // skip periodic treasury sync when mint/burn just refreshed data
+  transient var treasuryTradingPauses : [{ token : Principal; tokenSymbol : Text }] = [];
+  stable var lastPeriodicSyncSuccess : Int = 0; // tracks last successful periodic sync completion
 
   // --- Circuit Breaker Conditions ---
   stable let circuitBreakerConditions = Map.new<Nat, CircuitBreakerCondition>();
@@ -1190,6 +1194,40 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
   };
 
+  // Kong confidence weight: derived from slippage on a 1-unit quote.
+  // Lower slippage = deeper liquidity = more reliable price.
+  private func kongSlippageToWeight(slippage : ?Float) : Float {
+    switch (slippage) {
+      case (?s) {
+        if (s == 0.001) { 1.0 }       // Effectively zero slippage
+        else if (s < 0.1) { 0.9 }     // <0.1%: excellent liquidity
+        else if (s < 0.35) { 0.7 }     // <0.5%: good
+        else if (s < 0.39) { 0.4 }     // <1%: moderate
+        else if (s < 0.45) { 0.15 }    // <3%: poor
+        else if (s < 0.55) { 0.05 } 
+        else if (s < 0.70) { 0.02 }
+        else { 0.0 };                  // ≥3%: too thin, ignore
+      };
+      case null { 0.5 };
+    };
+  };
+
+  // ICPSwap confidence weight: derived from concentrated liquidity (L value).
+  // Higher L = more capital at current tick = more reliable price.
+  private func icpSwapLiquidityToWeight(liquidity : ?Nat) : Float {
+    switch (liquidity) {
+      case (?liq) {
+        let l = Float.fromInt(liq);
+        if (l <= 0.0) { 0.0 }
+        else if (l < 1_000_000) { 0.0 }
+        else if (l < 100_000_000) { 0.4 }
+        else if (l < 10_000_000_000) { 0.7 }
+        else { 1.0 };
+      };
+      case null { 0.5 };
+    };
+  };
+
   // Vault-local price refresh: queries BOTH ICPSwap and KongSwap directly.
   // Fires ALL futures upfront with (with timeout), then awaits — same pattern as treasury's syncPriceWithDEX.
   private func refreshPricesLocally() : async Bool {
@@ -1236,7 +1274,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // ── Await all futures and process results per token ──
     label tokenLoop for ((token, details) in Vector.vals(tokensToRefresh)) {
       var kongPrice : ?Float = null;
+      var kongSlippage : ?Float = null;
       var icpSwapPrice : ?Float = null;
+      var icpSwapLiquidity : ?Nat = null;
 
       // Await KongSwap
       switch (Map.get(kongFutures, phash, token)) {
@@ -1247,6 +1287,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
               case (#Ok(quote)) {
                 if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0) {
                   kongPrice := ?quote.mid_price;
+                  kongSlippage := ?quote.slippage;
                 };
               };
               case (#Err(_)) {};
@@ -1288,6 +1329,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
                 if (tokenICPPrice > 0.0 and tokenICPPrice >= 0.000001 and tokenICPPrice <= 100000.0) {
                   icpSwapPrice := ?tokenICPPrice;
+                  icpSwapLiquidity := ?metadata.liquidity;
                 };
               };
               case (#err(_)) {};
@@ -1299,25 +1341,45 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         case null {};
       };
 
-      // Merge prices — same logic as treasury:
-      // Variance <1%: average; >=1%: closest to last known
+      // Merge prices — liquidity-weighted (same as treasury)
       let finalPrice : ?Float = switch (kongPrice, icpSwapPrice) {
         case (?kp, ?ip) {
-          let maxP = Float.max(kp, ip);
-          let minP = Float.min(kp, ip);
-          let variance = if (maxP > 0.0) { (maxP - minP) / maxP } else { 1.0 };
-          if (variance <= 0.01) {
-            ?((kp + ip) / 2.0);
+          // Derive confidence weights from liquidity signals
+          let kongWeight = kongSlippageToWeight(kongSlippage);
+          let icpSwapWeight = icpSwapLiquidityToWeight(icpSwapLiquidity);
+          let totalWeight = kongWeight + icpSwapWeight;
+          if (totalWeight > 0.0) {
+            ?((kp * kongWeight + ip * icpSwapWeight) / totalWeight);
           } else {
-            let lastPriceFloat = Float.fromInt(details.priceInICP) / 100_000_000.0;
-            let kongDiff = Float.abs(kp - lastPriceFloat);
-            let icpSwapDiff = Float.abs(ip - lastPriceFloat);
-            if (kongDiff <= icpSwapDiff) { ?kp } else { ?ip };
+            ?((kp + ip) / 2.0);
           };
         };
         case (?kp, null) { if (kp > 0.0) { ?kp } else { null } };
         case (null, ?ip) { if (ip > 0.0) { ?ip } else { null } };
         case (null, null) { null };
+      };
+
+      // Debug: log per-token price merge details
+      switch (kongPrice, icpSwapPrice) {
+        case (?kp, ?ip) {
+          let kw = kongSlippageToWeight(kongSlippage);
+          let iw = icpSwapLiquidityToWeight(icpSwapLiquidity);
+          logger.info("PRICE", details.tokenSymbol # " merge: Kong=" # Float.toText(kp) # " slip=" #
+            (switch (kongSlippage) { case (?s) { Float.toText(s) }; case null { "n/a" } }) # " w=" # Float.toText(kw) #
+            " | ICPSwap=" # Float.toText(ip) # " liq=" #
+            (switch (icpSwapLiquidity) { case (?l) { Nat.toText(l) }; case null { "n/a" } }) # " w=" # Float.toText(iw) #
+            " -> final=" # (switch (finalPrice) { case (?f) { Float.toText(f) }; case null { "null" } }),
+            "refreshPricesLocally");
+        };
+        case (?kp, null) {
+          logger.info("PRICE", details.tokenSymbol # " Kong-only: " # Float.toText(kp), "refreshPricesLocally");
+        };
+        case (null, ?ip) {
+          logger.info("PRICE", details.tokenSymbol # " ICPSwap-only: " # Float.toText(ip), "refreshPricesLocally");
+        };
+        case (null, null) {
+          logger.warn("PRICE", details.tokenSymbol # " no price from either DEX", "refreshPricesLocally");
+        };
       };
 
       switch (finalPrice) {
@@ -1349,30 +1411,76 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   private func getPausedPortfolioTokens() : [{ token : Principal; symbol : Text }] {
     let paused = Vector.new<{ token : Principal; symbol : Text }>();
+    let seen = Map.new<Principal, Bool>();
+
+    // Check isPaused and pausedDueToSyncFailure from tokenDetailsMap
     for ((token, details) in Map.entries(tokenDetailsMap)) {
-      if (details.Active and details.isPaused) {
+      if (details.Active and (details.isPaused or details.pausedDueToSyncFailure)) {
         Vector.add(paused, { token; symbol = details.tokenSymbol });
+        Map.set(seen, phash, token, true);
       };
     };
+
+    // Also include tokens with active treasury trading pauses (circuit breakers, price alerts)
+    for (tp in treasuryTradingPauses.vals()) {
+      if (Map.get(seen, phash, tp.token) == null) {
+        switch (Map.get(tokenDetailsMap, phash, tp.token)) {
+          case (?details) {
+            if (details.Active) {
+              Vector.add(paused, { token = tp.token; symbol = tp.tokenSymbol });
+            };
+          };
+          case null {};
+        };
+      };
+    };
+
     Vector.toArray(paused);
   };
 
   private func getHistoricalLowPrice(token : Principal, window : Int) : Nat {
     let cutoff = now() - window;
-    var lowest : Nat = 0;
-    switch (Map.get(tokenDetailsMap, phash, token)) {
-      case (?details) {
-        lowest := details.priceInICP;
-        for (pp in details.pastPrices.vals()) {
-          if (pp.time >= cutoff and pp.icpPrice > 0) {
-            if (lowest == 0 or pp.icpPrice < lowest) {
-              lowest := pp.icpPrice;
+
+    // Start with current treasury price as baseline
+    var lowest : Nat = switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?details) { details.priceInICP };
+      case null { return 0 };
+    };
+
+    var foundInWindow = false;
+
+    // Primary: vault's own tokenPriceHistory (stable, always populated on every sync + mint/burn)
+    switch (Map.get(tokenPriceHistory, phash, token)) {
+      case (?vec) {
+        for (entry in Vector.vals(vec)) {
+          if (entry.0 >= cutoff and entry.1 > 0) {
+            foundInWindow := true;
+            if (lowest == 0 or entry.1 < lowest) {
+              lowest := entry.1;
             };
           };
         };
       };
       case null {};
     };
+
+    // Fallback: pastPrices from tokenDetailsMap (non-empty only after refreshPricesAndGetDetails;
+    // empty after periodic sync. Covers first-ever operation before any vault snapshots exist.)
+    if (not foundInWindow) {
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) {
+          for (pp in details.pastPrices.vals()) {
+            if (pp.time >= cutoff and pp.icpPrice > 0) {
+              if (lowest == 0 or pp.icpPrice < lowest) {
+                lowest := pp.icpPrice;
+              };
+            };
+          };
+        };
+        case null {};
+      };
+    };
+
     lowest;
   };
 
@@ -1475,8 +1583,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#PriceChange) { "Price " # dirText };
       case (#BalanceChange) { "Balance " # dirText };
       case (#DecimalChange) { "Decimal change" };
+      case (#TokenPaused) { "Token paused" };
     };
-    let details = typeText # " of " # Float.toText(changePercent) # "% on " # tokenSymbol # " (threshold: " # Float.toText(cond.thresholdPercent) # "%, condition #" # Nat.toText(cond.id) # ")";
+    let details = if (cond.conditionType == #TokenPaused) {
+      "Token paused on " # tokenSymbol # " (condition #" # Nat.toText(cond.id) # ")";
+    } else {
+      typeText # " of " # Float.toText(changePercent) # "% on " # tokenSymbol # " (threshold: " # Float.toText(cond.thresholdPercent) # "%, condition #" # Nat.toText(cond.id) # ")";
+    };
 
     let alertId = nextAlertId;
     nextAlertId += 1;
@@ -1580,6 +1693,46 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         logger.warn("CIRCUIT_BREAKER", details, "circuitBreakerCheck");
       };
     };
+  };
+
+  // Returns (rejected, blockMint, blockBurn, pausedTokens) — checks #TokenPaused circuit breaker conditions
+  private func checkTokenPausedConditions() : (Bool, Bool, Bool, [{ token : Principal; symbol : Text }]) {
+    let pausedTokens = getPausedPortfolioTokens();
+    if (pausedTokens.size() == 0) return (false, false, false, []);
+
+    var rejected = false;
+    var blockMint = false;
+    var blockBurn = false;
+
+    for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+      if (cond.enabled and cond.conditionType == #TokenPaused) {
+        var applicable = false;
+        if (cond.applicableTokens.size() == 0) {
+          applicable := true;
+        } else {
+          for (pt in pausedTokens.vals()) {
+            if (isTokenApplicable(pt.token, cond.applicableTokens)) applicable := true;
+          };
+        };
+        if (applicable) {
+          // #TokenPaused is a real-time condition: restriction lifts when token unpauses.
+          // Don't set persistent CB flags (mintPausedByCircuitBreaker etc.) — those are
+          // for anomaly conditions requiring admin reset.
+          switch (cond.action) {
+            case (#RejectOperation) { rejected := true };
+            case (#PauseMint) { blockMint := true };
+            case (#PauseBurn) { blockBurn := true };
+            case (#PauseBoth) { blockMint := true; blockBurn := true };
+          };
+          for (pt in pausedTokens.vals()) {
+            if (isTokenApplicable(pt.token, cond.applicableTokens)) {
+              recordAlert(cond, ?pt.token, 0.0);
+            };
+          };
+        };
+      };
+    };
+    (rejected, blockMint, blockBurn, pausedTokens);
   };
 
   // Returns true if any #RejectOperation condition fired
@@ -1925,10 +2078,46 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (isMint and mintPausedByCircuitBreaker) return #err(#CircuitBreakerActive);
     if (not isMint and burnPausedByCircuitBreaker) return #err(#CircuitBreakerActive);
 
+    // Timer health: if periodic sync hasn't completed in >20 min, block operations and restart timer
+    let MAX_SYNC_STALENESS : Int = 20 * 60 * 1_000_000_000; // 20 minutes
+    if (lastPeriodicSyncSuccess > 0 and now() - lastPeriodicSyncSuccess > MAX_SYNC_STALENESS) {
+      startPeriodicSyncTimer();
+      logger.warn("PRE_CHECK", "Periodic sync timer stale (" # Int.toText((now() - lastPeriodicSyncSuccess) / 1_000_000_000) # "s). Restarted timer.", "performSharedPreChecks");
+      return #err(#UnexpectedError("Vault sync timer was stale. Timer restarted — please retry in 2 minutes."));
+    };
+
     // Acquire lock
     switch (acquireLock(caller)) {
       case (#err(e)) { return #err(e) };
       case (#ok(())) {};
+    };
+
+    // Sync pause/status flags from treasury BEFORE price refresh.
+    // This ensures refreshPricesLocally() and arePricesFresh() see consistent isPaused values.
+    // Without this, a token could be skipped during refresh (isPaused=true) then
+    // un-paused by a later sync, causing arePricesFresh() to flag it as stale.
+    try {
+      let cached = await treasury.getTokenDetailsCache();
+      for ((token, detail) in cached.tokenDetails.vals()) {
+        switch (Map.get(tokenDetailsMap, phash, token)) {
+          case (?existing) {
+            if (existing.isPaused != detail.isPaused or existing.pausedDueToSyncFailure != detail.pausedDueToSyncFailure or existing.Active != detail.Active) {
+              Map.set(tokenDetailsMap, phash, token, {
+                existing with
+                isPaused = detail.isPaused;
+                pausedDueToSyncFailure = detail.pausedDueToSyncFailure;
+                Active = detail.Active;
+              });
+            };
+          };
+          case null {
+            Map.set(tokenDetailsMap, phash, token, detail);
+          };
+        };
+      };
+      treasuryTradingPauses := cached.tradingPauses;
+    } catch (e) {
+      logger.warn("PRE_CHECK", "Token status sync failed: " # Error.message(e), "performSharedPreChecks");
     };
 
     // Price refresh: skip if refreshed within 30s and still fresh
@@ -1936,74 +2125,74 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (now() - lastLocalPriceRefreshTime < 30_000_000_000 and arePricesFresh()) {
       priceRefreshOk := true;
     } else {
-      // Primary: refresh prices via treasury (parallel DEX calls with sufficient cycles)
+      // Primary: refresh prices directly via DEXes (same path as timer — unified price source)
       try {
-        switch (await treasury.refreshPricesAndGetDetails()) {
-          case (#ok(result)) {
-            let refreshTime = now();
-            for ((token, detail) in result.tokenDetails.vals()) {
-              // Preserve optimistic balance — treasury doesn't know about in-flight deposits/withdrawals
-              let preservedBalance = switch (Map.get(tokenDetailsMap, phash, token)) {
-                case (?existing) { existing.balance };
-                case null { detail.balance };
-              };
-              Map.set(tokenDetailsMap, phash, token, { detail with balance = preservedBalance; lastTimeSynced = refreshTime });
-            };
-            lastLocalPriceRefreshTime := refreshTime;
-            priceRefreshOk := true;
-            logger.info("PRE_CHECK", "Refreshed prices via treasury", "performSharedPreChecks");
-
-            // Record snapshots & check per-token circuit breaker conditions
-            var operationRejected = false;
-            for ((token, detail) in result.tokenDetails.vals()) {
-              if (recordAndCheckTokenSnapshot(token, detail.priceInICP, detail.balance, detail.tokenDecimals)) {
-                operationRejected := true;
-              };
-            };
-            if (operationRejected or (isMint and mintPausedByCircuitBreaker) or (not isMint and burnPausedByCircuitBreaker)) {
-              releaseLock(caller);
-              return #err(#CircuitBreakerActive);
-            };
-          };
-          case (#err(msg)) {
-            logger.warn("PRE_CHECK", "Treasury price refresh failed: " # msg, "performSharedPreChecks");
-          };
+        let success = await refreshPricesLocally();
+        if (success) {
+          priceRefreshOk := true;
+          logger.info("PRE_CHECK", "Refreshed prices via direct DEX queries", "performSharedPreChecks");
+        } else {
+          logger.warn("PRE_CHECK", "Direct DEX refresh returned no updates", "performSharedPreChecks");
         };
       } catch (e) {
-        logger.warn("PRE_CHECK", "Treasury price refresh exception: " # Error.message(e), "performSharedPreChecks");
+        logger.warn("PRE_CHECK", "Direct DEX refresh failed: " # Error.message(e), "performSharedPreChecks");
       };
 
-      // Fallback: refresh prices directly via ICPSwap + KongSwap if treasury failed
+      // Fallback: use treasury cached prices if direct DEX failed
       if (not priceRefreshOk) {
         try {
-          let success = await refreshPricesLocally();
-          if (success) {
-            priceRefreshOk := true;
-            logger.info("PRE_CHECK", "Refreshed prices via direct DEX fallback (ICPSwap + KongSwap)", "performSharedPreChecks");
-          } else {
-            logger.warn("PRE_CHECK", "Direct DEX fallback returned no price updates", "performSharedPreChecks");
+          let cached = await treasury.getTokenDetailsCache();
+          for ((token, detail) in cached.tokenDetails.vals()) {
+            let preservedBalance = switch (Map.get(tokenDetailsMap, phash, token)) {
+              case (?existing) { existing.balance };
+              case null { detail.balance };
+            };
+            Map.set(tokenDetailsMap, phash, token, { detail with balance = preservedBalance; lastTimeSynced = now() });
           };
+          priceRefreshOk := true;
+          logger.info("PRE_CHECK", "Refreshed prices via treasury cache fallback", "performSharedPreChecks");
         } catch (e) {
-          logger.warn("PRE_CHECK", "Direct DEX fallback failed: " # Error.message(e), "performSharedPreChecks");
+          logger.warn("PRE_CHECK", "Treasury cache fallback also failed: " # Error.message(e), "performSharedPreChecks");
         };
       };
+
+      // Circuit breaker: per-token snapshot checks
+      if (priceRefreshOk) {
+        var operationRejected = false;
+        for ((token, details) in Map.entries(tokenDetailsMap)) {
+          if (details.Active and details.priceInICP > 0) {
+            if (recordAndCheckTokenSnapshot(token, details.priceInICP, details.balance, details.tokenDecimals)) {
+              operationRejected := true;
+            };
+          };
+        };
+        let (pauseRejectedEarly, blockMintEarly, blockBurnEarly, _) = checkTokenPausedConditions();
+        if (pauseRejectedEarly) operationRejected := true;
+        if ((isMint and blockMintEarly) or (not isMint and blockBurnEarly)) operationRejected := true;
+
+        if (operationRejected or (isMint and mintPausedByCircuitBreaker) or (not isMint and burnPausedByCircuitBreaker)) {
+          releaseLock(caller);
+          return #err(#CircuitBreakerActive);
+        };
+      };
+    };
+
+    // Check for paused portfolio tokens — more critical than price freshness.
+    // CB adds visibility (alerts, logs, CRUD). Fallback ensures stale-price safety can't be bypassed.
+    let (pauseRejected, blockMint, blockBurn, pausedTokens) = checkTokenPausedConditions();
+    if (pauseRejected) {
+      releaseLock(caller);
+      return #err(#CircuitBreakerActive);
+    };
+    if (pausedTokens.size() > 0 and ((isMint and blockMint) or (not isMint and blockBurn))) {
+      releaseLock(caller);
+      return #err(#PortfolioTokenPaused({ pausedTokens }));
     };
 
     // Check price staleness
     if (not arePricesFresh()) {
       releaseLock(caller);
       return #err(#PriceStale);
-    };
-
-    // Check for paused portfolio tokens — block MINTING (not burning) if any token paused
-    // Paused tokens have stale prices which would corrupt NAV for minting
-    // Burning is allowed: proportional share distribution works regardless of exact prices
-    if (isMint) {
-      let pausedTokens = getPausedPortfolioTokens();
-      if (pausedTokens.size() > 0) {
-        releaseLock(caller);
-        return #err(#PortfolioTokenPaused({ pausedTokens }));
-      };
     };
 
     #ok(());
@@ -2270,8 +2459,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let mintId = nextMintId;
     nextMintId += 1;
 
-    // Optimistic NAV: reflect net deposit before treasury sync (fee stays in sub2)
-    let optPortfolio = nav.portfolioValueICP + netValue;
+    // Optimistic NAV: release pending reservation and forward deposits to portfolio
+    // (updates tokenDetailsMap.balance synchronously), then compute portfolio value
+    // from actual balances at spot prices — same approach as burn path (line 3268).
+    releasePendingMintValue(ICPprincipal, depositAmount);
+    forwardDepositsToPortfolio(caller, deposits, netValue, depositAmount, mintId);
+    let optPortfolio = calculatePortfolioValueICP();
     let optSupply = nav.nachosSupply + nachosAmount;
     cachedNAV := ?{
       navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
@@ -2283,12 +2476,6 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
     lastMintBurnTime := now();
-
-    // Release pending reservation BEFORE forwarding to avoid double-counting window
-    releasePendingMintValue(ICPprincipal, depositAmount);
-
-    // Forward net deposit to treasury default subaccount (fee stays in sub2)
-    forwardDepositsToPortfolio(caller, deposits, netValue, depositAmount, mintId);
 
     releaseLock(caller);
 
@@ -2350,9 +2537,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     recordDeposit(blockKey, caller, tokenPrincipal, depositAmount, blockNumber);
 
-    // Conservative price discovery — 30-minute window (matching portfolio share mode)
-    let THIRTY_MINUTES_NS : Int = 30 * 60 * 1_000_000_000;
-    let tokenPriceICP = getConservativePriceWithWindow(tokenPrincipal, THIRTY_MINUTES_NS);
+    // Conservative price discovery — 33-minute window (wider than portfolio share for extra single-token protection)
+    let THIRTY_THREE_MINUTES_NS : Int = 33 * 60 * 1_000_000_000;
+    let tokenPriceICP = getConservativePriceWithWindow(tokenPrincipal, THIRTY_THREE_MINUTES_NS);
     if (tokenPriceICP == 0) {
       ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
       releaseLock(caller);
@@ -2526,8 +2713,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let mintId = nextMintId;
     nextMintId += 1;
 
-    // Optimistic NAV: reflect net deposit before treasury sync (fee stays in sub2)
-    let optPortfolio = nav.portfolioValueICP + netValue;
+    // Optimistic NAV: release pending reservation and forward deposits to portfolio
+    // (updates tokenDetailsMap.balance synchronously), then compute portfolio value
+    // from actual balances at spot prices — same approach as burn path.
+    releasePendingMintValue(tokenPrincipal, reservedValueSpot);
+    forwardDepositsToPortfolio(caller, deposits, netValue, usedValueICP, mintId);
+    let optPortfolio = calculatePortfolioValueICP();
     let optSupply = nav.nachosSupply + nachosAmount;
     cachedNAV := ?{
       navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
@@ -2539,13 +2730,6 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
     lastMintBurnTime := now();
-
-    // Release pending reservation BEFORE forwarding to avoid a double-counting window
-    // where concurrent mints see both the pending value AND the optimistic balance update.
-    releasePendingMintValue(tokenPrincipal, reservedValueSpot);
-
-    // Forward net deposit to treasury default subaccount (fee stays in sub2)
-    forwardDepositsToPortfolio(caller, deposits, netValue, usedValueICP, mintId);
 
     releaseLock(caller);
 
@@ -2848,8 +3032,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let mintId = nextMintId;
     nextMintId += 1;
 
-    // Optimistic NAV: reflect net deposit before treasury sync (fee stays in sub2)
-    let optPortfolio = nav.portfolioValueICP + netValue;
+    // Optimistic NAV: release pending reservations and forward deposits to portfolio
+    // (updates tokenDetailsMap.balance synchronously), then compute portfolio value
+    // from actual balances at spot prices — same approach as burn path.
+    releaseAllPendingReservations();
+    forwardDepositsToPortfolio(caller, depositsArr, netValue, totalValueICP, mintId);
+    let optPortfolio = calculatePortfolioValueICP();
     let optSupply = nav.nachosSupply + nachosAmount;
     cachedNAV := ?{
       navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
@@ -2861,12 +3049,6 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     cachedSupplyTime := now();
     recordNavSnapshot(#Mint);
     lastMintBurnTime := now();
-
-    // Release pending reservations BEFORE forwarding to avoid double-counting window
-    releaseAllPendingReservations();
-
-    // Forward net deposits to treasury default subaccount (fee stays in sub2)
-    forwardDepositsToPortfolio(caller, depositsArr, netValue, totalValueICP, mintId);
 
     releaseLock(caller);
 
@@ -3115,8 +3297,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
     };
 
-    // Optimistic NAV: immediately reflect the burn so concurrent operations see reduced portfolio + supply
-    let optPortfolio = if (nav.portfolioValueICP > netValueICP) { nav.portfolioValueICP - netValueICP } else { 0 };
+    // Optimistic NAV: balances already deducted above (including transfer fees), so compute
+    // portfolio value directly from current state rather than theoretical netValueICP.
+    // This correctly accounts for transfer fees, skipped dust tokens, and burn fee retention.
+    let optPortfolio = calculatePortfolioValueICP();
     let optSupply = if (nav.nachosSupply > nachosAmount) { nav.nachosSupply - nachosAmount } else { 0 };
     cachedNAV := ?{
       navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
@@ -3370,12 +3554,49 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     #ok("Circuit breaker reset");
   };
 
+  // --- NAV History Management ---
+
+  public shared ({ caller }) func clearNavHistory() : async Text {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) return "Not authorized";
+    let size = Vector.size(navHistory);
+    if (size == 0) return "NAV history already empty";
+    let lastEntry = Vector.get(navHistory, size - 1);
+    while (Vector.size(navHistory) > 0) {
+      ignore Vector.removeLast(navHistory);
+    };
+    Vector.add(navHistory, lastEntry);
+    logger.info("ADMIN", "NAV history cleared from " # Nat.toText(size) # " to 1 entry by " # Principal.toText(caller), "clearNavHistory");
+    "Cleared NAV history from " # Nat.toText(size) # " entries to 1 (kept last)";
+  };
+
+  public shared ({ caller }) func clearTokenPriceHistory() : async Text {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) return "Not authorized";
+    var priceCount : Nat = 0;
+    var balCount : Nat = 0;
+    for ((token, _) in Map.entries(tokenPriceHistory)) {
+      switch (Map.get(tokenPriceHistory, phash, token)) {
+        case (?vec) { priceCount += Vector.size(vec) };
+        case null {};
+      };
+      ignore Map.remove(tokenPriceHistory, phash, token);
+    };
+    for ((token, _) in Map.entries(tokenBalanceHistory)) {
+      switch (Map.get(tokenBalanceHistory, phash, token)) {
+        case (?vec) { balCount += Vector.size(vec) };
+        case null {};
+      };
+      ignore Map.remove(tokenBalanceHistory, phash, token);
+    };
+    logger.info("ADMIN", "Token price/balance history cleared (" # Nat.toText(priceCount) # " price, " # Nat.toText(balCount) # " balance entries) by " # Principal.toText(caller), "clearTokenPriceHistory");
+    "Cleared " # Nat.toText(priceCount) # " price and " # Nat.toText(balCount) # " balance history entries";
+  };
+
   // --- Circuit Breaker Condition CRUD ---
 
   public shared ({ caller }) func addCircuitBreakerCondition(input : CircuitBreakerConditionInput) : async Result.Result<Nat, Text> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
     if (input.thresholdPercent <= 0.0 or input.thresholdPercent > 100.0) return #err("thresholdPercent must be 0-100");
-    if (input.timeWindowNS == 0 and input.conditionType != #DecimalChange) return #err("timeWindowNS must be > 0");
+    if (input.timeWindowNS == 0 and input.conditionType != #DecimalChange and input.conditionType != #TokenPaused) return #err("timeWindowNS must be > 0");
 
     let id = nextCircuitBreakerId;
     nextCircuitBreakerId += 1;
@@ -3386,6 +3607,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
     let direction = switch (input.conditionType) {
       case (#NavDrop) { #Down }; // always Down
+      case (#TokenPaused) { #Both }; // direction irrelevant for boolean check
       case _ { input.direction };
     };
 
@@ -3434,11 +3656,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let newThreshold = switch (thresholdPercent) { case (?v) { if (v > 0.0 and v <= 100.0) v else cond.thresholdPercent }; case null { cond.thresholdPercent } };
     let newWindow = switch (timeWindowNS) { case (?v) { if (v > 0) v else cond.timeWindowNS }; case null { cond.timeWindowNS } };
     let newDirection = switch (direction) {
-      case (?v) { if (cond.conditionType == #NavDrop) #Down else v }; // NavDrop always Down
+      case (?v) { if (cond.conditionType == #NavDrop) #Down else if (cond.conditionType == #TokenPaused) #Both else v };
       case null { cond.direction };
     };
     let newAction = switch (action) {
-      case (?v) { if (cond.conditionType == #DecimalChange) #PauseBoth else v }; // DecimalChange always PauseBoth
+      case (?v) { if (cond.conditionType == #DecimalChange) #PauseBoth else v };
       case null { cond.action };
     };
     let newTokens = switch (applicableTokens) { case (?v) { v }; case null { cond.applicableTokens } };
@@ -4008,8 +4230,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (not details.Active) return #err(#TokenNotActive);
     if (details.isPaused) return #err(#TokenPaused);
 
-    let THIRTY_MINUTES_NS : Int = 30 * 60 * 1_000_000_000;
-    let tokenPriceICP = getConservativePriceWithWindow(tokenPrincipal, THIRTY_MINUTES_NS);
+    let THIRTY_THREE_MINUTES_NS : Int = 33 * 60 * 1_000_000_000;
+    let tokenPriceICP = getConservativePriceWithWindow(tokenPrincipal, THIRTY_THREE_MINUTES_NS);
     if (tokenPriceICP == 0) return #err(#InvalidPrice);
 
     let depositValueICP = (tokenAmount * tokenPriceICP) / (10 ** details.tokenDecimals);
@@ -5520,20 +5742,43 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   private func startPeriodicSyncTimer<system>() {
     switch (periodicSyncTimerId) { case (?id) { cancelTimer(id) }; case null {} };
     periodicSyncTimerId := ?setTimer<system>(#nanoseconds(15 * 60 * 1_000_000_000), func() : async () {
-      // 1. Sync token details from treasury (skip if mint/burn just refreshed data)
+      // 1. Sync token details from treasury (skip full sync if mint/burn just refreshed data)
       if (now() - lastMintBurnTime >= 15 * 60 * 1_000_000_000) {
         try {
-          let details = await treasury.getTokenDetails();
-          for ((token, detail) in details.vals()) {
+          let cached = await treasury.getTokenDetailsCache();
+          for ((token, detail) in cached.tokenDetails.vals()) {
             Map.set(tokenDetailsMap, phash, token, detail);
-            // Record snapshots & check per-token circuit breaker conditions
-            ignore recordAndCheckTokenSnapshot(token, detail.priceInICP, detail.balance, detail.tokenDecimals);
+            // Note: do NOT record CB snapshots here — treasury prices differ from DEX prices.
+            // CB recording happens after step 4 (refreshPricesLocally) using fresh DEX prices.
           };
+          treasuryTradingPauses := cached.tradingPauses;
         } catch (e) {
           logger.warn("TIMER", "Token details sync failed: " # Error.message(e), "periodicSync");
         };
       } else {
-        logger.info("TIMER", "Skipping treasury balance sync — mint/burn refreshed data recently", "periodicSync");
+        // Even when skipping full sync, sync status flags (isPaused, pausedDueToSyncFailure, Active)
+        try {
+          let cached = await treasury.getTokenDetailsCache();
+          for ((token, detail) in cached.tokenDetails.vals()) {
+            switch (Map.get(tokenDetailsMap, phash, token)) {
+              case (?existing) {
+                if (existing.isPaused != detail.isPaused or existing.pausedDueToSyncFailure != detail.pausedDueToSyncFailure or existing.Active != detail.Active) {
+                  Map.set(tokenDetailsMap, phash, token, {
+                    existing with
+                    isPaused = detail.isPaused;
+                    pausedDueToSyncFailure = detail.pausedDueToSyncFailure;
+                    Active = detail.Active;
+                  });
+                };
+              };
+              case null {};
+            };
+          };
+          treasuryTradingPauses := cached.tradingPauses;
+        } catch (e) {
+          logger.warn("TIMER", "Token status flag sync failed: " # Error.message(e), "periodicSync");
+        };
+        logger.info("TIMER", "Skipping full treasury sync — synced status flags only", "periodicSync");
       };
 
       // 2. Clean rate limit windows (moved here from per-operation for efficiency)
@@ -5552,14 +5797,39 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         logger.warn("TIMER", "Allocation sync failed: " # Error.message(e), "periodicSync");
       };
 
-      // 4. Calculate NAV + record snapshot
-      ignore await calculateNAV();
-      recordNavSnapshot(#Scheduled);
+      // Always reschedule FIRST — ensures timer survives even if subsequent sync code traps
+      startPeriodicSyncTimer();
 
-      // 5. Circuit breaker checks (NAV conditions + per-token already ran above)
+      // 4. Refresh prices directly from DEXes (vault's own function, not treasury cache)
+      try {
+        let priceRefreshOk = await refreshPricesLocally();
+        if (not priceRefreshOk) {
+          logger.warn("TIMER", "DEX price refresh returned false — NAV will use cached prices", "periodicSync");
+        };
+      } catch (e) {
+        logger.warn("TIMER", "DEX price refresh failed: " # Error.message(e) # " — NAV will use cached prices", "periodicSync");
+      };
+
+      // 4b. Record CB snapshots using fresh DEX prices (after refreshPricesLocally, not treasury prices)
+      for ((token, details) in Map.entries(tokenDetailsMap)) {
+        if (details.Active and details.priceInICP > 0) {
+          ignore recordAndCheckTokenSnapshot(token, details.priceInICP, details.balance, details.tokenDecimals);
+        };
+      };
+
+      // 5. Calculate NAV + record snapshot
+      try {
+        ignore await calculateNAV();
+        recordNavSnapshot(#Scheduled);
+      } catch (e) {
+        logger.warn("TIMER", "NAV calculation failed: " # Error.message(e), "periodicSync");
+      };
+
+      // 6. Circuit breaker checks (NAV conditions + per-token already ran above)
       checkNavConditions();
 
-      startPeriodicSyncTimer();
+      // 7. Mark sync success for timer health check
+      lastPeriodicSyncSuccess := now();
     });
   };
 
@@ -5630,6 +5900,29 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       });
       logger.info("LIFECYCLE", "Seeded default NavDrop circuit breaker condition", "seedDefaults");
     };
+
+    // Seed default #TokenPaused condition (blocks minting when any portfolio token is paused)
+    var hasTokenPausedCondition = false;
+    for ((_, cond) in Map.entries(circuitBreakerConditions)) {
+      if (cond.conditionType == #TokenPaused) hasTokenPausedCondition := true;
+    };
+    if (not hasTokenPausedCondition) {
+      let id = nextCircuitBreakerId;
+      nextCircuitBreakerId += 1;
+      Map.set(circuitBreakerConditions, Map.nhash, id, {
+        id;
+        conditionType = #TokenPaused;
+        thresholdPercent = 0.0;
+        timeWindowNS = 0;
+        direction = #Both;
+        action = #PauseMint : CircuitBreakerAction;
+        applicableTokens = [] : [Principal];
+        enabled = true;
+        createdAt = now();
+        createdBy = Principal.fromText("aaaaa-aa");
+      });
+      logger.info("LIFECYCLE", "Seeded default TokenPaused circuit breaker condition", "seedDefaults");
+    };
   };
 
   // --- Start All Timers ---
@@ -5650,6 +5943,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (?p) { ?(actor (Principal.toText(p)) : ICRC1.FullInterface) };
       case null { null };
     };
+
+    // Grace period for timer health check — timer just restarted, give it time to complete
+    lastPeriodicSyncSuccess := now();
 
     // Restart all timers
     startAllTimers();

@@ -294,6 +294,7 @@ module {
     #PriceChange;
     #BalanceChange;
     #DecimalChange;
+    #TokenPaused;
   };
 
   public type CircuitBreakerCondition = {

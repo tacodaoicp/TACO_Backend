@@ -1410,6 +1410,71 @@ phase5_additional_queries() {
   local burn_overclaim
   burn_overclaim=$(call "$NACHOS_VAULT" claimBurnFees "(principal \"$TEST_PRINCIPAL\", 999_999_999_999 : nat)")
   assert_contains "$burn_overclaim" "Insufficient" "Burn fee over-claim rejected"
+
+  # ── Token pause blocks minting test ──
+  if [ "$GENESIS_DONE" = "1" ]; then
+    info "Testing token pause blocks minting..."
+    local DAO_BACKEND="tisou-7aaaa-aaaai-atiea-cai"
+    # Use CLOWN — smallest portfolio weight, safe to pause temporarily
+    local CLOWN_PRINCIPAL="iwv6l-6iaaa-aaaal-ajjjq-cai"
+
+    # Step 1: Pause CLOWN via DAO
+    call "$DAO_BACKEND" pauseToken "(principal \"$CLOWN_PRINCIPAL\", \"nachos test pause\")" >/dev/null
+    info "Paused CLOWN token via DAO"
+
+    # Step 2: Wait for DAO → treasury sync to complete (happens inside pauseToken await).
+    # The vault syncs status flags from treasury.getTokenDetailsCache() on every mint attempt.
+    sleep 3
+
+    # Step 3: Attempt mint — should fail with PortfolioTokenPaused or CircuitBreakerActive
+    local block_pause
+    block_pause=$(transfer_icp_to_treasury "$MINT_AMOUNT")
+    if [[ "$block_pause" != TRANSFER_FAILED* ]]; then
+      local pause_result
+      pause_result=$(call "$NACHOS_VAULT" mintNachos "($block_pause : nat, 0 : nat)")
+      if echo "$pause_result" | grep -qF "PortfolioTokenPaused"; then
+        pass "Mint rejected with PortfolioTokenPaused when portfolio token paused"
+      elif echo "$pause_result" | grep -qF "CircuitBreakerActive"; then
+        pass "Mint rejected with CircuitBreakerActive when portfolio token paused"
+      else
+        fail "Mint rejected when portfolio token paused" "Expected PortfolioTokenPaused or CircuitBreakerActive, got: $pause_result"
+      fi
+    else
+      skip "Token pause mint rejection" "ICP transfer failed"
+    fi
+
+    # Step 4: Verify system status shows paused tokens
+    local status_paused
+    status_paused=$(call "$NACHOS_VAULT" getSystemStatus)
+    assert_contains "$status_paused" "hasPausedTokens = true" "System status shows hasPausedTokens = true"
+
+    # Step 5: Verify #TokenPaused CB condition exists
+    local cb_conditions
+    cb_conditions=$(call "$NACHOS_VAULT" getCircuitBreakerConditions)
+    assert_contains "$cb_conditions" "TokenPaused" "Circuit breaker conditions include TokenPaused"
+
+    # Step 6: Unpause to restore
+    call "$DAO_BACKEND" unpauseToken "(principal \"$CLOWN_PRINCIPAL\", \"nachos test restore\")" >/dev/null
+    # Wait for DAO → treasury sync (happens inside unpauseToken await)
+    sleep 3
+
+    # Step 7: Do a dummy mint attempt to force the vault to refresh from treasury
+    local block_unpause
+    block_unpause=$(transfer_icp_to_treasury "$MINT_AMOUNT")
+    if [[ "$block_unpause" != TRANSFER_FAILED* ]]; then
+      local unpause_result
+      unpause_result=$(call "$NACHOS_VAULT" mintNachos "($block_unpause : nat, 0 : nat)")
+      # Don't care if it succeeds or fails — just forcing a treasury refresh
+    fi
+
+    # Step 8: Verify system status shows no paused tokens
+    local status_unpaused
+    status_unpaused=$(call "$NACHOS_VAULT" getSystemStatus)
+    assert_contains "$status_unpaused" "hasPausedTokens = false" "System status shows hasPausedTokens = false after unpause"
+    pass "Token pause test complete, token unpaused"
+  else
+    skip "Token pause blocks minting" "Genesis not complete"
+  fi
 }
 
 # ════════════════════════════════════════════════════════════════

@@ -139,6 +139,11 @@ export const idlFactory = ({ IDL }) => {
     'CanisterStart' : IDL.Null,
     'TokenPause' : IDL.Record({ 'token' : IDL.Principal }),
     'AdminRemove' : IDL.Record({ 'removedAdmin' : IDL.Principal }),
+    'TokenMaxAllocationUpdate' : IDL.Record({
+      'token' : IDL.Principal,
+      'newMaxBP' : IDL.Opt(IDL.Nat),
+      'oldMaxBP' : IDL.Opt(IDL.Nat),
+    }),
     'SystemStateChange' : IDL.Record({
       'oldState' : SystemState,
       'newState' : SystemState,
@@ -183,6 +188,7 @@ export const idlFactory = ({ IDL }) => {
     'updateSystemParameter' : IDL.Null,
     'updateTreasuryConfig' : IDL.Null,
     'getFollowActions' : IDL.Null,
+    'setTokenMaxAllocation' : IDL.Null,
     'updateSpamParameters' : IDL.Null,
     'addToken' : IDL.Null,
     'getAdminActions' : IDL.Null,
@@ -344,6 +350,26 @@ export const idlFactory = ({ IDL }) => {
     'pausedDueToSyncFailure' : IDL.Bool,
     'tokenType' : TokenType,
   });
+  const PublicTokenDetailsWithMaxAllocation = IDL.Record({
+    'lastTimeSynced' : IDL.Int,
+    'balance' : IDL.Nat,
+    'isPaused' : IDL.Bool,
+    'Active' : IDL.Bool,
+    'epochAdded' : IDL.Int,
+    'priceInICP' : IDL.Nat,
+    'priceInUSD' : IDL.Float64,
+    'tokenTransferFee' : IDL.Nat,
+    'tokenDecimals' : IDL.Nat,
+    'tokenSymbol' : IDL.Text,
+    'tokenName' : IDL.Text,
+    'pausedDueToSyncFailure' : IDL.Bool,
+    'tokenType' : TokenType,
+    'maxAllocationBasisPoints' : IDL.Opt(IDL.Nat),
+  });
+  const PublicTokenDetailsWithMaxAllocationEntry = IDL.Tuple(
+    IDL.Principal,
+    PublicTokenDetailsWithMaxAllocation,
+  );
   const FollowerInfo = IDL.Record({
     'canBeFollowed' : IDL.Bool,
     'followerCount' : IDL.Nat,
@@ -575,6 +601,9 @@ export const idlFactory = ({ IDL }) => {
                 'totalVotingPowerByHotkeySetters' : IDL.Nat,
                 'neuronCount' : IDL.Nat,
               }),
+              'tokenMaxAllocations' : IDL.Vec(
+                IDL.Tuple(IDL.Principal, IDL.Nat)
+              ),
             })
           ),
         ],
@@ -662,6 +691,11 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(PublicTokenDetailsEntry)],
         ['query'],
       ),
+    'getTokenDetailsWithoutPastPricesMaxAllocations' : IDL.Func(
+        [],
+        [IDL.Vec(PublicTokenDetailsWithMaxAllocationEntry)],
+        ['query'],
+      ),
     'getUserAllocation' : IDL.Func([], [IDL.Opt(UserState)], ['query']),
     'getUserNeurons' : IDL.Func(
         [IDL.Principal],
@@ -710,6 +744,11 @@ export const idlFactory = ({ IDL }) => {
     'removeFollower' : IDL.Func([IDL.Principal], [Result_6], []),
     'removeToken' : IDL.Func([IDL.Principal, IDL.Text], [Result_1], []),
     'setTacoAddress' : IDL.Func([IDL.Principal], [], []),
+    'setTokenMaxAllocation' : IDL.Func(
+        [IDL.Principal, IDL.Opt(IDL.Nat), IDL.Text],
+        [Result_1],
+        [],
+      ),
     'set_sns_governance_canister_id' : IDL.Func([IDL.Principal], [], []),
     'syncTokenDetailsFromTreasury' : IDL.Func(
         [IDL.Vec(IDL.Tuple(IDL.Principal, TokenDetails))],

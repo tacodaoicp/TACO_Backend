@@ -70,6 +70,10 @@ persistent actor validation {
       #Ok("unpauseToken called for token " # Principal.toText(token) # " with reason: " # debug_show(reason));
     };
 
+    public query func validate_setTokenMaxAllocation(token : Principal, maxBP : ?Nat, reason : Text) : async ValidationResult {
+      #Ok("setTokenMaxAllocation called for token " # Principal.toText(token) # " with maxBP: " # debug_show(maxBP) # " reason: " # debug_show(reason));
+    };
+
     // 3013
     public query func validate_updateSystemParameter(param : SystemParameter, reason : ?Text) : async ValidationResult {
       #Ok("updateSystemParameter called with param " # debug_show(param) # " with reason: " # debug_show(reason));

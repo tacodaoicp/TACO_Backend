@@ -48,7 +48,10 @@ dfx deploy token $NETWORK --argument "(opt record {
     max_memo = opt 64;
     advanced_settings = null;
     metadata = null;
-    fee_collector = null;
+    fee_collector = opt record {
+      owner = principal \"$ADMIN_PRINCIPAL\";
+      subaccount = null;
+    };
     transaction_window = null;
     permitted_drift = null;
     max_accounts = opt 100000000;

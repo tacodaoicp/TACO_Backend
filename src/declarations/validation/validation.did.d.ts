@@ -2,6 +2,26 @@ import type { Principal } from '@dfinity/principal';
 import type { ActorMethod } from '@dfinity/agent';
 import type { IDL } from '@dfinity/candid';
 
+export type CircuitBreakerAction = { 'RejectOperation' : null } |
+  { 'PauseBoth' : null } |
+  { 'PauseBurn' : null } |
+  { 'PauseMint' : null };
+export interface CircuitBreakerConditionInput {
+  'direction' : { 'Up' : null } |
+    { 'Both' : null } |
+    { 'Down' : null },
+  'action' : CircuitBreakerAction,
+  'timeWindowNS' : bigint,
+  'conditionType' : CircuitBreakerConditionType,
+  'enabled' : boolean,
+  'thresholdPercent' : number,
+  'applicableTokens' : Array<Principal>,
+}
+export type CircuitBreakerConditionType = { 'DecimalChange' : null } |
+  { 'BalanceChange' : null } |
+  { 'TokenPaused' : null } |
+  { 'NavDrop' : null } |
+  { 'PriceChange' : null };
 export type PortfolioDirection = { 'Up' : null } |
   { 'Down' : null };
 export type PortfolioValueType = { 'ICP' : null } |
@@ -34,6 +54,7 @@ export interface UpdateConfig {
   'maxTradesStored' : [] | [bigint],
   'maxTradeValueICP' : [] | [bigint],
   'minTradeValueICP' : [] | [bigint],
+  'minAllocationDiffBasisPoints' : [] | [bigint],
   'portfolioRebalancePeriodNS' : [] | [bigint],
   'longSyncIntervalNS' : [] | [bigint],
   'maxTradeAttemptsPerInterval' : [] | [bigint],
@@ -46,8 +67,18 @@ export interface _SERVICE {
   'get_gnsf1_cnt' : ActorMethod<[], bigint>,
   'test_gnsf1' : ActorMethod<[], undefined>,
   'test_gnsf2' : ActorMethod<[Principal], undefined>,
+  'validate_addAcceptedMintToken' : ActorMethod<[Principal], ValidationResult>,
+  'validate_addCircuitBreakerCondition' : ActorMethod<
+    [CircuitBreakerConditionInput],
+    ValidationResult
+  >,
+  'validate_addFeeExemptPrincipal' : ActorMethod<[Principal], ValidationResult>,
   'validate_addPortfolioCircuitBreakerCondition' : ActorMethod<
     [string, PortfolioDirection, number, bigint, PortfolioValueType],
+    ValidationResult
+  >,
+  'validate_addRateLimitExemptPrincipal' : ActorMethod<
+    [Principal],
     ValidationResult
   >,
   'validate_addToRewardSkipList' : ActorMethod<
@@ -59,20 +90,60 @@ export interface _SERVICE {
     [string, PriceDirection, number, bigint, Array<Principal>],
     ValidationResult
   >,
+  'validate_claimNachosBurnFees' : ActorMethod<
+    [Principal, bigint],
+    ValidationResult
+  >,
+  'validate_claimNachosCancellationFees' : ActorMethod<
+    [Principal, Principal, bigint],
+    ValidationResult
+  >,
+  'validate_claimNachosMintFees' : ActorMethod<
+    [Principal, bigint],
+    ValidationResult
+  >,
   'validate_clearAllTradingPauses' : ActorMethod<
     [[] | [string]],
+    ValidationResult
+  >,
+  'validate_enableCircuitBreakerCondition' : ActorMethod<
+    [bigint, boolean],
     ValidationResult
   >,
   'validate_executeTradingCycle' : ActorMethod<
     [[] | [string]],
     ValidationResult
   >,
+  'validate_nachosEmergencyPause' : ActorMethod<[string], ValidationResult>,
+  'validate_nachosEmergencyUnpause' : ActorMethod<[string], ValidationResult>,
+  'validate_pauseNachosBurning' : ActorMethod<[string], ValidationResult>,
+  'validate_pauseNachosMinting' : ActorMethod<[string], ValidationResult>,
   'validate_pauseToken' : ActorMethod<[Principal, string], ValidationResult>,
   'validate_pauseTokenFromTradingManual' : ActorMethod<
     [Principal, string],
     ValidationResult
   >,
   'validate_recoverPoolBalances' : ActorMethod<[], ValidationResult>,
+  'validate_recoverStuckNachos' : ActorMethod<
+    [Principal, bigint],
+    ValidationResult
+  >,
+  'validate_recoverWronglySentTokens' : ActorMethod<
+    [Principal, bigint, Principal],
+    ValidationResult
+  >,
+  'validate_removeAcceptedMintToken' : ActorMethod<
+    [Principal],
+    ValidationResult
+  >,
+  'validate_removeCircuitBreakerCondition' : ActorMethod<
+    [bigint],
+    ValidationResult
+  >,
+  'validate_removeFeeExemptPrincipal' : ActorMethod<
+    [Principal],
+    ValidationResult
+  >,
   'validate_removeFromRewardSkipList' : ActorMethod<
     [Uint8Array | number[]],
     ValidationResult
@@ -81,11 +152,28 @@ export interface _SERVICE {
     [bigint],
     ValidationResult
   >,
+  'validate_removeRateLimitExemptPrincipal' : ActorMethod<
+    [Principal],
+    ValidationResult
+  >,
+  'validate_removeRewardPenalty' : ActorMethod<
+    [Uint8Array | number[]],
+    ValidationResult
+  >,
   'validate_removeTriggerCondition' : ActorMethod<[bigint], ValidationResult>,
   'validate_resetImportTimestamps' : ActorMethod<[Principal], ValidationResult>,
+  'validate_resetNachosCircuitBreaker' : ActorMethod<
+    [string],
+    ValidationResult
+  >,
+  'validate_retryFailedTransfers' : ActorMethod<[], ValidationResult>,
   'validate_runManualBatchImport' : ActorMethod<[Principal], ValidationResult>,
   'validate_sendToken' : ActorMethod<
     [Principal, bigint, Principal, [] | [Subaccount]],
+    ValidationResult
+  >,
+  'validate_setAcceptedMintTokenEnabled' : ActorMethod<
+    [Principal, boolean],
     ValidationResult
   >,
   'validate_setDistributionPeriod' : ActorMethod<[bigint], ValidationResult>,
@@ -98,6 +186,14 @@ export interface _SERVICE {
   'validate_setPeriodicRewardPot' : ActorMethod<[bigint], ValidationResult>,
   'validate_setPortfolioCircuitBreakerConditionActive' : ActorMethod<
     [bigint, boolean],
+    ValidationResult
+  >,
+  'validate_setRewardPenalty' : ActorMethod<
+    [Uint8Array | number[], bigint],
+    ValidationResult
+  >,
+  'validate_setTokenMaxAllocation' : ActorMethod<
+    [Principal, [] | [bigint], string],
     ValidationResult
   >,
   'validate_setTriggerConditionActive' : ActorMethod<
@@ -136,13 +232,34 @@ export interface _SERVICE {
     [bigint, bigint, PriceType],
     ValidationResult
   >,
+  'validate_unpauseNachosBurning' : ActorMethod<[string], ValidationResult>,
+  'validate_unpauseNachosMinting' : ActorMethod<[string], ValidationResult>,
   'validate_unpauseToken' : ActorMethod<[Principal, string], ValidationResult>,
   'validate_unpauseTokenFromTrading' : ActorMethod<
     [Principal, [] | [string]],
     ValidationResult
   >,
+  'validate_updateCancellationFeeMultiplier' : ActorMethod<
+    [bigint],
+    ValidationResult
+  >,
+  'validate_updateCircuitBreakerCondition' : ActorMethod<
+    [
+      bigint,
+      [] | [number],
+      [] | [bigint],
+      [] | [{ 'Up' : null } | { 'Both' : null } | { 'Down' : null }],
+      [] | [CircuitBreakerAction],
+      [] | [Array<Principal>],
+    ],
+    ValidationResult
+  >,
   'validate_updateMaxPortfolioSnapshots' : ActorMethod<
     [bigint, [] | [string]],
+    ValidationResult
+  >,
+  'validate_updateNachosFees' : ActorMethod<
+    [[] | [bigint], [] | [bigint]],
     ValidationResult
   >,
   'validate_updatePortfolioSnapshotInterval' : ActorMethod<

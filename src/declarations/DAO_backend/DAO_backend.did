@@ -281,6 +281,28 @@ type RefreshError =
    SystemInactive;
    UnexpectedError: text;
  };
+type PublicTokenDetailsWithMaxAllocationEntry = 
+ record {
+   principal;
+   PublicTokenDetailsWithMaxAllocation;
+ };
+type PublicTokenDetailsWithMaxAllocation = 
+ record {
+   Active: bool;
+   balance: nat;
+   epochAdded: int;
+   isPaused: bool;
+   lastTimeSynced: int;
+   maxAllocationBasisPoints: opt nat;
+   pausedDueToSyncFailure: bool;
+   priceInICP: nat;
+   priceInUSD: float64;
+   tokenDecimals: nat;
+   tokenName: text;
+   tokenSymbol: text;
+   tokenTransferFee: nat;
+   tokenType: TokenType;
+ };
 type PublicTokenDetailsEntry = 
  record {
    principal;
@@ -499,6 +521,10 @@ type ContinuousDAO =
            totalVotingPower: nat;
          };
         tokenDetails: vec PublicTokenDetailsEntry;
+        tokenMaxAllocations: vec record {
+                                   principal;
+                                   nat;
+                                 };
         votingPowerMetrics:
          record {
            allocatedVotingPower: nat;
@@ -555,6 +581,8 @@ type ContinuousDAO =
                                }) query;
    getTokenDetailsWithoutPastPrices: () ->
     (vec PublicTokenDetailsEntry) query;
+   getTokenDetailsWithoutPastPricesMaxAllocations: () ->
+    (vec PublicTokenDetailsWithMaxAllocationEntry) query;
    getUserAllocation: () -> (opt UserState) query;
    getUserNeurons: ("principal": principal) -> (vec NeuronVP) query;
    getUserRegisteredTokens: () -> (vec principal) query;
@@ -575,6 +603,8 @@ type ContinuousDAO =
    removeFollower: (follower: principal) -> (Result_6);
    removeToken: (token: principal, reason: text) -> (Result_1);
    setTacoAddress: (address: principal) -> ();
+   setTokenMaxAllocation: (token: principal, maxBP: opt nat, reason: 
+    text) -> (Result_1);
    set_sns_governance_canister_id: (p: principal) -> ();
    syncTokenDetailsFromTreasury: (tokenDetails:
     vec record {
@@ -672,6 +702,7 @@ type AdminFunction =
    removeToken;
    setTacoAddress;
    setTest;
+   setTokenMaxAllocation;
    startRebalancing;
    stopRebalancing;
    stopToken;
@@ -716,6 +747,12 @@ type AdminActionType =
       viaGovernance: bool;
     };
    TokenDelete: record {token: principal;};
+   TokenMaxAllocationUpdate:
+    record {
+      newMaxBP: opt nat;
+      oldMaxBP: opt nat;
+      token: principal;
+    };
    TokenPause: record {token: principal;};
    TokenRemove: record {token: principal;};
    TokenUnpause: record {token: principal;};
