@@ -125,9 +125,16 @@ module {
     swap : shared (SwapArgs) -> async Result.Result<Nat, ICPSwapError>;
     //swap2 : shared (Principal, SwapArgs) -> async Result.Result<Nat, ICPSwapError>;
     withdraw : shared (WithdrawArgs) -> async Result.Result<Nat, ICPSwapError>;
-    //withdraw2 : shared (Principal, WithdrawArgs) -> async Result.Result<Nat, ICPSwapError>;
+    withdrawToSubaccount : shared (WithdrawToSubaccountArgs) -> async Result.Result<Nat, ICPSwapError>;
     // Combined deposit+swap - reduces 2 calls to 1, saving ~5-8s per trade
     depositAndSwap : shared (DepositAndSwapArgs) -> async Result.Result<Nat, ICPSwapError>;
+  };
+
+  public type WithdrawToSubaccountArgs = {
+    fee : Nat;
+    token : Text;
+    subaccount : Blob;
+    amount : Nat;
   };
 
   public type ICPSwapPriceInfo = {

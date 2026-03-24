@@ -6,6 +6,7 @@ import Cycles "mo:base/ExperimentalCycles";
 import Treasury_types "../treasury/treasury_types";
 import DAO_types "../DAO_backend/dao_types";
 import NachosTypes "../nachos_vault/nachos_vault_types";
+import TacoSwapTypes "../taco_swap/taco_swap_types";
 import Nat "mo:base/Nat";
 
 persistent actor validation {
@@ -492,6 +493,38 @@ persistent actor validation {
 
     public query func validate_enableCircuitBreakerCondition(conditionId : Nat, enabled : Bool) : async ValidationResult {
       #Ok("enableCircuitBreakerCondition: id=" # Nat.toText(conditionId) # " enabled=" # debug_show(enabled));
+    };
+
+// ==============================
+// taco_swap.mo GNSF Admin functions
+// ==============================
+
+    public query func validate_pauseTacoSwap(reason : Text) : async ValidationResult {
+      #Ok("pauseTacoSwap called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_unpauseTacoSwap(reason : Text) : async ValidationResult {
+      #Ok("unpauseTacoSwap called with reason: " # debug_show(reason));
+    };
+
+    public query func validate_setTacoSwapPoolId(poolId : Principal, zeroForOne : Bool) : async ValidationResult {
+      #Ok("setTacoSwapPoolId called with poolId: " # Principal.toText(poolId) # " zeroForOne: " # debug_show(zeroForOne));
+    };
+
+    public query func validate_updateTacoSwapConfig(config : TacoSwapTypes.SwapConfig) : async ValidationResult {
+      #Ok("updateTacoSwapConfig called with config: " # debug_show(config));
+    };
+
+    public query func validate_recoverTacoSwapFunds(principal : Principal) : async ValidationResult {
+      #Ok("recoverTacoSwapFunds called for principal: " # Principal.toText(principal));
+    };
+
+    public query func validate_retryTacoSwapPending() : async ValidationResult {
+      #Ok("retryTacoSwapPending: Retry all pending swaps");
+    };
+
+    public query func validate_recoverTacoSwapPoolBalances() : async ValidationResult {
+      #Ok("recoverTacoSwapPoolBalances: Recover stuck tokens from ICPSwap pools");
     };
 
 }

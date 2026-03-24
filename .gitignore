@@ -42,4 +42,5 @@ sns_canister_source/
 
 # NACHOS ledger (cloned from icdevsorg/ICRC_fungible)
 nachos_ledger/
+taco-onramp-session/
 

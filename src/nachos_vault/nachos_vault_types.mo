@@ -3,6 +3,12 @@ import Principal "mo:base/Principal";
 module {
 
   // ═══════════════════════════════════════════════════════
+  // ACCOUNT TYPE (ICRC-1 compatible)
+  // ═══════════════════════════════════════════════════════
+
+  public type Account = { owner : Principal; subaccount : ?Blob };
+
+  // ═══════════════════════════════════════════════════════
   // ACCEPTED TOKEN TYPES
   // ═══════════════════════════════════════════════════════
 
@@ -41,12 +47,14 @@ module {
     feeValueICP : Nat;
     netValueICP : Nat;
     nachosLedgerTxId : ?Nat;
+    recipient : Account;
   };
 
   public type MintRecord = {
     id : Nat;
     timestamp : Int;
     caller : Principal;
+    recipient : ?Account;
     mintMode : MintMode;
     deposits : [TokenDeposit];
     excessReturned : [TokenDeposit];
@@ -126,6 +134,7 @@ module {
   public type ActiveDeposit = {
     blockKey : Text;
     caller : Principal;
+    fromSubaccount : ?Blob;
     tokenPrincipal : Principal;
     amount : Nat;
     blockNumber : Nat;

@@ -2,5 +2,9 @@
   "devDependencies": {
     "prettier": "^3.2.5",
     "prettier-plugin-motoko": "^0.8.4"
+  },
+  "dependencies": {
+    "-": "^0.0.1",
+    "wrangler": "^4.75.0"
   }
 }

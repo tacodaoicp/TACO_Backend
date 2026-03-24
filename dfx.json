@@ -73,6 +73,10 @@
       "main": "src/nachos_vault/nachos_vault.mo",
       "type": "motoko",
       "args": "--enhanced-orthogonal-persistence"
+    },
+    "taco_swap": {
+      "main": "src/taco_swap/taco_swap.mo",
+      "type": "motoko"
     }
   },
   "networks": {

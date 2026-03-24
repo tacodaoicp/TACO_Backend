@@ -11,6 +11,7 @@ import ICRC1 "mo:icrc1/ICRC1";
 import Ledger "../helper/Ledger";
 import Debug "mo:base/Debug";
 import Vector "mo:vector";
+import Buffer "mo:base/Buffer";
 import Error "mo:base/Error";
 import { now } = "mo:base/Time";
 import { setTimer; cancelTimer } = "mo:base/Timer";
@@ -22,6 +23,7 @@ import Nat8 "mo:base/Nat8";
 import Float "mo:base/Float";
 import Array "mo:base/Array";
 import SwapTypes "../swap/swap_types";
+import TrieSet "mo:base/TrieSet";
 import SpamProtection "../helper/spam_protection";
 import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
@@ -29,9 +31,9 @@ import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 import SHA224 "../helper/SHA224";
 import CRC32 "../helper/CRC32";
-// import Migration "migration"; // Migration applied (TokenPaused CB variant)
+//import Migration "./migration";
 
-// (with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // ═══════════════════════════════════════════════════════════════════
@@ -47,9 +49,22 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   transient let canister_ids = CanisterIds.CanisterIds(this_canister_id());
   transient let TREASURY_ID = canister_ids.getCanisterId(#treasury);
   transient let DAO_BACKEND_ID = canister_ids.getCanisterId(#DAO_backend);
+  transient let TACO_SWAP_ID = canister_ids.getCanisterId(#taco_swap);
 
   transient let logger = Logger.Logger();
   transient let spamGuard = SpamProtection.SpamGuard(this_canister_id());
+
+  // Whitelist taco_swap for inter-canister calls (bypass spam guard)
+  do {
+    spamGuard.state.allowedCanisters := TrieSet.put(
+      spamGuard.state.allowedCanisters, TACO_SWAP_ID,
+      Principal.hash(TACO_SWAP_ID), Principal.equal,
+    );
+  };
+
+  private func isAuthorizedCanister(p : Principal) : Bool {
+    p == TACO_SWAP_ID;
+  };
 
   transient let taco_dao_sns_governance_canister_id : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
   transient let ICPprincipalText = "ryjl3-tyaaa-aaaaa-aaaba-cai";
@@ -90,6 +105,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   type CircuitBreakerCondition = NachosTypes.CircuitBreakerCondition;
   type CircuitBreakerAlert = NachosTypes.CircuitBreakerAlert;
   type CircuitBreakerConditionInput = NachosTypes.CircuitBreakerConditionInput;
+  type Account = NachosTypes.Account;
 
   // Actor references
   transient let treasury = actor (Principal.toText(TREASURY_ID)) : actor {
@@ -98,12 +114,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Principal, Nat8)], Bool) -> async (Bool, ?[(Principal, Nat64)]);
     refreshAllPrices : shared () -> async Result.Result<{ tokensRefreshed : Nat; timestamp : Int; icpPriceUSD : Float }, Text>;
     refreshPricesAndGetDetails : shared () -> async Result.Result<{ tokensRefreshed : Nat; timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)] }, Text>;
+    getAvailableBalancesForBurn : shared ([Principal]) -> async Result.Result<[(Principal, Nat)], Text>;
   };
 
   // Query-typed actor refs for composite query calls (same canister, query interface)
   transient let treasuryQuery = actor (Principal.toText(TREASURY_ID)) : actor {
     getTokenDetails : shared query () -> async [(Principal, TokenDetails)];
     getTokenDetailsCache : shared query () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }] };
+    getAvailableBalancesForBurn : shared query ([Principal]) -> async Result.Result<[(Principal, Nat)], Text>;
   };
 
   transient let dao = actor (Principal.toText(DAO_BACKEND_ID)) : actor {
@@ -265,6 +283,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // --- Pending Mint Value Tracker (prevents cross-user allocation over-subscription) ---
   transient let pendingMintValueByToken = Map.new<Principal, Nat>();
 
+  // --- Pending Burn Value Tracker (prevents concurrent burn over-allocation) ---
+  transient let pendingBurnValueByToken = Map.new<Principal, Nat>();
+
   // --- Per-Token History (vault-owned, not overwritten by treasury sync) ---
   stable let tokenPriceHistory = Map.new<Principal, Vector.Vector<(Int, Nat)>>();
   stable let tokenBalanceHistory = Map.new<Principal, Vector.Vector<(Int, Nat)>>();
@@ -384,7 +405,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- ICP Block Verifier ---
-  private func verifyICPBlock(blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyICPBlock(blockNumber : Nat, expectedFrom : Principal, expectedFromSubaccount : ?Blob, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let icpLedger : actor {
       query_blocks : shared query { start : Nat64; length : Nat64 } -> async QueryBlocksResponse;
     } = actor (ICPprincipalText);
@@ -416,7 +437,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         case (?block) {
           switch (block.transaction.operation) {
             case (?#Transfer({ from; to; amount })) {
-              let expectedFromAid = computeAccountIdentifier(expectedFrom, null);
+              let expectedFromAid = computeAccountIdentifier(expectedFrom, expectedFromSubaccount);
               let expectedToAid = computeAccountIdentifier(expectedRecipient, ?subaccountByteToBlob(expectedToSubaccount));
 
               if (from != expectedFromAid) return #err("Sender mismatch");
@@ -434,7 +455,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- ICRC-1/2 Block Verifier ---
-  private func verifyICRC1Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyICRC1Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedFromSubaccount : ?Blob, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let token : actor {
       get_transactions : shared query { start : Nat; length : Nat } -> async {
         first_index : Nat;
@@ -482,10 +503,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         switch (tx.transfer) {
           case (?xfer) {
             if (xfer.from.owner != expectedFrom) return #err("Sender mismatch");
-            // Validate sender subaccount is default (null or all-zeros)
-            switch (xfer.from.subaccount) {
-              case (?sub) { if (not isAllZeros(Blob.fromArray(sub))) return #err("Sender used non-default subaccount") };
-              case null {};
+            // Validate sender subaccount matches expected
+            switch (xfer.from.subaccount, expectedFromSubaccount) {
+              case (null, null) {};
+              case (null, ?exp) { if (not isAllZeros(exp)) return #err("Sender subaccount mismatch") };
+              case (?actual, null) { if (not isAllZeros(Blob.fromArray(actual))) return #err("Sender subaccount mismatch") };
+              case (?actual, ?exp) { if (Blob.fromArray(actual) != exp) return #err("Sender subaccount mismatch") };
             };
             if (xfer.to.owner != expectedRecipient) return #err("Recipient owner mismatch");
             if (not matchSubaccount(?Blob.fromArray(expectedToSub), xfer.to.subaccount)) return #err("Recipient subaccount mismatch");
@@ -505,9 +528,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
               switch (tx.transfer) {
                 case (?xfer) {
                   if (xfer.from.owner != expectedFrom) return #err("Sender mismatch (archive)");
-                  switch (xfer.from.subaccount) {
-                    case (?sub) { if (not isAllZeros(Blob.fromArray(sub))) return #err("Sender used non-default subaccount (archive)") };
-                    case null {};
+                  switch (xfer.from.subaccount, expectedFromSubaccount) {
+                    case (null, null) {};
+                    case (null, ?exp) { if (not isAllZeros(exp)) return #err("Sender subaccount mismatch (archive)") };
+                    case (?actual, null) { if (not isAllZeros(Blob.fromArray(actual))) return #err("Sender subaccount mismatch (archive)") };
+                    case (?actual, ?exp) { if (Blob.fromArray(actual) != exp) return #err("Sender subaccount mismatch (archive)") };
                   };
                   if (xfer.to.owner != TREASURY_ID) return #err("Recipient owner mismatch (archive)");
                   if (not matchSubaccount(?Blob.fromArray(expectedToSub), xfer.to.subaccount)) return #err("Recipient subaccount mismatch (archive)");
@@ -527,7 +552,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- ICRC-3 Block Verifier ---
-  private func verifyICRC3Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyICRC3Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedFromSubaccount : ?Blob, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let token : actor {
       icrc3_get_blocks : shared query [{ start : Nat; length : Nat }] -> async {
         log_length : Nat;
@@ -625,7 +650,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
               if (fromOwner != expectedFrom) return #err("Sender mismatch");
 
-              // Validate sender subaccount is default (null or all-zeros)
+              // Validate sender subaccount matches expected
               switch (lookupInMap(txMap, "from")) {
                 case (?fromVal) {
                   switch (extractMap(fromVal)) {
@@ -634,12 +659,20 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                         case (?subVal) {
                           switch (extractBlob(subVal)) {
                             case (?sub) {
-                              if (not isAllZeros(sub)) return #err("Sender used non-default subaccount");
+                              switch (expectedFromSubaccount) {
+                                case (null) { if (not isAllZeros(sub)) return #err("Sender subaccount mismatch") };
+                                case (?exp) { if (sub != exp) return #err("Sender subaccount mismatch") };
+                              };
                             };
                             case null {};
                           };
                         };
-                        case null {};
+                        case null {
+                          switch (expectedFromSubaccount) {
+                            case (?exp) { if (not isAllZeros(exp)) return #err("Sender subaccount mismatch") };
+                            case null {};
+                          };
+                        };
                       };
                     };
                     case null {};
@@ -708,7 +741,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- Unified Block Verification Dispatcher ---
-  private func verifyBlock(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
+  private func verifyBlock(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedFromSubaccount : ?Blob, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
     let tokenType : ?TokenType = switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
       case (?details) { ?details.tokenType };
       case null {
@@ -726,9 +759,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     switch (tokenType) {
       case null { #err("Unknown token") };
-      case (?#ICP) { await verifyICPBlock(blockNumber, expectedFrom, expectedRecipient, expectedToSubaccount) };
-      case (?#ICRC12) { await verifyICRC1Block(tokenPrincipal, blockNumber, expectedFrom, expectedRecipient, expectedToSubaccount) };
-      case (?#ICRC3) { await verifyICRC3Block(tokenPrincipal, blockNumber, expectedFrom, expectedRecipient, expectedToSubaccount) };
+      case (?#ICP) { await verifyICPBlock(blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount) };
+      case (?#ICRC12) { await verifyICRC1Block(tokenPrincipal, blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount) };
+      case (?#ICRC3) { await verifyICRC3Block(tokenPrincipal, blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount) };
     };
   };
 
@@ -948,10 +981,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Principal.toText(tokenPrincipal) # ":" # Nat.toText(blockNumber);
   };
 
-  private func recordDeposit(blockKey : Text, caller : Principal, tokenPrincipal : Principal, amount : Nat, blockNumber : Nat) {
+  private func recordDeposit(blockKey : Text, caller : Principal, fromSubaccount : ?Blob, tokenPrincipal : Principal, amount : Nat, blockNumber : Nat) {
     let deposit : ActiveDeposit = {
       blockKey;
       caller;
+      fromSubaccount;
       tokenPrincipal;
       amount;
       blockNumber;
@@ -973,12 +1007,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // Cancel deposit AND create refund task atomically — prevents double-refund via cancelDeposit()
-  private func cancelDepositAndRefund<system>(blockKey : Text, caller : Principal, refundAmount : Nat, tokenPrincipal : Principal, fromSubaccount : Nat8, opType : TransferOperationType, opId : Nat) : Nat {
+  private func cancelDepositAndRefund<system>(blockKey : Text, caller : Principal, refundAmount : Nat, tokenPrincipal : Principal, treasurySubaccount : Nat8, opType : TransferOperationType, opId : Nat, callerFromSub : ?Blob) : Nat {
     switch (Map.get(activeDeposits, thash, blockKey)) {
       case (?deposit) { Map.set(activeDeposits, thash, blockKey, { deposit with status = #Cancelled }) };
       case null {};
     };
-    createTransferTask(caller, #principal(caller), refundAmount, tokenPrincipal, fromSubaccount, opType, opId);
+    let returnTo : TransferRecipient = switch (callerFromSub) {
+      case (?sub) { #accountId({ owner = caller; subaccount = ?sub }) };
+      case null { #principal(caller) };
+    };
+    createTransferTask(caller, returnTo, refundAmount, tokenPrincipal, treasurySubaccount, opType, opId);
   };
 
   public shared ({ caller }) func cancelDeposit(tokenPrincipal : Principal, blockNumber : Nat) : async Result.Result<{ refundTaskId : Nat }, NachosError> {
@@ -1026,9 +1064,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Mark as cancelled BEFORE await (safe async)
     Map.set(activeDeposits, thash, blockKey, { deposit with status = #Cancelled });
 
+    let returnTo : TransferRecipient = switch (deposit.fromSubaccount) {
+      case (?sub) { #accountId({ owner = caller; subaccount = ?sub }) };
+      case null { #principal(caller) };
+    };
+
     let taskId = createTransferTask(
       caller,
-      #principal(caller),
+      returnTo,
       refundAmount,
       tokenPrincipal,
       NachosTreasurySubaccount,
@@ -1805,6 +1848,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // ═══════════════════════════════════════════════════════════════════
 
   private func acquireLock(caller : Principal) : Result.Result<(), NachosError> {
+    if (isAuthorizedCanister(caller)) return #ok(()); // Skip lock for authorized canisters
     switch (Map.get(operationLocks, phash, caller)) {
       case (?lockTime) {
         if (now() - lockTime < LOCK_TIMEOUT_NS) {
@@ -1818,6 +1862,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   private func releaseLock(caller : Principal) {
+    if (isAuthorizedCanister(caller)) return; // No-op for authorized canisters
     ignore Map.remove(operationLocks, phash, caller);
   };
 
@@ -1862,6 +1907,33 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   private func getPendingMintValue(token : Principal) : Nat {
     switch (Map.get(pendingMintValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+  };
+
+  private func reservePendingBurnValue(token : Principal, amount : Nat) {
+    let current = switch (Map.get(pendingBurnValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+    Map.set(pendingBurnValueByToken, phash, token, current + amount);
+  };
+
+  private func releasePendingBurnValue(token : Principal, amount : Nat) {
+    let current = switch (Map.get(pendingBurnValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+    if (current > amount) {
+      Map.set(pendingBurnValueByToken, phash, token, current - amount);
+    } else {
+      ignore Map.remove(pendingBurnValueByToken, phash, token);
+    };
+  };
+
+  private func getPendingBurnValue(token : Principal) : Nat {
+    switch (Map.get(pendingBurnValueByToken, phash, token)) {
       case (?v) { v };
       case null { 0 };
     };
@@ -1937,7 +2009,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // global rate limit bypass by concurrent users interleaving at await points.
   // If the mint later fails, the rate slot stays consumed (conservative but safe).
   private func checkAndRecordMintRateLimit(caller : Principal, valueICP : Nat) : Result.Result<(), NachosError> {
-    if (isRateLimitExempt(caller)) return #ok(());
+    if (isRateLimitExempt(caller) or isAuthorizedCanister(caller)) return #ok(());
 
     let cutoff = now() - FOUR_HOURS_NS;
 
@@ -2203,7 +2275,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // ═══════════════════════════════════════════════════════════════════
 
   // Helper: Mint NACHOS tokens to a user (vault IS the minting account)
-  private func mintNachosTokens(to : Principal, amount : Nat) : async Result.Result<Nat, Text> {
+  private func mintNachosTokens(to : { owner : Principal; subaccount : ?Blob }, amount : Nat) : async Result.Result<Nat, Text> {
     let ledger = switch (nachosLedger) {
       case (?l) { l };
       case null { return #err("Nachos ledger not set") };
@@ -2212,7 +2284,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     try {
       let result = await ledger.icrc1_transfer({
         from_subaccount = null; // null = minting account = vault
-        to = { owner = to; subaccount = null };
+        to = { owner = to.owner; subaccount = to.subaccount };
         amount;
         fee = null;
         memo = null;
@@ -2228,10 +2300,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- 10A: Genesis Mint ---
-  public shared ({ caller }) func genesisMint(blockNumber : Nat) : async Result.Result<MintResult, NachosError> {
+  public shared ({ caller }) func genesisMint(blockNumber : Nat, fromSubaccount : ?Blob, recipient : ?Account) : async Result.Result<MintResult, NachosError> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller)) return #err(#NotAuthorized);
     if (genesisComplete) return #err(#GenesisAlreadyDone);
     if (nachosLedger == null) return #err(#UnexpectedError("Nachos ledger not set"));
+
+    let effectiveRecipient : Account = switch (recipient) {
+      case (?r) r;
+      case null { { owner = caller; subaccount = null } };
+    };
 
     let blockKey = makeBlockKey(ICPprincipal, blockNumber);
     if (Map.has(blocksDone, thash, blockKey)) return #err(#BlockAlreadyProcessed);
@@ -2240,7 +2317,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify block
-    let verifyResult = await verifyICPBlock(blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
+    let verifyResult = await verifyICPBlock(blockNumber, caller, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount);
     let depositAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -2258,12 +2335,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosAmount = (depositAmount * ONE_E8S) / INITIAL_NAV_PER_TOKEN_E8S;
 
     // Mint NACHOS tokens
-    let mintTxResult = await mintNachosTokens(caller, nachosAmount);
+    let mintTxResult = await mintNachosTokens(effectiveRecipient, nachosAmount);
     let nachosLedgerTxId = switch (mintTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
-        // Return ICP on failure
-        ignore createTransferTask(caller, #principal(caller), depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, 0);
+        // Return ICP on failure — refund goes to sender, not recipient
+        let returnTo : TransferRecipient = switch (fromSubaccount) {
+          case (?sub) { #accountId({ owner = caller; subaccount = ?sub }) };
+          case null { #principal(caller) };
+        };
+        ignore createTransferTask(caller, returnTo, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, 0);
         ignore Map.remove(blocksDone, thash, blockKey);
         return #err(#TransferError(e));
       };
@@ -2272,7 +2353,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     genesisComplete := true;
 
     // Record deposit and operation
-    recordDeposit(blockKey, caller, ICPprincipal, depositAmount, blockNumber);
+    recordDeposit(blockKey, caller, fromSubaccount, ICPprincipal, depositAmount, blockNumber);
     consumeDeposit(blockKey, 0);
     recordDepositStat(ICPprincipal, depositAmount, caller, blockNumber, depositAmount);
 
@@ -2282,6 +2363,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       id = 0;
       timestamp = now();
       caller;
+      recipient = ?effectiveRecipient;
       mintMode = #ICP;
       deposits;
       excessReturned = [];
@@ -2323,15 +2405,21 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       feeValueICP = 0;
       netValueICP = depositAmount;
       nachosLedgerTxId;
+      recipient = effectiveRecipient;
     });
   };
 
   // --- 10B: Mode A — ICP Deposit ---
-  public shared ({ caller }) func mintNachos(blockNumber : Nat, minimumNachosReceive : Nat) : async Result.Result<MintResult, NachosError> {
+  public shared ({ caller }) func mintNachos(blockNumber : Nat, minimumNachosReceive : Nat, fromSubaccount : ?Blob, recipient : ?Account) : async Result.Result<MintResult, NachosError> {
     // Pre-checks
     switch (await performSharedPreChecks(caller, true)) {
       case (#err(e)) { return #err(e) };
       case (#ok(())) {};
+    };
+
+    let effectiveRecipient : Account = switch (recipient) {
+      case (?r) r;
+      case null { { owner = caller; subaccount = null } };
     };
 
     let blockKey = makeBlockKey(ICPprincipal, blockNumber);
@@ -2344,7 +2432,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify block
-    let verifyResult = await verifyICPBlock(blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
+    let verifyResult = await verifyICPBlock(blockNumber, caller, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount);
     let depositAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -2355,18 +2443,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
 
     // Record deposit
-    recordDeposit(blockKey, caller, ICPprincipal, depositAmount, blockNumber);
+    recordDeposit(blockKey, caller, fromSubaccount, ICPprincipal, depositAmount, blockNumber);
 
     // Check minimum value
     if (depositAmount < minMintValueICP) {
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
     };
 
     // Check maximum value per operation
     if (maxMintAmountICP > 0 and depositAmount > maxMintAmountICP) {
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#AboveMaximumValue({ max = maxMintAmountICP; requested = depositAmount }));
     };
@@ -2374,7 +2462,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Rate limit check
     switch (checkAndRecordMintRateLimit(caller, depositAmount)) {
       case (#err(e)) {
-        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
         releaseLock(caller);
         return #err(e);
       };
@@ -2390,7 +2478,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ok(n)) { n };
       case (#err(e)) {
         releasePendingMintValue(ICPprincipal, depositAmount);
-        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
         releaseLock(caller);
         return #err(#UnexpectedError(e));
       };
@@ -2400,7 +2488,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let feeValue = calculateFee(caller, depositAmount, mintFeeBasisPoints, minMintFeeICP);
     if (feeValue >= depositAmount) {
       releasePendingMintValue(ICPprincipal, depositAmount);
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
     };
@@ -2412,18 +2500,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Slippage check
     if (nachosAmount < minimumNachosReceive) {
       releasePendingMintValue(ICPprincipal, depositAmount);
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#SlippageExceeded);
     };
 
     // Mint NACHOS
-    let mintTxResult = await mintNachosTokens(caller, nachosAmount);
+    let mintTxResult = await mintNachosTokens(effectiveRecipient, nachosAmount);
     let nachosLedgerTxId = switch (mintTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
         releasePendingMintValue(ICPprincipal, depositAmount);
-        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, ICPprincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
         releaseLock(caller);
         return #err(#TransferError(e));
       };
@@ -2439,6 +2527,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       id = nextMintId;
       timestamp = now();
       caller;
+      recipient = ?effectiveRecipient;
       mintMode = #ICP;
       deposits;
       excessReturned = [];
@@ -2493,15 +2582,21 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       feeValueICP = feeValue;
       netValueICP = netValue;
       nachosLedgerTxId;
+      recipient = effectiveRecipient;
     });
   };
 
   // --- 10C: Mode B — Single Token Deposit ---
-  public shared ({ caller }) func mintNachosWithToken(tokenPrincipal : Principal, blockNumber : Nat, minimumNachosReceive : Nat) : async Result.Result<MintResult, NachosError> {
+  public shared ({ caller }) func mintNachosWithToken(tokenPrincipal : Principal, blockNumber : Nat, minimumNachosReceive : Nat, fromSubaccount : ?Blob, recipient : ?Account) : async Result.Result<MintResult, NachosError> {
     // Pre-checks
     switch (await performSharedPreChecks(caller, true)) {
       case (#err(e)) { return #err(e) };
       case (#ok(())) {};
+    };
+
+    let effectiveRecipient : Account = switch (recipient) {
+      case (?r) r;
+      case null { { owner = caller; subaccount = null } };
     };
 
     // Check token is accepted
@@ -2525,7 +2620,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify block
-    let verifyResult = await verifyBlock(tokenPrincipal, blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
+    let verifyResult = await verifyBlock(tokenPrincipal, blockNumber, caller, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount);
     let depositAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -2535,13 +2630,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
     };
 
-    recordDeposit(blockKey, caller, tokenPrincipal, depositAmount, blockNumber);
+    recordDeposit(blockKey, caller, fromSubaccount, tokenPrincipal, depositAmount, blockNumber);
 
     // Conservative price discovery — 33-minute window (wider than portfolio share for extra single-token protection)
     let THIRTY_THREE_MINUTES_NS : Int = 33 * 60 * 1_000_000_000;
     let tokenPriceICP = getConservativePriceWithWindow(tokenPrincipal, THIRTY_THREE_MINUTES_NS);
     if (tokenPriceICP == 0) {
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#InvalidPrice);
     };
@@ -2553,7 +2648,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     // Decimal safety guard
     if (tokenDecimals > 36) {
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#UnexpectedError("Token decimals exceeds maximum supported (36)"));
     };
@@ -2568,20 +2663,20 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let depositValueSpot = (depositAmount * spotPriceICP) / (10 ** tokenDecimals);
 
     if (depositValueICP < minMintValueICP) {
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
     };
 
     if (maxMintAmountICP > 0 and depositValueICP > maxMintAmountICP) {
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#AboveMaximumValue({ max = maxMintAmountICP; requested = depositValueICP }));
     };
 
     switch (checkAndRecordMintRateLimit(caller, depositValueICP)) {
       case (#err(e)) {
-        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
         releaseLock(caller);
         return #err(e);
       };
@@ -2618,7 +2713,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       if (effectiveCurrentValue + depositValueSpot > maxAllowedValue) {
         if (effectiveCurrentValue >= maxAllowedValue) {
           // Already at or over allocation (including pending mints)
-          ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+          ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
           releaseLock(caller);
           return #err(#AllocationExceeded);
         };
@@ -2640,7 +2735,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     // Return excess
     let excessReturned = if (excessAmount > 0) {
-      ignore createTransferTask(caller, #principal(caller), excessAmount, tokenPrincipal, NachosTreasurySubaccount, #ExcessReturn, blockNumber);
+      let excessReturnTo : TransferRecipient = switch (fromSubaccount) {
+        case (?sub) { #accountId({ owner = caller; subaccount = ?sub }) };
+        case null { #principal(caller) };
+      };
+      ignore createTransferTask(caller, excessReturnTo, excessAmount, tokenPrincipal, NachosTreasurySubaccount, #ExcessReturn, blockNumber);
       [{ token = tokenPrincipal; amount = excessAmount; priceUsed = tokenPriceICP; valueICP = (excessAmount * tokenPriceICP) / (10 ** tokenDecimals) }];
     } else { [] : [TokenDeposit] };
 
@@ -2649,7 +2748,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ok(n)) { n };
       case (#err(e)) {
         releasePendingMintValue(tokenPrincipal, reservedValueSpot);
-        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+        ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
         releaseLock(caller);
         return #err(#UnexpectedError(e));
       };
@@ -2658,7 +2757,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let feeValue = calculateFee(caller, usedValueICP, mintFeeBasisPoints, minMintFeeICP);
     if (feeValue >= usedValueICP) {
       releasePendingMintValue(tokenPrincipal, reservedValueSpot);
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#BelowMinimumValue);
     };
@@ -2667,18 +2766,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (nachosAmount < minimumNachosReceive) {
       releasePendingMintValue(tokenPrincipal, reservedValueSpot);
-      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+      ignore cancelDepositAndRefund(blockKey, caller, depositAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
       releaseLock(caller);
       return #err(#SlippageExceeded);
     };
 
     // Mint NACHOS
-    let mintTxResult = await mintNachosTokens(caller, nachosAmount);
+    let mintTxResult = await mintNachosTokens(effectiveRecipient, nachosAmount);
     let nachosLedgerTxId = switch (mintTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
         releasePendingMintValue(tokenPrincipal, reservedValueSpot);
-        ignore cancelDepositAndRefund(blockKey, caller, usedAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber);
+        ignore cancelDepositAndRefund(blockKey, caller, usedAmount, tokenPrincipal, NachosTreasurySubaccount, #MintReturn, blockNumber, fromSubaccount);
         releaseLock(caller);
         return #err(#TransferError(e));
       };
@@ -2693,6 +2792,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       id = nextMintId;
       timestamp = now();
       caller;
+      recipient = ?effectiveRecipient;
       mintMode = #SingleToken;
       deposits;
       excessReturned;
@@ -2747,6 +2847,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       feeValueICP = feeValue;
       netValueICP = netValue;
       nachosLedgerTxId;
+      recipient = effectiveRecipient;
     });
   };
 
@@ -2754,7 +2855,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   public shared ({ caller }) func mintNachosWithPortfolioShare(
     depositInfos : [{ token : Principal; blockNumber : Nat }],
     minimumNachosReceive : Nat,
+    fromSubaccount : ?Blob,
+    recipient : ?Account,
   ) : async Result.Result<MintResult, NachosError> {
+    let effectiveRecipient : Account = switch (recipient) {
+      case (?r) r;
+      case null { { owner = caller; subaccount = null } };
+    };
+
     switch (await performSharedPreChecks(caller, true)) {
       case (#err(e)) { return #err(e) };
       case (#ok(())) {};
@@ -2780,17 +2888,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Verify each block
     var verifyIdx : Nat = 0;
     for (info in depositInfos.vals()) {
-      let verifyResult = await verifyBlock(info.token, info.blockNumber, caller, TREASURY_ID, NachosTreasurySubaccount);
+      let verifyResult = await verifyBlock(info.token, info.blockNumber, caller, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount);
       switch (verifyResult) {
         case (#ok({ amount })) {
           let blockKey = makeBlockKey(info.token, info.blockNumber);
           Vector.add(verifiedDeposits, { token = info.token; amount; blockNumber = info.blockNumber; blockKey });
-          recordDeposit(blockKey, caller, info.token, amount, info.blockNumber);
+          recordDeposit(blockKey, caller, fromSubaccount, info.token, amount, info.blockNumber);
         };
         case (#err(e)) {
           // Cancel and refund already verified deposits on failure
           for (vd in Vector.vals(verifiedDeposits)) {
-            ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+            ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
           };
           // Clean up block keys for unverified
           var cleanIdx = verifyIdx;
@@ -2816,7 +2924,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       if (price == 0) {
         // Cancel all deposits and return everything
         for (vd2 in Vector.vals(verifiedDeposits)) {
-          ignore cancelDepositAndRefund(vd2.blockKey, caller, vd2.amount, vd2.token, NachosTreasurySubaccount, #MintReturn, vd2.blockNumber);
+          ignore cancelDepositAndRefund(vd2.blockKey, caller, vd2.amount, vd2.token, NachosTreasurySubaccount, #MintReturn, vd2.blockNumber, fromSubaccount);
         };
         releaseLock(caller);
         return #err(#InvalidPrice);
@@ -2834,7 +2942,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (totalValueICP < minMintValueICP) {
       for (vd in Vector.vals(verifiedDeposits)) {
-        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
       };
       releaseLock(caller);
       return #err(#BelowMinimumValue);
@@ -2842,7 +2950,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (maxMintAmountICP > 0 and totalValueICP > maxMintAmountICP) {
       for (vd in Vector.vals(verifiedDeposits)) {
-        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
       };
       releaseLock(caller);
       return #err(#AboveMaximumValue({ max = maxMintAmountICP; requested = totalValueICP }));
@@ -2923,7 +3031,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         if (deviation > portfolioShareMaxDeviationBP) {
           releaseAllPendingReservations();
           for (vd in Vector.vals(verifiedDeposits)) {
-            ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+            ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
           };
           let receivedProportions = Vector.new<{ token : Principal; basisPoints : Nat }>();
           for ((rTok, rAgg) in Map.entries(aggregatedByToken)) {
@@ -2943,7 +3051,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#err(e)) {
         releaseAllPendingReservations();
         for (vd in Vector.vals(verifiedDeposits)) {
-          ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+          ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
         };
         releaseLock(caller);
         return #err(e);
@@ -2956,7 +3064,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#err(e)) {
         releaseAllPendingReservations();
         for (vd in Vector.vals(verifiedDeposits)) {
-          ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+          ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
         };
         releaseLock(caller);
         return #err(#UnexpectedError(e));
@@ -2967,7 +3075,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (feeValue >= totalValueICP) {
       releaseAllPendingReservations();
       for (vd in Vector.vals(verifiedDeposits)) {
-        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
       };
       releaseLock(caller);
       return #err(#BelowMinimumValue);
@@ -2978,19 +3086,19 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (nachosAmount < minimumNachosReceive) {
       releaseAllPendingReservations();
       for (vd in Vector.vals(verifiedDeposits)) {
-        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+        ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
       };
       releaseLock(caller);
       return #err(#SlippageExceeded);
     };
 
-    let mintTxResult = await mintNachosTokens(caller, nachosAmount);
+    let mintTxResult = await mintNachosTokens(effectiveRecipient, nachosAmount);
     let nachosLedgerTxId = switch (mintTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
         releaseAllPendingReservations();
         for (vd in Vector.vals(verifiedDeposits)) {
-          ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber);
+          ignore cancelDepositAndRefund(vd.blockKey, caller, vd.amount, vd.token, NachosTreasurySubaccount, #MintReturn, vd.blockNumber, fromSubaccount);
         };
         releaseLock(caller);
         return #err(#TransferError(e));
@@ -3012,6 +3120,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       id = nextMintId;
       timestamp = now();
       caller;
+      recipient = ?effectiveRecipient;
       mintMode = #PortfolioShare;
       deposits = depositsArr;
       excessReturned = [];
@@ -3066,6 +3175,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       feeValueICP = feeValue;
       netValueICP = netValue;
       nachosLedgerTxId;
+      recipient = effectiveRecipient;
     });
   };
 
@@ -3141,7 +3251,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Map.set(blocksDone, thash, blockKey, now());
 
     // Verify NACHOS transfer to deposit subaccount
-    let verifyResult = await verifyBlock(nachosLedgerP, nachosBlockNumber, caller, Principal.fromActor(this), NachosDepositSubaccount);
+    let verifyResult = await verifyBlock(nachosLedgerP, nachosBlockNumber, caller, null, Principal.fromActor(this), NachosDepositSubaccount);
     let nachosAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
@@ -3235,10 +3345,21 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
     let netValueICP = redemptionValueICP - feeValue;
 
-    // Calculate proportional entitlements per token
-    let portfolioValue = calculatePortfolioValueICP();
-    if (portfolioValue == 0) {
-      if (nachosAmount > NACHOS_FEE) {
+    // ===== FRESH BALANCE QUERY: Query real-time available balances from treasury =====
+    // Build list of active token principals
+    let tokenPrincipals = Buffer.Buffer<Principal>(Map.size(tokenDetailsMap));
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and details.priceInICP > 0) {
+        tokenPrincipals.add(token);
+      };
+    };
+
+    // Query treasury for fresh available balances (minus pending burns)
+    let freshBalancesResult = await treasury.getAvailableBalancesForBurn(Buffer.toArray(tokenPrincipals));
+    let freshBalances = switch (freshBalancesResult) {
+      case (#err(e)) {
+        // Critical: fresh balance query failed, cannot proceed safely
+        if (nachosAmount > NACHOS_FEE) {
           let returnAmount = nachosAmount - NACHOS_FEE;
           switch (await returnNachosToUser(caller, returnAmount)) {
             case (#ok(_)) {};
@@ -3247,41 +3368,79 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
             };
           };
         };
+        releaseLock(caller);
+        return #err(#UnexpectedError("Treasury balance query failed: " # e));
+      };
+      case (#ok(balances)) { balances };
+    };
+
+    // Build fresh balance map for quick lookup
+    let freshBalanceMap = Map.new<Principal, Nat>();
+    for ((token, balance) in freshBalances.vals()) {
+      Map.set(freshBalanceMap, phash, token, balance);
+    };
+
+    // ===== Calculate portfolio value using FRESH balances =====
+    var freshPortfolioValueICP : Nat = 0;
+    label portfolioLoop for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (not details.Active or details.priceInICP == 0) { continue portfolioLoop };
+
+      let freshBalance = switch (Map.get(freshBalanceMap, phash, token)) {
+        case (?bal) { bal };
+        case null { details.balance }; // Fallback to cached if not in fresh map
+      };
+      let tokenValueICP = (freshBalance * details.priceInICP) / (10 ** details.tokenDecimals);
+      freshPortfolioValueICP += tokenValueICP;
+    };
+
+    // Guard against zero portfolio (should never happen after genesis)
+    if (freshPortfolioValueICP == 0) {
+      if (nachosAmount > NACHOS_FEE) {
+        let returnAmount = nachosAmount - NACHOS_FEE;
+        switch (await returnNachosToUser(caller, returnAmount)) {
+          case (#ok(_)) {};
+          case (#err(msg)) {
+            logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
+          };
+        };
+      };
       releaseLock(caller);
       return #err(#UnexpectedError("Portfolio value is zero"));
     };
 
+    // ===== Calculate token distributions using FRESH balances =====
     let tokensToSend = Vector.new<{ token : Principal; amount : Nat; fromSubaccount : Nat8 }>();
     let skippedDust = Vector.new<Principal>();
 
-    for ((token, details) in Map.entries(tokenDetailsMap)) {
-      if (details.Active and details.balance > 0 and details.priceInICP > 0) {
-        let tokenValueICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-        let tokenShareBP = (tokenValueICP * 10_000) / portfolioValue;
+    label distributionLoop for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (not details.Active or details.priceInICP == 0) { continue distributionLoop };
 
-        // Proportional amount of this token to send (fee distributed proportionally)
-        let tokenEntitlementICP = (netValueICP * tokenShareBP) / 10_000;
-        let tokenAmount = (tokenEntitlementICP * (10 ** details.tokenDecimals)) / details.priceInICP;
+      let freshBalance = switch (Map.get(freshBalanceMap, phash, token)) {
+        case (?bal) { bal };
+        case null { details.balance }; // Fallback to cached
+      };
 
-        // Skip dust (less than 3x transfer fee)
-        if (tokenAmount <= details.tokenTransferFee * 3) {
-          Vector.add(skippedDust, token);
-        } else if (tokenAmount > details.balance) {
-          // Insufficient balance
-          if (nachosAmount > NACHOS_FEE) {
-          let returnAmount = nachosAmount - NACHOS_FEE;
-          switch (await returnNachosToUser(caller, returnAmount)) {
-            case (#ok(_)) {};
-            case (#err(msg)) {
-              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
-            };
-          };
-        };
-          releaseLock(caller);
-          return #err(#InsufficientLiquidity({ token; available = details.balance; requested = tokenAmount }));
-        } else {
-          Vector.add(tokensToSend, { token; amount = tokenAmount; fromSubaccount = 0 : Nat8 });
-        };
+      if (freshBalance == 0) { continue distributionLoop };
+
+      // Calculate token's share of portfolio using FRESH balance
+      let tokenValueICP = (freshBalance * details.priceInICP) / (10 ** details.tokenDecimals);
+      let tokenShareBP = (tokenValueICP * 10_000) / freshPortfolioValueICP;
+
+      // Proportional amount of this token to send (fee distributed proportionally)
+      let tokenEntitlementICP = (netValueICP * tokenShareBP) / 10_000;
+      let tokenAmount = (tokenEntitlementICP * (10 ** details.tokenDecimals)) / details.priceInICP;
+
+      // Skip dust (less than 3x transfer fee)
+      if (tokenAmount <= details.tokenTransferFee * 3) {
+        Vector.add(skippedDust, token);
+      } else if (tokenAmount + details.tokenTransferFee > freshBalance) {
+        // Insufficient fresh balance: log warning and skip (graceful degradation)
+        logger.warn("BURN", "Insufficient fresh balance for " # details.tokenSymbol # " - requested=" # Nat.toText(tokenAmount + details.tokenTransferFee) # " available=" # Nat.toText(freshBalance) # " - token skipped in distribution", "redeemNachos");
+      } else {
+        // Reserve pending burn BEFORE any further awaits
+        reservePendingBurnValue(token, tokenAmount + details.tokenTransferFee);
+
+        Vector.add(tokensToSend, { token; amount = tokenAmount; fromSubaccount = 2 : Nat8 }); // NachosTreasurySubaccount = 2
       };
     };
 
@@ -3323,6 +3482,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                 cachedNAV := ?nav;
                 cachedSupply := nav.nachosSupply;
                 cachedSupplyTime := now();
+
+                // Release all pending burns on slippage failure
+                for (ts2 in Vector.vals(tokensToSend)) {
+                  switch (Map.get(tokenDetailsMap, phash, ts2.token)) {
+                    case (?details) {
+                      releasePendingBurnValue(ts2.token, ts2.amount + details.tokenTransferFee);
+                    };
+                    case null {};
+                  };
+                };
+
                 if (nachosAmount > NACHOS_FEE) {
           let returnAmount = nachosAmount - NACHOS_FEE;
           switch (await returnNachosToUser(caller, returnAmount)) {
@@ -3352,6 +3522,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         cachedNAV := ?nav;
         cachedSupply := nav.nachosSupply;
         cachedSupplyTime := now();
+
+        // Release all pending burns on burn failure
+        for (ts in Vector.vals(tokensToSend)) {
+          switch (Map.get(tokenDetailsMap, phash, ts.token)) {
+            case (?details) {
+              releasePendingBurnValue(ts.token, ts.amount + details.tokenTransferFee);
+            };
+            case null {};
+          };
+        };
+
         if (nachosAmount > NACHOS_FEE) {
           let returnAmount = nachosAmount - NACHOS_FEE;
           switch (await returnNachosToUser(caller, returnAmount)) {
@@ -3408,6 +3589,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     recordNavSnapshot(#Burn);
     lastMintBurnTime := now();
+
+    // Release all pending burns now that transfers are submitted to treasury
+    for (ts in Vector.vals(tokensToSend)) {
+      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
+        case (?details) {
+          releasePendingBurnValue(ts.token, ts.amount + details.tokenTransferFee);
+        };
+        case null {};
+      };
+    };
+
     releaseLock(caller);
 
     logger.info("BURN", "Burn #" # Nat.toText(burnId) # " " # Nat.toText(nachosAmount) # " NACHOS redeemed for " # Nat.toText(netValueICP) # " ICP worth", "redeemNachos");
@@ -3587,8 +3779,33 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
       ignore Map.remove(tokenBalanceHistory, phash, token);
     };
-    logger.info("ADMIN", "Token price/balance history cleared (" # Nat.toText(priceCount) # " price, " # Nat.toText(balCount) # " balance entries) by " # Principal.toText(caller), "clearTokenPriceHistory");
-    "Cleared " # Nat.toText(priceCount) # " price and " # Nat.toText(balCount) # " balance history entries";
+
+    // Refresh prices from DEXes to establish new baseline
+    let refreshSuccess = await refreshPricesLocally();
+
+    // Record fresh prices/balances as first entry for each active token
+    let currentTime = now();
+    var tokensRefreshed : Nat = 0;
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active) {
+        // Record price history
+        let priceVec = getOrCreateHistory(tokenPriceHistory, token);
+        Vector.add(priceVec, (currentTime, details.priceInICP));
+
+        // Record balance history
+        let balVec = getOrCreateHistory(tokenBalanceHistory, token);
+        Vector.add(balVec, (currentTime, details.balance));
+
+        tokensRefreshed += 1;
+      };
+    };
+
+    let msg = "Cleared " # Nat.toText(priceCount) # " price and " # Nat.toText(balCount)
+      # " balance history entries, refreshed baseline prices for "
+      # Nat.toText(tokensRefreshed) # " tokens";
+
+    logger.info("ADMIN", msg # " by " # Principal.toText(caller), "clearTokenPriceHistory");
+    msg
   };
 
   // --- Circuit Breaker Condition CRUD ---
@@ -3851,7 +4068,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     for (sub in subaccountsToTry.vals()) {
       if (not verified) {
         try {
-          let result = await verifyBlock(tokenPrincipal, blockNumber, senderPrincipal, TREASURY_ID, sub);
+          let result = await verifyBlock(tokenPrincipal, blockNumber, senderPrincipal, null, TREASURY_ID, sub);
           switch (result) {
             case (#ok({ amount })) {
               verifiedAmount := amount;
@@ -5747,9 +5964,22 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         try {
           let cached = await treasury.getTokenDetailsCache();
           for ((token, detail) in cached.tokenDetails.vals()) {
-            Map.set(tokenDetailsMap, phash, token, detail);
-            // Note: do NOT record CB snapshots here — treasury prices differ from DEX prices.
+            // Preserve vault's own DEX prices — treasury prices differ from DEX prices
+            // and overwriting would cause false circuit breaker alarms when DEX refresh fails.
             // CB recording happens after step 4 (refreshPricesLocally) using fresh DEX prices.
+            switch (Map.get(tokenDetailsMap, phash, token)) {
+              case (?existing) {
+                Map.set(tokenDetailsMap, phash, token, {
+                  detail with
+                  priceInICP = existing.priceInICP;
+                  lastTimeSynced = existing.lastTimeSynced;
+                });
+              };
+              case null {
+                // New token — use treasury price as initial value
+                Map.set(tokenDetailsMap, phash, token, detail);
+              };
+            };
           };
           treasuryTradingPauses := cached.tradingPauses;
         } catch (e) {
@@ -5801,20 +6031,26 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       startPeriodicSyncTimer();
 
       // 4. Refresh prices directly from DEXes (vault's own function, not treasury cache)
+      var dexRefreshOk = false;
       try {
-        let priceRefreshOk = await refreshPricesLocally();
-        if (not priceRefreshOk) {
+        dexRefreshOk := await refreshPricesLocally();
+        if (not dexRefreshOk) {
           logger.warn("TIMER", "DEX price refresh returned false — NAV will use cached prices", "periodicSync");
         };
       } catch (e) {
         logger.warn("TIMER", "DEX price refresh failed: " # Error.message(e) # " — NAV will use cached prices", "periodicSync");
       };
 
-      // 4b. Record CB snapshots using fresh DEX prices (after refreshPricesLocally, not treasury prices)
-      for ((token, details) in Map.entries(tokenDetailsMap)) {
-        if (details.Active and details.priceInICP > 0) {
-          ignore recordAndCheckTokenSnapshot(token, details.priceInICP, details.balance, details.tokenDecimals);
+      // 4b. Record CB snapshots ONLY if DEX prices are fresh — stale/treasury prices
+      // would cause false circuit breaker alarms due to price source differences
+      if (dexRefreshOk) {
+        for ((token, details) in Map.entries(tokenDetailsMap)) {
+          if (details.Active and details.priceInICP > 0) {
+            ignore recordAndCheckTokenSnapshot(token, details.priceInICP, details.balance, details.tokenDecimals);
+          };
         };
+      } else {
+        logger.info("TIMER", "Skipping CB snapshot recording — DEX prices not available", "periodicSync");
       };
 
       // 5. Calculate NAV + record snapshot
@@ -5951,6 +6187,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     startAllTimers();
 
     logger.info("LIFECYCLE", "Post-upgrade complete, timers restarted", "postupgrade");
+  };
+
+  // --- Debug Functions ---
+
+  // Debug function for monitoring pending burns during development/testing
+  public query func debugPendingBurns() : async [(Principal, Nat)] {
+    Iter.toArray(Map.entries(pendingBurnValueByToken))
   };
 
   // --- Initial timer start (first deploy) ---

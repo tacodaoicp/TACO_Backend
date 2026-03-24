@@ -1047,7 +1047,7 @@ phase3_icp_mint() {
   local mint_result cycles_before cycles_after cycles_used mint_start mint_end
   cycles_before=$(get_vault_cycles)
   mint_start=$(date +%s)
-  mint_result=$(call "$NACHOS_VAULT" mintNachos "($block : nat, 0 : nat)")
+  mint_result=$(call "$NACHOS_VAULT" mintNachos "($block : nat, 0 : nat, null, null)")
   mint_end=$(date +%s)
   MINT_TIME_SECS=$((mint_end - mint_start))
   info "Mint result: $(echo "$mint_result" | head -c 500)"
@@ -1130,23 +1130,23 @@ phase4_error_handling() {
 
   # First mint should succeed
   local result1
-  result1=$(call "$NACHOS_VAULT" mintNachos "($block : nat, 0 : nat)")
+  result1=$(call "$NACHOS_VAULT" mintNachos "($block : nat, 0 : nat, null, null)")
   assert_contains "$result1" "ok =" "First mint with block $block succeeds"
 
   # Second mint with same block should fail
   local result2
-  result2=$(call "$NACHOS_VAULT" mintNachos "($block : nat, 0 : nat)")
+  result2=$(call "$NACHOS_VAULT" mintNachos "($block : nat, 0 : nat, null, null)")
   assert_contains "$result2" "BlockAlreadyProcessed" "Duplicate block rejected (#BlockAlreadyProcessed)"
 
   # ── Genesis already done ──
   local genesis_result
-  genesis_result=$(call "$NACHOS_VAULT" genesisMint "(0 : nat)")
+  genesis_result=$(call "$NACHOS_VAULT" genesisMint "(0 : nat, null, null)")
   assert_contains "$genesis_result" "GenesisAlreadyDone" "Second genesis rejected (#GenesisAlreadyDone)"
 
   # ── Non-accepted token ──
   local bad_token="aaaaa-aa"
   local token_result
-  token_result=$(call "$NACHOS_VAULT" mintNachosWithToken "(principal \"$bad_token\", 0 : nat, 0 : nat)")
+  token_result=$(call "$NACHOS_VAULT" mintNachosWithToken "(principal \"$bad_token\", 0 : nat, 0 : nat, null, null)")
   assert_not_contains "$token_result" "ok =" "Non-accepted token mint rejected"
 
   # ── Paused system ──
@@ -1156,7 +1156,7 @@ phase4_error_handling() {
   block2=$(transfer_icp_to_treasury "$MINT_AMOUNT")
   if [[ "$block2" != TRANSFER_FAILED* ]]; then
     local paused_result
-    paused_result=$(call "$NACHOS_VAULT" mintNachos "($block2 : nat, 0 : nat)")
+    paused_result=$(call "$NACHOS_VAULT" mintNachos "($block2 : nat, 0 : nat, null, null)")
     assert_contains "$paused_result" "SystemPaused" "Mint rejected when system paused"
   fi
   call "$NACHOS_VAULT" emergencyUnpause >/dev/null
@@ -1168,7 +1168,7 @@ phase4_error_handling() {
   block3=$(transfer_icp_to_treasury "$MINT_AMOUNT")
   if [[ "$block3" != TRANSFER_FAILED* ]]; then
     local disabled_result
-    disabled_result=$(call "$NACHOS_VAULT" mintNachos "($block3 : nat, 0 : nat)")
+    disabled_result=$(call "$NACHOS_VAULT" mintNachos "($block3 : nat, 0 : nat, null, null)")
     assert_contains "$disabled_result" "MintingDisabled" "Mint rejected when minting disabled"
   fi
   call "$NACHOS_VAULT" unpauseMinting >/dev/null
@@ -1189,7 +1189,7 @@ phase4_error_handling() {
   block_warmup=$(transfer_icp_to_treasury "$MINT_AMOUNT")
   if [[ "$block_warmup" != TRANSFER_FAILED* ]]; then
     local warmup_result
-    warmup_result=$(call "$NACHOS_VAULT" mintNachos "($block_warmup : nat, 0 : nat)")
+    warmup_result=$(call "$NACHOS_VAULT" mintNachos "($block_warmup : nat, 0 : nat, null, null)")
     assert_contains "$warmup_result" "ok =" "Warmup mint with block $block_warmup succeeds at default limit"
   fi
 
@@ -1210,7 +1210,7 @@ phase4_error_handling() {
   block_rl=$(transfer_icp_to_treasury "$MINT_AMOUNT")
   if [[ "$block_rl" != TRANSFER_FAILED* ]]; then
     local rl_result
-    rl_result=$(call "$NACHOS_VAULT" mintNachos "($block_rl : nat, 0 : nat)")
+    rl_result=$(call "$NACHOS_VAULT" mintNachos "($block_rl : nat, 0 : nat, null, null)")
     assert_not_contains "$rl_result" "ok =" "Mint rejected when rate limit exceeded"
   fi
 
@@ -1240,7 +1240,7 @@ phase4_error_handling() {
   block_max=$(transfer_icp_to_treasury "$MINT_AMOUNT")
   if [[ "$block_max" != TRANSFER_FAILED* ]]; then
     local max_result
-    max_result=$(call "$NACHOS_VAULT" mintNachos "($block_max : nat, 0 : nat)")
+    max_result=$(call "$NACHOS_VAULT" mintNachos "($block_max : nat, 0 : nat, null, null)")
     assert_contains "$max_result" "AboveMaximumValue" "Mint rejected when above maxMintAmountICP"
   fi
 
@@ -1266,7 +1266,7 @@ phase4_error_handling() {
   block_val=$(transfer_icp_to_treasury "$MINT_AMOUNT")
   if [[ "$block_val" != TRANSFER_FAILED* ]]; then
     local val_result
-    val_result=$(call "$NACHOS_VAULT" mintNachos "($block_val : nat, 0 : nat)")
+    val_result=$(call "$NACHOS_VAULT" mintNachos "($block_val : nat, 0 : nat, null, null)")
     assert_contains "$val_result" "UserMintLimitExceeded" "Mint rejected when per-user ICP value limit exceeded"
   fi
 
@@ -1349,7 +1349,7 @@ phase5_additional_queries() {
     if [[ "$block_slip" != TRANSFER_FAILED* ]]; then
       # Pass an absurdly high minimum — should fail with slippage/minimum error
       local slip_result
-      slip_result=$(call "$NACHOS_VAULT" mintNachos "($block_slip : nat, 999_999_999_999_999 : nat)")
+      slip_result=$(call "$NACHOS_VAULT" mintNachos "($block_slip : nat, 999_999_999_999_999 : nat, null, null)")
       assert_not_contains "$slip_result" "ok =" "Mint rejected when minimumNachosReceive too high"
     fi
   else
@@ -1431,7 +1431,7 @@ phase5_additional_queries() {
     block_pause=$(transfer_icp_to_treasury "$MINT_AMOUNT")
     if [[ "$block_pause" != TRANSFER_FAILED* ]]; then
       local pause_result
-      pause_result=$(call "$NACHOS_VAULT" mintNachos "($block_pause : nat, 0 : nat)")
+      pause_result=$(call "$NACHOS_VAULT" mintNachos "($block_pause : nat, 0 : nat, null, null)")
       if echo "$pause_result" | grep -qF "PortfolioTokenPaused"; then
         pass "Mint rejected with PortfolioTokenPaused when portfolio token paused"
       elif echo "$pause_result" | grep -qF "CircuitBreakerActive"; then
@@ -1463,7 +1463,7 @@ phase5_additional_queries() {
     block_unpause=$(transfer_icp_to_treasury "$MINT_AMOUNT")
     if [[ "$block_unpause" != TRANSFER_FAILED* ]]; then
       local unpause_result
-      unpause_result=$(call "$NACHOS_VAULT" mintNachos "($block_unpause : nat, 0 : nat)")
+      unpause_result=$(call "$NACHOS_VAULT" mintNachos "($block_unpause : nat, 0 : nat, null, null)")
       # Don't care if it succeeds or fails — just forcing a treasury refresh
     fi
 

@@ -485,6 +485,49 @@ module {
     totalCount : Nat;
   };
 
+  // Enhanced treasury dashboard response — bundles 6 query results into one
+  public type EnhancedTreasuryDashboard = {
+    tradingStatus : {
+      rebalanceStatus : RebalanceStatus;
+      executedTrades : [TradeRecord];
+      portfolioState : {
+        totalValueICP : Nat;
+        totalValueUSD : Float;
+        currentAllocations : [(Principal, Nat)];
+        targetAllocations : [(Principal, Nat)];
+      };
+      metrics : {
+        lastUpdate : Int;
+        lastRebalanceAttempt : Int;
+        totalTradesExecuted : Nat;
+        totalTradesFailed : Nat;
+        totalTradesSkipped : Nat;
+        skipBreakdown : SkipBreakdown;
+        avgSlippage : Float;
+        successRate : Float;
+        skipRate : Float;
+      };
+    };
+    portfolioSnapshotStatus : {
+      status : { #Running; #Stopped };
+      intervalMinutes : Nat;
+      lastSnapshotTime : Int;
+    };
+    recentSnapshots : {
+      snapshots : [PortfolioSnapshot];
+      totalCount : Nat;
+    };
+    tradingPauses : TradingPausesResponse;
+    longSyncTimerStatus : {
+      lastRunTime : Int;
+      nextScheduledTime : Int;
+      isRunning : Bool;
+      timerId : Nat;
+      intervalNS : Nat;
+    };
+    systemParameters : RebalanceConfigResponse;
+  };
+
   // Errors for trading pause operations
   public type TradingPauseError = {
     #NotAuthorized;

@@ -217,6 +217,30 @@ shared (deployer) persistent actor class Rewards() = this {
     transactionId: ?Nat; // ICRC1 transaction ID if successful
   };
 
+  // Dashboard bundle type (getRewardsDashboard)
+  public type RewardsDashboard = {
+    balances: [(Blob, Nat)];
+    withdrawals: [WithdrawalRecord];
+    distributions: {
+      total: Nat;
+      hasMore: Bool;
+      records: [UserDistributionSummary];
+    };
+    distributionStatus: {
+      inProgress: Bool;
+      currentDistributionId: ?Nat;
+      lastDistributionTime: Int;
+      nextDistributionTime: Int;
+      distributionEnabled: Bool;
+    };
+    totalDistributed: Nat;
+    withdrawalStats: {
+      totalWithdrawn: Nat;
+      totalWithdrawals: Nat;
+      totalRecordsInHistory: Nat;
+    };
+  };
+
   // Leaderboard types
   public type LeaderboardTimeframe = {
     #OneWeek;      // Latest distribution period (7 days)
@@ -3592,7 +3616,7 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // Get user's withdrawal history (authenticated user only)
-  public shared ({ caller }) func getUserWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
+  public shared query ({ caller }) func getUserWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
     let maxLimit = switch (limit) {
       case (?l) { if (l > 50) { 50 } else { l } }; // Cap at 50 records for users
       case null { 20 }; // Default to 20 records
@@ -3632,6 +3656,136 @@ shared (deployer) persistent actor class Rewards() = this {
       totalWithdrawals = totalWithdrawals;
       totalRecordsInHistory = Vector.size(withdrawalHistory);
     }
+  };
+
+  // Bundled rewards dashboard query — replaces 4-6 separate calls with a single query
+  public shared query ({ caller }) func getRewardsDashboard(
+    neuronIds: [Blob],
+    withdrawalLimit: ?Nat,
+    distributionLimit: ?Nat,
+  ) : async RewardsDashboard {
+
+    // 1. Neuron reward balances (same as getNeuronRewardBalances)
+    let balances = Array.map<Blob, (Blob, Nat)>(neuronIds, func(neuronId) {
+      let balance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
+        case (?bal) { bal };
+        case null { 0 };
+      };
+      (neuronId, balance)
+    });
+
+    // 2. User withdrawal history (same as getUserWithdrawalHistory, using caller)
+    let wdLimit = switch (withdrawalLimit) {
+      case (?l) { if (l > 50) { 50 } else { l } };
+      case null { 20 };
+    };
+    let historySize = Vector.size(withdrawalHistory);
+    let userRecords = Buffer.Buffer<WithdrawalRecord>(wdLimit);
+    var wi = historySize;
+    var wFound = 0;
+    while (wi > 0 and wFound < wdLimit) {
+      wi -= 1;
+      switch (Vector.getOpt(withdrawalHistory, wi)) {
+        case (?record) {
+          if (record.caller == caller) {
+            userRecords.add(record);
+            wFound += 1;
+          };
+        };
+        case null {};
+      };
+    };
+
+    // 3. User distribution rewards (same as getUserDistributionRewards, offset=0)
+    let distLimit = switch (distributionLimit) {
+      case (?l) { if (l > 50) { 50 } else { l } };
+      case null { 10 };
+    };
+    let distributions = if (neuronIds.size() == 0) {
+      { total = 0; hasMore = false; records = [] : [UserDistributionSummary] };
+    } else {
+      let groups = Map.new<Nat, Buffer.Buffer<NeuronDistributionEntry>>();
+      for (nid in neuronIds.vals()) {
+        switch (Map.get(neuronDistributionIndex, bhash, nid)) {
+          case (?entries) {
+            for (entry in entries.vals()) {
+              switch (Map.get(groups, nhash, entry.distributionId)) {
+                case (?buf) { buf.add(entry) };
+                case null {
+                  let buf = Buffer.Buffer<NeuronDistributionEntry>(1);
+                  buf.add(entry);
+                  Map.set(groups, nhash, entry.distributionId, buf);
+                };
+              };
+            };
+          };
+          case null {};
+        };
+      };
+
+      let summaries = Buffer.Buffer<UserDistributionSummary>(Map.size(groups));
+      for ((_, buf) in Map.entries(groups)) {
+        let first = buf.get(0);
+        let neuronRewards = Array.map<NeuronDistributionEntry, NeuronRewardSummary>(
+          Buffer.toArray(buf),
+          func(e) : NeuronRewardSummary {
+            {
+              neuronId = e.neuronId;
+              rewardAmount = e.rewardAmount;
+              performanceScore = e.performanceScore;
+              votingPower = e.votingPower;
+              rewardScore = e.rewardScore;
+              performanceScoreICP = e.performanceScoreICP;
+            };
+          },
+        );
+        summaries.add({
+          distributionId = first.distributionId;
+          distributionTime = first.distributionTime;
+          startTime = first.startTime;
+          endTime = first.endTime;
+          totalRewardPot = first.totalRewardPot;
+          neuronRewards = neuronRewards;
+        });
+      };
+
+      let sorted = Array.sort<UserDistributionSummary>(
+        Buffer.toArray(summaries),
+        func(a, b) { Int.compare(b.distributionTime, a.distributionTime) },
+      );
+
+      let totalMatches = sorted.size();
+      let take = Nat.min(distLimit, totalMatches);
+      let records = Array.tabulate<UserDistributionSummary>(take, func(i) { sorted[i] });
+      {
+        total = totalMatches;
+        hasMore = take < totalMatches;
+        records = records;
+      };
+    };
+
+    // 4. Distribution status (same as getCurrentDistributionStatus)
+    let distStatus = {
+      inProgress = switch (currentDistributionId) { case (?_) { true }; case null { false } };
+      currentDistributionId = currentDistributionId;
+      lastDistributionTime = lastDistributionTime;
+      nextDistributionTime = lastDistributionTime + distributionPeriodNS;
+      distributionEnabled = distributionEnabled;
+    };
+
+    // 5 + 6. Assemble dashboard
+    {
+      balances = balances;
+      withdrawals = Buffer.toArray(userRecords);
+      distributions = distributions;
+      distributionStatus = distStatus;
+      totalDistributed = totalDistributed;
+      withdrawalStats = {
+        totalWithdrawn = totalWithdrawn;
+        totalWithdrawals = totalWithdrawals;
+        totalRecordsInHistory = Vector.size(withdrawalHistory);
+      };
+    };
   };
 
   //=========================================================================

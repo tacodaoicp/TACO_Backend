@@ -28,9 +28,9 @@ import Buffer "mo:base/Buffer";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
 import Char "mo:base/Char";
-import Migration "./migration";
+//import Migration "./migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 
 shared (deployer) persistent actor class ContinuousDAO() = this {
 
@@ -3652,6 +3652,152 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
         lastSnapshotTime;
         totalVotingPower;
       };
+    };
+  };
+
+  // Consolidated VoteView dashboard query — replaces getAggregateAllocation + getTokenDetailsWithoutPastPricesMaxAllocations
+  // + getHistoricBalanceAndAllocation + votingPowerMetrics + getSnapshotInfo + getAllocationStats + getUserAllocation
+  public query ({ caller }) func getVoteDashboard(user : ?Principal) : async ?{
+    aggregateAllocation : [(Principal, Nat)];
+    tokenDetails : [PublicTokenDetailsWithMaxAllocationEntry];
+    historicBalanceAndAllocation : [(Int, HistoricBalanceAllocation)];
+    votingPowerMetrics : {
+      allocatedVotingPower : Nat;
+      neuronCount : Nat;
+      principalCount : Nat;
+      totalVotingPower : Nat;
+      totalVotingPowerByHotkeySetters : Nat;
+    };
+    snapshotInfo : {
+      lastSnapshotId : Nat;
+      lastSnapshotTime : Int;
+      totalVotingPower : Nat;
+    };
+    allocationStats : AllocationStats;
+    userAllocation : ?UserState;
+  } {
+    if (not isAllowedQuery(caller)) { return null };
+
+    // 1. Aggregate allocation in basis points
+    var totalAllocatedVP : Nat = 0;
+    for (vp in Map.vals(aggregateAllocation)) {
+      totalAllocatedVP += vp;
+    };
+    let allocResults = Vector.new<(Principal, Nat)>();
+    if (totalAllocatedVP > 0) {
+      for ((token, vp) in Map.entries(aggregateAllocation)) {
+        Vector.add(allocResults, (token, (vp * 10000) / totalAllocatedVP));
+      };
+    };
+
+    // 2. Token details with max allocation basis points
+    let tokens = Iter.toArray(
+      Iter.map(
+        Map.entries(tokenDetailsMap),
+        func((principal : Principal, details : TokenDetails)) : PublicTokenDetailsWithMaxAllocationEntry {
+          (principal, {
+            Active = details.Active;
+            isPaused = details.isPaused;
+            epochAdded = details.epochAdded;
+            tokenName = details.tokenName;
+            tokenSymbol = details.tokenSymbol;
+            tokenDecimals = details.tokenDecimals;
+            tokenTransferFee = details.tokenTransferFee;
+            balance = details.balance;
+            priceInICP = details.priceInICP;
+            priceInUSD = details.priceInUSD;
+            tokenType = details.tokenType;
+            lastTimeSynced = details.lastTimeSynced;
+            pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+            maxAllocationBasisPoints = Map.get(tokenMaxAllocationBP, phash, principal);
+          });
+        },
+      )
+    );
+
+    // 3. Historic balance and allocation — last 50 snapshots
+    let histResult = BTree.scanLimit(
+      balanceHistory,
+      Int.compare,
+      0,
+      Time.now(),
+      #bwd,
+      50,
+    );
+
+    // 4. Allocation stats
+    var usersWithAlloc = 0;
+    var totalUserVP = 0;
+    var mostRecentUser : Int = 0;
+    var recentUserUpdates = 0;
+
+    let nowNs = Time.now();
+    let thirtyDaysNs = 30 * 24 * 60 * 60 * 1_000_000_000;
+
+    for ((_principal, userState) in Map.entries(userStates)) {
+      if (userState.allocations.size() > 0) {
+        usersWithAlloc += 1;
+        totalUserVP += userState.votingPower;
+        if (userState.lastAllocationUpdate > mostRecentUser) {
+          mostRecentUser := userState.lastAllocationUpdate;
+        };
+        if (nowNs - userState.lastAllocationUpdate < thirtyDaysNs) {
+          recentUserUpdates += 1;
+        };
+      };
+    };
+
+    var neuronsWithAlloc = 0;
+    var totalNeuronVP = 0;
+    var mostRecentNeuron : Int = 0;
+    var recentNeuronUpdates = 0;
+
+    for ((_neuronId, neuronAlloc) in Map.entries(neuronAllocationMap)) {
+      if (neuronAlloc.allocations.size() > 0) {
+        neuronsWithAlloc += 1;
+        totalNeuronVP += neuronAlloc.votingPower;
+        if (neuronAlloc.lastUpdate > mostRecentNeuron) {
+          mostRecentNeuron := neuronAlloc.lastUpdate;
+        };
+        if (nowNs - neuronAlloc.lastUpdate < thirtyDaysNs) {
+          recentNeuronUpdates += 1;
+        };
+      };
+    };
+
+    let mostRecent = if (mostRecentUser > mostRecentNeuron) { mostRecentUser } else { mostRecentNeuron };
+
+    // 5. Optional user state lookup
+    let userState = switch (user) {
+      case (?p) { Map.get(userStates, phash, p) };
+      case (null) { null };
+    };
+
+    ?{
+      aggregateAllocation = Vector.toArray(allocResults);
+      tokenDetails = tokens;
+      historicBalanceAndAllocation = histResult.results;
+      votingPowerMetrics = {
+        totalVotingPower;
+        totalVotingPowerByHotkeySetters;
+        allocatedVotingPower;
+        principalCount = Map.size(userStates);
+        neuronCount = Map.size(neuronAllocationMap);
+      };
+      snapshotInfo = {
+        lastSnapshotId;
+        lastSnapshotTime;
+        totalVotingPower;
+      };
+      allocationStats = {
+        usersWithAllocations = usersWithAlloc;
+        neuronsWithAllocations = neuronsWithAlloc;
+        totalUserVotingPower = totalUserVP;
+        totalNeuronVotingPower = totalNeuronVP;
+        mostRecentUpdateTime = mostRecent;
+        recentUpdatesCount = recentUserUpdates + recentNeuronUpdates;
+      };
+      userAllocation = userState;
     };
   };
 

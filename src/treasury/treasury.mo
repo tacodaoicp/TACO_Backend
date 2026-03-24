@@ -113,6 +113,7 @@ import CanisterIds "../helper/CanisterIds";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
+import Buffer "mo:base/Buffer";
 
 //import Migration "./migration";
 
@@ -321,6 +322,36 @@ shared (deployer) persistent actor class treasury() = this {
     };
   };
 
+  // Pending burn tracking helpers
+  // These coordinate with NACHOS vault to prevent trading reserved tokens
+  private func addPendingBurn(token : Principal, amountE8s : Nat) {
+    let current = switch (Map.get(pendingBurnsByToken, phash, token)) {
+      case (?amount) { amount };
+      case null { 0 };
+    };
+    Map.set(pendingBurnsByToken, phash, token, current + amountE8s);
+  };
+
+  private func releasePendingBurn(token : Principal, amountE8s : Nat) {
+    let current = switch (Map.get(pendingBurnsByToken, phash, token)) {
+      case (?amount) { amount };
+      case null { 0 };
+    };
+    let newValue = if (current > amountE8s) { current - amountE8s } else { 0 };
+    if (newValue > 0) {
+      Map.set(pendingBurnsByToken, phash, token, newValue);
+    } else {
+      ignore Map.remove(pendingBurnsByToken, phash, token);
+    };
+  };
+
+  private func getPendingBurn(token : Principal) : Nat {
+    switch (Map.get(pendingBurnsByToken, phash, token)) {
+      case (?amount) { amount };
+      case null { 0 };
+    };
+  };
+
   // Randomization
   // NOTE: Fuzz.fromSeed internally uses Nat64.fromNat, so seed must be < 2^64
   transient let fuzz = Fuzz.fromSeed((Fuzz.fromSeed(Int.abs(now()) % (2 ** 63)).nat.randomRange(45978345345987, 2 ** 63)) % (2 ** 63));
@@ -416,6 +447,10 @@ shared (deployer) persistent actor class treasury() = this {
   // Key is normalized (sorted) so order doesn't matter.
   // Skipped pairs go directly to ICP fallback in do_executeTradingStep.
   stable let pairSkipMap = Map.new<(Principal, Principal), Int>();
+
+  // Track pending burns to coordinate with NACHOS vault
+  // Prevents trading cycle from selling tokens that are reserved for burn payouts
+  transient let pendingBurnsByToken = Map.new<Principal, Nat>();
 
   // Note: Kong claims are now managed by Kong directly - no local tracking needed
   // Use KongSwap.getPendingClaims() to query and KongSwap.executeClaim() to recover
@@ -1347,36 +1382,10 @@ shared (deployer) persistent actor class treasury() = this {
     });
   };
 
-  // Consolidated treasury dashboard — wraps getTradingStatus for single-call FE access
-  public shared query func getTreasuryDashboard() : async Result.Result<{
-    tradingStatus : {
-      rebalanceStatus : RebalanceStatus;
-      executedTrades : [TradeRecord];
-      portfolioState : {
-        totalValueICP : Nat;
-        totalValueUSD : Float;
-        currentAllocations : [(Principal, Nat)];
-        targetAllocations : [(Principal, Nat)];
-      };
-      metrics : {
-        lastUpdate : Int;
-        lastRebalanceAttempt : Int;
-        totalTradesExecuted : Nat;
-        totalTradesFailed : Nat;
-        totalTradesSkipped : Nat;
-        skipBreakdown : {
-          noPairsFound : Nat;
-          noExecutionPath : Nat;
-          tokensFiltered : Nat;
-          pausedTokens : Nat;
-          insufficientCandidates : Nat;
-        };
-        avgSlippage : Float;
-        successRate : Float;
-        skipRate : Float;
-      };
-    };
-  }, Text> {
+  // Enhanced treasury dashboard — bundles 6 query results (tradingStatus, snapshotStatus,
+  // recentSnapshots, tradingPauses, longSyncTimerStatus, systemParameters) into one call
+  public shared query func getEnhancedTreasuryDashboard() : async Result.Result<TreasuryTypes.EnhancedTreasuryDashboard, Text> {
+    // --- Trading status (same as getTradingStatus) ---
     var totalValueICP = 0;
     var totalValueUSD : Float = 0;
     let currentAllocs = Vector.new<(Principal, Nat)>();
@@ -1412,6 +1421,15 @@ shared (deployer) persistent actor class treasury() = this {
     } else { 0.0 };
     let skipRate = if (totalAttempts > 0) { Float.fromInt(rebalanceState.metrics.totalTradesSkipped) / Float.fromInt(totalAttempts) } else { 0.0 };
 
+    // --- Recent snapshots (last 5, same as getPortfolioHistory(5)) ---
+    let allSnapshots = Vector.toArray(portfolioSnapshots);
+    let snapshotTotal = allSnapshots.size();
+    let snapshotStart = if (snapshotTotal > 5) { snapshotTotal - 5 } else { 0 };
+    let recentSnaps = Array.subArray(allSnapshots, snapshotStart, snapshotTotal - snapshotStart);
+
+    // --- Trading pauses (same as listTradingPauses) ---
+    let pausedArray = Iter.toArray(Map.vals(tradingPauses));
+
     #ok({
       tradingStatus = {
         rebalanceStatus = rebalanceState.status;
@@ -1439,6 +1457,40 @@ shared (deployer) persistent actor class treasury() = this {
           successRate = successRate;
           skipRate = skipRate;
         };
+      };
+      portfolioSnapshotStatus = {
+        status = portfolioSnapshotStatus;
+        intervalMinutes = portfolioSnapshotIntervalNS / (60 * 1_000_000_000);
+        lastSnapshotTime = lastPortfolioSnapshotTime;
+      };
+      recentSnapshots = {
+        snapshots = recentSnaps;
+        totalCount = snapshotTotal;
+      };
+      tradingPauses = {
+        pausedTokens = pausedArray;
+        totalCount = pausedArray.size();
+      };
+      longSyncTimerStatus = {
+        lastRunTime = lastLongSyncTime;
+        nextScheduledTime = nextLongSyncTime;
+        isRunning = longSyncTimerId != 0;
+        timerId = longSyncTimerId;
+        intervalNS = rebalanceConfig.longSyncIntervalNS;
+      };
+      systemParameters = {
+        rebalanceIntervalNS = rebalanceConfig.rebalanceIntervalNS;
+        maxTradeAttemptsPerInterval = rebalanceConfig.maxTradeAttemptsPerInterval;
+        minTradeValueICP = rebalanceConfig.minTradeValueICP;
+        maxTradeValueICP = rebalanceConfig.maxTradeValueICP;
+        portfolioRebalancePeriodNS = rebalanceConfig.portfolioRebalancePeriodNS;
+        maxSlippageBasisPoints = rebalanceConfig.maxSlippageBasisPoints;
+        maxTradesStored = rebalanceConfig.maxTradesStored;
+        maxKongswapAttempts = rebalanceConfig.maxKongswapAttempts;
+        shortSyncIntervalNS = rebalanceConfig.shortSyncIntervalNS;
+        longSyncIntervalNS = rebalanceConfig.longSyncIntervalNS;
+        tokenSyncTimeoutNS = rebalanceConfig.tokenSyncTimeoutNS;
+        minAllocationDiffBasisPoints = minAllocationDiffBasisPoints;
       };
     });
   };
@@ -3537,6 +3589,17 @@ shared (deployer) persistent actor class treasury() = this {
     assert (caller == DAOPrincipal or caller == MintVaultPrincipal or caller == NachosVaultPrincipal);
 
     if (Immediate) {
+      // Track pending burns: reserve tokens being sent out (prevents trading cycle from selling them)
+      // Heuristic: transfers from subaccount 2 (NachosTreasurySubaccount) are burn payouts
+      let burnPayouts = Vector.new<(Principal, Nat)>(); // Store for cleanup after transfers
+      for (task in tempTransferQueue.vals()) {
+        let (recipient, amount, token, fromSubaccount) = task;
+        if (fromSubaccount == 2) {  // NachosTreasurySubaccount = 2 (NACHOS burn payouts)
+          addPendingBurn(token, amount);
+          Vector.add(burnPayouts, (token, amount));
+        };
+      };
+
       let blocks = Vector.new<(Principal, Nat64)>();
       // Pre-fill with placeholder values
       for (i in tempTransferQueue.vals()) {
@@ -3634,6 +3697,11 @@ shared (deployer) persistent actor class treasury() = this {
         } catch (_) {
           Vector.put(blocks, transferTask.1.4, (transferTask.1.2, natToNat64(0)));
         };
+      };
+
+      // Release pending burns now that transfers are complete
+      for ((token, amount) in Vector.vals(burnPayouts)) {
+        releasePendingBurn(token, amount);
       };
 
       return (true, ?Vector.toArray(blocks));
@@ -4350,18 +4418,379 @@ shared (deployer) persistent actor class treasury() = this {
                     };
                   };
                 };
-                case (#ok(#Split(_))) {
-                  logger.info("PAIR_SKIP", "Split route found for pair skip fallback but not implemented", "do_executeTradingStep");
+                case (#ok(#Split(split))) {
+                  // SPLIT ICP FALLBACK for PAIR SKIP
+                  Debug.print("Pair skip: ICP fallback split route found, executing both legs");
+                  logger.info("PAIR_SKIP_SPLIT",
+                    "Executing split ICP fallback for skipped pair - Kong=" # Nat.toText(split.kongswap.percentBP / 100) # "%" #
+                    " ICP=" # Nat.toText(split.icpswap.percentBP / 100) # "%",
+                    "do_executeTradingStep"
+                  );
+
+                  let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                  // KongSwap leg
+                  let kongFinalAmount : Nat = if (isExactTargeting and split.kongswap.slippageBP > 0) {
+                    let denominator = 10000 + split.kongswap.slippageBP;
+                    (split.kongswap.amount * 10000) / denominator
+                  } else { split.kongswap.amount };
+
+                  let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < split.kongswap.amount and split.kongswap.amount > 0) {
+                    (split.kongswap.expectedOut * kongFinalAmount) / split.kongswap.amount
+                  } else { split.kongswap.expectedOut };
+
+                  let kongIdealOut : Nat = if (split.kongswap.slippageBP < 9900) {
+                    (kongAdjustedExpectedOut * 10000) / (10000 - split.kongswap.slippageBP)
+                  } else { kongAdjustedExpectedOut };
+
+                  let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                  let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                  // ICPSwap leg
+                  let icpFinalAmount : Nat = if (isExactTargeting and split.icpswap.slippageBP > 0) {
+                    let denominator = 10000 + split.icpswap.slippageBP;
+                    (split.icpswap.amount * 10000) / denominator
+                  } else { split.icpswap.amount };
+
+                  let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < split.icpswap.amount and split.icpswap.amount > 0) {
+                    (split.icpswap.expectedOut * icpFinalAmount) / split.icpswap.amount
+                  } else { split.icpswap.expectedOut };
+
+                  let icpIdealOut : Nat = if (split.icpswap.slippageBP < 9900) {
+                    (icpAdjustedExpectedOut * 10000) / (10000 - split.icpswap.slippageBP)
+                  } else { icpAdjustedExpectedOut };
+
+                  let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                  let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                  // Execute both trades IN PARALLEL to ICP
+                  let splitResult = await* executeSplitTrade(
+                    sellToken, ICPprincipal,
+                    kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                    icpFinalAmount, icpMinAmountOut, icpIdealOut
+                  );
+
+                  var kongSuccess = false;
+                  var icpSuccess = false;
+                  let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                  // Handle KongSwap result
+                  switch (splitResult.kongResult) {
+                    case (#ok(record)) {
+                      let fallbackRecord : TradeRecord = {
+                        record with
+                        error = ?("PAIR_SKIP_SPLIT: Pair in skip map, original target was " # skipBuySymbol # ", traded for ICP (KongSwap leg)");
+                      };
+                      Vector.add(lastTrades, fallbackRecord);
+                      kongSuccess := true;
+                      logger.info("PAIR_SKIP_SPLIT", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                    };
+                    case (#err(errKong)) {
+                      let failedRecord : TradeRecord = {
+                        tokenSold = sellToken; tokenBought = ICPprincipal;
+                        amountSold = kongFinalAmount; amountBought = 0;
+                        exchange = #KongSwap; timestamp = now();
+                        success = false; error = ?("PAIR_SKIP_SPLIT failed: " # errKong); slippage = 0.0;
+                      };
+                      Vector.add(lastTrades, failedRecord);
+                      logger.error("PAIR_SKIP_SPLIT", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                    };
+                  };
+
+                  // Handle ICPSwap result
+                  switch (splitResult.icpResult) {
+                    case (#ok(record)) {
+                      let fallbackRecord : TradeRecord = {
+                        record with
+                        error = ?("PAIR_SKIP_SPLIT: Pair in skip map, original target was " # skipBuySymbol # ", traded for ICP (ICPSwap leg)");
+                      };
+                      Vector.add(lastTrades, fallbackRecord);
+                      icpSuccess := true;
+                      logger.info("PAIR_SKIP_SPLIT", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                    };
+                    case (#err(errIcp)) {
+                      let failedRecord : TradeRecord = {
+                        tokenSold = sellToken; tokenBought = ICPprincipal;
+                        amountSold = icpFinalAmount; amountBought = 0;
+                        exchange = #ICPSwap; timestamp = now();
+                        success = false; error = ?("PAIR_SKIP_SPLIT failed: " # errIcp); slippage = 0.0;
+                      };
+                      Vector.add(lastTrades, failedRecord);
+                      logger.error("PAIR_SKIP_SPLIT", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                    };
+                  };
+
+                  // Trim trade history
+                  if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                    Vector.reverse(lastTrades);
+                    while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                      ignore Vector.removeLast(lastTrades);
+                    };
+                    Vector.reverse(lastTrades);
+                  };
+
+                  let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                  let failCount : Nat = 2 - successCount;
+
+                  rebalanceState := {
+                    rebalanceState with
+                    metrics = {
+                      rebalanceState.metrics with
+                      totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                      totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                    };
+                    lastTrades = lastTrades;
+                  };
+
+                  if (kongSuccess or icpSuccess) {
+                    success := true;
+                    tradingBackoffLevel := 0;
+                    Debug.print("Pair skip ICP fallback split completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                    await updateBalances();
+                    await takePortfolioSnapshot(#PostTrade);
+                    checkPortfolioCircuitBreakerConditions();
+                    await* logPortfolioState("Post-pair-skip-ICP-fallback-split completed");
+                  } else {
+                    incrementSkipCounter(#noExecutionPath);
+                    rebalanceState := {
+                      rebalanceState with
+                      metrics = {
+                        rebalanceState.metrics with
+                        currentStatus = #Failed("Pair skip ICP fallback split: both legs failed");
+                      };
+                    };
+                    await* recoverFromFailure();
+                  };
                 };
-                case (#ok(#Partial(_))) {
-                  logger.info("PAIR_SKIP", "Partial route found for pair skip fallback but not implemented", "do_executeTradingStep");
+
+                case (#ok(#Partial(partial))) {
+                  // PARTIAL ICP FALLBACK for PAIR SKIP
+                  Debug.print("Pair skip: ICP fallback partial route found, executing both legs");
+                  logger.info("PAIR_SKIP_PARTIAL",
+                    "Executing partial ICP fallback for skipped pair - Kong=" # Nat.toText(partial.kongswap.percentBP / 100) # "%" #
+                    " ICP=" # Nat.toText(partial.icpswap.percentBP / 100) # "%" #
+                    " Total=" # Nat.toText(partial.totalPercentBP / 100) # "%",
+                    "do_executeTradingStep"
+                  );
+
+                  let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                  // KongSwap leg
+                  let kongFinalAmount : Nat = if (isExactTargeting and partial.kongswap.slippageBP > 0) {
+                    let denominator = 10000 + partial.kongswap.slippageBP;
+                    (partial.kongswap.amount * 10000) / denominator
+                  } else { partial.kongswap.amount };
+
+                  let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < partial.kongswap.amount and partial.kongswap.amount > 0) {
+                    (partial.kongswap.expectedOut * kongFinalAmount) / partial.kongswap.amount
+                  } else { partial.kongswap.expectedOut };
+
+                  let kongIdealOut : Nat = if (partial.kongswap.slippageBP < 9900) {
+                    (kongAdjustedExpectedOut * 10000) / (10000 - partial.kongswap.slippageBP)
+                  } else { kongAdjustedExpectedOut };
+
+                  let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                  let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                  // ICPSwap leg
+                  let icpFinalAmount : Nat = if (isExactTargeting and partial.icpswap.slippageBP > 0) {
+                    let denominator = 10000 + partial.icpswap.slippageBP;
+                    (partial.icpswap.amount * 10000) / denominator
+                  } else { partial.icpswap.amount };
+
+                  let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < partial.icpswap.amount and partial.icpswap.amount > 0) {
+                    (partial.icpswap.expectedOut * icpFinalAmount) / partial.icpswap.amount
+                  } else { partial.icpswap.expectedOut };
+
+                  let icpIdealOut : Nat = if (partial.icpswap.slippageBP < 9900) {
+                    (icpAdjustedExpectedOut * 10000) / (10000 - partial.icpswap.slippageBP)
+                  } else { icpAdjustedExpectedOut };
+
+                  let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                  let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                  let splitResult = await* executeSplitTrade(
+                    sellToken, ICPprincipal,
+                    kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                    icpFinalAmount, icpMinAmountOut, icpIdealOut
+                  );
+
+                  var kongSuccess = false;
+                  var icpSuccess = false;
+                  let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                  switch (splitResult.kongResult) {
+                    case (#ok(record)) {
+                      let fallbackRecord : TradeRecord = {
+                        record with
+                        error = ?("PAIR_SKIP_PARTIAL: Pair in skip map, original target was " # skipBuySymbol # ", traded for ICP (KongSwap leg)");
+                      };
+                      Vector.add(lastTrades, fallbackRecord);
+                      kongSuccess := true;
+                      logger.info("PAIR_SKIP_PARTIAL", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                    };
+                    case (#err(errKong)) {
+                      let failedRecord : TradeRecord = {
+                        tokenSold = sellToken; tokenBought = ICPprincipal;
+                        amountSold = kongFinalAmount; amountBought = 0;
+                        exchange = #KongSwap; timestamp = now();
+                        success = false; error = ?("PAIR_SKIP_PARTIAL failed: " # errKong); slippage = 0.0;
+                      };
+                      Vector.add(lastTrades, failedRecord);
+                      logger.error("PAIR_SKIP_PARTIAL", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                    };
+                  };
+
+                  switch (splitResult.icpResult) {
+                    case (#ok(record)) {
+                      let fallbackRecord : TradeRecord = {
+                        record with
+                        error = ?("PAIR_SKIP_PARTIAL: Pair in skip map, original target was " # skipBuySymbol # ", traded for ICP (ICPSwap leg)");
+                      };
+                      Vector.add(lastTrades, fallbackRecord);
+                      icpSuccess := true;
+                      logger.info("PAIR_SKIP_PARTIAL", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                    };
+                    case (#err(errIcp)) {
+                      let failedRecord : TradeRecord = {
+                        tokenSold = sellToken; tokenBought = ICPprincipal;
+                        amountSold = icpFinalAmount; amountBought = 0;
+                        exchange = #ICPSwap; timestamp = now();
+                        success = false; error = ?("PAIR_SKIP_PARTIAL failed: " # errIcp); slippage = 0.0;
+                      };
+                      Vector.add(lastTrades, failedRecord);
+                      logger.error("PAIR_SKIP_PARTIAL", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                    };
+                  };
+
+                  let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                  let failCount : Nat = 2 - successCount;
+                  rebalanceState := {
+                    rebalanceState with
+                    metrics = {
+                      rebalanceState.metrics with
+                      totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                      totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                    };
+                    lastTrades = lastTrades;
+                  };
+
+                  if (kongSuccess or icpSuccess) {
+                    success := true;
+                    tradingBackoffLevel := 0;
+                    Debug.print("Pair skip ICP fallback partial completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                    await updateBalances();
+                    await takePortfolioSnapshot(#PostTrade);
+                    checkPortfolioCircuitBreakerConditions();
+                    await* logPortfolioState("Post-pair-skip-ICP-fallback-partial completed");
+                  } else {
+                    incrementSkipCounter(#noExecutionPath);
+                    rebalanceState := {
+                      rebalanceState with
+                      metrics = {
+                        rebalanceState.metrics with
+                        currentStatus = #Failed("Pair skip ICP fallback partial: both legs failed");
+                      };
+                    };
+                    await* recoverFromFailure();
+                  };
                 };
                 case (#err(skipRouteError)) {
                   logger.warn("PAIR_SKIP",
-                    "No ICP fallback route available for skipped pair - Error=" # skipRouteError.reason,
+                    "Pair skip ICP fallback failed at full size - Error=" # skipRouteError.reason,
                     "do_executeTradingStep"
                   );
-                  incrementSkipCounter(#noExecutionPath);
+
+                  // NEW: Try REDUCED amount for ICP fallback (reuses quotes from skipRouteError)
+                  label reducedPairSkipFallback switch (estimateMaxTradeableAmount(
+                    skipRouteError.kongQuotes, skipRouteError.icpQuotes, tradeSize,
+                    rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                  )) {
+                    case (?reduced) {
+                      if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
+                        logger.info("SKIP_REDUCED",
+                          "Reduced pair skip ICP fallback too small - IcpWorth=" # Nat.toText(reduced.icpWorth) #
+                          " < " # Nat.toText(rebalanceConfig.minTradeValueICP / 3),
+                          "do_executeTradingStep"
+                        );
+                        break reducedPairSkipFallback;
+                      };
+
+                      logger.info("PAIR_SKIP_REDUCED_ICP",
+                        "Executing reduced ICP fallback for skipped pair - Original=" # Nat.toText(tradeSize) #
+                        " Reduced=" # Nat.toText(reduced.amount) #
+                        " Exchange=" # debug_show(reduced.exchange) #
+                        " Pair=" # skipSellSymbol # "/" # skipBuySymbol #
+                        " Fallback=" # skipSellSymbol # "/ICP" #
+                        " IcpWorth=" # Nat.toText(reduced.icpWorth),
+                        "do_executeTradingStep"
+                      );
+
+                      let reducedIcpTradeResult = await* executeTrade(
+                        sellToken, ICPprincipal,
+                        reduced.amount, reduced.exchange,
+                        reduced.minAmountOut, reduced.idealOut
+                      );
+
+                      switch (reducedIcpTradeResult) {
+                        case (#ok(record)) {
+                          let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                          let reducedIcpRecord : TradeRecord = {
+                            record with
+                            error = ?("PAIR_SKIP_REDUCED_ICP: Pair in skip map, original target was " # skipBuySymbol # ", traded reduced amount for ICP");
+                          };
+                          Vector.add(lastTrades, reducedIcpRecord);
+
+                          if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                            Vector.reverse(lastTrades);
+                            while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                              ignore Vector.removeLast(lastTrades);
+                            };
+                            Vector.reverse(lastTrades);
+                          };
+
+                          rebalanceState := {
+                            rebalanceState with
+                            metrics = {
+                              rebalanceState.metrics with
+                              totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                            };
+                            lastTrades = lastTrades;
+                          };
+
+                          success := true;
+                          tradingBackoffLevel := 0;
+
+                          logger.info("PAIR_SKIP_REDUCED_ICP",
+                            "REDUCED ICP fallback SUCCESS - Sold=" # Nat.toText(record.amountSold) #
+                            " ICP_received=" # Nat.toText(record.amountBought) #
+                            " Exchange=" # debug_show(record.exchange),
+                            "do_executeTradingStep"
+                          );
+
+                          await updateBalances();
+                          await takePortfolioSnapshot(#PostTrade);
+                          checkPortfolioCircuitBreakerConditions();
+                          await* logPortfolioState("Post-PAIR-SKIP-REDUCED-ICP-fallback");
+                        };
+                        case (#err(reducedIcpError)) {
+                          logger.warn("PAIR_SKIP_REDUCED_ICP",
+                            "Reduced ICP fallback also failed - Error=" # reducedIcpError,
+                            "do_executeTradingStep"
+                          );
+                        };
+                      };
+                    };
+                    case null {
+                      Debug.print("No viable reduced ICP fallback amount for pair skip");
+                    };
+                  };
+
+                  // If reduced succeeded, return early (success will be true)
+                  // Otherwise continue to skip counter
+                  if (not success) {
+                    incrementSkipCounter(#noExecutionPath);
+                  };
                 };
               };
               continue a;
@@ -4686,17 +5115,371 @@ shared (deployer) persistent actor class treasury() = this {
                                 };
                               };
                             };
-                            case (#ok(#Split(_))) {
-                              logger.info("ICP_FALLBACK", "Split ICP fallback route found but not implemented for exec failure path", "do_executeTradingStep");
+                            case (#ok(#Split(split))) {
+                              // SPLIT ICP FALLBACK after Single execution failure
+                              Debug.print("ICP fallback split route found after single exec failure, executing both legs");
+                              logger.info("ICP_FALLBACK_SPLIT",
+                                "Executing split ICP fallback after single failure - Kong=" # Nat.toText(split.kongswap.percentBP / 100) # "%" #
+                                " ICP=" # Nat.toText(split.icpswap.percentBP / 100) # "%",
+                                "do_executeTradingStep"
+                              );
+
+                              let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                              // KongSwap leg
+                              let kongFinalAmount : Nat = if (isExactTargeting and split.kongswap.slippageBP > 0) {
+                                let denominator = 10000 + split.kongswap.slippageBP;
+                                (split.kongswap.amount * 10000) / denominator
+                              } else { split.kongswap.amount };
+
+                              let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < split.kongswap.amount and split.kongswap.amount > 0) {
+                                (split.kongswap.expectedOut * kongFinalAmount) / split.kongswap.amount
+                              } else { split.kongswap.expectedOut };
+
+                              let kongIdealOut : Nat = if (split.kongswap.slippageBP < 9900) {
+                                (kongAdjustedExpectedOut * 10000) / (10000 - split.kongswap.slippageBP)
+                              } else { kongAdjustedExpectedOut };
+
+                              let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                              let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                              // ICPSwap leg
+                              let icpFinalAmount : Nat = if (isExactTargeting and split.icpswap.slippageBP > 0) {
+                                let denominator = 10000 + split.icpswap.slippageBP;
+                                (split.icpswap.amount * 10000) / denominator
+                              } else { split.icpswap.amount };
+
+                              let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < split.icpswap.amount and split.icpswap.amount > 0) {
+                                (split.icpswap.expectedOut * icpFinalAmount) / split.icpswap.amount
+                              } else { split.icpswap.expectedOut };
+
+                              let icpIdealOut : Nat = if (split.icpswap.slippageBP < 9900) {
+                                (icpAdjustedExpectedOut * 10000) / (10000 - split.icpswap.slippageBP)
+                              } else { icpAdjustedExpectedOut };
+
+                              let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                              let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                              let splitResult = await* executeSplitTrade(
+                                sellToken, ICPprincipal,
+                                kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                                icpFinalAmount, icpMinAmountOut, icpIdealOut
+                              );
+
+                              var kongSuccess = false;
+                              var icpSuccess = false;
+
+                              // Handle KongSwap result
+                              switch (splitResult.kongResult) {
+                                case (#ok(record)) {
+                                  let fallbackRecord : TradeRecord = {
+                                    record with
+                                    error = ?("ICP_FALLBACK_SPLIT: Original " # buySymbol # " trade failed, sold for ICP (KongSwap leg)");
+                                  };
+                                  Vector.add(lastTrades, fallbackRecord);
+                                  kongSuccess := true;
+                                  logger.info("ICP_FALLBACK_SPLIT", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                                };
+                                case (#err(errKong)) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = kongFinalAmount; amountBought = 0;
+                                    exchange = #KongSwap; timestamp = now();
+                                    success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errKong); slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("ICP_FALLBACK_SPLIT", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                                };
+                              };
+
+                              // Handle ICPSwap result
+                              switch (splitResult.icpResult) {
+                                case (#ok(record)) {
+                                  let fallbackRecord : TradeRecord = {
+                                    record with
+                                    error = ?("ICP_FALLBACK_SPLIT: Original " # buySymbol # " trade failed, sold for ICP (ICPSwap leg)");
+                                  };
+                                  Vector.add(lastTrades, fallbackRecord);
+                                  icpSuccess := true;
+                                  logger.info("ICP_FALLBACK_SPLIT", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                                };
+                                case (#err(errIcp)) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = icpFinalAmount; amountBought = 0;
+                                    exchange = #ICPSwap; timestamp = now();
+                                    success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errIcp); slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("ICP_FALLBACK_SPLIT", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                                };
+                              };
+
+                              // Trim trade history
+                              if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                Vector.reverse(lastTrades);
+                                while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                  ignore Vector.removeLast(lastTrades);
+                                };
+                                Vector.reverse(lastTrades);
+                              };
+
+                              let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                              let failCount : Nat = 2 - successCount;
+
+                              rebalanceState := {
+                                rebalanceState with
+                                metrics = {
+                                  rebalanceState.metrics with
+                                  totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                                  totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                                };
+                                lastTrades = lastTrades;
+                              };
+
+                              if (kongSuccess or icpSuccess) {
+                                success := true;
+                                fallbackSucceeded := true;  // CRITICAL: Set this for outer code check
+                                tradingBackoffLevel := 0;
+                                Debug.print("ICP fallback split after single failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                                await updateBalances();
+                                await takePortfolioSnapshot(#PostTrade);
+                                checkPortfolioCircuitBreakerConditions();
+                                await* logPortfolioState("Post-ICP-fallback-split (after single exec failure)");
+                              } else {
+                                // Both legs failed - fallbackSucceeded remains false, outer code will handle metrics
+                                rebalanceState := {
+                                  rebalanceState with
+                                  metrics = {
+                                    rebalanceState.metrics with
+                                    currentStatus = #Failed("ICP fallback split after single failure: both legs failed");
+                                  };
+                                };
+                              };
                             };
-                            case (#ok(#Partial(_))) {
-                              logger.info("ICP_FALLBACK", "Partial ICP fallback route found but not implemented for exec failure path", "do_executeTradingStep");
+
+                            case (#ok(#Partial(partial))) {
+                              // PARTIAL ICP FALLBACK after Single execution failure
+                              Debug.print("ICP fallback partial route found after single exec failure, executing both legs");
+                              logger.info("ICP_FALLBACK_PARTIAL",
+                                "Executing partial ICP fallback after single failure - Kong=" # Nat.toText(partial.kongswap.percentBP / 100) # "%" #
+                                " ICP=" # Nat.toText(partial.icpswap.percentBP / 100) # "%" #
+                                " Total=" # Nat.toText(partial.totalPercentBP / 100) # "%",
+                                "do_executeTradingStep"
+                              );
+
+                              let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                              // KongSwap leg
+                              let kongFinalAmount : Nat = if (isExactTargeting and partial.kongswap.slippageBP > 0) {
+                                let denominator = 10000 + partial.kongswap.slippageBP;
+                                (partial.kongswap.amount * 10000) / denominator
+                              } else { partial.kongswap.amount };
+
+                              let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < partial.kongswap.amount and partial.kongswap.amount > 0) {
+                                (partial.kongswap.expectedOut * kongFinalAmount) / partial.kongswap.amount
+                              } else { partial.kongswap.expectedOut };
+
+                              let kongIdealOut : Nat = if (partial.kongswap.slippageBP < 9900) {
+                                (kongAdjustedExpectedOut * 10000) / (10000 - partial.kongswap.slippageBP)
+                              } else { kongAdjustedExpectedOut };
+
+                              let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                              let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                              // ICPSwap leg
+                              let icpFinalAmount : Nat = if (isExactTargeting and partial.icpswap.slippageBP > 0) {
+                                let denominator = 10000 + partial.icpswap.slippageBP;
+                                (partial.icpswap.amount * 10000) / denominator
+                              } else { partial.icpswap.amount };
+
+                              let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < partial.icpswap.amount and partial.icpswap.amount > 0) {
+                                (partial.icpswap.expectedOut * icpFinalAmount) / partial.icpswap.amount
+                              } else { partial.icpswap.expectedOut };
+
+                              let icpIdealOut : Nat = if (partial.icpswap.slippageBP < 9900) {
+                                (icpAdjustedExpectedOut * 10000) / (10000 - partial.icpswap.slippageBP)
+                              } else { icpAdjustedExpectedOut };
+
+                              let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                              let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                              let splitResult = await* executeSplitTrade(
+                                sellToken, ICPprincipal,
+                                kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                                icpFinalAmount, icpMinAmountOut, icpIdealOut
+                              );
+
+                              var kongSuccess = false;
+                              var icpSuccess = false;
+
+                              switch (splitResult.kongResult) {
+                                case (#ok(record)) {
+                                  let fallbackRecord : TradeRecord = {
+                                    record with
+                                    error = ?("ICP_FALLBACK_PARTIAL: Original " # buySymbol # " trade failed, sold for ICP (KongSwap leg)");
+                                  };
+                                  Vector.add(lastTrades, fallbackRecord);
+                                  kongSuccess := true;
+                                  logger.info("ICP_FALLBACK_PARTIAL", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                                };
+                                case (#err(errKong)) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = kongFinalAmount; amountBought = 0;
+                                    exchange = #KongSwap; timestamp = now();
+                                    success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errKong); slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("ICP_FALLBACK_PARTIAL", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                                };
+                              };
+
+                              switch (splitResult.icpResult) {
+                                case (#ok(record)) {
+                                  let fallbackRecord : TradeRecord = {
+                                    record with
+                                    error = ?("ICP_FALLBACK_PARTIAL: Original " # buySymbol # " trade failed, sold for ICP (ICPSwap leg)");
+                                  };
+                                  Vector.add(lastTrades, fallbackRecord);
+                                  icpSuccess := true;
+                                  logger.info("ICP_FALLBACK_PARTIAL", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                                };
+                                case (#err(errIcp)) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = icpFinalAmount; amountBought = 0;
+                                    exchange = #ICPSwap; timestamp = now();
+                                    success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errIcp); slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("ICP_FALLBACK_PARTIAL", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                                };
+                              };
+
+                              let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                              let failCount : Nat = 2 - successCount;
+                              rebalanceState := {
+                                rebalanceState with
+                                metrics = {
+                                  rebalanceState.metrics with
+                                  totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                                  totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                                };
+                                lastTrades = lastTrades;
+                              };
+
+                              if (kongSuccess or icpSuccess) {
+                                success := true;
+                                fallbackSucceeded := true;  // CRITICAL: Set this for outer code check
+                                tradingBackoffLevel := 0;
+                                Debug.print("ICP fallback partial after single failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                                await updateBalances();
+                                await takePortfolioSnapshot(#PostTrade);
+                                checkPortfolioCircuitBreakerConditions();
+                                await* logPortfolioState("Post-ICP-fallback-partial (after single exec failure)");
+                              } else {
+                                // Both legs failed - fallbackSucceeded remains false, outer code will handle metrics
+                                rebalanceState := {
+                                  rebalanceState with
+                                  metrics = {
+                                    rebalanceState.metrics with
+                                    currentStatus = #Failed("ICP fallback partial after single failure: both legs failed");
+                                  };
+                                };
+                              };
                             };
                             case (#err(icpRouteError)) {
                               logger.warn("ICP_FALLBACK",
-                                "No ICP fallback route available - Error=" # icpRouteError.reason,
+                                "ICP fallback failed at full size after single exec failure - Error=" # icpRouteError.reason,
                                 "do_executeTradingStep"
                               );
+
+                              // NEW: Try REDUCED amount for ICP fallback (reuses quotes from icpRouteError)
+                              label reducedIcpFallbackAfterSingle switch (estimateMaxTradeableAmount(
+                                icpRouteError.kongQuotes, icpRouteError.icpQuotes, finalTradeSize,
+                                rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                              )) {
+                                case (?reduced) {
+                                  if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
+                                    logger.info("SKIP_REDUCED",
+                                      "Reduced ICP fallback after single exec failure too small - IcpWorth=" # Nat.toText(reduced.icpWorth) #
+                                      " < " # Nat.toText(rebalanceConfig.minTradeValueICP / 3),
+                                      "do_executeTradingStep"
+                                    );
+                                    break reducedIcpFallbackAfterSingle;
+                                  };
+
+                                  logger.info("REDUCED_ICP_FALLBACK",
+                                    "Executing reduced ICP fallback after single exec failure - Original=" # Nat.toText(finalTradeSize) #
+                                    " Reduced=" # Nat.toText(reduced.amount) #
+                                    " Exchange=" # debug_show(reduced.exchange) #
+                                    " Pair=" # sellSymbol # "/" # buySymbol #
+                                    " Fallback=" # sellSymbol # "/ICP" #
+                                    " IcpWorth=" # Nat.toText(reduced.icpWorth),
+                                    "do_executeTradingStep"
+                                  );
+
+                                  let reducedIcpTradeResult = await* executeTrade(
+                                    sellToken, ICPprincipal,
+                                    reduced.amount, reduced.exchange,
+                                    reduced.minAmountOut, reduced.idealOut
+                                  );
+
+                                  switch (reducedIcpTradeResult) {
+                                    case (#ok(record)) {
+                                      let reducedIcpRecord : TradeRecord = {
+                                        record with
+                                        error = ?("REDUCED_ICP_FALLBACK: Original " # buySymbol # " trade failed, traded reduced amount for ICP");
+                                      };
+                                      Vector.add(lastTrades, reducedIcpRecord);
+
+                                      if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                                        Vector.reverse(lastTrades);
+                                        while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                          ignore Vector.removeLast(lastTrades);
+                                        };
+                                        Vector.reverse(lastTrades);
+                                      };
+
+                                      rebalanceState := {
+                                        rebalanceState with
+                                        metrics = {
+                                          rebalanceState.metrics with
+                                          totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                                        };
+                                        lastTrades = lastTrades;
+                                      };
+
+                                      success := true;
+                                      fallbackSucceeded := true;  // CRITICAL: Prevents outer code from double-counting failure
+                                      tradingBackoffLevel := 0;
+
+                                      logger.info("REDUCED_ICP_FALLBACK",
+                                        "REDUCED ICP fallback SUCCESS after single exec failure - Sold=" # Nat.toText(record.amountSold) #
+                                        " ICP_received=" # Nat.toText(record.amountBought) #
+                                        " Exchange=" # debug_show(record.exchange),
+                                        "do_executeTradingStep"
+                                      );
+
+                                      await updateBalances();
+                                      await takePortfolioSnapshot(#PostTrade);
+                                      checkPortfolioCircuitBreakerConditions();
+                                      await* logPortfolioState("Post-REDUCED-ICP-fallback (after single exec failure)");
+                                    };
+                                    case (#err(reducedIcpError)) {
+                                      logger.warn("REDUCED_ICP_FALLBACK",
+                                        "Reduced ICP fallback also failed after single exec failure - Error=" # reducedIcpError,
+                                        "do_executeTradingStep"
+                                      );
+                                      // fallbackSucceeded remains false, outer code at line 5402 will handle metrics
+                                    };
+                                  };
+                                };
+                                case null {
+                                  Debug.print("No viable reduced ICP fallback amount after single exec failure");
+                                };
+                              };
                             };
                           };
                         };
@@ -4950,18 +5733,377 @@ shared (deployer) persistent actor class treasury() = this {
                               };
                             };
                           };
-                          case (#ok(#Split(_))) {
-                            logger.info("ICP_FALLBACK", "Split ICP fallback route found but not implemented for split-failure path", "do_executeTradingStep");
+                          case (#ok(#Split(split))) {
+                            // SPLIT ICP FALLBACK after Split execution failure
+                            Debug.print("ICP fallback split route found after split exec failure, executing both legs");
+                            logger.info("ICP_FALLBACK_SPLIT",
+                              "Executing split ICP fallback after split failure - Kong=" # Nat.toText(split.kongswap.percentBP / 100) # "%" #
+                              " ICP=" # Nat.toText(split.icpswap.percentBP / 100) # "%",
+                              "do_executeTradingStep"
+                            );
+
+                            let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                            // KongSwap leg
+                            let kongFinalAmount : Nat = if (isExactTargeting and split.kongswap.slippageBP > 0) {
+                              let denominator = 10000 + split.kongswap.slippageBP;
+                              (split.kongswap.amount * 10000) / denominator
+                            } else { split.kongswap.amount };
+
+                            let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < split.kongswap.amount and split.kongswap.amount > 0) {
+                              (split.kongswap.expectedOut * kongFinalAmount) / split.kongswap.amount
+                            } else { split.kongswap.expectedOut };
+
+                            let kongIdealOut : Nat = if (split.kongswap.slippageBP < 9900) {
+                              (kongAdjustedExpectedOut * 10000) / (10000 - split.kongswap.slippageBP)
+                            } else { kongAdjustedExpectedOut };
+
+                            let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                            // ICPSwap leg
+                            let icpFinalAmount : Nat = if (isExactTargeting and split.icpswap.slippageBP > 0) {
+                              let denominator = 10000 + split.icpswap.slippageBP;
+                              (split.icpswap.amount * 10000) / denominator
+                            } else { split.icpswap.amount };
+
+                            let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < split.icpswap.amount and split.icpswap.amount > 0) {
+                              (split.icpswap.expectedOut * icpFinalAmount) / split.icpswap.amount
+                            } else { split.icpswap.expectedOut };
+
+                            let icpIdealOut : Nat = if (split.icpswap.slippageBP < 9900) {
+                              (icpAdjustedExpectedOut * 10000) / (10000 - split.icpswap.slippageBP)
+                            } else { icpAdjustedExpectedOut };
+
+                            let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                            let splitResult = await* executeSplitTrade(
+                              sellToken, ICPprincipal,
+                              kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                            );
+
+                            var kongSuccess = false;
+                            var icpSuccess = false;
+                            let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                            // Handle KongSwap result
+                            switch (splitResult.kongResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_SPLIT: Both split legs failed for " # splitBuySymbol # ", sold for ICP (KongSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                kongSuccess := true;
+                                logger.info("ICP_FALLBACK_SPLIT", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errKong)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = kongFinalAmount; amountBought = 0;
+                                  exchange = #KongSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errKong); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_SPLIT", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                              };
+                            };
+
+                            // Handle ICPSwap result
+                            switch (splitResult.icpResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_SPLIT: Both split legs failed for " # splitBuySymbol # ", sold for ICP (ICPSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                icpSuccess := true;
+                                logger.info("ICP_FALLBACK_SPLIT", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errIcp)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = icpFinalAmount; amountBought = 0;
+                                  exchange = #ICPSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errIcp); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_SPLIT", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                              };
+                            };
+
+                            // Trim trade history
+                            if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                              Vector.reverse(lastTrades);
+                              while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                ignore Vector.removeLast(lastTrades);
+                              };
+                              Vector.reverse(lastTrades);
+                            };
+
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                            let failCount : Nat = 2 - successCount;
+
+                            rebalanceState := {
+                              rebalanceState with
+                              metrics = {
+                                rebalanceState.metrics with
+                                totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                                totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                              };
+                              lastTrades = lastTrades;
+                            };
+
+                            if (kongSuccess or icpSuccess) {
+                              success := true;
+                              tradingBackoffLevel := 0;
+                              Debug.print("ICP fallback split after split failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                              await updateBalances();
+                              await takePortfolioSnapshot(#PostTrade);
+                              checkPortfolioCircuitBreakerConditions();
+                              await* logPortfolioState("Post-ICP-fallback-split (after split failure)");
+                            } else {
+                              incrementSkipCounter(#noExecutionPath);
+                              rebalanceState := {
+                                rebalanceState with
+                                metrics = {
+                                  rebalanceState.metrics with
+                                  currentStatus = #Failed("ICP fallback (after split failure) split: both legs failed");
+                                };
+                              };
+                              await* recoverFromFailure();
+                            };
                           };
-                          case (#ok(#Partial(_))) {
-                            logger.info("ICP_FALLBACK", "Partial ICP fallback route found but not implemented for split-failure path", "do_executeTradingStep");
+
+                          case (#ok(#Partial(partial))) {
+                            // PARTIAL ICP FALLBACK after Split execution failure
+                            Debug.print("ICP fallback partial route found after split exec failure, executing both legs");
+                            logger.info("ICP_FALLBACK_PARTIAL",
+                              "Executing partial ICP fallback after split failure - Kong=" # Nat.toText(partial.kongswap.percentBP / 100) # "%" #
+                              " ICP=" # Nat.toText(partial.icpswap.percentBP / 100) # "%" #
+                              " Total=" # Nat.toText(partial.totalPercentBP / 100) # "%",
+                              "do_executeTradingStep"
+                            );
+
+                            let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                            // KongSwap leg
+                            let kongFinalAmount : Nat = if (isExactTargeting and partial.kongswap.slippageBP > 0) {
+                              let denominator = 10000 + partial.kongswap.slippageBP;
+                              (partial.kongswap.amount * 10000) / denominator
+                            } else { partial.kongswap.amount };
+
+                            let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < partial.kongswap.amount and partial.kongswap.amount > 0) {
+                              (partial.kongswap.expectedOut * kongFinalAmount) / partial.kongswap.amount
+                            } else { partial.kongswap.expectedOut };
+
+                            let kongIdealOut : Nat = if (partial.kongswap.slippageBP < 9900) {
+                              (kongAdjustedExpectedOut * 10000) / (10000 - partial.kongswap.slippageBP)
+                            } else { kongAdjustedExpectedOut };
+
+                            let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                            // ICPSwap leg
+                            let icpFinalAmount : Nat = if (isExactTargeting and partial.icpswap.slippageBP > 0) {
+                              let denominator = 10000 + partial.icpswap.slippageBP;
+                              (partial.icpswap.amount * 10000) / denominator
+                            } else { partial.icpswap.amount };
+
+                            let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < partial.icpswap.amount and partial.icpswap.amount > 0) {
+                              (partial.icpswap.expectedOut * icpFinalAmount) / partial.icpswap.amount
+                            } else { partial.icpswap.expectedOut };
+
+                            let icpIdealOut : Nat = if (partial.icpswap.slippageBP < 9900) {
+                              (icpAdjustedExpectedOut * 10000) / (10000 - partial.icpswap.slippageBP)
+                            } else { icpAdjustedExpectedOut };
+
+                            let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                            let splitResult = await* executeSplitTrade(
+                              sellToken, ICPprincipal,
+                              kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                            );
+
+                            var kongSuccess = false;
+                            var icpSuccess = false;
+                            let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                            switch (splitResult.kongResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_PARTIAL: Both split legs failed for " # splitBuySymbol # ", sold for ICP (KongSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                kongSuccess := true;
+                                logger.info("ICP_FALLBACK_PARTIAL", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errKong)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = kongFinalAmount; amountBought = 0;
+                                  exchange = #KongSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errKong); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_PARTIAL", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                              };
+                            };
+
+                            switch (splitResult.icpResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_PARTIAL: Both split legs failed for " # splitBuySymbol # ", sold for ICP (ICPSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                icpSuccess := true;
+                                logger.info("ICP_FALLBACK_PARTIAL", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errIcp)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = icpFinalAmount; amountBought = 0;
+                                  exchange = #ICPSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errIcp); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_PARTIAL", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                              };
+                            };
+
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                            let failCount : Nat = 2 - successCount;
+                            rebalanceState := {
+                              rebalanceState with
+                              metrics = {
+                                rebalanceState.metrics with
+                                totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                                totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                              };
+                              lastTrades = lastTrades;
+                            };
+
+                            if (kongSuccess or icpSuccess) {
+                              success := true;
+                              tradingBackoffLevel := 0;
+                              Debug.print("ICP fallback partial after split failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                              await updateBalances();
+                              await takePortfolioSnapshot(#PostTrade);
+                              checkPortfolioCircuitBreakerConditions();
+                              await* logPortfolioState("Post-ICP-fallback-partial (after split failure)");
+                            } else {
+                              incrementSkipCounter(#noExecutionPath);
+                              rebalanceState := {
+                                rebalanceState with
+                                metrics = {
+                                  rebalanceState.metrics with
+                                  currentStatus = #Failed("ICP fallback (after split failure) partial: both legs failed");
+                                };
+                              };
+                              await* recoverFromFailure();
+                            };
                           };
                           case (#err(icpRouteError)) {
                             logger.warn("ICP_FALLBACK",
-                              "No ICP fallback route available after split failure - Error=" # icpRouteError.reason,
+                              "ICP fallback failed at full size after split failure - Error=" # icpRouteError.reason,
                               "do_executeTradingStep"
                             );
-                            incrementSkipCounter(#noExecutionPath);
+
+                            // NEW: Try REDUCED amount for ICP fallback (reuses quotes from icpRouteError)
+                            label reducedIcpFallbackAfterSplit switch (estimateMaxTradeableAmount(
+                              icpRouteError.kongQuotes, icpRouteError.icpQuotes, tradeSize,
+                              rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                            )) {
+                              case (?reduced) {
+                                if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
+                                  logger.info("SKIP_REDUCED",
+                                    "Reduced ICP fallback after split failure too small - IcpWorth=" # Nat.toText(reduced.icpWorth) #
+                                    " < " # Nat.toText(rebalanceConfig.minTradeValueICP / 3),
+                                    "do_executeTradingStep"
+                                  );
+                                  break reducedIcpFallbackAfterSplit;
+                                };
+
+                                logger.info("REDUCED_ICP_FALLBACK",
+                                  "Executing reduced ICP fallback after split failure - Original=" # Nat.toText(tradeSize) #
+                                  " Reduced=" # Nat.toText(reduced.amount) #
+                                  " Exchange=" # debug_show(reduced.exchange) #
+                                  " Pair=" # splitSellSymbol # "/" # splitBuySymbol #
+                                  " Fallback=" # splitSellSymbol # "/ICP" #
+                                  " IcpWorth=" # Nat.toText(reduced.icpWorth),
+                                  "do_executeTradingStep"
+                                );
+
+                                let reducedIcpTradeResult = await* executeTrade(
+                                  sellToken, ICPprincipal,
+                                  reduced.amount, reduced.exchange,
+                                  reduced.minAmountOut, reduced.idealOut
+                                );
+
+                                switch (reducedIcpTradeResult) {
+                                  case (#ok(record)) {
+                                    let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                                    let reducedIcpRecord : TradeRecord = {
+                                      record with
+                                      error = ?("REDUCED_ICP_FALLBACK: Both split legs failed for " # splitBuySymbol # ", traded reduced amount for ICP");
+                                    };
+                                    Vector.add(lastTrades, reducedIcpRecord);
+
+                                    if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                                      Vector.reverse(lastTrades);
+                                      while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                        ignore Vector.removeLast(lastTrades);
+                                      };
+                                      Vector.reverse(lastTrades);
+                                    };
+
+                                    rebalanceState := {
+                                      rebalanceState with
+                                      metrics = {
+                                        rebalanceState.metrics with
+                                        totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                                      };
+                                      lastTrades = lastTrades;
+                                    };
+
+                                    success := true;
+                                    tradingBackoffLevel := 0;
+
+                                    logger.info("REDUCED_ICP_FALLBACK",
+                                      "REDUCED ICP fallback SUCCESS after split failure - Sold=" # Nat.toText(record.amountSold) #
+                                      " ICP_received=" # Nat.toText(record.amountBought) #
+                                      " Exchange=" # debug_show(record.exchange),
+                                      "do_executeTradingStep"
+                                    );
+
+                                    await updateBalances();
+                                    await takePortfolioSnapshot(#PostTrade);
+                                    checkPortfolioCircuitBreakerConditions();
+                                    await* logPortfolioState("Post-REDUCED-ICP-fallback (after split failure)");
+                                  };
+                                  case (#err(reducedIcpError)) {
+                                    logger.warn("REDUCED_ICP_FALLBACK",
+                                      "Reduced ICP fallback also failed after split failure - Error=" # reducedIcpError,
+                                      "do_executeTradingStep"
+                                    );
+                                  };
+                                };
+                              };
+                              case null {
+                                Debug.print("No viable reduced ICP fallback amount after split failure");
+                              };
+                            };
+
+                            // If reduced succeeded, return early
+                            if (not success) {
+                              incrementSkipCounter(#noExecutionPath);
+                            };
                           };
                         };
                       };
@@ -5205,18 +6347,377 @@ shared (deployer) persistent actor class treasury() = this {
                               };
                             };
                           };
-                          case (#ok(#Split(_))) {
-                            logger.info("ICP_FALLBACK", "Split ICP fallback route found but not implemented for partial-failure path", "do_executeTradingStep");
+                          case (#ok(#Split(split))) {
+                            // SPLIT ICP FALLBACK after Partial execution failure
+                            Debug.print("ICP fallback split route found after partial exec failure, executing both legs");
+                            logger.info("ICP_FALLBACK_SPLIT",
+                              "Executing split ICP fallback after partial failure - Kong=" # Nat.toText(split.kongswap.percentBP / 100) # "%" #
+                              " ICP=" # Nat.toText(split.icpswap.percentBP / 100) # "%",
+                              "do_executeTradingStep"
+                            );
+
+                            let ourSlippageToleranceBasisPoints : Nat = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                            // KongSwap leg
+                            let kongFinalAmount : Nat = if (isExactTargeting and split.kongswap.slippageBP > 0) {
+                              let denominator = 10000 + split.kongswap.slippageBP;
+                              (split.kongswap.amount * 10000) / denominator
+                            } else { split.kongswap.amount };
+
+                            let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < split.kongswap.amount and split.kongswap.amount > 0) {
+                              (split.kongswap.expectedOut * kongFinalAmount) / split.kongswap.amount
+                            } else { split.kongswap.expectedOut };
+
+                            let kongIdealOut : Nat = if (split.kongswap.slippageBP < 9900) {
+                              (kongAdjustedExpectedOut * 10000) / (10000 - split.kongswap.slippageBP)
+                            } else { kongAdjustedExpectedOut };
+
+                            let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                            // ICPSwap leg
+                            let icpFinalAmount : Nat = if (isExactTargeting and split.icpswap.slippageBP > 0) {
+                              let denominator = 10000 + split.icpswap.slippageBP;
+                              (split.icpswap.amount * 10000) / denominator
+                            } else { split.icpswap.amount };
+
+                            let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < split.icpswap.amount and split.icpswap.amount > 0) {
+                              (split.icpswap.expectedOut * icpFinalAmount) / split.icpswap.amount
+                            } else { split.icpswap.expectedOut };
+
+                            let icpIdealOut : Nat = if (split.icpswap.slippageBP < 9900) {
+                              (icpAdjustedExpectedOut * 10000) / (10000 - split.icpswap.slippageBP)
+                            } else { icpAdjustedExpectedOut };
+
+                            let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                            // Execute both trades IN PARALLEL to ICP
+                            let splitResult = await* executeSplitTrade(
+                              sellToken, ICPprincipal,
+                              kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                            );
+
+                            var kongSuccess = false;
+                            var icpSuccess = false;
+                            let lastTrades = Vector.clone(rebalanceState.lastTrades);
+
+                            // Handle KongSwap result
+                            switch (splitResult.kongResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_SPLIT: Both partial legs failed for " # partialBuySymbol # ", sold for ICP (KongSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                kongSuccess := true;
+                                logger.info("ICP_FALLBACK_SPLIT", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errKong)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = kongFinalAmount; amountBought = 0;
+                                  exchange = #KongSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errKong); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_SPLIT", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                              };
+                            };
+
+                            // Handle ICPSwap result
+                            switch (splitResult.icpResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_SPLIT: Both partial legs failed for " # partialBuySymbol # ", sold for ICP (ICPSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                icpSuccess := true;
+                                logger.info("ICP_FALLBACK_SPLIT", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errIcp)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = icpFinalAmount; amountBought = 0;
+                                  exchange = #ICPSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_SPLIT failed: " # errIcp); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_SPLIT", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                              };
+                            };
+
+                            // Trim trade history
+                            if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                              Vector.reverse(lastTrades);
+                              while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                ignore Vector.removeLast(lastTrades);
+                              };
+                              Vector.reverse(lastTrades);
+                            };
+
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                            let failCount : Nat = 2 - successCount;
+
+                            rebalanceState := {
+                              rebalanceState with
+                              metrics = {
+                                rebalanceState.metrics with
+                                totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                                totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                              };
+                              lastTrades = lastTrades;
+                            };
+
+                            if (kongSuccess or icpSuccess) {
+                              success := true;
+                              tradingBackoffLevel := 0;
+                              Debug.print("ICP fallback split after partial failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                              await updateBalances();
+                              await takePortfolioSnapshot(#PostTrade);
+                              checkPortfolioCircuitBreakerConditions();
+                              await* logPortfolioState("Post-ICP-fallback-split (after partial exec failure)");
+                            } else {
+                              incrementSkipCounter(#noExecutionPath);
+                              rebalanceState := {
+                                rebalanceState with
+                                metrics = {
+                                  rebalanceState.metrics with
+                                  currentStatus = #Failed("ICP fallback split after partial failure: both legs failed");
+                                };
+                              };
+                              await* recoverFromFailure();
+                            };
                           };
-                          case (#ok(#Partial(_))) {
-                            logger.info("ICP_FALLBACK", "Partial ICP fallback route found but not implemented for partial-failure path", "do_executeTradingStep");
+
+                          case (#ok(#Partial(partial))) {
+                            // PARTIAL ICP FALLBACK after Partial execution failure
+                            Debug.print("ICP fallback partial route found after partial exec failure, executing both legs");
+                            logger.info("ICP_FALLBACK_PARTIAL",
+                              "Executing partial ICP fallback after partial failure - Kong=" # Nat.toText(partial.kongswap.percentBP / 100) # "%" #
+                              " ICP=" # Nat.toText(partial.icpswap.percentBP / 100) # "%" #
+                              " Total=" # Nat.toText(partial.totalPercentBP / 100) # "%",
+                              "do_executeTradingStep"
+                            );
+
+                            let ourSlippageToleranceBasisPoints = if (rebalanceConfig.maxSlippageBasisPoints > 10000) { 10000 } else { rebalanceConfig.maxSlippageBasisPoints };
+
+                            // KongSwap leg
+                            let kongFinalAmount : Nat = if (isExactTargeting and partial.kongswap.slippageBP > 0) {
+                              let denominator = 10000 + partial.kongswap.slippageBP;
+                              (partial.kongswap.amount * 10000) / denominator
+                            } else { partial.kongswap.amount };
+
+                            let kongAdjustedExpectedOut : Nat = if (kongFinalAmount < partial.kongswap.amount and partial.kongswap.amount > 0) {
+                              (partial.kongswap.expectedOut * kongFinalAmount) / partial.kongswap.amount
+                            } else { partial.kongswap.expectedOut };
+
+                            let kongIdealOut : Nat = if (partial.kongswap.slippageBP < 9900) {
+                              (kongAdjustedExpectedOut * 10000) / (10000 - partial.kongswap.slippageBP)
+                            } else { kongAdjustedExpectedOut };
+
+                            let kongToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let kongMinAmountOut : Nat = (kongIdealOut * kongToleranceMultiplier) / 10000;
+
+                            // ICPSwap leg
+                            let icpFinalAmount : Nat = if (isExactTargeting and partial.icpswap.slippageBP > 0) {
+                              let denominator = 10000 + partial.icpswap.slippageBP;
+                              (partial.icpswap.amount * 10000) / denominator
+                            } else { partial.icpswap.amount };
+
+                            let icpAdjustedExpectedOut : Nat = if (icpFinalAmount < partial.icpswap.amount and partial.icpswap.amount > 0) {
+                              (partial.icpswap.expectedOut * icpFinalAmount) / partial.icpswap.amount
+                            } else { partial.icpswap.expectedOut };
+
+                            let icpIdealOut : Nat = if (partial.icpswap.slippageBP < 9900) {
+                              (icpAdjustedExpectedOut * 10000) / (10000 - partial.icpswap.slippageBP)
+                            } else { icpAdjustedExpectedOut };
+
+                            let icpToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+                            let icpMinAmountOut : Nat = (icpIdealOut * icpToleranceMultiplier) / 10000;
+
+                            let splitResult = await* executeSplitTrade(
+                              sellToken, ICPprincipal,
+                              kongFinalAmount, kongMinAmountOut, kongIdealOut,
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                            );
+
+                            var kongSuccess = false;
+                            var icpSuccess = false;
+
+                            switch (splitResult.kongResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_PARTIAL: Both partial legs failed for " # partialBuySymbol # ", sold for ICP (KongSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                kongSuccess := true;
+                                logger.info("ICP_FALLBACK_PARTIAL", "KongSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errKong)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = kongFinalAmount; amountBought = 0;
+                                  exchange = #KongSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errKong); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_PARTIAL", "KongSwap leg failed: " # errKong, "do_executeTradingStep");
+                              };
+                            };
+
+                            switch (splitResult.icpResult) {
+                              case (#ok(record)) {
+                                let fallbackRecord : TradeRecord = {
+                                  record with
+                                  error = ?("ICP_FALLBACK_PARTIAL: Both partial legs failed for " # partialBuySymbol # ", sold for ICP (ICPSwap leg)");
+                                };
+                                Vector.add(lastTrades, fallbackRecord);
+                                icpSuccess := true;
+                                logger.info("ICP_FALLBACK_PARTIAL", "ICPSwap leg succeeded - ICP_received=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(errIcp)) {
+                                let failedRecord : TradeRecord = {
+                                  tokenSold = sellToken; tokenBought = ICPprincipal;
+                                  amountSold = icpFinalAmount; amountBought = 0;
+                                  exchange = #ICPSwap; timestamp = now();
+                                  success = false; error = ?("ICP_FALLBACK_PARTIAL failed: " # errIcp); slippage = 0.0;
+                                };
+                                Vector.add(lastTrades, failedRecord);
+                                logger.error("ICP_FALLBACK_PARTIAL", "ICPSwap leg failed: " # errIcp, "do_executeTradingStep");
+                              };
+                            };
+
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 });
+                            let failCount : Nat = 2 - successCount;
+                            rebalanceState := {
+                              rebalanceState with
+                              metrics = {
+                                rebalanceState.metrics with
+                                totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + successCount;
+                                totalTradesFailed = rebalanceState.metrics.totalTradesFailed + failCount;
+                              };
+                              lastTrades = lastTrades;
+                            };
+
+                            if (kongSuccess or icpSuccess) {
+                              success := true;
+                              tradingBackoffLevel := 0;
+                              Debug.print("ICP fallback partial after partial failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
+                              await updateBalances();
+                              await takePortfolioSnapshot(#PostTrade);
+                              checkPortfolioCircuitBreakerConditions();
+                              await* logPortfolioState("Post-ICP-fallback-partial (after partial exec failure)");
+                            } else {
+                              incrementSkipCounter(#noExecutionPath);
+                              rebalanceState := {
+                                rebalanceState with
+                                metrics = {
+                                  rebalanceState.metrics with
+                                  currentStatus = #Failed("ICP fallback partial after partial failure: both legs failed");
+                                };
+                              };
+                              await* recoverFromFailure();
+                            };
                           };
                           case (#err(icpRouteError)) {
                             logger.warn("ICP_FALLBACK",
-                              "No ICP fallback route available after partial failure - Error=" # icpRouteError.reason,
+                              "ICP fallback failed at full size after partial failure - Error=" # icpRouteError.reason,
                               "do_executeTradingStep"
                             );
-                            incrementSkipCounter(#noExecutionPath);
+
+                            // NEW: Try REDUCED amount for ICP fallback (reuses quotes from icpRouteError)
+                            label reducedIcpFallbackAfterPartial switch (estimateMaxTradeableAmount(
+                              icpRouteError.kongQuotes, icpRouteError.icpQuotes, tradeSize,
+                              rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                            )) {
+                              case (?reduced) {
+                                if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
+                                  logger.info("SKIP_REDUCED",
+                                    "Reduced ICP fallback after partial failure too small - IcpWorth=" # Nat.toText(reduced.icpWorth) #
+                                    " < " # Nat.toText(rebalanceConfig.minTradeValueICP / 3),
+                                    "do_executeTradingStep"
+                                  );
+                                  break reducedIcpFallbackAfterPartial;
+                                };
+
+                                logger.info("REDUCED_ICP_FALLBACK",
+                                  "Executing reduced ICP fallback after partial failure - Original=" # Nat.toText(tradeSize) #
+                                  " Reduced=" # Nat.toText(reduced.amount) #
+                                  " Exchange=" # debug_show(reduced.exchange) #
+                                  " Pair=" # partialSellSymbol # "/" # partialBuySymbol #
+                                  " Fallback=" # partialSellSymbol # "/ICP" #
+                                  " IcpWorth=" # Nat.toText(reduced.icpWorth),
+                                  "do_executeTradingStep"
+                                );
+
+                                let reducedIcpTradeResult = await* executeTrade(
+                                  sellToken, ICPprincipal,
+                                  reduced.amount, reduced.exchange,
+                                  reduced.minAmountOut, reduced.idealOut
+                                );
+
+                                switch (reducedIcpTradeResult) {
+                                  case (#ok(record)) {
+                                    let lastTrades = Vector.clone(rebalanceState.lastTrades);
+                                    let reducedIcpRecord : TradeRecord = {
+                                      record with
+                                      error = ?("REDUCED_ICP_FALLBACK: Both partial legs failed for " # partialBuySymbol # ", traded reduced amount for ICP");
+                                    };
+                                    Vector.add(lastTrades, reducedIcpRecord);
+
+                                    if (Vector.size(lastTrades) >= rebalanceConfig.maxTradesStored) {
+                                      Vector.reverse(lastTrades);
+                                      while (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
+                                        ignore Vector.removeLast(lastTrades);
+                                      };
+                                      Vector.reverse(lastTrades);
+                                    };
+
+                                    rebalanceState := {
+                                      rebalanceState with
+                                      metrics = {
+                                        rebalanceState.metrics with
+                                        totalTradesExecuted = rebalanceState.metrics.totalTradesExecuted + 1;
+                                      };
+                                      lastTrades = lastTrades;
+                                    };
+
+                                    success := true;
+                                    tradingBackoffLevel := 0;
+
+                                    logger.info("REDUCED_ICP_FALLBACK",
+                                      "REDUCED ICP fallback SUCCESS after partial failure - Sold=" # Nat.toText(record.amountSold) #
+                                      " ICP_received=" # Nat.toText(record.amountBought) #
+                                      " Exchange=" # debug_show(record.exchange),
+                                      "do_executeTradingStep"
+                                    );
+
+                                    await updateBalances();
+                                    await takePortfolioSnapshot(#PostTrade);
+                                    checkPortfolioCircuitBreakerConditions();
+                                    await* logPortfolioState("Post-REDUCED-ICP-fallback (after partial failure)");
+                                  };
+                                  case (#err(reducedIcpError)) {
+                                    logger.warn("REDUCED_ICP_FALLBACK",
+                                      "Reduced ICP fallback also failed after partial failure - Error=" # reducedIcpError,
+                                      "do_executeTradingStep"
+                                    );
+                                  };
+                                };
+                              };
+                              case null {
+                                Debug.print("No viable reduced ICP fallback amount after partial failure");
+                              };
+                            };
+
+                            // If reduced succeeded, return early
+                            if (not success) {
+                              incrementSkipCounter(#noExecutionPath);
+                            };
                           };
                         };
                       };
@@ -6334,7 +7835,9 @@ shared (deployer) persistent actor class treasury() = this {
     let toBuy = Vector.new<(Principal, Nat)>();
 
     for ((token, diff, value) in tradeDiffs.vals()) {
-      if (not isTokenPausedFromTrading(token)) {
+      // Skip tokens that are paused or have active pending burns (reserved for NACHOS vault payouts)
+      let hasPendingBurn = getPendingBurn(token) > 0;
+      if (not isTokenPausedFromTrading(token) and not hasPendingBurn) {
         if (diff < 0) {
           Vector.add(toSell, (token, Int.abs(diff)));
         } else if (diff > 0) {
@@ -8976,6 +10479,35 @@ shared (deployer) persistent actor class treasury() = this {
     };
   };
 
+  // Query fresh available balances for specified tokens, accounting for pending burns
+  // Used by NACHOS vault to get real-time balances during burn operations
+  public shared query ({ caller }) func getAvailableBalancesForBurn(
+    tokens : [Principal]
+  ) : async Result.Result<[(Principal, Nat)], Text> {
+    // Authorization: Only NachosVaultPrincipal can query available balances
+    if (caller != NachosVaultPrincipal) {
+      return #err("Unauthorized: Only NACHOS vault can query available balances for burn");
+    };
+
+    let results = Buffer.Buffer<(Principal, Nat)>(tokens.size());
+
+    for (token in tokens.vals()) {
+      // Get current balance from tokenDetailsMap
+      let balance = switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) { details.balance };
+        case null { 0 };
+      };
+
+      // Subtract pending burns (tokens reserved for in-flight burn payouts)
+      let pending = getPendingBurn(token);
+      let available = if (balance > pending) { balance - pending } else { 0 };
+
+      results.add((token, available));
+    };
+
+    #ok(Buffer.toArray(results))
+  };
+
   /**
    * Update token metadata (name, symbol, decimals, fees)
    *
@@ -9636,6 +11168,11 @@ public shared ({ caller }) func withdrawAllCyclesToSelf() : async Result.Result<
 
   public query func get_canister_cycles() : async { cycles : Nat } {
     { cycles = Cycles.balance() };
+  };
+
+  // Debug function for monitoring pending burns during development/testing
+  public query func debugPendingBurnsInTreasury() : async [(Principal, Nat)] {
+    Iter.toArray(Map.entries(pendingBurnsByToken))
   };
 
 };
