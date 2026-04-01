@@ -458,12 +458,24 @@ persistent actor validation {
       #Ok("recoverStuckNachos: Recover " # debug_show(amount) # " stuck NACHOS to " # Principal.toText(recipient));
     };
 
-    public query func validate_claimNachosMintFees(recipient : Principal, amount : Nat) : async ValidationResult {
-      #Ok("claimMintFees: Claim " # debug_show(amount) # " e8s ICP mint fees to " # Principal.toText(recipient));
+    public query func validate_retryFailedBurnDelivery(burnId : Nat) : async ValidationResult {
+      #Ok("retryFailedBurnDelivery: Retry failed token deliveries for burn #" # debug_show(burnId));
     };
 
-    public query func validate_claimNachosBurnFees(recipient : Principal, amount : Nat) : async ValidationResult {
-      #Ok("claimBurnFees: Claim " # debug_show(amount) # " e8s ICP burn fees to " # Principal.toText(recipient));
+    public query func validate_retryFailedForwardDelivery(mintId : Nat) : async ValidationResult {
+      #Ok("retryFailedForwardDelivery: Retry failed forward transfers for mint #" # debug_show(mintId));
+    };
+
+    public query func validate_retryFailedRefundDelivery(opId : Nat) : async ValidationResult {
+      #Ok("retryFailedRefundDelivery: Retry failed refund transfers for operation #" # debug_show(opId));
+    };
+
+    public query func validate_claimNachosMintFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async ValidationResult {
+      #Ok("claimMintFees: Claim " # debug_show(amount) # " mint fees for token " # Principal.toText(tokenPrincipal) # " to " # Principal.toText(recipient));
+    };
+
+    public query func validate_claimNachosBurnFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async ValidationResult {
+      #Ok("claimBurnFees: Claim " # debug_show(amount) # " burn fees for token " # Principal.toText(tokenPrincipal) # " to " # Principal.toText(recipient));
     };
 
     public query func validate_claimNachosCancellationFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async ValidationResult {

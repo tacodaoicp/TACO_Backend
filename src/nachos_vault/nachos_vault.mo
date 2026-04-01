@@ -217,6 +217,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable let pendingTransfers = Vector.new<VaultTransferTask>();
   stable let completedTransfers = Map.new<Nat, VaultTransferTask>();
   stable let transferTaskKeys = Map.new<Text, Nat>(); // dedup key -> task id
+  stable let failedBurnDeliveries = Map.new<Nat, [NachosTypes.FailedDeliveryEntry]>(); // burnId -> failed entries
+  stable let failedForwardDeliveries = Map.new<Nat, [NachosTypes.FailedDeliveryEntry]>(); // mintId -> failed forward entries
+  stable let failedRefundDeliveries = Map.new<Nat, [NachosTypes.FailedDeliveryEntry]>(); // opId -> failed refund entries
   stable var nextTransferTaskId : Nat = 0;
   // maxCompletedTransfers removed — time-based cleanup (30 days) replaces count-based limit
 
@@ -231,12 +234,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable let feeHistory = Vector.new<FeeRecord>();
 
   // --- Claimable Fee Tracking ---
+  // Legacy ICP-only tracking (kept for upgrade compatibility, no longer written to)
   stable var accumulatedMintFeesICP : Nat = 0;
   stable var claimedMintFeesICP : Nat = 0;
   stable var accumulatedBurnFeesICP : Nat = 0;
   stable var claimedBurnFeesICP : Nat = 0;
-  stable let accumulatedCancellationFees = Map.new<Principal, Nat>(); // token -> amount
-  stable let claimedCancellationFees = Map.new<Principal, Nat>(); // token -> amount
+  // Per-token fee tracking (token principal -> accumulated amount in token units)
+  stable let accumulatedMintFees = Map.new<Principal, Nat>();
+  stable let claimedMintFees = Map.new<Principal, Nat>();
+  stable let accumulatedBurnFees = Map.new<Principal, Nat>();
+  stable let claimedBurnFees = Map.new<Principal, Nat>();
+  stable let accumulatedCancellationFees = Map.new<Principal, Nat>();
+  stable let claimedCancellationFees = Map.new<Principal, Nat>();
 
   // --- Operation Counters ---
   stable var nextMintId : Nat = 0;
@@ -273,6 +282,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   transient var lastMintBurnTime : Int = 0; // skip periodic treasury sync when mint/burn just refreshed data
   transient var treasuryTradingPauses : [{ token : Principal; tokenSymbol : Text }] = [];
   stable var lastPeriodicSyncSuccess : Int = 0; // tracks last successful periodic sync completion
+  transient var lastBalanceRefreshTime : Int = 0; // last time we queried token ledgers for treasury balances
 
   // --- Circuit Breaker Conditions ---
   stable let circuitBreakerConditions = Map.new<Nat, CircuitBreakerCondition>();
@@ -285,6 +295,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // --- Pending Burn Value Tracker (prevents concurrent burn over-allocation) ---
   transient let pendingBurnValueByToken = Map.new<Principal, Nat>();
+
+  // --- Pending Forward Value Tracker (in-transit mint deposits not yet in treasury) ---
+  transient let pendingForwardValueByToken = Map.new<Principal, Nat>(); // token principal → token amount
 
   // --- Per-Token History (vault-owned, not overwritten by treasury sync) ---
   stable let tokenPriceHistory = Map.new<Principal, Vector.Vector<(Int, Nat)>>();
@@ -810,14 +823,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           #ForwardToPortfolio,
           mintId,
         );
-        // Optimistic balance: reflect forwarded deposit in tokenDetailsMap
-        // so subsequent calculateNAV() sees the updated portfolio value
-        switch (Map.get(tokenDetailsMap, phash, deposit.token)) {
-          case (?details) {
-            Map.set(tokenDetailsMap, phash, deposit.token, { details with balance = details.balance + netTokenAmount });
-          };
-          case null {};
-        };
+        // Track in-transit forward so calculatePortfolioValueICP() includes it.
+        // Does NOT modify tokenDetailsMap.balance — that's only updated by
+        // refreshBalancesFromLedgers() when treasury actually has the tokens.
+        reservePendingForwardValue(deposit.token, netTokenAmount);
       };
     };
   };
@@ -868,8 +877,25 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   private func processTransferQueue() : async () {
+    // --- Stale #Sent recovery: catch tasks orphaned by traps/upgrades ---
+    var si = 0;
+    while (si < Vector.size(pendingTransfers)) {
+      let staleTask = Vector.get(pendingTransfers, si);
+      switch (staleTask.status) {
+        case (#Sent) {
+          if (now() - staleTask.updatedAt > 15 * 60 * 1_000_000_000) {
+            Vector.put(pendingTransfers, si, { staleTask with status = #Failed("Stale sent - auto-recovered") });
+            logger.warn("TRANSFER_QUEUE", "Task #" # Nat.toText(staleTask.id) # " stale #Sent for >15min, reset to Failed", "processTransferQueue");
+          };
+        };
+        case _ {};
+      };
+      si += 1;
+    };
+
     let pending = Vector.new<(TransferRecipient, Nat, Principal, Nat8)>();
     let taskIndices = Vector.new<Nat>();
+    var needsReconciliation = false;
 
     // Collect pending and failed-retryable tasks
     var i = 0;
@@ -883,8 +909,88 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
             // Mark as Sent BEFORE await (safe async)
             Vector.put(pendingTransfers, i, { task with status = #Sent; updatedAt = now(); retryCount = task.retryCount + 1 });
           } else if (task.retryCount == 5) {
-            // Log once on exhaustion, bump to 6 to prevent repeated logging
+            // --- Exhaustion handler ---
             logger.error("TRANSFER_QUEUE", "Task #" # Nat.toText(task.id) # " EXHAUSTED all retries. type=" # operationTypeToText(task.operationType) # " amount=" # Nat.toText(task.amount) # " token=" # Principal.toText(task.tokenPrincipal), "processTransferQueue");
+
+            // Release pending burn value — transfer never happened, tokens still in treasury
+            if (task.operationType == #BurnPayout) {
+              let fee = switch (Map.get(tokenDetailsMap, phash, task.tokenPrincipal)) {
+                case (?d) { d.tokenTransferFee }; case null { 0 };
+              };
+              releasePendingBurnValue(task.tokenPrincipal, task.amount + fee);
+
+              // Track failed delivery for user retry
+              let entry : NachosTypes.FailedDeliveryEntry = {
+                token = task.tokenPrincipal;
+                amount = task.amount;
+                originalTaskId = task.id;
+                retryTaskId = null;
+                status = #Undelivered;
+                exhaustedAt = now();
+                retriedAt = null;
+              };
+              let existing = switch (Map.get(failedBurnDeliveries, nhash, task.operationId)) {
+                case (?arr) { arr }; case null { [] };
+              };
+              Map.set(failedBurnDeliveries, nhash, task.operationId, Array.append(existing, [entry]));
+
+              // Remove dedup key so user retry can create fresh task
+              let dedupKey = Principal.toText(task.tokenPrincipal) # ":" # operationTypeToText(task.operationType) # ":" # Nat.toText(task.operationId) # ":" # Nat.toText(task.amount);
+              ignore Map.remove(transferTaskKeys, thash, dedupKey);
+
+              needsReconciliation := true;
+              logger.error("TRANSFER_QUEUE", "BurnPayout exhausted for burn #" # Nat.toText(task.operationId) # " token=" # Principal.toText(task.tokenPrincipal) # " amount=" # Nat.toText(task.amount) # " — tracked in failedBurnDeliveries, user can retry", "processTransferQueue");
+            };
+
+            // Release pending forward value — forward never happened, tokens still in vault deposit subaccount
+            if (task.operationType == #ForwardToPortfolio) {
+              releasePendingForwardValue(task.tokenPrincipal, task.amount);
+
+              // Track failed forward for admin recovery
+              let fwdEntry : NachosTypes.FailedDeliveryEntry = {
+                token = task.tokenPrincipal;
+                amount = task.amount;
+                originalTaskId = task.id;
+                retryTaskId = null;
+                status = #Undelivered;
+                exhaustedAt = now();
+                retriedAt = null;
+              };
+              let fwdExisting = switch (Map.get(failedForwardDeliveries, nhash, task.operationId)) {
+                case (?arr) { arr }; case null { [] };
+              };
+              Map.set(failedForwardDeliveries, nhash, task.operationId, Array.append(fwdExisting, [fwdEntry]));
+
+              let fwdDedupKey = Principal.toText(task.tokenPrincipal) # ":" # operationTypeToText(task.operationType) # ":" # Nat.toText(task.operationId) # ":" # Nat.toText(task.amount);
+              ignore Map.remove(transferTaskKeys, thash, fwdDedupKey);
+
+              needsReconciliation := true;
+              logger.error("TRANSFER_QUEUE", "ForwardToPortfolio exhausted for mint #" # Nat.toText(task.operationId) # " token=" # Principal.toText(task.tokenPrincipal) # " amount=" # Nat.toText(task.amount) # " — tracked in failedForwardDeliveries", "processTransferQueue");
+            };
+
+            // Track failed refund deliveries (user deposits that couldn't be returned)
+            if (task.operationType == #MintReturn or task.operationType == #CancelReturn or task.operationType == #ExcessReturn) {
+              let refundEntry : NachosTypes.FailedDeliveryEntry = {
+                token = task.tokenPrincipal;
+                amount = task.amount;
+                originalTaskId = task.id;
+                retryTaskId = null;
+                status = #Undelivered;
+                exhaustedAt = now();
+                retriedAt = null;
+              };
+              let refundExisting = switch (Map.get(failedRefundDeliveries, nhash, task.operationId)) {
+                case (?arr) { arr }; case null { [] };
+              };
+              Map.set(failedRefundDeliveries, nhash, task.operationId, Array.append(refundExisting, [refundEntry]));
+
+              let refundDedupKey = Principal.toText(task.tokenPrincipal) # ":" # operationTypeToText(task.operationType) # ":" # Nat.toText(task.operationId) # ":" # Nat.toText(task.amount);
+              ignore Map.remove(transferTaskKeys, thash, refundDedupKey);
+
+              needsReconciliation := true;
+              logger.error("TRANSFER_QUEUE", operationTypeToText(task.operationType) # " exhausted for op #" # Nat.toText(task.operationId) # " token=" # Principal.toText(task.tokenPrincipal) # " amount=" # Nat.toText(task.amount) # " — tracked in failedRefundDeliveries", "processTransferQueue");
+            };
+
             Vector.put(pendingTransfers, i, { task with retryCount = 6 });
           };
         };
@@ -893,7 +999,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       i += 1;
     };
 
-    if (Vector.size(pending) == 0) return;
+    if (Vector.size(pending) == 0) {
+      // Even if no new tasks to send, run reconciliation if needed
+      if (needsReconciliation) {
+        try { ignore await refreshPricesLocally() } catch (_) {};
+        try { ignore await refreshBalancesFromLedgers() } catch (_) {};
+        ignore await calculateNAV();
+        recordNavSnapshot(#Manual);
+      };
+      return;
+    };
 
     let batch = Vector.toArray(pending);
 
@@ -911,6 +1026,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                 let blockIndex = result.1;
                 if (blockIndex > 0) {
                   Vector.put(pendingTransfers, taskIdx, { task with status = #Confirmed(blockIndex); updatedAt = now(); blockIndex = ?blockIndex; actualAmountSent = ?task.amount });
+                  // Release pending burn value — transfer confirmed on-chain
+                  if (task.operationType == #BurnPayout) {
+                    let fee = switch (Map.get(tokenDetailsMap, phash, task.tokenPrincipal)) {
+                      case (?d) { d.tokenTransferFee }; case null { 0 };
+                    };
+                    releasePendingBurnValue(task.tokenPrincipal, task.amount + fee);
+                  };
+                  // Release pending forward value — tokens arrived in treasury
+                  if (task.operationType == #ForwardToPortfolio) {
+                    releasePendingForwardValue(task.tokenPrincipal, task.amount);
+                  };
                 } else {
                   Vector.put(pendingTransfers, taskIdx, { task with status = #Failed("Zero block index returned"); updatedAt = now() });
                 };
@@ -943,6 +1069,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     // Move confirmed to completed
     cleanupConfirmedTransfers();
+
+    // Reconcile NAV after exhaustion events
+    if (needsReconciliation) {
+      try { ignore await refreshPricesLocally() } catch (_) {};
+      try { ignore await refreshBalancesFromLedgers() } catch (_) {};
+      ignore await calculateNAV();
+      recordNavSnapshot(#Manual);
+    };
   };
 
   private func cleanupConfirmedTransfers() {
@@ -1019,12 +1153,71 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     createTransferTask(caller, returnTo, refundAmount, tokenPrincipal, treasurySubaccount, opType, opId);
   };
 
-  public shared ({ caller }) func cancelDeposit(tokenPrincipal : Principal, blockNumber : Nat) : async Result.Result<{ refundTaskId : Nat }, NachosError> {
+  public shared ({ caller }) func cancelDeposit(tokenPrincipal : Principal, blockNumber : Nat, fromSubaccount : ?Blob) : async Result.Result<{ refundTaskId : Nat }, NachosError> {
     let blockKey = makeBlockKey(tokenPrincipal, blockNumber);
 
     let deposit = switch (Map.get(activeDeposits, thash, blockKey)) {
       case (?d) { d };
-      case null { return #err(#DepositNotFound) };
+      case null {
+        // Deposit not in our records — try on-chain verification as fallback.
+        // Handles deposits where mintNachos was never called or failed before recordDeposit.
+
+        // If block was already fully processed (mint succeeded), don't allow cancel
+        if (Map.has(blocksDone, thash, blockKey)) {
+          return #err(#DepositAlreadyConsumed);
+        };
+
+        // Verify block on-chain: confirm caller sent tokens to TREASURY:NachosTreasurySubaccount
+        let verifyResult = try {
+          await verifyBlock(tokenPrincipal, blockNumber, caller, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount);
+        } catch (e) {
+          return #err(#DepositNotFound);
+        };
+
+        switch (verifyResult) {
+          case (#err(_)) { return #err(#DepositNotFound) };
+          case (#ok({ amount })) {
+            // Mark block as done to prevent replay
+            Map.set(blocksDone, thash, blockKey, now());
+
+            // Get token fee
+            let tokenFee = switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
+              case (?details) { details.tokenTransferFee };
+              case null { 10_000 };
+            };
+            let cancellationFee = tokenFee * cancellationFeeMultiplier;
+            if (amount <= cancellationFee) return #err(#InsufficientBalance);
+            let refundAmount = amount - cancellationFee;
+
+            // Track fee
+            let prevFees = switch (Map.get(accumulatedCancellationFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+            Map.set(accumulatedCancellationFees, phash, tokenPrincipal, prevFees + cancellationFee);
+
+            // Record as cancelled for audit trail
+            recordDeposit(blockKey, caller, fromSubaccount, tokenPrincipal, amount, blockNumber);
+            Map.set(activeDeposits, thash, blockKey, {
+              blockKey;
+              caller;
+              fromSubaccount;
+              tokenPrincipal;
+              amount;
+              blockNumber;
+              timestamp = now();
+              status = #Cancelled : DepositStatus;
+              mintBurnId = null : ?Nat;
+              cancellationTxId = null : ?Nat64;
+            });
+
+            let returnTo : TransferRecipient = switch (fromSubaccount) {
+              case (?sub) { #accountId({ owner = caller; subaccount = ?sub }) };
+              case null { #principal(caller) };
+            };
+            let taskId = createTransferTask(caller, returnTo, refundAmount, tokenPrincipal, NachosTreasurySubaccount, #CancelReturn, blockNumber);
+            logger.info("DEPOSIT", "Cancelled unregistered deposit via on-chain verification blockKey=" # blockKey # " refund=" # Nat.toText(refundAmount), "cancelDeposit");
+            return #ok({ refundTaskId = taskId });
+          };
+        };
+      };
     };
 
     if (deposit.caller != caller) return #err(#NotDepositor);
@@ -1150,6 +1343,56 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // tokenDetailsMap.balance (which is unsafe to rollback since treasury sync can overwrite it).
     for ((_, pendingVal) in Map.entries(pendingMintValueByToken)) {
       totalValueE8s += pendingVal;
+    };
+    // Subtract in-flight burn outflows for correct NAV.
+    // pendingBurnValueByToken stores token amounts (not ICP) reserved during burn until
+    // transfer confirms/exhausts. This is the sole tracking for outgoing burn value,
+    // replacing the fragile optimistic tokenDetailsMap.balance deduction which could
+    // be overwritten by refreshBalancesFromLedgers().
+    for ((token, pendingVal) in Map.entries(pendingBurnValueByToken)) {
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) {
+          if (details.Active and details.priceInICP > 0) {
+            let pendingICP = (pendingVal * details.priceInICP) / (10 ** details.tokenDecimals);
+            totalValueE8s := if (totalValueE8s > pendingICP) { totalValueE8s - pendingICP } else { 0 };
+          };
+        };
+        case null {};
+      };
+    };
+    // Add in-transit forward deposits (tokens in vault deposit subaccount awaiting treasury transfer).
+    // pendingForwardValueByToken stores token amounts reserved during mint until the
+    // ForwardToPortfolio transfer confirms/exhausts. Independent of tokenDetailsMap.balance,
+    // so it survives refreshBalancesFromLedgers() overwrites.
+    for ((token, pendingVal) in Map.entries(pendingForwardValueByToken)) {
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) {
+          if (details.Active and details.priceInICP > 0) {
+            let pendingICP = (pendingVal * details.priceInICP) / (10 ** details.tokenDecimals);
+            totalValueE8s += pendingICP;
+          };
+        };
+        case null {};
+      };
+    };
+    // Subtract undelivered failed burn deliveries — tokens still in treasury but owed to users.
+    // When BurnPayout transfers exhaust, releasePendingBurnValue() removes the pending deduction,
+    // but the tokens are still earmarked for the user (tracked in failedBurnDeliveries).
+    // Without this subtraction, NAV is inflated by the value of undelivered payouts.
+    for ((_, entries) in Map.entries(failedBurnDeliveries)) {
+      for (entry in entries.vals()) {
+        if (entry.status != #Delivered) {
+          switch (Map.get(tokenDetailsMap, phash, entry.token)) {
+            case (?details) {
+              if (details.Active and details.priceInICP > 0) {
+                let entryICP = (entry.amount * details.priceInICP) / (10 ** details.tokenDecimals);
+                totalValueE8s := if (totalValueE8s > entryICP) { totalValueE8s - entryICP } else { 0 };
+              };
+            };
+            case null {};
+          };
+        };
+      };
     };
     totalValueE8s;
   };
@@ -1450,6 +1693,48 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       lastLocalPriceRefreshTime := finalTime;
     };
     anyUpdated;
+  };
+
+  /// Query on-chain balances for all portfolio tokens held by treasury (subaccount 0).
+  /// Fires ALL futures in parallel with 10s timeouts, then awaits results.
+  /// Falls back to cached balance per-token on failure.
+  private func refreshBalancesFromLedgers() : async Nat {
+    var refreshed : Nat = 0;
+    let treasuryAccount : ICRC1.Account = { owner = TREASURY_ID; subaccount = null };
+
+    // Snapshot active tokens
+    let tokens = Vector.new<(Principal, TokenDetails)>();
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active) Vector.add(tokens, (token, details));
+    };
+
+    // ── Fire ALL balance queries in parallel (same pattern as refreshPricesLocally) ──
+    let balanceFutures = Map.new<Principal, async Nat>();
+    for ((token, _) in Vector.vals(tokens)) {
+      let ledger : ICRC1.FullInterface = actor (Principal.toText(token));
+      let fut = (with timeout = 10) ledger.icrc1_balance_of(treasuryAccount);
+      Map.set(balanceFutures, phash, token, fut);
+    };
+
+    // ── Await all futures and update tokenDetailsMap ──
+    for ((token, details) in Vector.vals(tokens)) {
+      switch (Map.get(balanceFutures, phash, token)) {
+        case (?fut) {
+          try {
+            let balance = await fut;
+            Map.set(tokenDetailsMap, phash, token, { details with balance });
+            refreshed += 1;
+          } catch (e) {
+            logger.warn("BALANCE", "Ledger query failed for " # details.tokenSymbol # ": " # Error.message(e) # " — using cached balance " # Nat.toText(details.balance), "refreshBalancesFromLedgers");
+          };
+        };
+        case null {};
+      };
+    };
+
+    if (refreshed > 0) lastBalanceRefreshTime := now();
+    logger.info("BALANCE", "Refreshed " # Nat.toText(refreshed) # "/" # Nat.toText(Vector.size(tokens)) # " token balances from ledgers", "refreshBalancesFromLedgers");
+    refreshed;
   };
 
   private func getPausedPortfolioTokens() : [{ token : Principal; symbol : Text }] {
@@ -1873,17 +2158,6 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
   };
 
-  private func rollbackOptimisticBurnBalances(tokensToSend : Vector.Vector<{ token : Principal; amount : Nat; fromSubaccount : Nat8 }>) {
-    for (ts in Vector.vals(tokensToSend)) {
-      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
-        case (?details) {
-          Map.set(tokenDetailsMap, phash, ts.token, { details with balance = details.balance + ts.amount + details.tokenTransferFee });
-        };
-        case null {};
-      };
-    };
-  };
-
   // --- Pending Mint Value Tracking (prevents cross-user allocation gaming) ---
   private func reservePendingMintValue(token : Principal, valueICP : Nat) {
     let current = switch (Map.get(pendingMintValueByToken, phash, token)) {
@@ -1934,6 +2208,34 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   private func getPendingBurnValue(token : Principal) : Nat {
     switch (Map.get(pendingBurnValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+  };
+
+  // --- Pending Forward Value Tracking (in-transit vault→treasury deposits after mint) ---
+  private func reservePendingForwardValue(token : Principal, amount : Nat) {
+    let current = switch (Map.get(pendingForwardValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+    Map.set(pendingForwardValueByToken, phash, token, current + amount);
+  };
+
+  private func releasePendingForwardValue(token : Principal, amount : Nat) {
+    let current = switch (Map.get(pendingForwardValueByToken, phash, token)) {
+      case (?v) { v };
+      case null { 0 };
+    };
+    if (current > amount) {
+      Map.set(pendingForwardValueByToken, phash, token, current - amount);
+    } else {
+      ignore Map.remove(pendingForwardValueByToken, phash, token);
+    };
+  };
+
+  private func getPendingForwardValue(token : Principal) : Nat {
+    switch (Map.get(pendingForwardValueByToken, phash, token)) {
       case (?v) { v };
       case null { 0 };
     };
@@ -2214,17 +2516,32 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       if (not priceRefreshOk) {
         try {
           let cached = await treasury.getTokenDetailsCache();
-          for ((token, detail) in cached.tokenDetails.vals()) {
-            let preservedBalance = switch (Map.get(tokenDetailsMap, phash, token)) {
-              case (?existing) { existing.balance };
-              case null { detail.balance };
+          // Reject treasury prices if they're too old
+          if (now() - cached.timestamp > MAX_PRICE_STALENESS_NS) {
+            logger.warn("PRE_CHECK", "Treasury cache too stale (" # Int.toText((now() - cached.timestamp) / 1_000_000_000) # "s old), rejecting fallback", "performSharedPreChecks");
+          } else {
+            for ((token, detail) in cached.tokenDetails.vals()) {
+              let preservedBalance = switch (Map.get(tokenDetailsMap, phash, token)) {
+                case (?existing) { existing.balance };
+                case null { detail.balance };
+              };
+              // Preserve original lastTimeSynced from treasury — don't lie about freshness
+              Map.set(tokenDetailsMap, phash, token, { detail with balance = preservedBalance });
             };
-            Map.set(tokenDetailsMap, phash, token, { detail with balance = preservedBalance; lastTimeSynced = now() });
+            priceRefreshOk := true;
+            logger.info("PRE_CHECK", "Refreshed prices via treasury cache fallback (" # Int.toText((now() - cached.timestamp) / 1_000_000_000) # "s old)", "performSharedPreChecks");
           };
-          priceRefreshOk := true;
-          logger.info("PRE_CHECK", "Refreshed prices via treasury cache fallback", "performSharedPreChecks");
         } catch (e) {
           logger.warn("PRE_CHECK", "Treasury cache fallback also failed: " # Error.message(e), "performSharedPreChecks");
+        };
+      };
+
+      // Balance refresh: query token ledgers directly for treasury's on-chain balances
+      if (priceRefreshOk and now() - lastBalanceRefreshTime >= 30_000_000_000) {
+        try {
+          ignore await refreshBalancesFromLedgers();
+        } catch (e) {
+          logger.warn("PRE_CHECK", "Balance refresh from ledgers failed: " # Error.message(e) # " — using cached balances", "performSharedPreChecks");
         };
       };
 
@@ -2265,6 +2582,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (not arePricesFresh()) {
       releaseLock(caller);
       return #err(#PriceStale);
+    };
+
+    // Check balance staleness — block operations if ledger balances haven't been refreshed recently
+    if (now() - lastBalanceRefreshTime > MAX_PRICE_STALENESS_NS) {
+      logger.warn("PRE_CHECK", "Balance data stale: last refresh " # Int.toText((now() - lastBalanceRefreshTime) / 1_000_000_000) # "s ago", "performSharedPreChecks");
+      releaseLock(caller);
+      return #err(#PriceStale); // reuse PriceStale since balances are equally critical
     };
 
     #ok(());
@@ -2542,7 +2866,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Mint; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextMintId });
-      accumulatedMintFeesICP += feeValue;
+      // Per-token fee tracking: ICP mint → fee is in ICP e8s = token units
+      let prevFee = switch (Map.get(accumulatedMintFees, phash, ICPprincipal)) { case (?v) v; case null 0 };
+      Map.set(accumulatedMintFees, phash, ICPprincipal, prevFee + feeValue);
     };
 
     let mintId = nextMintId;
@@ -2706,8 +3032,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         case (?d) { (d.balance * d.priceInICP) / (10 ** d.tokenDecimals) };
         case null { 0 };
       };
-      // Include pending mints from other concurrent users
-      let effectiveCurrentValue = currentTokenValue + pendingValue;
+      // Include pending mints AND in-transit forwards from completed mints
+      let pendingForwardICP = switch (Map.get(tokenDetailsMap, phash, tokenPrincipal)) {
+        case (?d) { (getPendingForwardValue(tokenPrincipal) * d.priceInICP) / (10 ** d.tokenDecimals) };
+        case null { 0 };
+      };
+      let effectiveCurrentValue = currentTokenValue + pendingValue + pendingForwardICP;
       let maxAllowedValue = (portfolioValue * targetBP) / 10_000;
 
       if (effectiveCurrentValue + depositValueSpot > maxAllowedValue) {
@@ -2807,7 +3137,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Mint; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextMintId });
-      accumulatedMintFeesICP += feeValue;
+      // Per-token fee tracking: convert ICP fee to token units
+      let feeTokenAmount = (feeValue * (10 ** tokenDecimals)) / tokenPriceICP;
+      let prevFee = switch (Map.get(accumulatedMintFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+      Map.set(accumulatedMintFees, phash, tokenPrincipal, prevFee + feeTokenAmount);
     };
 
     let mintId = nextMintId;
@@ -3135,7 +3468,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Mint; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextMintId });
-      accumulatedMintFeesICP += feeValue;
+      // Per-token fee tracking: split fee proportionally across deposited tokens
+      for (deposit in depositsArr.vals()) {
+        if (totalValueICP > 0 and deposit.amount > 0) {
+          let feeTokenAmount = (deposit.amount * feeValue) / totalValueICP;
+          if (feeTokenAmount > 0) {
+            let prevFee = switch (Map.get(accumulatedMintFees, phash, deposit.token)) { case (?v) v; case null 0 };
+            Map.set(accumulatedMintFees, phash, deposit.token, prevFee + feeTokenAmount);
+          };
+        };
+      };
     };
 
     let mintId = nextMintId;
@@ -3345,39 +3687,26 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
     let netValueICP = redemptionValueICP - feeValue;
 
-    // ===== FRESH BALANCE QUERY: Query real-time available balances from treasury =====
-    // Build list of active token principals
-    let tokenPrincipals = Buffer.Buffer<Principal>(Map.size(tokenDetailsMap));
+    // ===== FRESH BALANCE QUERY: Query on-chain balances directly from token ledgers =====
+    // performSharedPreChecks already refreshed balances, but force refresh if >5s stale
+    if (now() - lastBalanceRefreshTime > 5_000_000_000) {
+      try {
+        ignore await refreshBalancesFromLedgers();
+      } catch (e) {
+        logger.warn("BURN", "Ledger balance refresh failed: " # Error.message(e) # " — using cached balances", "redeemNachos");
+      };
+    };
+
+    // Build fresh balance map from tokenDetailsMap (now populated with on-chain balances)
+    // Subtract vault's own pendingBurnValueByToken to account for in-flight burns
+    let freshBalanceMap = Map.new<Principal, Nat>();
     for ((token, details) in Map.entries(tokenDetailsMap)) {
       if (details.Active and details.priceInICP > 0) {
-        tokenPrincipals.add(token);
+        let onChainBalance = details.balance;
+        let pendingBurns = getPendingBurnValue(token);
+        let available = if (onChainBalance > pendingBurns) { onChainBalance - pendingBurns } else { 0 };
+        Map.set(freshBalanceMap, phash, token, available);
       };
-    };
-
-    // Query treasury for fresh available balances (minus pending burns)
-    let freshBalancesResult = await treasury.getAvailableBalancesForBurn(Buffer.toArray(tokenPrincipals));
-    let freshBalances = switch (freshBalancesResult) {
-      case (#err(e)) {
-        // Critical: fresh balance query failed, cannot proceed safely
-        if (nachosAmount > NACHOS_FEE) {
-          let returnAmount = nachosAmount - NACHOS_FEE;
-          switch (await returnNachosToUser(caller, returnAmount)) {
-            case (#ok(_)) {};
-            case (#err(msg)) {
-              logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg # " — NACHOS stuck in deposit subaccount, admin recovery required", "redeemNachos");
-            };
-          };
-        };
-        releaseLock(caller);
-        return #err(#UnexpectedError("Treasury balance query failed: " # e));
-      };
-      case (#ok(balances)) { balances };
-    };
-
-    // Build fresh balance map for quick lookup
-    let freshBalanceMap = Map.new<Principal, Nat>();
-    for ((token, balance) in freshBalances.vals()) {
-      Map.set(freshBalanceMap, phash, token, balance);
     };
 
     // ===== Calculate portfolio value using FRESH balances =====
@@ -3444,21 +3773,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
     };
 
-    // IMMEDIATELY deduct optimistic balances so concurrent burns see reduced availability
-    for (ts in Vector.vals(tokensToSend)) {
-      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
-        case (?details) {
-          let totalDebit = ts.amount + details.tokenTransferFee;
-          let newBalance = if (details.balance > totalDebit) { details.balance - totalDebit } else { 0 };
-          Map.set(tokenDetailsMap, phash, ts.token, { details with balance = newBalance });
-        };
-        case null {};
-      };
-    };
-
-    // Optimistic NAV: balances already deducted above (including transfer fees), so compute
-    // portfolio value directly from current state rather than theoretical netValueICP.
-    // This correctly accounts for transfer fees, skipped dust tokens, and burn fee retention.
+    // Optimistic NAV: pendingBurnValueByToken (reserved above) is subtracted in
+    // calculatePortfolioValueICP(), so the portfolio value correctly reflects in-flight
+    // burn outflows. This is resilient to refreshBalancesFromLedgers() overwrites since
+    // pendingBurnValueByToken is independent of tokenDetailsMap.balance.
     let optPortfolio = calculatePortfolioValueICP();
     let optSupply = if (nav.nachosSupply > nachosAmount) { nav.nachosSupply - nachosAmount } else { 0 };
     cachedNAV := ?{
@@ -3478,7 +3796,6 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           for (ts in Vector.vals(tokensToSend)) {
             if (ts.token == minVal.token) {
               if (ts.amount < minVal.minAmount) {
-                rollbackOptimisticBurnBalances(tokensToSend);
                 cachedNAV := ?nav;
                 cachedSupply := nav.nachosSupply;
                 cachedSupplyTime := now();
@@ -3518,7 +3835,6 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let nachosLedgerTxId = switch (burnTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
-        rollbackOptimisticBurnBalances(tokensToSend);
         cachedNAV := ?nav;
         cachedSupply := nav.nachosSupply;
         cachedSupplyTime := now();
@@ -3581,7 +3897,26 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Burn; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextBurnId });
-      accumulatedBurnFeesICP += feeValue;
+      // Per-token burn fee tracking: fee = gross entitlement - net entitlement per token
+      for (ts in Vector.vals(tokensToSend)) {
+        switch (Map.get(tokenDetailsMap, phash, ts.token)) {
+          case (?details) {
+            if (details.priceInICP > 0 and freshPortfolioValueICP > 0) {
+              let freshBal = switch (Map.get(freshBalanceMap, phash, ts.token)) { case (?b) b; case null details.balance };
+              let tokenValueICP = (freshBal * details.priceInICP) / (10 ** details.tokenDecimals);
+              let tokenShareBP = (tokenValueICP * 10_000) / freshPortfolioValueICP;
+              let grossEntitlementICP = (redemptionValueICP * tokenShareBP) / 10_000;
+              let grossTokenAmount = (grossEntitlementICP * (10 ** details.tokenDecimals)) / details.priceInICP;
+              let feeTokenAmount = if (grossTokenAmount > ts.amount) { grossTokenAmount - ts.amount } else { 0 };
+              if (feeTokenAmount > 0) {
+                let prevFee = switch (Map.get(accumulatedBurnFees, phash, ts.token)) { case (?v) v; case null 0 };
+                Map.set(accumulatedBurnFees, phash, ts.token, prevFee + feeTokenAmount);
+              };
+            };
+          };
+          case null {};
+        };
+      };
     };
 
     let burnId = nextBurnId;
@@ -3590,15 +3925,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     recordNavSnapshot(#Burn);
     lastMintBurnTime := now();
 
-    // Release all pending burns now that transfers are submitted to treasury
-    for (ts in Vector.vals(tokensToSend)) {
-      switch (Map.get(tokenDetailsMap, phash, ts.token)) {
-        case (?details) {
-          releasePendingBurnValue(ts.token, ts.amount + details.tokenTransferFee);
-        };
-        case null {};
-      };
-    };
+    // NOTE: pendingBurnValueByToken is NOT released here. It stays reserved until
+    // processTransferQueue() confirms or exhausts each transfer task. This ensures
+    // calculatePortfolioValueICP() always reflects in-flight outflows, even if
+    // refreshBalancesFromLedgers() overwrites tokenDetailsMap.balance in between.
 
     releaseLock(caller);
 
@@ -3630,6 +3960,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     nachosLedger := ?(actor (Principal.toText(ledgerPrincipal)) : ICRC1.FullInterface);
     logger.info("ADMIN", "Set NACHOS ledger principal to " # Principal.toText(ledgerPrincipal), "setNachosLedgerPrincipal");
     #ok("Ledger principal set");
+  };
+
+  public shared ({ caller }) func adminForceRefreshBalances() : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) return #err("Not authorized");
+    try {
+      let count = await refreshBalancesFromLedgers();
+      #ok("Refreshed " # Nat.toText(count) # " token balances from ledgers");
+    } catch (e) {
+      #err("Balance refresh failed: " # Error.message(e));
+    };
   };
 
   public shared ({ caller }) func updateNachosConfig(config : NachosUpdateConfig) : async Result.Result<Text, Text> {
@@ -3994,36 +4334,36 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     #ok("Removed rate limit exemption");
   };
 
-  // Claim accumulated mint fees (ICP) — admin sends to any recipient
-  public shared ({ caller }) func claimMintFees(recipient : Principal, amount : Nat) : async Result.Result<Text, Text> {
+  // Claim accumulated mint fees (per-token) — admin sends specific token to recipient
+  public shared ({ caller }) func claimMintFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async Result.Result<Text, Text> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
-    let claimable = accumulatedMintFeesICP - claimedMintFeesICP;
+    let accumulated = switch (Map.get(accumulatedMintFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    let claimed = switch (Map.get(claimedMintFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    let claimable = accumulated - claimed;
     if (amount == 0) return #err("Amount must be > 0");
-    if (amount > claimable) return #err("Insufficient claimable fees: " # Nat.toText(claimable) # " available, " # Nat.toText(amount) # " requested");
+    if (amount > claimable) return #err("Insufficient claimable mint fees: " # Nat.toText(claimable) # " available, " # Nat.toText(amount) # " requested");
 
-    // Deduct before creating transfer task (no awaits in this function — fully atomic on IC)
-    claimedMintFeesICP += amount;
+    Map.set(claimedMintFees, phash, tokenPrincipal, claimed + amount);
+    let taskId = createTransferTask(caller, #principal(recipient), amount, tokenPrincipal, NachosTreasurySubaccount, #Recovery, claimed + amount);
 
-    let taskId = createTransferTask(caller, #principal(recipient), amount, ICPprincipal, NachosTreasurySubaccount, #Recovery, claimedMintFeesICP);
-
-    logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " ICP mint fees -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimMintFees");
-    #ok("Claimed " # Nat.toText(amount) # " e8s ICP, transfer task #" # Nat.toText(taskId));
+    logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " mint fees for " # Principal.toText(tokenPrincipal) # " -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimMintFees");
+    #ok("Claimed " # Nat.toText(amount) # " mint fees, transfer task #" # Nat.toText(taskId));
   };
 
-  // Claim accumulated burn fees (ICP-equivalent) — admin sends to any recipient
-  public shared ({ caller }) func claimBurnFees(recipient : Principal, amount : Nat) : async Result.Result<Text, Text> {
+  // Claim accumulated burn fees (per-token) — admin sends specific token to recipient
+  public shared ({ caller }) func claimBurnFees(recipient : Principal, tokenPrincipal : Principal, amount : Nat) : async Result.Result<Text, Text> {
     if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
-    let claimable = accumulatedBurnFeesICP - claimedBurnFeesICP;
+    let accumulated = switch (Map.get(accumulatedBurnFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    let claimed = switch (Map.get(claimedBurnFees, phash, tokenPrincipal)) { case (?v) v; case null 0 };
+    let claimable = accumulated - claimed;
     if (amount == 0) return #err("Amount must be > 0");
     if (amount > claimable) return #err("Insufficient claimable burn fees: " # Nat.toText(claimable) # " available, " # Nat.toText(amount) # " requested");
 
-    // Deduct before creating transfer task (no awaits in this function — fully atomic on IC)
-    claimedBurnFeesICP += amount;
+    Map.set(claimedBurnFees, phash, tokenPrincipal, claimed + amount);
+    let taskId = createTransferTask(caller, #principal(recipient), amount, tokenPrincipal, NachosTreasurySubaccount, #Recovery, claimed + amount);
 
-    let taskId = createTransferTask(caller, #principal(recipient), amount, ICPprincipal, NachosTreasurySubaccount, #Recovery, claimedBurnFeesICP);
-
-    logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " ICP burn fees -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimBurnFees");
-    #ok("Claimed " # Nat.toText(amount) # " e8s ICP burn fees, transfer task #" # Nat.toText(taskId));
+    logger.info("FEES", "Admin claimed " # Nat.toText(amount) # " burn fees for " # Principal.toText(tokenPrincipal) # " -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "claimBurnFees");
+    #ok("Claimed " # Nat.toText(amount) # " burn fees, transfer task #" # Nat.toText(taskId));
   };
 
   // Claim accumulated cancellation/recovery fees (per-token) — admin sends to any recipient
@@ -4138,6 +4478,269 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     logger.info("TRANSFER_QUEUE", "Admin reset " # Nat.toText(reset) # " exhausted transfer tasks", "retryFailedTransfers");
     if (reset > 0) { ensureTransferQueueRunning() };
     #ok(reset);
+  };
+
+  // User retry: re-queue failed burn payout transfers for a specific burn.
+  // Called by the original burner when their tokens were not delivered.
+  public shared ({ caller }) func retryFailedBurnDelivery(burnId : Nat) : async Result.Result<[Nat], NachosError> {
+    // Validate burnId
+    if (burnId >= Vector.size(burnHistory)) {
+      return #err(#UnexpectedError("Invalid burn ID"));
+    };
+    let burnRecord = Vector.get(burnHistory, burnId);
+
+    // Only the original burner can retry
+    if (caller != burnRecord.caller and not isMasterAdmin(caller) and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let entries = switch (Map.get(failedBurnDeliveries, nhash, burnId)) {
+      case (?e) { e }; case null { return #err(#UnexpectedError("No failed deliveries for this burn")) };
+    };
+
+    let newTaskIds = Vector.new<Nat>();
+    let updatedEntries = Vector.new<NachosTypes.FailedDeliveryEntry>();
+    var anyRetried = false;
+
+    for (entry in entries.vals()) {
+      if (entry.status == #Undelivered) {
+        let fee = switch (Map.get(tokenDetailsMap, phash, entry.token)) {
+          case (?d) { d.tokenTransferFee }; case null { 0 };
+        };
+
+        // createTransferTask handles dedup — key was removed on exhaustion
+        let taskId = createTransferTask(
+          burnRecord.caller,
+          #principal(burnRecord.caller),
+          entry.amount,
+          entry.token,
+          2 : Nat8, // NachosTreasurySubaccount
+          #BurnPayout,
+          burnId,
+        );
+
+        // Re-reserve pending burn for the retry task
+        reservePendingBurnValue(entry.token, entry.amount + fee);
+
+        Vector.add(newTaskIds, taskId);
+        Vector.add(updatedEntries, {
+          entry with
+          status = #RetryQueued;
+          retryTaskId = ?taskId;
+          retriedAt = ?now();
+        });
+        anyRetried := true;
+      } else {
+        Vector.add(updatedEntries, entry);
+      };
+    };
+
+    Map.set(failedBurnDeliveries, nhash, burnId, Vector.toArray(updatedEntries));
+
+    if (anyRetried) {
+      ensureTransferQueueRunning();
+      logger.info("TRANSFER_QUEUE", "User retried failed burn delivery for burn #" # Nat.toText(burnId) # " — " # Nat.toText(Vector.size(newTaskIds)) # " tasks created", "retryFailedBurnDelivery");
+    };
+
+    #ok(Vector.toArray(newTaskIds));
+  };
+
+  // Query failed burn deliveries for a user or all (admin).
+  public shared query ({ caller }) func getFailedBurnDeliveries(user : ?Principal) : async [{ burnId : Nat; entries : [NachosTypes.FailedDeliveryEntry] }] {
+    let isAdmin = isMasterAdmin(caller) or Principal.isController(caller);
+    let results = Vector.new<{ burnId : Nat; entries : [NachosTypes.FailedDeliveryEntry] }>();
+
+    for ((burnId, entries) in Map.entries(failedBurnDeliveries)) {
+      switch (user) {
+        case (?u) {
+          if (burnId < Vector.size(burnHistory)) {
+            let record = Vector.get(burnHistory, burnId);
+            if (record.caller == u or (isAdmin and true) or caller == u) {
+              Vector.add(results, { burnId; entries });
+            };
+          };
+        };
+        case null {
+          if (isAdmin) {
+            Vector.add(results, { burnId; entries });
+          } else {
+            // Non-admin without user filter: return only caller's own
+            if (burnId < Vector.size(burnHistory)) {
+              let record = Vector.get(burnHistory, burnId);
+              if (record.caller == caller) {
+                Vector.add(results, { burnId; entries });
+              };
+            };
+          };
+        };
+      };
+    };
+
+    Vector.toArray(results);
+  };
+
+  // Admin retry: re-queue failed forward transfers for a specific mint.
+  // Called when ForwardToPortfolio transfers exhaust (tokens stuck in vault deposit subaccount).
+  public shared ({ caller }) func retryFailedForwardDelivery(mintId : Nat) : async Result.Result<[Nat], NachosError> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    let entries = switch (Map.get(failedForwardDeliveries, nhash, mintId)) {
+      case (?e) { e }; case null { return #err(#UnexpectedError("No failed forward deliveries for this mint")) };
+    };
+
+    let newTaskIds = Vector.new<Nat>();
+    let updatedEntries = Vector.new<NachosTypes.FailedDeliveryEntry>();
+    var anyRetried = false;
+
+    for (entry in entries.vals()) {
+      if (entry.status == #Undelivered) {
+        let taskId = createTransferTask(
+          Principal.fromText("aaaaa-aa"), // admin-initiated
+          #accountId({ owner = TREASURY_ID; subaccount = null }),
+          entry.amount,
+          entry.token,
+          2 : Nat8, // NachosTreasurySubaccount
+          #ForwardToPortfolio,
+          mintId,
+        );
+
+        // Re-reserve pending forward for the retry task
+        reservePendingForwardValue(entry.token, entry.amount);
+
+        Vector.add(newTaskIds, taskId);
+        Vector.add(updatedEntries, {
+          entry with
+          status = #RetryQueued;
+          retryTaskId = ?taskId;
+          retriedAt = ?now();
+        });
+        anyRetried := true;
+      } else {
+        Vector.add(updatedEntries, entry);
+      };
+    };
+
+    Map.set(failedForwardDeliveries, nhash, mintId, Vector.toArray(updatedEntries));
+
+    if (anyRetried) {
+      ensureTransferQueueRunning();
+      logger.info("TRANSFER_QUEUE", "Admin retried failed forward delivery for mint #" # Nat.toText(mintId) # " — " # Nat.toText(Vector.size(newTaskIds)) # " tasks created", "retryFailedForwardDelivery");
+    };
+
+    #ok(Vector.toArray(newTaskIds));
+  };
+
+  // Query failed forward deliveries (admin only).
+  public shared query ({ caller }) func getFailedForwardDeliveries() : async [{ mintId : Nat; entries : [NachosTypes.FailedDeliveryEntry] }] {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller)) { return [] };
+    let results = Vector.new<{ mintId : Nat; entries : [NachosTypes.FailedDeliveryEntry] }>();
+    for ((mintId, entries) in Map.entries(failedForwardDeliveries)) {
+      Vector.add(results, { mintId; entries });
+    };
+    Vector.toArray(results);
+  };
+
+  // Admin/user retry: re-queue failed refund transfers (MintReturn, CancelReturn, ExcessReturn).
+  public shared ({ caller }) func retryFailedRefundDelivery(opId : Nat) : async Result.Result<[Nat], NachosError> {
+    let entries = switch (Map.get(failedRefundDeliveries, nhash, opId)) {
+      case (?e) { e }; case null { return #err(#UnexpectedError("No failed refund deliveries for this operation")) };
+    };
+
+    // Check authorization: any undelivered entry's original task must be caller's or admin
+    let isAdmin = isMasterAdmin(caller) or Principal.isController(caller);
+    if (not isAdmin) {
+      // Non-admin: verify they are the caller for one of the original tasks
+      var isOwner = false;
+      for (entry in entries.vals()) {
+        // Look up the original task to find the caller
+        var ti = 0;
+        while (ti < Vector.size(pendingTransfers)) {
+          let task = Vector.get(pendingTransfers, ti);
+          if (task.id == entry.originalTaskId and task.caller == caller) {
+            isOwner := true;
+          };
+          ti += 1;
+        };
+      };
+      if (not isOwner) return #err(#NotAuthorized);
+    };
+
+    let newTaskIds = Vector.new<Nat>();
+    let updatedEntries = Vector.new<NachosTypes.FailedDeliveryEntry>();
+    var anyRetried = false;
+
+    for (entry in entries.vals()) {
+      if (entry.status == #Undelivered) {
+        // Look up original task details for recipient and opType
+        var foundCaller = Principal.fromText("aaaaa-aa");
+        var foundOpType : TransferOperationType = #MintReturn;
+        var ti = 0;
+        while (ti < Vector.size(pendingTransfers)) {
+          let task = Vector.get(pendingTransfers, ti);
+          if (task.id == entry.originalTaskId) {
+            foundCaller := task.caller;
+            foundOpType := task.operationType;
+          };
+          ti += 1;
+        };
+
+        let taskId = createTransferTask(
+          foundCaller,
+          #principal(foundCaller),
+          entry.amount,
+          entry.token,
+          2 : Nat8, // NachosTreasurySubaccount
+          foundOpType,
+          opId,
+        );
+
+        Vector.add(newTaskIds, taskId);
+        Vector.add(updatedEntries, {
+          entry with
+          status = #RetryQueued;
+          retryTaskId = ?taskId;
+          retriedAt = ?now();
+        });
+        anyRetried := true;
+      } else {
+        Vector.add(updatedEntries, entry);
+      };
+    };
+
+    Map.set(failedRefundDeliveries, nhash, opId, Vector.toArray(updatedEntries));
+
+    if (anyRetried) {
+      ensureTransferQueueRunning();
+      logger.info("TRANSFER_QUEUE", "Retried failed refund delivery for op #" # Nat.toText(opId) # " — " # Nat.toText(Vector.size(newTaskIds)) # " tasks created", "retryFailedRefundDelivery");
+    };
+
+    #ok(Vector.toArray(newTaskIds));
+  };
+
+  // Query failed refund deliveries.
+  public shared query ({ caller }) func getFailedRefundDeliveries() : async [{ opId : Nat; entries : [NachosTypes.FailedDeliveryEntry] }] {
+    let isAdmin = isMasterAdmin(caller) or Principal.isController(caller);
+    let results = Vector.new<{ opId : Nat; entries : [NachosTypes.FailedDeliveryEntry] }>();
+    for ((opId, entries) in Map.entries(failedRefundDeliveries)) {
+      if (isAdmin) {
+        Vector.add(results, { opId; entries });
+      } else {
+        // Non-admin: check if any entry's original task belongs to caller
+        var isOwner = false;
+        var ti = 0;
+        while (ti < Vector.size(pendingTransfers)) {
+          let task = Vector.get(pendingTransfers, ti);
+          for (entry in entries.vals()) {
+            if (task.id == entry.originalTaskId and task.caller == caller) isOwner := true;
+          };
+          ti += 1;
+        };
+        if (isOwner) Vector.add(results, { opId; entries });
+      };
+    };
+    Vector.toArray(results);
   };
 
   // Admin: recover NACHOS stuck in the deposit subaccount due to failed returnNachosToUser calls.
@@ -4715,6 +5318,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     globalBurnIn4h : Nat;
     maxMintPer4h : Nat;
     maxBurnPer4h : Nat;
+
+    // Claimable fees (all per-token)
+    claimableMintFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
+    claimableBurnFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
+    claimableCancellationFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
   } {
     // 1. Try to fetch fresh data from treasury + DAO via query calls
     var tokenDetails : [(Principal, TokenDetails)] = [];
@@ -4916,6 +5524,31 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       globalBurnIn4h = aGBurn;
       maxMintPer4h = maxMintICPWorthPer4Hours;
       maxBurnPer4h = maxNachosBurnPer4Hours;
+      // Claimable fees (all per-token)
+      claimableMintFees = do {
+        let cm = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+        for ((token, acc) in Map.entries(accumulatedMintFees)) {
+          let cl = switch (Map.get(claimedMintFees, phash, token)) { case (?v) v; case null 0 };
+          if (acc > cl) Vector.add(cm, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+        };
+        Vector.toArray(cm);
+      };
+      claimableBurnFees = do {
+        let cb = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+        for ((token, acc) in Map.entries(accumulatedBurnFees)) {
+          let cl = switch (Map.get(claimedBurnFees, phash, token)) { case (?v) v; case null 0 };
+          if (acc > cl) Vector.add(cb, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+        };
+        Vector.toArray(cb);
+      };
+      claimableCancellationFees = do {
+        let cc = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+        for ((token, acc) in Map.entries(accumulatedCancellationFees)) {
+          let cl = switch (Map.get(claimedCancellationFees, phash, token)) { case (?v) v; case null 0 };
+          if (acc > cl) Vector.add(cc, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+        };
+        Vector.toArray(cc);
+      };
     };
   };
 
@@ -5012,9 +5645,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Transfer queue
     transferQueue : { pending : Nat; completed : Nat; exhausted : Nat; tasks : [VaultTransferTask] };
 
-    // Claimable fees
-    claimableMintFees : { accumulated : Nat; claimed : Nat; claimable : Nat };
-    claimableBurnFees : { accumulated : Nat; claimed : Nat; claimable : Nat };
+    // Claimable fees (all per-token)
+    claimableMintFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
+    claimableBurnFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
     claimableCancellationFees : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }];
 
     // Operational metrics
@@ -5236,14 +5869,24 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       { pending = Vector.size(pendingTransfers); completed = Map.size(completedTransfers); exhausted; tasks = Vector.toArray(pendingTransfers) };
     } else { { pending = 0 : Nat; completed = 0 : Nat; exhausted = 0 : Nat; tasks = [] : [VaultTransferTask] } };
 
-    // Claimable fees
+    // Claimable fees (all per-token)
     let claimMint = if (isAdmin) {
-      { accumulated = accumulatedMintFeesICP; claimed = claimedMintFeesICP; claimable = accumulatedMintFeesICP - claimedMintFeesICP };
-    } else { { accumulated = 0 : Nat; claimed = 0 : Nat; claimable = 0 : Nat } };
+      let cm = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+      for ((token, acc) in Map.entries(accumulatedMintFees)) {
+        let cl = switch (Map.get(claimedMintFees, phash, token)) { case (?v) v; case null 0 };
+        if (acc > cl) Vector.add(cm, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+      };
+      Vector.toArray(cm);
+    } else { [] : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] };
 
     let claimBurn = if (isAdmin) {
-      { accumulated = accumulatedBurnFeesICP; claimed = claimedBurnFeesICP; claimable = accumulatedBurnFeesICP - claimedBurnFeesICP };
-    } else { { accumulated = 0 : Nat; claimed = 0 : Nat; claimable = 0 : Nat } };
+      let cb = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+      for ((token, acc) in Map.entries(accumulatedBurnFees)) {
+        let cl = switch (Map.get(claimedBurnFees, phash, token)) { case (?v) v; case null 0 };
+        if (acc > cl) Vector.add(cb, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+      };
+      Vector.toArray(cb);
+    } else { [] : [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] };
 
     let claimCancel = if (isAdmin) {
       let cc = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
@@ -5366,12 +6009,22 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     Vector.toArray(result);
   };
 
-  public shared query ({ caller }) func getClaimableMintFees() : async { accumulated : Nat; claimed : Nat; claimable : Nat } {
-    { accumulated = accumulatedMintFeesICP; claimed = claimedMintFeesICP; claimable = accumulatedMintFeesICP - claimedMintFeesICP };
+  public shared query ({ caller }) func getClaimableMintFees() : async [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] {
+    let result = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+    for ((token, acc) in Map.entries(accumulatedMintFees)) {
+      let cl = switch (Map.get(claimedMintFees, phash, token)) { case (?v) v; case null 0 };
+      if (acc > cl) Vector.add(result, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+    };
+    Vector.toArray(result);
   };
 
-  public shared query ({ caller }) func getClaimableBurnFees() : async { accumulated : Nat; claimed : Nat; claimable : Nat } {
-    { accumulated = accumulatedBurnFeesICP; claimed = claimedBurnFeesICP; claimable = accumulatedBurnFeesICP - claimedBurnFeesICP };
+  public shared query ({ caller }) func getClaimableBurnFees() : async [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] {
+    let result = Vector.new<{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }>();
+    for ((token, acc) in Map.entries(accumulatedBurnFees)) {
+      let cl = switch (Map.get(claimedBurnFees, phash, token)) { case (?v) v; case null 0 };
+      if (acc > cl) Vector.add(result, { token; accumulated = acc; claimed = cl; claimable = acc - cl });
+    };
+    Vector.toArray(result);
   };
 
   public shared query ({ caller }) func getClaimableCancellationFees() : async [{ token : Principal; accumulated : Nat; claimed : Nat; claimable : Nat }] {
@@ -5620,7 +6273,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         sortedBuf[Int.abs(sj) + 1] := sortedBuf[Int.abs(sj)];
         sj -= 1;
       };
-      sortedBuf[Int.abs(sj) + 1] := key;
+      sortedBuf[Int.abs(sj + 1)] := key;
       si += 1;
     };
     let recentTx = Vector.new<TxEntry>();
@@ -5973,6 +6626,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                   detail with
                   priceInICP = existing.priceInICP;
                   lastTimeSynced = existing.lastTimeSynced;
+                  balance = existing.balance; // preserve vault's own ledger-queried balance
                 });
               };
               case null {
@@ -6041,6 +6695,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         logger.warn("TIMER", "DEX price refresh failed: " # Error.message(e) # " — NAV will use cached prices", "periodicSync");
       };
 
+      // 4a. Refresh token balances directly from ledgers (trust-minimized)
+      try {
+        ignore await refreshBalancesFromLedgers();
+      } catch (e) {
+        logger.warn("TIMER", "Ledger balance refresh failed: " # Error.message(e), "periodicSync");
+      };
+
       // 4b. Record CB snapshots ONLY if DEX prices are fresh — stale/treasury prices
       // would cause false circuit breaker alarms due to price source differences
       if (dexRefreshOk) {
@@ -6053,12 +6714,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         logger.info("TIMER", "Skipping CB snapshot recording — DEX prices not available", "periodicSync");
       };
 
-      // 5. Calculate NAV + record snapshot
-      try {
-        ignore await calculateNAV();
-        recordNavSnapshot(#Scheduled);
-      } catch (e) {
-        logger.warn("TIMER", "NAV calculation failed: " # Error.message(e), "periodicSync");
+      // 5. Calculate NAV + record snapshot (only with fresh prices — stale NAV is worse than no update)
+      if (dexRefreshOk) {
+        try {
+          ignore await calculateNAV();
+          recordNavSnapshot(#Scheduled);
+        } catch (e) {
+          logger.warn("TIMER", "NAV calculation failed: " # Error.message(e), "periodicSync");
+        };
+      } else {
+        logger.info("TIMER", "Skipping NAV snapshot — DEX prices not available", "periodicSync");
       };
 
       // 6. Circuit breaker checks (NAV conditions + per-token already ran above)
@@ -6180,13 +6845,54 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case null { null };
     };
 
+    // Recompute transient pendingBurnValueByToken from stable pendingTransfers.
+    // This ensures calculatePortfolioValueICP() correctly subtracts in-flight burn
+    // outflows after an upgrade, since pendingBurnValueByToken resets on upgrade.
+    var j = 0;
+    while (j < Vector.size(pendingTransfers)) {
+      let task = Vector.get(pendingTransfers, j);
+      if (task.operationType == #BurnPayout) {
+        switch (task.status) {
+          case (#Pending or #Sent or #Failed(_)) {
+            if (task.retryCount < 5) {
+              let fee = switch (Map.get(tokenDetailsMap, phash, task.tokenPrincipal)) {
+                case (?d) { d.tokenTransferFee }; case null { 0 };
+              };
+              reservePendingBurnValue(task.tokenPrincipal, task.amount + fee);
+            };
+          };
+          case _ {};
+        };
+      };
+      j += 1;
+    };
+
+    // Recompute transient pendingForwardValueByToken from stable pendingTransfers.
+    // Same pattern as burn recomputation — ensures calculatePortfolioValueICP()
+    // includes in-transit forward deposits after an upgrade.
+    var k = 0;
+    while (k < Vector.size(pendingTransfers)) {
+      let task = Vector.get(pendingTransfers, k);
+      if (task.operationType == #ForwardToPortfolio) {
+        switch (task.status) {
+          case (#Pending or #Sent or #Failed(_)) {
+            if (task.retryCount < 5) {
+              reservePendingForwardValue(task.tokenPrincipal, task.amount);
+            };
+          };
+          case _ {};
+        };
+      };
+      k += 1;
+    };
+
     // Grace period for timer health check — timer just restarted, give it time to complete
     lastPeriodicSyncSuccess := now();
 
     // Restart all timers
     startAllTimers();
 
-    logger.info("LIFECYCLE", "Post-upgrade complete, timers restarted", "postupgrade");
+    logger.info("LIFECYCLE", "Post-upgrade complete, timers restarted, pendingBurnValues recomputed", "postupgrade");
   };
 
   // --- Debug Functions ---
@@ -6194,6 +6900,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // Debug function for monitoring pending burns during development/testing
   public query func debugPendingBurns() : async [(Principal, Nat)] {
     Iter.toArray(Map.entries(pendingBurnValueByToken))
+  };
+
+  // Debug function for monitoring pending forwards during development/testing
+  public query func debugPendingForwards() : async [(Principal, Nat)] {
+    Iter.toArray(Map.entries(pendingForwardValueByToken))
   };
 
   // --- Initial timer start (first deploy) ---

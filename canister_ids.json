@@ -3,6 +3,9 @@
     "ic": "vxqw7-iqaaa-aaaan-qzziq-cai",
     "staging": "tisou-7aaaa-aaaai-atiea-cai"
   },
+  "OTC_backend": {
+    "ic": "qioex-5iaaa-aaaan-q52ba-cai"
+  },
   "dao_admin_archive": {
     "ic": "cspwf-4aaaa-aaaan-qz5ia-cai",
     "staging": "b6ygs-xaaaa-aaaan-qz5ca-cai"
@@ -18,6 +21,9 @@
   "dao_neuron_allocation_archive": {
     "ic": "dnhfs-7yaaa-aaaan-qz5mq-cai",
     "staging": "cajb4-qqaaa-aaaan-qz5la-cai"
+  },
+  "exchange_treasury": {
+    "ic": "qbnpl-laaaa-aaaan-q52aq-cai"
   },
   "nachos_ledger": {
     "staging": "pabnq-2qaaa-aaaam-qhryq-cai"

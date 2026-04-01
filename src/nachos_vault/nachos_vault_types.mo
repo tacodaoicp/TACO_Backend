@@ -288,6 +288,26 @@ module {
   };
 
   // ═══════════════════════════════════════════════════════
+  // FAILED DELIVERY TYPES
+  // ═══════════════════════════════════════════════════════
+
+  public type FailedDeliveryStatus = {
+    #Undelivered;
+    #RetryQueued;
+    #Delivered;
+  };
+
+  public type FailedDeliveryEntry = {
+    token : Principal;
+    amount : Nat;
+    originalTaskId : Nat;
+    retryTaskId : ?Nat;
+    status : FailedDeliveryStatus;
+    exhaustedAt : Int;
+    retriedAt : ?Int;
+  };
+
+  // ═══════════════════════════════════════════════════════
   // CIRCUIT BREAKER TYPES
   // ═══════════════════════════════════════════════════════
 

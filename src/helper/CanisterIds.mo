@@ -22,6 +22,8 @@ module CanisterId {
         #reward_withdrawal_archive;
         #nachos_vault;
         #taco_swap;
+        #OTC_backend;
+        #exchange_treasury;
     };
     
     // Define the environments
@@ -51,6 +53,8 @@ module CanisterId {
             (#Staging, #reward_withdrawal_archive, Principal.fromText("dwczx-faaaa-aaaan-qz5oa-cai")),
             (#Staging, #nachos_vault, Principal.fromText("p4nog-baaaa-aaaad-qkwpa-cai")),
             (#Staging, #taco_swap, Principal.fromText("2uddx-dqaaa-aaaan-q5qja-cai")),
+            (#Staging, #OTC_backend, Principal.fromText("aaaaa-aa")), // Placeholder - update after deploy
+            (#Staging, #exchange_treasury, Principal.fromText("aaaaa-aa")), // Placeholder - update after deploy
 
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),
@@ -68,7 +72,9 @@ module CanisterId {
             (#Production, #reward_distribution_archive, Principal.fromText("uqkap-jiaaa-aaaan-qz6tq-cai")),
             (#Production, #reward_withdrawal_archive, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai")),
             (#Production, #nachos_vault, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai")), // Placeholder - update after deploy
-            (#Production, #taco_swap, Principal.fromText("2uddx-dqaaa-aaaan-q5qja-cai"))
+            (#Production, #taco_swap, Principal.fromText("2uddx-dqaaa-aaaan-q5qja-cai")),
+            (#Production, #OTC_backend, Principal.fromText("aaaaa-aa")), // Placeholder - update after deploy
+            (#Production, #exchange_treasury, Principal.fromText("aaaaa-aa")) // Placeholder - update after deploy
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {

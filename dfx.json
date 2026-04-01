@@ -77,6 +77,41 @@
     "taco_swap": {
       "main": "src/taco_swap/taco_swap.mo",
       "type": "motoko"
+    },
+    "OTC_backend": {
+      "main": "src/exchange/main.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_treasury": {
+      "main": "src/exchange/treasury.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_faucet": {
+      "main": "src/exchange/faucet.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_test": {
+      "main": "src/exchange/examples/test.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_testActorA": {
+      "main": "src/exchange/examples/testActorA.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_testActorB": {
+      "main": "src/exchange/examples/testActorB.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_testActorC": {
+      "main": "src/exchange/examples/testActorC.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     }
   },
   "networks": {

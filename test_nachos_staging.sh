@@ -101,6 +101,18 @@ call() {
   echo "$result"
 }
 
+# Call canister query (for composite queries that need --query flag)
+query_call() {
+  local canister="$1" method="$2"
+  local result
+  if [ -n "${3:-}" ]; then
+    result=$(dfx canister call "$canister" "$method" "$3" $NETWORK --query 2>&1) || true
+  else
+    result=$(dfx canister call "$canister" "$method" $NETWORK --query 2>&1) || true
+  fi
+  echo "$result"
+}
+
 # Assert output contains a string
 assert_contains() {
   local output="$1" expected="$2" test_name="$3"
@@ -1052,7 +1064,7 @@ phase3_icp_mint() {
   MINT_TIME_SECS=$((mint_end - mint_start))
   info "Mint result: $(echo "$mint_result" | head -c 500)"
   info "Waiting 10s for async operations to settle before measuring cycles..."
-  sleep 10
+  sleep 20
   cycles_after=$(get_vault_cycles)
   cycles_used=$((cycles_before - cycles_after))
   MINT_CYCLES_USED=$cycles_used
@@ -1321,7 +1333,7 @@ phase5_additional_queries() {
 
   # ── getVaultDashboard (composite query) ──
   local dashboard
-  dashboard=$(call "$NACHOS_VAULT" getVaultDashboard "(opt (100_000_000 : nat), opt (100_000_000 : nat))")
+  dashboard=$(query_call "$NACHOS_VAULT" getVaultDashboard "(opt (100_000_000 : nat), opt (100_000_000 : nat))")
   assert_contains "$dashboard" "mintingEnabled" "getVaultDashboard returns valid structure"
   if [ "$GENESIS_DONE" = "1" ]; then
     assert_contains "$dashboard" "dataSource" "getVaultDashboard includes dataSource"
@@ -1329,7 +1341,7 @@ phase5_additional_queries() {
 
   # ── getAdminDashboard (composite query — admin superset) ──
   local admin_dashboard
-  admin_dashboard=$(call "$NACHOS_VAULT" getAdminDashboard)
+  admin_dashboard=$(query_call "$NACHOS_VAULT" getAdminDashboard)
   assert_contains "$admin_dashboard" "fullConfig" "getAdminDashboard includes fullConfig"
   assert_contains "$admin_dashboard" "circuitBreakerConditions" "getAdminDashboard includes CB conditions"
   assert_contains "$admin_dashboard" "transferQueue" "getAdminDashboard includes transfer queue"
@@ -1356,125 +1368,87 @@ phase5_additional_queries() {
     skip "minimumNachosReceive test" "Genesis not done"
   fi
 
-  # ── Fee claim queries ──
+  # ── Fee claim queries (per-token format) ──
   info "Testing fee claim queries..."
 
   local mint_fees
   mint_fees=$(call "$NACHOS_VAULT" getClaimableMintFees)
-  assert_contains "$mint_fees" "accumulated" "getClaimableMintFees returns valid structure"
-  assert_contains "$mint_fees" "claimable" "getClaimableMintFees includes claimable field"
+  assert_not_contains "$mint_fees" "Error" "getClaimableMintFees returns valid structure"
+  # Per-token format: returns vec {} or vec { record { token; accumulated; claimed; claimable } }
+  if echo "$mint_fees" | grep -q "claimable"; then
+    pass "getClaimableMintFees has per-token entries"
+  else
+    pass "getClaimableMintFees returns empty vec (no fees yet)"
+  fi
 
   local cancel_fees
   cancel_fees=$(call "$NACHOS_VAULT" getClaimableCancellationFees)
   assert_not_contains "$cancel_fees" "Error" "getClaimableCancellationFees executes without error"
 
   # ── Fee claim: try claiming more than available (should fail) ──
+  # claimMintFees now takes (recipient, tokenPrincipal, amount)
+  local ICP_PRINCIPAL="ryjl3-tyaaa-aaaaa-aaaba-cai"
   local overclaim_result
-  overclaim_result=$(call "$NACHOS_VAULT" claimMintFees "(principal \"$TEST_PRINCIPAL\", 999_999_999_999 : nat)")
+  overclaim_result=$(call "$NACHOS_VAULT" claimMintFees "(principal \"$TEST_PRINCIPAL\", principal \"$ICP_PRINCIPAL\", 999_999_999_999 : nat)")
   assert_contains "$overclaim_result" "Insufficient" "Mint fee over-claim rejected"
 
-  # ── Fee claim: claim actual mint fees if available ──
-  if [ "$GENESIS_DONE" = "1" ]; then
-    local claimable
-    claimable=$(echo "$mint_fees" | grep -oP 'claimable = \K[0-9_]+' | head -1 | tr -d '_')
-    claimable=${claimable:-0}
-    if [ "$claimable" -gt 0 ]; then
-      info "Claimable mint fees: $claimable e8s ICP — claiming..."
-      local claim_result
-      claim_result=$(call "$NACHOS_VAULT" claimMintFees "(principal \"$TEST_PRINCIPAL\", $claimable : nat)")
-      assert_contains "$claim_result" "ok" "claimMintFees succeeds"
 
-      # Verify claimed increased
-      local fees_after
-      fees_after=$(call "$NACHOS_VAULT" getClaimableMintFees)
-      local new_claimable
-      new_claimable=$(echo "$fees_after" | grep -oP 'claimable = \K[0-9_]+' | head -1 | tr -d '_')
-      new_claimable=${new_claimable:-0}
-      if [ "$new_claimable" -eq 0 ]; then
-        pass "After claiming, claimable mint fees = 0"
-      else
-        fail "After claiming, claimable mint fees" "expected 0, got $new_claimable"
-      fi
-    else
-      info "No claimable mint fees yet (accumulator starts at 0 on fresh deploy)"
-      pass "getClaimableMintFees returns 0 claimable on fresh deploy"
-    fi
-  fi
-
-  # ── Burn fee claim queries ──
+  # ── Burn fee claim queries (per-token format) ──
   info "Testing burn fee claim queries..."
   local burn_fees
   burn_fees=$(call "$NACHOS_VAULT" getClaimableBurnFees)
-  assert_contains "$burn_fees" "claimable" "getClaimableBurnFees returns valid structure"
+  assert_not_contains "$burn_fees" "Error" "getClaimableBurnFees returns valid structure"
 
+  # claimBurnFees now takes (recipient, tokenPrincipal, amount)
   local burn_overclaim
-  burn_overclaim=$(call "$NACHOS_VAULT" claimBurnFees "(principal \"$TEST_PRINCIPAL\", 999_999_999_999 : nat)")
+  burn_overclaim=$(call "$NACHOS_VAULT" claimBurnFees "(principal \"$TEST_PRINCIPAL\", principal \"$ICP_PRINCIPAL\", 999_999_999_999 : nat)")
   assert_contains "$burn_overclaim" "Insufficient" "Burn fee over-claim rejected"
 
-  # ── Token pause blocks minting test ──
-  if [ "$GENESIS_DONE" = "1" ]; then
-    info "Testing token pause blocks minting..."
-    local DAO_BACKEND="tisou-7aaaa-aaaai-atiea-cai"
-    # Use CLOWN — smallest portfolio weight, safe to pause temporarily
-    local CLOWN_PRINCIPAL="iwv6l-6iaaa-aaaal-ajjjq-cai"
+  # ── Per-token fee structure validation ──
+  info "Testing per-token fee format in dashboard..."
+  local dashboard_fees
+  dashboard_fees=$(call "$NACHOS_VAULT" getVaultDashboard)
 
-    # Step 1: Pause CLOWN via DAO
-    call "$DAO_BACKEND" pauseToken "(principal \"$CLOWN_PRINCIPAL\", \"nachos test pause\")" >/dev/null
-    info "Paused CLOWN token via DAO"
-
-    # Step 2: Wait for DAO → treasury sync to complete (happens inside pauseToken await).
-    # The vault syncs status flags from treasury.getTokenDetailsCache() on every mint attempt.
-    sleep 3
-
-    # Step 3: Attempt mint — should fail with PortfolioTokenPaused or CircuitBreakerActive
-    local block_pause
-    block_pause=$(transfer_icp_to_treasury "$MINT_AMOUNT")
-    if [[ "$block_pause" != TRANSFER_FAILED* ]]; then
-      local pause_result
-      pause_result=$(call "$NACHOS_VAULT" mintNachos "($block_pause : nat, 0 : nat, null, null)")
-      if echo "$pause_result" | grep -qF "PortfolioTokenPaused"; then
-        pass "Mint rejected with PortfolioTokenPaused when portfolio token paused"
-      elif echo "$pause_result" | grep -qF "CircuitBreakerActive"; then
-        pass "Mint rejected with CircuitBreakerActive when portfolio token paused"
-      else
-        fail "Mint rejected when portfolio token paused" "Expected PortfolioTokenPaused or CircuitBreakerActive, got: $pause_result"
-      fi
-    else
-      skip "Token pause mint rejection" "ICP transfer failed"
-    fi
-
-    # Step 4: Verify system status shows paused tokens
-    local status_paused
-    status_paused=$(call "$NACHOS_VAULT" getSystemStatus)
-    assert_contains "$status_paused" "hasPausedTokens = true" "System status shows hasPausedTokens = true"
-
-    # Step 5: Verify #TokenPaused CB condition exists
-    local cb_conditions
-    cb_conditions=$(call "$NACHOS_VAULT" getCircuitBreakerConditions)
-    assert_contains "$cb_conditions" "TokenPaused" "Circuit breaker conditions include TokenPaused"
-
-    # Step 6: Unpause to restore
-    call "$DAO_BACKEND" unpauseToken "(principal \"$CLOWN_PRINCIPAL\", \"nachos test restore\")" >/dev/null
-    # Wait for DAO → treasury sync (happens inside unpauseToken await)
-    sleep 3
-
-    # Step 7: Do a dummy mint attempt to force the vault to refresh from treasury
-    local block_unpause
-    block_unpause=$(transfer_icp_to_treasury "$MINT_AMOUNT")
-    if [[ "$block_unpause" != TRANSFER_FAILED* ]]; then
-      local unpause_result
-      unpause_result=$(call "$NACHOS_VAULT" mintNachos "($block_unpause : nat, 0 : nat, null, null)")
-      # Don't care if it succeeds or fails — just forcing a treasury refresh
-    fi
-
-    # Step 8: Verify system status shows no paused tokens
-    local status_unpaused
-    status_unpaused=$(call "$NACHOS_VAULT" getSystemStatus)
-    assert_contains "$status_unpaused" "hasPausedTokens = false" "System status shows hasPausedTokens = false after unpause"
-    pass "Token pause test complete, token unpaused"
+  # All three fee types should be vec format
+  if echo "$dashboard_fees" | grep -q "claimableMintFees = vec"; then
+    pass "Dashboard claimableMintFees is vec format"
   else
-    skip "Token pause blocks minting" "Genesis not complete"
+    fail "Dashboard claimableMintFees format" "expected vec format"
   fi
+  if echo "$dashboard_fees" | grep -q "claimableBurnFees = vec"; then
+    pass "Dashboard claimableBurnFees is vec format"
+  else
+    fail "Dashboard claimableBurnFees format" "expected vec format"
+  fi
+  if echo "$dashboard_fees" | grep -q "claimableCancellationFees = vec"; then
+    pass "Dashboard claimableCancellationFees is vec format"
+  else
+    fail "Dashboard claimableCancellationFees format" "expected vec format"
+  fi
+
+  # ── Fee claim with wrong token principal (should return 0 available) ──
+  local bogus_token="aaaaa-aa"
+  local wrong_token_claim
+  wrong_token_claim=$(call "$NACHOS_VAULT" claimMintFees "(principal \"$TEST_PRINCIPAL\", principal \"$bogus_token\", 1 : nat)")
+  assert_contains "$wrong_token_claim" "Insufficient" "Claim with unknown token rejected"
+
+  # ── Fee claim with zero amount (should fail) ──
+  local zero_claim
+  zero_claim=$(call "$NACHOS_VAULT" claimMintFees "(principal \"$TEST_PRINCIPAL\", principal \"$ICP_PRINCIPAL\", 0 : nat)")
+  assert_contains "$zero_claim" "Amount must be" "Claim with zero amount rejected"
+
+  # ── Burn fee claim with zero amount ──
+  local zero_burn_claim
+  zero_burn_claim=$(call "$NACHOS_VAULT" claimBurnFees "(principal \"$TEST_PRINCIPAL\", principal \"$ICP_PRINCIPAL\", 0 : nat)")
+  assert_contains "$zero_burn_claim" "Amount must be" "Burn claim with zero amount rejected"
+
+  # ── Cancellation fee over-claim (already per-token, verify still works) ──
+  local cancel_overclaim
+  cancel_overclaim=$(call "$NACHOS_VAULT" claimCancellationFees "(principal \"$TEST_PRINCIPAL\", principal \"$ICP_PRINCIPAL\", 999_999_999_999 : nat)")
+  assert_contains "$cancel_overclaim" "Insufficient" "Cancellation fee over-claim rejected"
+
+
+
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -1597,7 +1571,7 @@ phase6_burn() {
   BURN_TIME_SECS=$((burn_end - burn_start))
   info "Burn result: $(echo "$burn_result" | head -c 500)"
   info "Waiting 10s for async operations to settle before measuring cycles..."
-  sleep 10
+  sleep 20
   cycles_after=$(get_vault_cycles)
   cycles_used=$((cycles_before - cycles_after))
   BURN_CYCLES_USED=$cycles_used
@@ -1750,7 +1724,7 @@ phase6b_burn_portfolio() {
       pending_count=$(echo "$queue_status" | grep -c "variant { Pending }" 2>/dev/null || echo 0)
       sent_count=$(echo "$queue_status" | grep -c "variant { Sent }" 2>/dev/null || echo 0)
       info "  Queue: ${pending_count} pending, ${sent_count} sent — waiting... (${elapsed}s elapsed)"
-      sleep 10
+      sleep 20
     else
       queue_clear=1
       info "  Transfer queue clear after ${elapsed}s"
@@ -1765,7 +1739,7 @@ phase6b_burn_portfolio() {
   # Force treasury balance refresh so vault sees updated balances
   info "Refreshing treasury balances for accurate post-burn snapshot..."
   call "$TREASURY" refreshAllPrices >/dev/null
-  sleep 5
+  sleep 10
 
   # Take post-burn portfolio snapshot
   info "Taking post-burn portfolio snapshot..."

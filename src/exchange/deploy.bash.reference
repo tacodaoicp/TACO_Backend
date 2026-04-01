@@ -1,0 +1,432 @@
+#!/bin/bash
+#TACO-OTC= 5kuny-yiaaa-aaaal-acgta-cai 
+#DAO = hjcnr-bqaaa-aaaaq-aacka-cai
+#Test token= mxzaz-hqaaa-aaaar-qaada-cai
+#Test token 2= zxeu2-7aaaa-aaaaq-aaafa-cai
+
+#TACO token= csyra-haaaa-aaaaq-aacva-cai
+
+#ICP ledger= ryjl3-tyaaa-aaaaa-aaaba-cai
+
+#ckusdc: xevnm-gaaaa-aaaar-qafnq-cai
+
+#TestActor1=hhaaz-2aaaa-aaaaq-aacla-cai
+#TestActor2=qtooy-2yaaa-aaaaq-aabvq-cai
+#TestActor3=aanaa-xaaaa-aaaah-aaeiq-cai
+
+#Treasury = mbl7t-vyaaa-aaaak-ae5xq-cai
+#Treasury-DAO = ar2zl-5qaaa-aaaan-qavoa-cai
+
+#DAO-testscript =ca6gz-lqaaa-aaaaq-aacwa-cai
+#Exchange-testscript =pcj6u-uaaaa-aaaak-aewnq-cai
+
+if [ "$EUID" -eq 0 ]; then
+  echo "This script should not be run with sudo privileges."
+  echo "Please run the script without using sudo."
+  exit 1
+fi
+
+dfx stop
+
+PORTS=("8080" "8000" "40049" "4943" "6667")
+
+for port in "${PORTS[@]}"; do
+    # Find the process using the specific port and kill it
+    pids=$(sudo lsof -i tcp:"$port" |sudo  awk 'NR!=1 {print $2}' |sudo xargs)
+    if [ -n "$pids" ]; then
+        sudo kill -9 $pids
+    fi
+done
+
+#sudo chmod -R 755 /home/d/.config/dfx/
+#sudo chmod -R 755 /usr/local/lib/node_modules
+#sudo chmod -R 755 /home/
+
+dfx start --background --clean --artificial-delay 300 --host 127.0.0.1:6667
+
+
+export TestActor1="hhaaz-2aaaa-aaaaq-aacla-cai"
+export TestActor2="qtooy-2yaaa-aaaaq-aabvq-cai"
+export TestActor3="aanaa-xaaaa-aaaah-aaeiq-cai"
+export DAO="hjcnr-bqaaa-aaaaq-aacka-cai"
+export DAOtreasury="ar2zl-5qaaa-aaaan-qavoa-cai"
+
+dfx identity new defaultTACO --storage-mode=plaintext
+dfx identity export defaultTACO > identity.pem
+dfx identity use minterTACO
+dfx identity remove defaultTACO
+dfx identity import defaultTACO identity.pem --storage-mode=plaintext
+
+dfx identity new minterTACO --storage-mode=plaintext
+dfx identity export minterTACO > identity2.pem
+dfx identity use defaultTACO
+dfx identity remove minterTACO
+dfx identity import minterTACO identity2.pem --storage-mode=plaintext
+
+dfx identity new archive_controllerTACO --storage-mode=plaintext
+dfx identity export archive_controllerTACO > identity3.pem
+dfx identity use defaultTACO
+dfx identity remove archive_controllerTACO
+dfx identity import archive_controllerTACO identity3.pem --storage-mode=plaintext
+
+
+cd ../
+directory_name="ledger_canister"
+
+# Check if the directory exists
+if [ -d "./$directory_name" ]; then
+    # Delete the directory and its contents
+    echo "Directory './$directory_name' already there."
+    cd ledger_canister
+else
+    echo "Directory './$directory_name' does not exist."
+    dfx new ledger_canister
+    cd ledger_canister
+    new_json_content='{
+  "canisters": {
+    "ledger_canister": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/d87954601e4b22972899e9957e800406a0a6b929/rs/rosetta-api/icp_ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ledger-canister.wasm.gz",
+      "remote": {
+        "id": {
+          "ic": "ryjl3-tyaaa-aaaaa-aaaba-cai"
+        }
+      }
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}'
+
+echo "$new_json_content" > dfx.json
+fi
+
+
+
+
+
+
+dfx identity new minterTACO --storage-mode=plaintext
+dfx identity use minterTACO
+export MINTER_ACCOUNT_ID=$(dfx ledger account-id)
+dfx identity use defaultTACO
+export DEFAULT_ACCOUNT_ID=$(dfx ledger account-id)
+# URL of the file to download
+download_url="https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ledger-canister.wasm.gz"
+
+# Download the file to the current directory
+curl -o ledger-canister.wasm.gz "$download_url"
+mkdir -p ./.dfx/local/canisters/ledger_canister/
+cp ledger-canister.wasm.gz ./.dfx/local/canisters/ledger_canister/
+yes | dfx deploy --specified-id ryjl3-tyaaa-aaaaa-aaaba-cai ledger_canister --argument "
+  (variant {
+    Init = record {
+      minting_account = \"$MINTER_ACCOUNT_ID\";
+      initial_values = vec {
+        record {
+          \"$DEFAULT_ACCOUNT_ID\";
+          record {
+            e8s = 10_000_000_000_000_000 : nat64;
+          };
+        };
+      };
+      send_whitelist = vec {};
+      transfer_fee = opt record {
+        e8s = 10_000 : nat64;
+      };
+      token_symbol = opt \"LICP\";
+      token_name = opt \"Local ICP\";
+    }
+  })
+" --mode=reinstall
+
+
+export TestActor1ACC="711a345146b5013508e630b4fca3645293f20de369b46d20219622cb84628c7e"
+export TestActor2ACC="087bd635fda622aa0d7f2d66172a95a42b93eafe7dfd00de80429e9886c6189e"
+export TestActor3ACC="758bdb7e54b73605d1d743da9f3aad70637d4cddcba03db13137eaf35f12d375"
+export DAOACC="366bf011a8ff33b5e2acc655803e3391b6057df6c9cc5a6952cda58effd4b40b"
+dfx ledger transfer --memo "433" --e8s 50000000000000 $TestActor1ACC & 
+dfx ledger transfer --memo "433" --e8s 50000000000000 $TestActor2ACC & 
+dfx ledger transfer --memo "433" --e8s 50000000000000 $TestActor3ACC & 
+dfx ledger transfer --memo "433" --e8s 3000000000 $DAOACC & 
+
+
+echo $DEFAULT_ACCOUNT_ID
+cd ../
+directory_name="icrc1_ledger_canister"
+#https://dashboard.internetcomputer.org/releases
+# Check if the directory exists
+if [ -d "./$directory_name" ]; then
+    # Delete the directory and its contents
+    echo "Directory './$directory_name' is there."
+    cd icrc1_ledger_canister
+    echo '{
+  "canisters": {
+    "icrc1_ledger_canister": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    },
+    "icrc1_ledger_canister2": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    },
+    "ckusdc": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    },
+    "tacoToken": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}' > dfx.json
+    
+else
+    echo "Directory './$directory_name' does not exist. Creating..."
+    dfx new icrc1_ledger_canister
+    cd icrc1_ledger_canister
+    echo '{
+  "canisters": {
+    "icrc1_ledger_canister": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    },
+    "icrc1_ledger_canister2": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    },
+    "ckusdc": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    },
+    "tacoToken": {
+      "type": "custom",
+      "candid": "https://raw.githubusercontent.com/dfinity/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/rs/rosetta-api/icrc1/ledger/ledger.did",
+      "wasm": "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}' > dfx.json
+  
+fi
+
+
+
+dfx identity new minterTACO --storage-mode=plaintext
+dfx identity use minterTACO
+export MINTER=$(dfx identity get-principal)
+export TOKEN_NAME="My Token"
+export TOKEN_SYMBOL="XMTK"
+dfx identity use defaultTACO
+download_url="https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ic-icrc1-ledger.wasm.gz"
+
+# Download the file to the current directory
+
+curl -o ic-icrc1-ledger.wasm.gz "$download_url"
+
+mkdir -p ./.dfx/local/canisters/icrc1_ledger_canister/
+
+cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/
+
+export DEFAULT=$(dfx identity get-principal)
+export PRE_MINTED_TOKENS=10_000_000_000_000_000_000
+export pmt=777_777_700_000_000
+export TRANSFER_FEE=10_000
+dfx identity new archive_controllerTACO --storage-mode=plaintext
+dfx identity use archive_controllerTACO
+export ARCHIVE_CONTROLLER=$(dfx identity get-principal)
+export TRIGGER_THRESHOLD=2000
+export NUM_OF_BLOCK_TO_ARCHIVE=1000
+export CYCLE_FOR_ARCHIVE_CREATION=10000000000000
+
+
+yes | dfx deploy icrc1_ledger_canister --specified-id mxzaz-hqaaa-aaaar-qaada-cai --argument "(variant {Init = 
+record {
+     token_symbol = \"${TOKEN_SYMBOL}\";
+     token_name = \"${TOKEN_NAME}\";
+     minting_account = record { owner = principal \"${MINTER}\" };
+     transfer_fee = ${TRANSFER_FEE};
+     metadata = vec {};
+     initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${PRE_MINTED_TOKENS}; }; };
+     archive_options = record {
+         num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE};
+         trigger_threshold = ${TRIGGER_THRESHOLD};
+         controller_id = principal \"${ARCHIVE_CONTROLLER}\";
+         cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION};
+     };
+ }
+})" --mode=reinstall
+dfx identity use defaultTACO
+dfx canister call icrc1_ledger_canister icrc1_transfer "(record { to = record { owner = principal \"${TestActor1}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call icrc1_ledger_canister icrc1_transfer "(record { to = record { owner = principal \"${TestActor2}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call icrc1_ledger_canister icrc1_transfer "(record { to = record { owner = principal \"${TestActor3}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call icrc1_ledger_canister icrc1_transfer "(record { to = record { owner = principal \"${DAOtreasury}\";};  amount = 3_000_000_000;})" &
+
+yes | dfx deploy tacoToken --specified-id csyra-haaaa-aaaaq-aacva-cai --argument "(variant {Init = 
+record {
+     token_symbol = \"TACO\";
+     token_name = \"TACO\";
+     minting_account = record { owner = principal \"${MINTER}\" };
+     transfer_fee = 70000;
+     metadata = vec {};
+     initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${pmt}; }; };
+     archive_options = record {
+         num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE};
+         trigger_threshold = ${TRIGGER_THRESHOLD};
+         controller_id = principal \"${ARCHIVE_CONTROLLER}\";
+         cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION};
+     };
+ }
+})" --mode=reinstall
+
+
+dfx identity use defaultTACO
+dfx canister call tacoToken icrc1_transfer "(record { to = record { owner = principal \"${TestActor1}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call tacoToken icrc1_transfer "(record { to = record { owner = principal \"${TestActor2}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call tacoToken icrc1_transfer "(record { to = record { owner = principal \"${TestActor3}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call tacoToken icrc1_transfer "(record { to = record { owner = principal \"${DAOtreasury}\";};  amount = 3_000_000_000;})" &
+
+yes | dfx deploy icrc1_ledger_canister2 --specified-id zxeu2-7aaaa-aaaaq-aaafa-cai --argument "(variant {Init = record { token_symbol = \"${TOKEN_SYMBOL}2\"; token_name = \"${TOKEN_NAME}2\"; minting_account = record { owner = principal \"${MINTER}\" }; transfer_fee = ${TRANSFER_FEE}; metadata = vec {}; initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${PRE_MINTED_TOKENS}; }; }; archive_options = record { num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE}; trigger_threshold = ${TRIGGER_THRESHOLD}; controller_id = principal \"${ARCHIVE_CONTROLLER}\"; cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION}; }; }})" --mode=reinstall
+
+dfx canister call icrc1_ledger_canister icrc1_decimals '()' 
+
+
+dfx identity use defaultTACO
+
+dfx canister call icrc1_ledger_canister2 icrc1_transfer "(record { to = record { owner = principal \"${TestActor1}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call icrc1_ledger_canister2 icrc1_transfer "(record { to = record { owner = principal \"${TestActor2}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call icrc1_ledger_canister2 icrc1_transfer "(record { to = record { owner = principal \"${TestActor3}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call icrc1_ledger_canister2 icrc1_transfer "(record { to = record { owner = principal \"${DAOtreasury}\";};  amount = 3_000_000_000;})" &
+
+export TOKEN_NAME="USDC"
+export TOKEN_SYMBOL="USDC"
+yes | dfx deploy ckusdc --specified-id xevnm-gaaaa-aaaar-qafnq-cai --argument "(variant {Init = record { token_symbol = \"${TOKEN_SYMBOL}2\"; token_name = \"${TOKEN_NAME}2\"; minting_account = record { owner = principal \"${MINTER}\" }; transfer_fee = ${TRANSFER_FEE}; metadata = vec {}; initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${PRE_MINTED_TOKENS}; }; }; archive_options = record { num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE}; trigger_threshold = ${TRIGGER_THRESHOLD}; controller_id = principal \"${ARCHIVE_CONTROLLER}\"; cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION}; }; }})" --mode=reinstall
+
+dfx canister call ckusdc icrc1_decimals '()' 
+
+
+dfx identity use defaultTACO
+
+dfx canister call ckusdc icrc1_transfer "(record { to = record { owner = principal \"${TestActor1}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call ckusdc icrc1_transfer "(record { to = record { owner = principal \"${TestActor2}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call ckusdc icrc1_transfer "(record { to = record { owner = principal \"${TestActor3}\";};  amount = 5_000_000_000_000;})" &
+dfx canister call ckusdc icrc1_transfer "(record { to = record { owner = principal \"${DAOtreasury}\";};  amount = 3_000_000_000;})" &
+
+cd ../Exchange
+#dfx generate 
+
+dfx canister create --specified-id mbl7t-vyaaa-aaaak-ae5xq-cai treasury --compute-allocation 3
+yes | dfx deploy --specified-id mbl7t-vyaaa-aaaak-ae5xq-cai treasury --with-cycles 10000000000000 --mode=reinstall
+
+
+dfx canister create --specified-id 5kuny-yiaaa-aaaal-acgta-cai OTC_backend
+yes | dfx deploy --specified-id 5kuny-yiaaa-aaaal-acgta-cai OTC_backend --with-cycles 10000000000000 --mode=reinstall
+
+dfx canister create --specified-id hhaaz-2aaaa-aaaaq-aacla-cai ActorA
+yes | dfx deploy --specified-id hhaaz-2aaaa-aaaaq-aacla-cai ActorA --with-cycles 10000000000000 --mode=reinstall
+
+dfx canister create --specified-id qtooy-2yaaa-aaaaq-aabvq-cai ActorB
+yes | dfx deploy --specified-id qtooy-2yaaa-aaaaq-aabvq-cai ActorB --with-cycles 10000000000000 --mode=reinstall
+
+dfx canister create --specified-id aanaa-xaaaa-aaaah-aaeiq-cai ActorC
+yes | dfx deploy --specified-id aanaa-xaaaa-aaaah-aaeiq-cai ActorC --with-cycles 10000000000000 --mode=reinstall
+
+
+
+dfx canister create --specified-id pcj6u-uaaaa-aaaak-aewnq-cai test
+yes | dfx deploy --specified-id pcj6u-uaaaa-aaaak-aewnq-cai test --with-cycles 10000000000000 --mode=reinstall
+# dfx canister call test cancelAllPositions 
+if [ "$1" != "skip_tests" ]; then
+    dfx canister call test runTests '(false, false)' # Run all tests including stress tests
+else
+    dfx canister call test runTests '(false, true)' # Skip stress tests
+fi
+
+
+exit
+
+#to get worst case order size:
+dfx canister call test generateDummyData '(
+  record {
+    accesscode = "PublicRJGDvUTKfgkkzdFCAJmWUj4TyyFej8T00";
+    amount_sell = 100000000000000000000000;
+    amount_init = 500000000000000000000000;
+    token_sell_identifier = "mxzaz-hqaaa-aaaar-qaada-cai";
+    token_init_identifier = "mxzaz-hqaaa-aaaar-qaada-cai";
+    Fee = 10;
+    InitPrincipal = "lln4x-hp2pd-n3zlh-yjs3t-vx6iw-asy3g-mrkgb-shc25-3kf34-vdlpo-yae";
+  },
+  record {
+    amount_sell = 100000000000000000000000;
+    amount_init = 100000000000000000000000;
+    token_sell_identifier = "mxzaz-hqaaa-aaaar-qaada-cai";
+    token_init_identifier = "mxzaz-hqaaa-aaaar-qaada-cai";
+    trade_number = 42;
+    Fee = 10;
+    trade_done = 0;
+  },
+  record {
+    amount_sell = 100000000000000000000000;
+    amount_init = 100000000000000000000000;
+    token_sell_identifier = "mxzaz-hqaaa-aaaar-qaada-cai";
+    token_init_identifier = "mxzaz-hqaaa-aaaar-qaada-cai";
+    trade_done = 0;
+    seller_paid = 0;
+    init_paid = 0;
+    trade_number = 42;
+    SellerPrincipal = "lln4x-hp2pd-n3zlh-yjs3t-vx6iw-asy3g-mrkgb-shc25-3kf34-vdlpo-yae";
+    initPrincipal = "lln4x-hp2pd-n3zlh-yjs3t-vx6iw-asy3g-mrkgb-shc25-3kf34-vdlpo-yae";
+    Fee = 10;
+    seller_paid2 = 0;
+    init_paid2 = 0;
+    RevokeFee = 5;
+    time = '$(date +%s)000000000';
+    OCname = "DUMMY-OC-NAME999sa";
+  },
+  1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000070000000000000000000,
+  principal "lln4x-hp2pd-n3zlh-yjs3t-vx6iw-asy3g-mrkgb-shc25-3kf34-vdlpo-yae" 
+)'
+
+yes | dfx deploy --specified-id pcj6u-uaaaa-aaaak-aewnq-cai test --with-cycles 10000000000000 --mode=reinstall
+dfx canister call test cancelAllPositions 
+dfx canister call test runTests '(false)' 
+
+dfx canister call test cancelAllPositions 
+yes | dfx deploy --specified-id 5kuny-yiaaa-aaaal-acgta-cai OTC_backend --with-cycles 10000000000000 --mode=reinstall
+dfx canister call test runTests '(false)' 
+
+yes | dfx deploy --specified-id 5kuny-yiaaa-aaaal-acgta-cai OTC_backend --with-cycles 10000000000000 --mode=reinstall --compute-allocation 3
+
+yes | dfx deploy --specified-id pcj6u-uaaaa-aaaak-aewnq-cai test --with-cycles 10000000000000 --mode=reinstall 
+
+dfx canister call test runTests '(false)' 
+sleep 10
