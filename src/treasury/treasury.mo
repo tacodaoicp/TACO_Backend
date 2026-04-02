@@ -106,6 +106,7 @@ import Array "mo:base/Array";
 import Order "mo:base/Order";
 import KongSwap "../swap/kong_swap";
 import ICPSwap "../swap/icp_swap";
+import TACOSwap "../swap/taco_swap";
 import swaptypes "../swap/swap_types";
 import Fuzz "mo:fuzz";
 import SpamProtection "../helper/spam_protection";
@@ -207,11 +208,13 @@ shared (deployer) persistent actor class treasury() = this {
     #Split : {
       kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+      taco : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
     };
     #Partial : {
       kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
-      totalPercentBP : Nat;  // Sum of percentages (e.g., 6000 = 60%)
+      taco : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+      totalPercentBP : Nat;
     };
   };
 
@@ -4467,7 +4470,8 @@ shared (deployer) persistent actor class treasury() = this {
                   let splitResult = await* executeSplitTrade(
                     sellToken, ICPprincipal,
                     kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                    icpFinalAmount, icpMinAmountOut, icpIdealOut
+                    icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0 // TACO: not used in this 2-way split
                   );
 
                   var kongSuccess = false;
@@ -4612,7 +4616,8 @@ shared (deployer) persistent actor class treasury() = this {
                   let splitResult = await* executeSplitTrade(
                     sellToken, ICPprincipal,
                     kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                    icpFinalAmount, icpMinAmountOut, icpIdealOut
+                    icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0 // TACO: not used in this 2-way split
                   );
 
                   var kongSuccess = false;
@@ -5163,7 +5168,8 @@ shared (deployer) persistent actor class treasury() = this {
                               let splitResult = await* executeSplitTrade(
                                 sellToken, ICPprincipal,
                                 kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                                icpFinalAmount, icpMinAmountOut, icpIdealOut
+                                icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                               );
 
                               var kongSuccess = false;
@@ -5307,7 +5313,8 @@ shared (deployer) persistent actor class treasury() = this {
                               let splitResult = await* executeSplitTrade(
                                 sellToken, ICPprincipal,
                                 kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                                icpFinalAmount, icpMinAmountOut, icpIdealOut
+                                icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                               );
 
                               var kongSuccess = false;
@@ -5547,7 +5554,8 @@ shared (deployer) persistent actor class treasury() = this {
                     let splitResult = await* executeSplitTrade(
                       sellToken, buyToken,
                       kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                      icpFinalAmount, icpMinAmountOut, icpIdealOut
+                      icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                     );
 
                     // Track results
@@ -5781,7 +5789,8 @@ shared (deployer) persistent actor class treasury() = this {
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                             );
 
                             var kongSuccess = false;
@@ -5926,7 +5935,8 @@ shared (deployer) persistent actor class treasury() = this {
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                             );
 
                             var kongSuccess = false;
@@ -6162,7 +6172,8 @@ shared (deployer) persistent actor class treasury() = this {
                     let splitResult = await* executeSplitTrade(
                       sellToken, buyToken,
                       kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                      icpFinalAmount, icpMinAmountOut, icpIdealOut
+                      icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                     );
 
                     // Track results
@@ -6396,7 +6407,8 @@ shared (deployer) persistent actor class treasury() = this {
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                             );
 
                             var kongSuccess = false;
@@ -6541,7 +6553,8 @@ shared (deployer) persistent actor class treasury() = this {
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                              icpFinalAmount, icpMinAmountOut, icpIdealOut
+                              icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                             );
 
                             var kongSuccess = false;
@@ -7083,7 +7096,8 @@ shared (deployer) persistent actor class treasury() = this {
                       let splitResult = await* executeSplitTrade(
                         sellToken, ICPprincipal,
                         kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                        icpFinalAmount, icpMinAmountOut, icpIdealOut
+                        icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                       );
 
                       // Track results
@@ -7232,7 +7246,8 @@ shared (deployer) persistent actor class treasury() = this {
                       let splitResult = await* executeSplitTrade(
                         sellToken, ICPprincipal,
                         kongFinalAmount, kongMinAmountOut, kongIdealOut,
-                        icpFinalAmount, icpMinAmountOut, icpIdealOut
+                        icpFinalAmount, icpMinAmountOut, icpIdealOut,
+                    0, 0, 0
                       );
 
                       // Track results
@@ -8309,7 +8324,17 @@ shared (deployer) persistent actor class treasury() = this {
         };
       };
 
-      // Await all 20 quotes (must await each individually in Motoko)
+      // TACO Exchange quotes - 6 quotes at ~17%, 33%, 50%, 67%, 83%, 100%
+      let sellTokenText = Principal.toText(sellToken);
+      let buyTokenText = Principal.toText(buyToken);
+      let tacoFuture0 = (with timeout = 65) TACOSwap.getQuote(sellTokenText, buyTokenText, amountIn * 1 / 6, sellDecimals, buyDecimals);
+      let tacoFuture1 = (with timeout = 65) TACOSwap.getQuote(sellTokenText, buyTokenText, amountIn * 2 / 6, sellDecimals, buyDecimals);
+      let tacoFuture2 = (with timeout = 65) TACOSwap.getQuote(sellTokenText, buyTokenText, amountIn * 3 / 6, sellDecimals, buyDecimals);
+      let tacoFuture3 = (with timeout = 65) TACOSwap.getQuote(sellTokenText, buyTokenText, amountIn * 4 / 6, sellDecimals, buyDecimals);
+      let tacoFuture4 = (with timeout = 65) TACOSwap.getQuote(sellTokenText, buyTokenText, amountIn * 5 / 6, sellDecimals, buyDecimals);
+      let tacoFuture5 = (with timeout = 65) TACOSwap.getQuote(sellTokenText, buyTokenText, amountIn, sellDecimals, buyDecimals);
+
+      // Await all 25 quotes (must await each individually in Motoko)
       let kongResult0 = try { await kongFuture0 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult1 = try { await kongFuture1 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
       let kongResult2 = try { await kongFuture2 } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) };
@@ -8330,8 +8355,16 @@ shared (deployer) persistent actor class treasury() = this {
       let icpResult7 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture7 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
       let icpResult8 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture8 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
       let icpResult9 = if skipICPswap{#err("ICPSwap quote exception: " # "No ICPswap pool")} else{try { await icpFuture9 } catch (e) { #err("ICPSwap quote exception: " # Error.message(e)) }};
+      let tacoResult0 = try { await tacoFuture0 } catch (e) { #err("TACO quote exception: " # Error.message(e)) };
+      let tacoResult1 = try { await tacoFuture1 } catch (e) { #err("TACO quote exception: " # Error.message(e)) };
+      let tacoResult2 = try { await tacoFuture2 } catch (e) { #err("TACO quote exception: " # Error.message(e)) };
+      let tacoResult3 = try { await tacoFuture3 } catch (e) { #err("TACO quote exception: " # Error.message(e)) };
+      let tacoResult4 = try { await tacoFuture4 } catch (e) { #err("TACO quote exception: " # Error.message(e)) };
+      let tacoResult5 = try { await tacoFuture5 } catch (e) { #err("TACO quote exception: " # Error.message(e)) };
+
       let kongResults = [kongResult0, kongResult1, kongResult2, kongResult3, kongResult4, kongResult5, kongResult6, kongResult7, kongResult8, kongResult9];
       let icpResults = [icpResult0, icpResult1, icpResult2, icpResult3, icpResult4, icpResult5, icpResult6, icpResult7, icpResult8, icpResult9];
+      let tacoResults = [tacoResult0, tacoResult1, tacoResult2, tacoResult3, tacoResult4, tacoResult5];
 
       // Log raw quote results for debugging
       logger.info("QUOTE_DEBUG", "Raw Kong 100% result: " # debug_show(kongResult9), "findBestExecution");
@@ -8399,10 +8432,17 @@ shared (deployer) persistent actor class treasury() = this {
         extractIcp(icpResults[i], icpAmounts[i])
       });
 
+      // Extract TACO quotes (6 quotes at ~17%, 33%, 50%, 67%, 83%, 100%)
+      // Map: tacoIdx 0=17%, 1=33%, 2=50%, 3=67%, 4=83%, 5=100%
+      let taco = Array.tabulate<QuoteData>(6, func(i) {
+        extractKong(tacoResults[i], amountIn * (i + 1) / 6) // reuse extractKong — same SwapAmountsReply format
+      });
+
       // Log quote results summary
       logger.info("EXCHANGE_COMPARISON",
         "Quotes received - Kong_100%=" # Nat.toText(kong[9].out) # " (valid=" # debug_show(kong[9].valid) # ")" #
-        " ICP_100%=" # Nat.toText(icp[9].out) # " (valid=" # debug_show(icp[9].valid) # ")",
+        " ICP_100%=" # Nat.toText(icp[9].out) # " (valid=" # debug_show(icp[9].valid) # ")" #
+        " TACO_100%=" # Nat.toText(taco[5].out) # " (valid=" # debug_show(taco[5].valid) # ")",
         "findBestExecution"
       );
 
@@ -8418,7 +8458,7 @@ shared (deployer) persistent actor class treasury() = this {
       let STEP_BP : Nat = 1000;  // 10% per step
       let MIN_PARTIAL_TOTAL_BP : Nat = 4000;  // 40% minimum for partials
 
-      type Scenario = { name : Text; kongPct : Nat; icpPct : Nat; totalOut : Nat; kongSlipBP : Nat; icpSlipBP : Nat; kongIdx : Nat; icpIdx : Nat };
+      type Scenario = { name : Text; kongPct : Nat; icpPct : Nat; tacoPct : Nat; totalOut : Nat; kongSlipBP : Nat; icpSlipBP : Nat; tacoSlipBP : Nat; kongIdx : Nat; icpIdx : Nat; tacoIdx : Nat };
 
       var bestScenario : ?Scenario = null;
       var secondBestScenario : ?Scenario = null;
@@ -8446,13 +8486,10 @@ shared (deployer) persistent actor class treasury() = this {
       if (kong[9].valid) {
         updateBest({
           name = "SINGLE_KONG";
-          kongPct = 10000;
-          icpPct = 0;
+          kongPct = 10000; icpPct = 0; tacoPct = 0;
           totalOut = kong[9].out;
-          kongSlipBP = kong[9].slipBP;
-          icpSlipBP = 0;
-          kongIdx = 9;
-          icpIdx = 9;
+          kongSlipBP = kong[9].slipBP; icpSlipBP = 0; tacoSlipBP = 0;
+          kongIdx = 9; icpIdx = 9; tacoIdx = 4;
         });
       };
 
@@ -8460,57 +8497,127 @@ shared (deployer) persistent actor class treasury() = this {
       if (icp[9].valid) {
         updateBest({
           name = "SINGLE_ICP";
-          kongPct = 0;
-          icpPct = 10000;
+          kongPct = 0; icpPct = 10000; tacoPct = 0;
           totalOut = icp[9].out;
-          kongSlipBP = 0;
-          icpSlipBP = icp[9].slipBP;
-          kongIdx = 9;
-          icpIdx = 9;
+          kongSlipBP = 0; icpSlipBP = icp[9].slipBP; tacoSlipBP = 0;
+          kongIdx = 9; icpIdx = 9; tacoIdx = 4;
         });
       };
 
-      // All combinations - 10x10 = 100 checks
-      // Full splits (totalPct == 10000) -> updateBest for max output selection
-      // Partials (totalPct < 10000) -> partialScenarios for min slippage selection
+      // Scenario 3: Single TACO (100%) - index 5
+      if (taco[5].valid) {
+        updateBest({
+          name = "SINGLE_TACO";
+          kongPct = 0; icpPct = 0; tacoPct = 10000;
+          totalOut = taco[5].out;
+          kongSlipBP = 0; icpSlipBP = 0; tacoSlipBP = taco[5].slipBP;
+          kongIdx = 9; icpIdx = 9; tacoIdx = 5;
+        });
+      };
+
+      // All 3-way combinations: Kong(10% steps) x ICP(10% steps) x TACO(20% steps)
+      // Kong: 10 quotes at indices 0-9 = 10%-100% (STEP_BP = 1000)
+      // ICP:  10 quotes at indices 0-9 = 10%-100% (STEP_BP = 1000)
+      // TACO:  5 quotes at indices 0-4 = 20%-100% (TACO_STEP_BP = 2000)
+      let TACO_STEP_BP : Nat = 1667; // ~16.67% per step (6 quotes: 17%, 33%, 50%, 67%, 83%, 100%)
+
+      // 2-way Kong+ICP combinations (original 10x10, no TACO)
       label outerLoop for (kongIdxIter in Iter.range(0, 9)) {
         label innerLoop for (icpIdxIter in Iter.range(0, 9)) {
-          let kongPctCalc = (kongIdxIter + 1) * STEP_BP;  // 1000, 2000, ..., 10000
+          let kongPctCalc = (kongIdxIter + 1) * STEP_BP;
           let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
           let totalPctCalc = kongPctCalc + icpPctCalc;
 
-          // Skip if over 100%
-          if (totalPctCalc > 10000) {
-            continue innerLoop;
-          };
+          if (totalPctCalc > 10000) { continue innerLoop };
+          if (kongPctCalc == 10000 or icpPctCalc == 10000) { continue innerLoop };
 
-          // Skip 100% singles (already handled above)
-          if (kongPctCalc == 10000 or icpPctCalc == 10000) {
-            continue innerLoop;
-          };
-
-          // Check both quotes valid
           if (kong[kongIdxIter].valid and icp[icpIdxIter].valid) {
             let totalOutCalc = kong[kongIdxIter].out + icp[icpIdxIter].out;
-
             let scenario : Scenario = {
-              name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) #
-                     Nat.toText(kongPctCalc / 100) # "_" # Nat.toText(icpPctCalc / 100);
-              kongPct = kongPctCalc;
-              icpPct = icpPctCalc;
+              name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(icpPctCalc / 100) # "I";
+              kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = 0;
               totalOut = totalOutCalc;
-              kongSlipBP = kong[kongIdxIter].slipBP;
-              icpSlipBP = icp[icpIdxIter].slipBP;
-              kongIdx = kongIdxIter;
-              icpIdx = icpIdxIter;
+              kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = 0;
+              kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = 4;
             };
+            if (totalPctCalc == 10000) { updateBest(scenario) }
+            else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
+          };
+        };
+      };
 
-            if (totalPctCalc == 10000) {
-              // Full split - goes to best/secondBest selection by MAX output
-              updateBest(scenario);
-            } else {
-              // Partial split - separate collection for MIN slippage selection
-              Vector.add(partialScenarios, scenario);
+      // 2-way Kong+TACO combinations
+      label kongTacoLoop for (kongIdxIter in Iter.range(0, 9)) {
+        label tacoLoop1 for (tacoIdxIter in Iter.range(0, 5)) {
+          let kongPctCalc = (kongIdxIter + 1) * STEP_BP;
+          let tacoPctCalc = (tacoIdxIter + 1) * TACO_STEP_BP;
+          let totalPctCalc = kongPctCalc + tacoPctCalc;
+
+          if (totalPctCalc > 10000) { continue tacoLoop1 };
+          if (kongPctCalc == 10000 or tacoPctCalc == 10000) { continue tacoLoop1 };
+
+          if (kong[kongIdxIter].valid and taco[tacoIdxIter].valid) {
+            let totalOutCalc = kong[kongIdxIter].out + taco[tacoIdxIter].out;
+            let scenario : Scenario = {
+              name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(tacoPctCalc / 100) # "T";
+              kongPct = kongPctCalc; icpPct = 0; tacoPct = tacoPctCalc;
+              totalOut = totalOutCalc;
+              kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = 0; tacoSlipBP = taco[tacoIdxIter].slipBP;
+              kongIdx = kongIdxIter; icpIdx = 9; tacoIdx = tacoIdxIter;
+            };
+            if (totalPctCalc == 10000) { updateBest(scenario) }
+            else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
+          };
+        };
+      };
+
+      // 2-way ICP+TACO combinations
+      label icpTacoLoop for (icpIdxIter in Iter.range(0, 9)) {
+        label tacoLoop2 for (tacoIdxIter in Iter.range(0, 5)) {
+          let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
+          let tacoPctCalc = (tacoIdxIter + 1) * TACO_STEP_BP;
+          let totalPctCalc = icpPctCalc + tacoPctCalc;
+
+          if (totalPctCalc > 10000) { continue tacoLoop2 };
+          if (icpPctCalc == 10000 or tacoPctCalc == 10000) { continue tacoLoop2 };
+
+          if (icp[icpIdxIter].valid and taco[tacoIdxIter].valid) {
+            let totalOutCalc = icp[icpIdxIter].out + taco[tacoIdxIter].out;
+            let scenario : Scenario = {
+              name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(tacoPctCalc / 100) # "T";
+              kongPct = 0; icpPct = icpPctCalc; tacoPct = tacoPctCalc;
+              totalOut = totalOutCalc;
+              kongSlipBP = 0; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP;
+              kongIdx = 9; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter;
+            };
+            if (totalPctCalc == 10000) { updateBest(scenario) }
+            else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
+          };
+        };
+      };
+
+      // 3-way Kong+ICP+TACO combinations
+      label kongLoop3 for (kongIdxIter in Iter.range(0, 7)) { // max 80% Kong in 3-way
+        label icpLoop3 for (icpIdxIter in Iter.range(0, 7)) { // max 80% ICP in 3-way
+          label tacoLoop3 for (tacoIdxIter in Iter.range(0, 4)) { // max 83% TACO in 3-way (idx 4 = 83%)
+            let kongPctCalc = (kongIdxIter + 1) * STEP_BP;
+            let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
+            let tacoPctCalc = (tacoIdxIter + 1) * TACO_STEP_BP;
+            let totalPctCalc = kongPctCalc + icpPctCalc + tacoPctCalc;
+
+            if (totalPctCalc > 10000) { continue tacoLoop3 };
+
+            if (kong[kongIdxIter].valid and icp[icpIdxIter].valid and taco[tacoIdxIter].valid) {
+              let totalOutCalc = kong[kongIdxIter].out + icp[icpIdxIter].out + taco[tacoIdxIter].out;
+              let scenario : Scenario = {
+                name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(tacoPctCalc / 100) # "T";
+                kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = tacoPctCalc;
+                totalOut = totalOutCalc;
+                kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP;
+                kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter;
+              };
+              if (totalPctCalc == 10000) { updateBest(scenario) }
+              else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
             };
           };
         };
@@ -8550,12 +8657,12 @@ shared (deployer) persistent actor class treasury() = this {
 
             // Helper: combined slippage (NO FLOAT)
             func combinedSlip(p : Scenario) : Nat {
-              p.kongSlipBP + p.icpSlipBP
+              p.kongSlipBP + p.icpSlipBP + p.tacoSlipBP
             };
 
             // Helper: partial total percentage
             func totalPctFunc(p : Scenario) : Nat {
-              p.kongPct + p.icpPct
+              p.kongPct + p.icpPct + p.tacoPct
             };
 
             // Helper: partial value in ICP (safe division)
@@ -8761,6 +8868,9 @@ shared (deployer) persistent actor class treasury() = this {
                     slippageBP = finalIcpSlipBPP;
                     percentBP = finalIcpPctP;
                   };
+                  taco = {
+                    amount = 0; expectedOut = 0; slippageBP = 0; percentBP = 0;
+                  };
                   totalPercentBP = finalTotalPct;
                 }))
               };
@@ -8845,21 +8955,25 @@ shared (deployer) persistent actor class treasury() = this {
             "findBestExecution"
           );
 
+          // Also extract TACO percentage from best scenario
+          let finalTacoPct = best.tacoPct;
+          let finalTacoSlipBP = best.tacoSlipBP;
+
           if (finalKongPct == 10000) {
-            // Single KongSwap
             #ok(#Single({ exchange = #KongSwap; expectedOut = best.totalOut; slippageBP = finalKongSlipBP }))
           } else if (finalIcpPct == 10000) {
-            // Single ICPSwap
             #ok(#Single({ exchange = #ICPSwap; expectedOut = best.totalOut; slippageBP = finalIcpSlipBP }))
+          } else if (finalTacoPct == 10000) {
+            #ok(#Single({ exchange = #TACO; expectedOut = best.totalOut; slippageBP = finalTacoSlipBP }))
           } else {
-            // Split trade
+            // Split trade (2-way or 3-way)
             let kongAmount = (amountIn * finalKongPct) / 10000;
-            let icpAmount = amountIn - kongAmount;
+            let icpAmount = (amountIn * finalIcpPct) / 10000;
+            let tacoAmount = amountIn - kongAmount - icpAmount;
 
-            // Estimate expected output by interpolating from quotes
-            // Use the scenario indices to get base outputs, then scale
-            let kongExpectedOut = (kong[best.kongIdx].out * finalKongPct) / best.kongPct;
-            let icpExpectedOut = (icp[best.icpIdx].out * finalIcpPct) / best.icpPct;
+            let kongExpectedOut = if (best.kongPct > 0) { (kong[best.kongIdx].out * finalKongPct) / best.kongPct } else { 0 };
+            let icpExpectedOut = if (best.icpPct > 0) { (icp[best.icpIdx].out * finalIcpPct) / best.icpPct } else { 0 };
+            let tacoExpectedOut = if (best.tacoPct > 0) { (taco[best.tacoIdx].out * finalTacoPct) / best.tacoPct } else { 0 };
 
             #ok(#Split({
               kongswap = {
@@ -8873,6 +8987,12 @@ shared (deployer) persistent actor class treasury() = this {
                 expectedOut = icpExpectedOut;
                 slippageBP = finalIcpSlipBP;
                 percentBP = finalIcpPct;
+              };
+              taco = {
+                amount = tacoAmount;
+                expectedOut = tacoExpectedOut;
+                slippageBP = finalTacoSlipBP;
+                percentBP = finalTacoPct;
               };
             }))
           }
@@ -9005,9 +9125,10 @@ shared (deployer) persistent actor class treasury() = this {
   };
 
   /**
-   * Execute a split trade on BOTH exchanges IN PARALLEL
+   * Execute a split trade on up to 3 exchanges IN PARALLEL
    *
    * Kong tracks failed swaps as claims - recovery via recoverKongswapClaims()
+   * TACO tracks failed swaps via recoverWronglysent
    */
   private func executeSplitTrade(
     sellToken : Principal,
@@ -9018,7 +9139,10 @@ shared (deployer) persistent actor class treasury() = this {
     icpAmount : Nat,
     icpMinOut : Nat,
     icpIdealOut : Nat,
-  ) : async* { kongResult : Result.Result<TradeRecord, Text>; icpResult : Result.Result<TradeRecord, Text> } {
+    tacoAmount : Nat,
+    tacoMinOut : Nat,
+    tacoIdealOut : Nat,
+  ) : async* { kongResult : Result.Result<TradeRecord, Text>; icpResult : Result.Result<TradeRecord, Text>; tacoResult : Result.Result<TradeRecord, Text> } {
     let startTime = now();
 
     // Get symbols for KongSwap
@@ -9090,9 +9214,29 @@ shared (deployer) persistent actor class treasury() = this {
       };
     };
 
-    // NOW AWAIT BOTH RESULTS (they were running in parallel!)
+    // Launch TACO future in parallel (if amount > 0)
+    let tacoFutureExec : async Result.Result<swaptypes.TACOSwapReply, Text> = if (tacoAmount > 0) {
+      let sellTokenFee = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+        case (?d) { d.tokenTransferFee }; case null { 10000 };
+      };
+      let exchangeTreasuryPrincipal = Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai");
+      let exchangeTreasuryAccountId = Utils.principalToSubaccount(exchangeTreasuryPrincipal);
+      (with timeout = 65) TACOSwap.executeTransferAndSwapNoTracking({
+        tokenIn = sellToken;
+        tokenOut = buyToken;
+        amountIn = tacoAmount;
+        minAmountOut = tacoMinOut;
+        transferFee = sellTokenFee;
+        exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+      });
+    } else {
+      async { #err("TACO: zero amount") };
+    };
+
+    // NOW AWAIT ALL 3 RESULTS (they were running in parallel!)
     let kongRawResult = await kongFuture;
     let icpRawResult = await icpFuture;
+    let tacoRawResult = await tacoFutureExec;
 
     // Process KongSwap result
     let kongResult : Result.Result<TradeRecord, Text> = switch (kongRawResult) {
@@ -9135,7 +9279,28 @@ shared (deployer) persistent actor class treasury() = this {
       };
     };
 
-    { kongResult = kongResult; icpResult = icpResult };
+    // Process TACO result
+    let tacoResult : Result.Result<TradeRecord, Text> = switch (tacoRawResult) {
+      case (#ok(reply)) {
+        #ok({
+          tokenSold = sellToken;
+          tokenBought = buyToken;
+          amountSold = tacoAmount;
+          amountBought = reply.amountOut;
+          exchange = #TACO;
+          timestamp = startTime;
+          success = true;
+          error = null;
+          slippage = reply.slippage;
+        });
+      };
+      case (#err(e)) {
+        // TACO failed swaps can be recovered via recoverWronglysent
+        #err(e);
+      };
+    };
+
+    { kongResult = kongResult; icpResult = icpResult; tacoResult = tacoResult };
   };
 
   /**
@@ -9459,17 +9624,64 @@ shared (deployer) persistent actor class treasury() = this {
             };
           };
         };
+        case (#TACO) {
+          logger.info("TRADE_EXECUTION", "Executing TACO exchange swap", "executeTrade");
+
+          let sellTokenFee = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+            case (?d) { d.tokenFee }; case null { 10000 };
+          };
+
+          // Compute exchange treasury account ID for ICP legacy transfers
+          let exchangeTreasuryPrincipal = Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai");
+          let exchangeTreasuryAccountId = Utils.principalToSubaccount(exchangeTreasuryPrincipal);
+
+          let result = await* TACOSwap.executeTransferAndSwap({
+            tokenIn = sellToken;
+            tokenOut = buyToken;
+            amountIn = amountIn;
+            minAmountOut = minAmountOut;
+            transferFee = sellTokenFee;
+            exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+          });
+
+          switch (result) {
+            case (#ok(reply)) {
+              let effectiveSlippage = reply.slippage;
+              logger.info("TRADE_EXECUTION",
+                "TACO swap SUCCESS - In=" # Nat.toText(amountIn) # " Out=" # Nat.toText(reply.amountOut) #
+                " Slip=" # Float.toText(effectiveSlippage) # "%" #
+                " Route=" # debug_show(reply.route),
+                "executeTrade"
+              );
+              #ok({
+                tokenSold = sellToken;
+                tokenBought = buyToken;
+                amountSold = amountIn;
+                amountBought = reply.amountOut;
+                exchange = #TACO;
+                timestamp = now();
+                success = true;
+                error = null;
+                slippage = effectiveSlippage;
+              });
+            };
+            case (#err(e)) {
+              logger.error("TRADE_EXECUTION", "TACO swap FAILED: " # e, "executeTrade");
+              #err("TACO trade failed: " # e);
+            };
+          };
+        };
       };
     } catch (e) {
-      
+
       // VERBOSE LOGGING: Trade execution exception
-      logger.error("TRADE_EXECUTION", 
+      logger.error("TRADE_EXECUTION",
         "Trade execution EXCEPTION - Error=" # Error.message(e) #
         " Exchange=" # debug_show(exchange) #
         " Status=EXCEPTION",
         "executeTrade"
       );
-      
+
       #err("Trade execution error: " # Error.message(e));
     };
   };

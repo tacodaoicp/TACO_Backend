@@ -53,6 +53,9 @@ type create_trading_canister =
       ICRC12;
       ICRC3;
     }) -> (text);
+   addConcentratedLiquidity: (token0i: text, token1i: text, amount0i: 
+    nat, amount1i: nat, priceLower: nat, priceUpper: nat, block0i: nat,
+    block1i: nat) -> (text);
    addLiquidity: (token0i: text, token1i: text, amount0i: nat, amount1i: 
     nat, block0i: nat, block1i: nat) -> (text);
    addPosition: (Block: nat, amount_sell: nat, amount_init: nat,
@@ -89,6 +92,7 @@ type create_trading_canister =
                                    text;
                                    nat;
                                  });
+   claimLPFees: (token0i: text, token1i: text) -> (text);
    cleanTokenIds: () -> (text);
    collectFees: () -> (text);
    exchangeInfo: () -> (opt pool) query;
@@ -232,6 +236,15 @@ type create_trading_canister =
            token_init_identifier: text;
          };
       }) query;
+   getPoolRanges: (token0: text, token1: text) ->
+    (vec
+      record {
+        liquidity: nat;
+        ratioLower: nat;
+        ratioUpper: nat;
+        token0Locked: nat;
+        token1Locked: nat;
+      }) query;
    getPrivateTrade: (pass: text) -> (opt TradePosition) query;
    getTokenUSDPrices: (ICPpriceUSD: float64, ckUSDCpriceUSD: float64) ->
     (opt
@@ -248,6 +261,7 @@ type create_trading_canister =
           };
         error: bool;
       }) query;
+   getUserConcentratedPositions: () -> (vec ConcentratedPosition) query;
    getUserLiquidityDetailed: () -> (vec DetailedLiquidityPosition) query;
    getUserPreviousTrades: (token1: text, token2: text) ->
     (vec
@@ -306,6 +320,7 @@ type create_trading_canister =
    pauseToken: (token: text) -> ();
    recalibrateDAOpositions: (positions: vec PositionData) ->
     (vec RecalibratedPosition);
+   recoverBatch: (recoveries: vec RecoveryInput) -> (vec RecoveryResult);
    recoverWronglysent: (identifier: text, Block: nat, tType:
     variant {
       ICP;
@@ -313,6 +328,8 @@ type create_trading_canister =
       ICRC3;
     }) -> (bool);
    refundStuckFunds: () -> (text);
+   removeConcentratedLiquidity: (token0i: text, token1i: text, positionId:
+    nat, liquidityAmount: nat) -> (text);
    removeLiquidity: (token0i: text, token1i: text, liquidityAmount: nat) ->
     (text);
    retrieveFundsDao: (trades: vec record {
@@ -340,6 +357,8 @@ type create_trading_canister =
    setTest: (a: bool) -> ();
    swapMultiHop: (tokenIn: text, tokenOut: text, amountIn: nat, route:
     vec SwapHop, minAmountOut: nat, Block: nat) -> (text);
+   treasurySwap: (tokenIn: text, tokenOut: text, amountIn: nat, minAmountOut:
+    nat, block: nat) -> (text);
  };
 type TradePrivate2 = 
  record {
@@ -459,6 +478,23 @@ type SwapHop =
  record {
    tokenIn: text;
    tokenOut: text;
+ };
+type RecoveryResult = 
+ record {
+   block: nat;
+   error: text;
+   identifier: text;
+   success: bool;
+ };
+type RecoveryInput = 
+ record {
+   block: nat;
+   identifier: text;
+   tType: variant {
+            ICP;
+            ICRC12;
+            ICRC3;
+          };
  };
 type RecalibratedPosition = 
  record {
@@ -597,12 +633,26 @@ type ForeignPoolLiquidity =
  };
 type DetailedLiquidityPosition = 
  record {
+   fee0: nat;
+   fee1: nat;
    liquidity: nat;
    shareOfPool: float64;
    token0: text;
    token0Amount: nat;
    token1: text;
    token1Amount: nat;
+ };
+type ConcentratedPosition = 
+ record {
+   lastFeeGrowth0: nat;
+   lastFeeGrowth1: nat;
+   lastUpdateTime: int;
+   liquidity: nat;
+   positionId: nat;
+   ratioLower: nat;
+   ratioUpper: nat;
+   token0: text;
+   token1: text;
  };
 type BatchProcessResult = 
  record {

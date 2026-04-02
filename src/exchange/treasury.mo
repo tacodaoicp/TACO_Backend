@@ -65,7 +65,7 @@ shared (deployer) persistent actor class treasury() = this {
   transient let ICPprincipalText = "ryjl3-tyaaa-aaaaa-aaaba-cai";
   stable var acceptedTokens : [Text] = ["ryjl3-tyaaa-aaaaa-aaaba-cai", "kknbx-zyaaa-aaaaq-aae4a-cai"];
   stable let tokenInfo = Map.new<Text, { TransferFee : Nat; Decimals : Nat; Name : Text; Symbol : Text }>();
-  stable var canisterOTC = "qioex-5iaaa-aaaan-q52ba-cai"; // Set via setOTCCanister after deploy
+  stable var canisterOTC = "5kuny-yiaaa-aaaal-acgta-cai"; // Set via setOTCCanister after deploy
   stable var canisterOTCPrincipal = Principal.fromText(canisterOTC);
 
   public shared (msg) func setOTCCanister(id : Text) : async () {

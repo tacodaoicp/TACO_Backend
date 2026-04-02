@@ -63,9 +63,9 @@ shared (deployer) persistent actor class treasury() = this {
 
   stable let transferQueue = Vector.new<(TransferRecipient, Nat, Text)>();
   transient let ICPprincipalText = "ryjl3-tyaaa-aaaaa-aaaba-cai";
-  stable var acceptedTokens : [Text] = ["ryjl3-tyaaa-aaaaa-aaaba-cai", "zxeu2-7aaaa-aaaaq-aaafa-cai"];
+  stable var acceptedTokens : [Text] = ["ryjl3-tyaaa-aaaaa-aaaba-cai", "kknbx-zyaaa-aaaaq-aae4a-cai"];
   stable let tokenInfo = Map.new<Text, { TransferFee : Nat; Decimals : Nat; Name : Text; Symbol : Text }>();
-  stable var canisterOTC = "aaaaa-aa"; // Set via setOTCCanister after deploy
+  stable var canisterOTC = "qioex-5iaaa-aaaan-q52ba-cai"; // Set via setOTCCanister after deploy
   stable var canisterOTCPrincipal = Principal.fromText(canisterOTC);
 
   public shared (msg) func setOTCCanister(id : Text) : async () {
@@ -490,38 +490,23 @@ shared (deployer) persistent actor class treasury() = this {
             var decimals2 = 0;
             var name2 = "";
             var symbol2 = "";
-            var fee1 = get[3].1;
-            var decimals1 = get[0].1;
-            var name1 = get[1].1;
-            var symbol1 = get[2].1;
 
             for (i in Array.vals(get)) {
               switch (i.0) {
-                case "icrc1:fee" { fee1 := i.1 };
-                case "icrc1:name" { name1 := i.1 };
-                case "icrc1:symbol" { symbol1 := i.1 };
-                case "icrc1:decimals" { decimals1 := i.1 };
+                case "icrc1:fee" {
+                  switch (i.1) { case (#Nat(ok)) { fee2 := ok }; case (#Int(ok)) { fee2 := Int.abs(ok) }; case _ {} };
+                };
+                case "icrc1:name" {
+                  switch (i.1) { case (#Text(ok)) { name2 := ok }; case _ {} };
+                };
+                case "icrc1:symbol" {
+                  switch (i.1) { case (#Text(ok)) { symbol2 := ok }; case _ {} };
+                };
+                case "icrc1:decimals" {
+                  switch (i.1) { case (#Nat(ok)) { decimals2 := ok }; case (#Int(ok)) { decimals2 := Int.abs(ok) }; case _ {} };
+                };
                 case _ {};
               };
-            };
-
-            switch (fee1) {
-              case (#Nat(ok)) { fee2 := ok };
-              case (#Int(ok)) { fee2 := Int.abs(ok) };
-              case _ {};
-            };
-            switch (decimals1) {
-              case (#Nat(ok)) { decimals2 := ok };
-              case (#Int(ok)) { decimals2 := Int.abs(ok) };
-              case _ {};
-            };
-            switch (name1) {
-              case (#Text(ok)) { name2 := ok };
-              case _ {};
-            };
-            switch (symbol1) {
-              case (#Text(ok)) { symbol2 := ok };
-              case _ {};
             };
 
             let data2 = {
@@ -572,7 +557,7 @@ shared (deployer) persistent actor class treasury() = this {
       #setTest : () -> (a : Bool);
     };
   }) : Bool {
-    false
+    (caller == deployer.caller or caller == canisterOTCPrincipal or canisterOTC == "aaaaa-aa");
   };
 
 };

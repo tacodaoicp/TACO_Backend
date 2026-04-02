@@ -192,7 +192,20 @@ export const idlFactory = ({ IDL }) => {
     'token_sell_identifier' : IDL.Text,
     'filledSell' : IDL.Nat,
   });
+  const ConcentratedPosition = IDL.Record({
+    'ratioUpper' : IDL.Nat,
+    'lastFeeGrowth0' : IDL.Nat,
+    'lastFeeGrowth1' : IDL.Nat,
+    'liquidity' : IDL.Nat,
+    'positionId' : IDL.Nat,
+    'lastUpdateTime' : IDL.Int,
+    'token0' : IDL.Text,
+    'token1' : IDL.Text,
+    'ratioLower' : IDL.Nat,
+  });
   const DetailedLiquidityPosition = IDL.Record({
+    'fee0' : IDL.Nat,
+    'fee1' : IDL.Nat,
     'liquidity' : IDL.Nat,
     'shareOfPool' : IDL.Float64,
     'token0' : IDL.Text,
@@ -252,6 +265,21 @@ export const idlFactory = ({ IDL }) => {
     'revokeFee' : IDL.Nat,
     'poolId' : IDL.Tuple(IDL.Text, IDL.Text),
   });
+  const RecoveryInput = IDL.Record({
+    'tType' : IDL.Variant({
+      'ICP' : IDL.Null,
+      'ICRC3' : IDL.Null,
+      'ICRC12' : IDL.Null,
+    }),
+    'block' : IDL.Nat,
+    'identifier' : IDL.Text,
+  });
+  const RecoveryResult = IDL.Record({
+    'error' : IDL.Text,
+    'block' : IDL.Nat,
+    'success' : IDL.Bool,
+    'identifier' : IDL.Text,
+  });
   const create_trading_canister = IDL.Service({
     'ChangeReferralFees' : IDL.Func([IDL.Nat], [], []),
     'ChangeRevokefees' : IDL.Func([IDL.Nat], [], ['oneway']),
@@ -283,6 +311,20 @@ export const idlFactory = ({ IDL }) => {
             'ICRC3' : IDL.Null,
             'ICRC12' : IDL.Null,
           }),
+        ],
+        [IDL.Text],
+        [],
+      ),
+    'addConcentratedLiquidity' : IDL.Func(
+        [
+          IDL.Text,
+          IDL.Text,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
         ],
         [IDL.Text],
         [],
@@ -343,6 +385,7 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat))],
         [],
       ),
+    'claimLPFees' : IDL.Func([IDL.Text, IDL.Text], [IDL.Text], []),
     'cleanTokenIds' : IDL.Func([], [IDL.Text], []),
     'collectFees' : IDL.Func([], [IDL.Text], []),
     'exchangeInfo' : IDL.Func([], [IDL.Opt(pool)], ['query']),
@@ -537,6 +580,21 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getPoolRanges' : IDL.Func(
+        [IDL.Text, IDL.Text],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'ratioUpper' : IDL.Nat,
+              'token0Locked' : IDL.Nat,
+              'liquidity' : IDL.Nat,
+              'token1Locked' : IDL.Nat,
+              'ratioLower' : IDL.Nat,
+            })
+          ),
+        ],
+        ['query'],
+      ),
     'getPrivateTrade' : IDL.Func(
         [IDL.Text],
         [IDL.Opt(TradePosition)],
@@ -561,6 +619,11 @@ export const idlFactory = ({ IDL }) => {
             })
           ),
         ],
+        ['query'],
+      ),
+    'getUserConcentratedPositions' : IDL.Func(
+        [],
+        [IDL.Vec(ConcentratedPosition)],
         ['query'],
       ),
     'getUserLiquidityDetailed' : IDL.Func(
@@ -651,6 +714,11 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(RecalibratedPosition)],
         [],
       ),
+    'recoverBatch' : IDL.Func(
+        [IDL.Vec(RecoveryInput)],
+        [IDL.Vec(RecoveryResult)],
+        [],
+      ),
     'recoverWronglysent' : IDL.Func(
         [
           IDL.Text,
@@ -665,6 +733,11 @@ export const idlFactory = ({ IDL }) => {
         [],
       ),
     'refundStuckFunds' : IDL.Func([], [IDL.Text], []),
+    'removeConcentratedLiquidity' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat],
+        [IDL.Text],
+        [],
+      ),
     'removeLiquidity' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [IDL.Text], []),
     'retrieveFundsDao' : IDL.Func(
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat64))],
@@ -704,6 +777,11 @@ export const idlFactory = ({ IDL }) => {
     'setTest' : IDL.Func([IDL.Bool], [], []),
     'swapMultiHop' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Vec(SwapHop), IDL.Nat, IDL.Nat],
+        [IDL.Text],
+        [],
+      ),
+    'treasurySwap' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat, IDL.Nat],
         [IDL.Text],
         [],
       ),

@@ -513,4 +513,23 @@ module {
 
   public type ClaimsResult = { #Ok : [ClaimsReply]; #Err : Text };
   public type ClaimResult = { #Ok : ClaimReply; #Err : Text };
+
+  // ═══ TACO Exchange Types ═══
+
+  public type TACOSwapParams = {
+    tokenIn : Principal;
+    tokenOut : Principal;
+    amountIn : Nat;
+    minAmountOut : Nat;
+    transferFee : Nat;
+    exchangeTreasuryAccountId : Blob; // 32-byte account ID for ICP legacy transfers
+  };
+
+  public type TACOSwapReply = {
+    amountIn : Nat;
+    amountOut : Nat;
+    slippage : Float;
+    route : [Text];
+    blockNumber : Nat;
+  };
 };

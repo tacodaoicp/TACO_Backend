@@ -16,7 +16,20 @@ export interface BatchProcessResult {
   'execMessage' : string,
   'processedTrades' : Array<ProcessedTrade>,
 }
+export interface ConcentratedPosition {
+  'ratioUpper' : bigint,
+  'lastFeeGrowth0' : bigint,
+  'lastFeeGrowth1' : bigint,
+  'liquidity' : bigint,
+  'positionId' : bigint,
+  'lastUpdateTime' : bigint,
+  'token0' : string,
+  'token1' : string,
+  'ratioLower' : bigint,
+}
 export interface DetailedLiquidityPosition {
+  'fee0' : bigint,
+  'fee1' : bigint,
   'liquidity' : bigint,
   'shareOfPool' : number,
   'token0' : string,
@@ -129,6 +142,19 @@ export interface RecalibratedPosition {
   'amountSell' : bigint,
   'revokeFee' : bigint,
   'poolId' : [string, string],
+}
+export interface RecoveryInput {
+  'tType' : { 'ICP' : null } |
+    { 'ICRC3' : null } |
+    { 'ICRC12' : null },
+  'block' : bigint,
+  'identifier' : string,
+}
+export interface RecoveryResult {
+  'error' : string,
+  'block' : bigint,
+  'success' : boolean,
+  'identifier' : string,
 }
 export interface SwapHop { 'tokenIn' : string, 'tokenOut' : string }
 export interface SwapRecord {
@@ -260,6 +286,10 @@ export interface create_trading_canister {
     ],
     string
   >,
+  'addConcentratedLiquidity' : ActorMethod<
+    [string, string, bigint, bigint, bigint, bigint, bigint, bigint],
+    string
+  >,
   'addLiquidity' : ActorMethod<
     [string, string, bigint, bigint, bigint, bigint],
     string
@@ -303,6 +333,7 @@ export interface create_trading_canister {
   >,
   'checkFeesReferrer' : ActorMethod<[], Array<[string, bigint]>>,
   'claimFeesReferrer' : ActorMethod<[], Array<[string, bigint]>>,
+  'claimLPFees' : ActorMethod<[string, string], string>,
   'cleanTokenIds' : ActorMethod<[], string>,
   'collectFees' : ActorMethod<[], string>,
   'exchangeInfo' : ActorMethod<[], [] | [pool]>,
@@ -462,6 +493,18 @@ export interface create_trading_canister {
       ]
     >
   >,
+  'getPoolRanges' : ActorMethod<
+    [string, string],
+    Array<
+      {
+        'ratioUpper' : bigint,
+        'token0Locked' : bigint,
+        'liquidity' : bigint,
+        'token1Locked' : bigint,
+        'ratioLower' : bigint,
+      }
+    >
+  >,
   'getPrivateTrade' : ActorMethod<[string], [] | [TradePosition]>,
   'getTokenUSDPrices' : ActorMethod<
     [number, number],
@@ -481,6 +524,7 @@ export interface create_trading_canister {
       }
     ]
   >,
+  'getUserConcentratedPositions' : ActorMethod<[], Array<ConcentratedPosition>>,
   'getUserLiquidityDetailed' : ActorMethod<
     [],
     Array<DetailedLiquidityPosition>
@@ -553,6 +597,7 @@ export interface create_trading_canister {
     [Array<PositionData>],
     Array<RecalibratedPosition>
   >,
+  'recoverBatch' : ActorMethod<[Array<RecoveryInput>], Array<RecoveryResult>>,
   'recoverWronglysent' : ActorMethod<
     [
       string,
@@ -564,6 +609,10 @@ export interface create_trading_canister {
     boolean
   >,
   'refundStuckFunds' : ActorMethod<[], string>,
+  'removeConcentratedLiquidity' : ActorMethod<
+    [string, string, bigint, bigint],
+    string
+  >,
   'removeLiquidity' : ActorMethod<[string, string, bigint], string>,
   'retrieveFundsDao' : ActorMethod<[Array<[string, bigint]>], undefined>,
   'returncontractprincipal' : ActorMethod<[], string>,
@@ -593,6 +642,10 @@ export interface create_trading_canister {
   'setTest' : ActorMethod<[boolean], undefined>,
   'swapMultiHop' : ActorMethod<
     [string, string, bigint, Array<SwapHop>, bigint, bigint],
+    string
+  >,
+  'treasurySwap' : ActorMethod<
+    [string, string, bigint, bigint, bigint],
     string
   >,
 }

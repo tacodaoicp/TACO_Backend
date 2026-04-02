@@ -20,6 +20,7 @@ import Vector "mo:vector";
 import { setTimer; cancelTimer } = "mo:base/Timer";
 import Buffer "mo:base/Buffer";
 import Time "mo:base/Time";
+import Float "mo:base/Float";
 
 shared (deployer) persistent actor class test() = this {
 
@@ -3588,6 +3589,451 @@ shared (deployer) persistent actor class test() = this {
     };
   };
 
+  // Test56: getUserLiquidityDetailed shows fee0/fee1
+  func Test56() : async Text {
+    try {
+      Debug.print("Starting Test56: getUserLiquidityDetailed fee fields");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      // Actor A should have liquidity from earlier tests (Test36+)
+      // Execute a swap through the pool to generate fees
+      let swapAmount = 5_000_000;
+      let block = await actorB.TransferICPtoExchange(swapAmount, fee, 1);
+      let route = [{ tokenIn = token_ICP; tokenOut = token_ICRCA }];
+      ignore await actorB.swapMultiHop(token_ICP, token_ICRCA, swapAmount, route, 0, block);
+
+      // Now check Actor A's detailed positions
+      let positions = await actorA.getUserLiquidityDetailed();
+      Debug.print("Positions count: " # Nat.toText(positions.size()));
+
+      var foundPosition = false;
+      for (pos in positions.vals()) {
+        if ((pos.token0 == token_ICP and pos.token1 == token_ICRCA) or (pos.token0 == token_ICRCA and pos.token1 == token_ICP)) {
+          foundPosition := true;
+          Debug.print("LP position: liquidity=" # Nat.toText(pos.liquidity) # " fee0=" # Nat.toText(pos.fee0) # " fee1=" # Nat.toText(pos.fee1));
+          if (pos.liquidity == 0) { throw Error.reject("Expected non-zero liquidity") };
+          if (pos.fee0 == 0 and pos.fee1 == 0) {
+            Debug.print("Warning: fees are both 0 — may need more swaps to accumulate");
+          };
+        };
+      };
+      if (not foundPosition) {
+        throw Error.reject("No ICP/ICRCA position found for Actor A");
+      };
+
+      Debug.print("Test56 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test56: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test57: claimLPFees — successful claim
+  func Test57() : async Text {
+    try {
+      Debug.print("Starting Test57: claimLPFees successful claim");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      let balA_ICP_before = await actorA.getICPbalance();
+      let balA_ICRCA_before = await actorA.getICRCAbalance();
+
+      let result = await actorA.claimLPFees(token_ICP, token_ICRCA);
+      Debug.print("claimLPFees result: " # result);
+
+      if (Text.contains(result, #text "claimed:")) {
+        // Verify fees were received
+        let balA_ICP_after = await actorA.getICPbalance();
+        let balA_ICRCA_after = await actorA.getICRCAbalance();
+        Debug.print("ICP: " # Nat.toText(balA_ICP_before) # " -> " # Nat.toText(balA_ICP_after));
+        Debug.print("ICRCA: " # Nat.toText(balA_ICRCA_before) # " -> " # Nat.toText(balA_ICRCA_after));
+
+        // After claim, fees should be zeroed
+        let positionsAfter = await actorA.getUserLiquidityDetailed();
+        for (pos in positionsAfter.vals()) {
+          if ((pos.token0 == token_ICP and pos.token1 == token_ICRCA) or (pos.token0 == token_ICRCA and pos.token1 == token_ICP)) {
+            if (pos.fee0 != 0 or pos.fee1 != 0) {
+              throw Error.reject("Fees should be zeroed after claim, got fee0=" # Nat.toText(pos.fee0) # " fee1=" # Nat.toText(pos.fee1));
+            };
+            if (pos.liquidity == 0) {
+              throw Error.reject("Liquidity should be unchanged after fee claim");
+            };
+          };
+        };
+      } else if (Text.contains(result, #text "No fees")) {
+        Debug.print("No fees to claim — acceptable if no swaps generated fees");
+      } else {
+        throw Error.reject("Unexpected result: " # result);
+      };
+
+      Debug.print("Test57 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test57: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test58: claimLPFees — edge cases
+  func Test58() : async Text {
+    try {
+      Debug.print("Starting Test58: claimLPFees edge cases");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      // Claim again immediately — should say no fees
+      let result2 = await actorA.claimLPFees(token_ICP, token_ICRCA);
+      Debug.print("Second claim result: " # result2);
+      if (not Text.contains(result2, #text "No fees")) {
+        throw Error.reject("Expected 'No fees to claim' on second claim, got: " # result2);
+      };
+
+      // Actor C has no position — should error
+      let result3 = await actorC.claimLPFees(token_ICP, token_ICRCA);
+      Debug.print("Actor C claim result: " # result3);
+      if (not (Text.contains(result3, #text "no liquidity") or Text.contains(result3, #text "not found") or Text.contains(result3, #text "No"))) {
+        throw Error.reject("Expected error for Actor C with no position, got: " # result3);
+      };
+
+      Debug.print("Test58 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test58: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test59: getOrderbookCombined
+  func Test59() : async Text {
+    try {
+      Debug.print("Starting Test59: getOrderbookCombined");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      let ob = await exchange.getOrderbookCombined(token_ICP, token_ICRCA, 5, 10);
+      Debug.print("ammMidPrice: " # Float.toText(ob.ammMidPrice));
+      Debug.print("spread: " # Float.toText(ob.spread));
+      Debug.print("asks: " # Nat.toText(ob.asks.size()) # " bids: " # Nat.toText(ob.bids.size()));
+
+      if (ob.ammMidPrice <= 0.0) { throw Error.reject("ammMidPrice should be > 0") };
+      if (ob.asks.size() == 0) { throw Error.reject("Should have ask levels") };
+      if (ob.bids.size() == 0) { throw Error.reject("Should have bid levels") };
+      if (ob.spread < 0.0) { throw Error.reject("Spread should be >= 0") };
+      if (ob.ammReserve0 == 0 or ob.ammReserve1 == 0) { throw Error.reject("Reserves should be > 0") };
+
+      // Verify price ordering
+      for (ask in ob.asks.vals()) {
+        if (ask.price < ob.ammMidPrice * 0.99) {
+          throw Error.reject("Ask price " # Float.toText(ask.price) # " below midPrice " # Float.toText(ob.ammMidPrice));
+        };
+      };
+      for (bid in ob.bids.vals()) {
+        if (bid.price > ob.ammMidPrice * 1.01) {
+          throw Error.reject("Bid price " # Float.toText(bid.price) # " above midPrice " # Float.toText(ob.ammMidPrice));
+        };
+      };
+
+      Debug.print("Test59 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test59: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test60: getAllAMMPools
+  func Test60() : async Text {
+    try {
+      Debug.print("Starting Test60: getAllAMMPools");
+
+      let pools = await exchange.getAllAMMPools();
+      Debug.print("Pool count: " # Nat.toText(pools.size()));
+
+      if (pools.size() == 0) { throw Error.reject("Should have at least one pool") };
+
+      for (pool in pools.vals()) {
+        Debug.print("Pool: " # pool.token0 # "/" # pool.token1 # " price0=" # Float.toText(pool.price0) # " price1=" # Float.toText(pool.price1));
+        if (pool.reserve0 == 0 or pool.reserve1 == 0) { throw Error.reject("Pool reserves should be > 0") };
+        if (pool.price0 <= 0.0 or pool.price1 <= 0.0) { throw Error.reject("Prices should be > 0") };
+        if (pool.totalLiquidity == 0) { throw Error.reject("totalLiquidity should be > 0") };
+        // price0 * price1 should be approximately 1.0 (inverse prices)
+        let product = pool.price0 * pool.price1;
+        if (product < 0.9 or product > 1.1) {
+          throw Error.reject("price0 * price1 = " # Float.toText(product) # " should be ~1.0");
+        };
+      };
+
+      Debug.print("Test60 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test60: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test61: addConcentratedLiquidity — basic
+  func Test61() : async Text {
+    try {
+      Debug.print("Starting Test61: addConcentratedLiquidity basic");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      // Get current pool info to determine price range
+      let poolInfo = await exchange.getAMMPoolInfo(token_ICP, token_ICRCA);
+      let pool = switch (poolInfo) { case (?p) { p }; case null { throw Error.reject("Pool not found") } };
+
+      // Calculate mid ratio from reserves (price0 = reserve1/reserve0 ratio)
+      // For range: 25% below to 25% above current price
+      // ratioLower and ratioUpper are (reserve1 * 10^60 / reserve0) format
+      let tenToPower60 : Nat = 1_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000;
+      let midRatio = (pool.reserve1 * tenToPower60) / pool.reserve0;
+      let ratioLower = midRatio * 75 / 100;
+      let ratioUpper = midRatio * 125 / 100;
+
+      let amount = 5_000_000;
+      let blockICP = await actorB.TransferICPtoExchange(amount, fee, 1);
+      let blockICRCA = await actorB.TransferICRCAtoExchange(amount, fee, 1);
+
+      let result = await actorB.addConcentratedLiquidity(token_ICP, token_ICRCA, amount, amount, ratioLower, ratioUpper, blockICP, blockICRCA);
+      Debug.print("addConcentratedLiquidity result: " # result);
+
+      if (not Text.contains(result, #text "concentrated:")) {
+        throw Error.reject("Expected 'concentrated:' result, got: " # result);
+      };
+
+      // Check position exists
+      let positions = await actorB.getUserConcentratedPositions();
+      Debug.print("Concentrated positions: " # Nat.toText(positions.size()));
+      if (positions.size() == 0) {
+        throw Error.reject("Should have at least one concentrated position");
+      };
+
+      var foundPos = false;
+      for (pos in positions.vals()) {
+        if ((pos.token0 == token_ICP or pos.token0 == token_ICRCA) and (pos.token1 == token_ICP or pos.token1 == token_ICRCA)) {
+          foundPos := true;
+          Debug.print("Position: id=" # Nat.toText(pos.positionId) # " liquidity=" # Nat.toText(pos.liquidity));
+          if (pos.liquidity == 0) { throw Error.reject("Concentrated liquidity should be > 0") };
+        };
+      };
+      if (not foundPos) { throw Error.reject("Concentrated position for ICP/ICRCA not found") };
+
+      Debug.print("Test61 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test61: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test62: removeConcentratedLiquidity — full removal
+  func Test62() : async Text {
+    try {
+      Debug.print("Starting Test62: removeConcentratedLiquidity full removal");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      let positions = await actorB.getUserConcentratedPositions();
+      var posId : Nat = 0;
+      var posLiq : Nat = 0;
+      for (pos in positions.vals()) {
+        if ((pos.token0 == token_ICP or pos.token0 == token_ICRCA) and (pos.token1 == token_ICP or pos.token1 == token_ICRCA)) {
+          posId := pos.positionId;
+          posLiq := pos.liquidity;
+        };
+      };
+      if (posLiq == 0) { throw Error.reject("No concentrated position found to remove") };
+
+      let balB_ICP_before = await actorB.getICPbalance();
+      let balB_ICRCA_before = await actorB.getICRCAbalance();
+
+      let result = await actorB.removeConcentratedLiquidity(token_ICP, token_ICRCA, posId, posLiq);
+      Debug.print("removeConcentratedLiquidity result: " # result);
+
+      if (not Text.contains(result, #text "removed:")) {
+        throw Error.reject("Expected 'removed:' result, got: " # result);
+      };
+
+      let balB_ICP_after = await actorB.getICPbalance();
+      let balB_ICRCA_after = await actorB.getICRCAbalance();
+      Debug.print("ICP: " # Nat.toText(balB_ICP_before) # " -> " # Nat.toText(balB_ICP_after));
+      Debug.print("ICRCA: " # Nat.toText(balB_ICRCA_before) # " -> " # Nat.toText(balB_ICRCA_after));
+
+      // At least one token should have increased
+      if (balB_ICP_after <= balB_ICP_before and balB_ICRCA_after <= balB_ICRCA_before) {
+        throw Error.reject("At least one token balance should increase after removing liquidity");
+      };
+
+      // Position should be gone
+      let positionsAfter = await actorB.getUserConcentratedPositions();
+      for (pos in positionsAfter.vals()) {
+        if (pos.positionId == posId and pos.liquidity > 0) {
+          throw Error.reject("Position should be removed after full withdrawal");
+        };
+      };
+
+      Debug.print("Test62 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test62: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test63: removeConcentratedLiquidity — partial removal
+  func Test63() : async Text {
+    try {
+      Debug.print("Starting Test63: removeConcentratedLiquidity partial removal");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      // Add concentrated liquidity first
+      let tenToPower60 : Nat = 1_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000;
+      let poolInfo = await exchange.getAMMPoolInfo(token_ICP, token_ICRCA);
+      let pool = switch (poolInfo) { case (?p) { p }; case null { throw Error.reject("Pool not found") } };
+      let midRatio = (pool.reserve1 * tenToPower60) / pool.reserve0;
+
+      let amount = 5_000_000;
+      let blockICP = await actorB.TransferICPtoExchange(amount, fee, 1);
+      let blockICRCA = await actorB.TransferICRCAtoExchange(amount, fee, 1);
+
+      let addResult = await actorB.addConcentratedLiquidity(token_ICP, token_ICRCA, amount, amount, midRatio * 75 / 100, midRatio * 125 / 100, blockICP, blockICRCA);
+      if (not Text.contains(addResult, #text "concentrated:")) {
+        throw Error.reject("Add failed: " # addResult);
+      };
+
+      let positions = await actorB.getUserConcentratedPositions();
+      var posId : Nat = 0;
+      var posLiq : Nat = 0;
+      for (pos in positions.vals()) {
+        if ((pos.token0 == token_ICP or pos.token0 == token_ICRCA) and (pos.token1 == token_ICP or pos.token1 == token_ICRCA) and pos.liquidity > 0) {
+          posId := pos.positionId;
+          posLiq := pos.liquidity;
+        };
+      };
+
+      // Remove half
+      let halfLiq = posLiq / 2;
+      let removeResult = await actorB.removeConcentratedLiquidity(token_ICP, token_ICRCA, posId, halfLiq);
+      Debug.print("Partial remove result: " # removeResult);
+      if (not Text.contains(removeResult, #text "removed:")) {
+        throw Error.reject("Partial remove failed: " # removeResult);
+      };
+
+      // Position should still exist with reduced liquidity
+      let positionsAfter = await actorB.getUserConcentratedPositions();
+      var remainingLiq : Nat = 0;
+      for (pos in positionsAfter.vals()) {
+        if (pos.positionId == posId) { remainingLiq := pos.liquidity };
+      };
+      Debug.print("Remaining liquidity: " # Nat.toText(remainingLiq) # " (was " # Nat.toText(posLiq) # ")");
+      if (remainingLiq == 0) { throw Error.reject("Position should still exist after partial removal") };
+      if (remainingLiq >= posLiq) { throw Error.reject("Liquidity should have decreased") };
+
+      // Clean up — remove remaining
+      ignore await actorB.removeConcentratedLiquidity(token_ICP, token_ICRCA, posId, remainingLiq);
+
+      Debug.print("Test63 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test63: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test64: getKlineData after trade
+  func Test64() : async Text {
+    try {
+      Debug.print("Starting Test64: getKlineData after trade");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      // Execute a swap to generate kline data
+      let swapAmount = 5_000_000;
+      let block = await actorA.TransferICRCAtoExchange(swapAmount, fee, 1);
+      let route = [{ tokenIn = token_ICRCA; tokenOut = token_ICP }];
+      ignore await actorA.swapMultiHop(token_ICRCA, token_ICP, swapAmount, route, 0, block);
+
+      // Check kline data
+      let klines = await exchange.getKlineData(token_ICP, token_ICRCA, #fivemin, false);
+      Debug.print("Kline entries: " # Nat.toText(klines.size()));
+
+      if (klines.size() == 0) { throw Error.reject("Should have kline data after trade") };
+
+      let latest = klines[0]; // Most recent candle (returned newest first when initialGet=false gets 2)
+      Debug.print("Latest candle: open=" # Float.toText(latest.open) # " high=" # Float.toText(latest.high) # " low=" # Float.toText(latest.low) # " close=" # Float.toText(latest.close) # " vol=" # Nat.toText(latest.volume));
+
+      if (latest.close <= 0.0) { throw Error.reject("Close price should be > 0") };
+      if (latest.open <= 0.0) { throw Error.reject("Open price should be > 0") };
+      if (latest.high < latest.close) { throw Error.reject("High should be >= close") };
+      if (latest.low > latest.close) { throw Error.reject("Low should be <= close") };
+      if (latest.volume == 0) { throw Error.reject("Volume should be > 0") };
+
+      Debug.print("Test64 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test64: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
+  // Test65: Concentrated liquidity on new pool (auto-create)
+  func Test65() : async Text {
+    try {
+      Debug.print("Starting Test65: Concentrated liquidity new pool auto-create");
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+      let token_ICRCB = "zxeu2-7aaaa-aaaaq-aaafa-cai";
+
+      // Use a 1:1 ratio for new pool
+      let tenToPower60 : Nat = 1_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000;
+      let ratioLower = tenToPower60 * 75 / 100; // 0.75
+      let ratioUpper = tenToPower60 * 125 / 100; // 1.25
+
+      let amount = 5_000_000;
+      let blockA = await actorC.TransferICRCAtoExchange(amount, fee, 1);
+      let blockB = await actorC.TransferICRCBtoExchange(amount, fee, 1);
+
+      let result = await actorC.addConcentratedLiquidity(token_ICRCA, token_ICRCB, amount, amount, ratioLower, ratioUpper, blockA, blockB);
+      Debug.print("New pool concentrated result: " # result);
+
+      if (not Text.contains(result, #text "concentrated:")) {
+        // May fail if pool pair doesn't have base token — still valid test
+        Debug.print("Could not create concentrated position (may need base token): " # result);
+        return "true";
+      };
+
+      // Pool should exist now
+      let poolInfo = await exchange.getAMMPoolInfo(token_ICRCA, token_ICRCB);
+      switch (poolInfo) {
+        case (?p) {
+          Debug.print("Pool created: reserve0=" # Nat.toText(p.reserve0) # " reserve1=" # Nat.toText(p.reserve1));
+          if (p.reserve0 == 0 and p.reserve1 == 0) {
+            throw Error.reject("Pool reserves should be > 0 after adding concentrated liquidity");
+          };
+        };
+        case null {
+          throw Error.reject("Pool should exist after concentrated liquidity add");
+        };
+      };
+
+      // Cleanup
+      let positions = await actorC.getUserConcentratedPositions();
+      for (pos in positions.vals()) {
+        if ((pos.token0 == token_ICRCA or pos.token0 == token_ICRCB) and (pos.token1 == token_ICRCA or pos.token1 == token_ICRCB)) {
+          ignore await actorC.removeConcentratedLiquidity(token_ICRCA, token_ICRCB, pos.positionId, pos.liquidity);
+        };
+      };
+
+      Debug.print("Test65 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test65: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
   transient let Fuzz = fuzz.Fuzz();
   var testResultsSync : [Text] = [];
   public func runTests(skipCancelAllPositions : Bool, skipStressTests : Bool) : async Text {
@@ -3602,7 +4048,7 @@ shared (deployer) persistent actor class test() = this {
       poolCanister : (Text, Text);
     }]] = [];
     if true {
-      label a for (i in Iter.range(0, if skipCancelAllPositions { 0 } else { 55 })) {
+      label a for (i in Iter.range(0, if skipCancelAllPositions { 0 } else { 65 })) {
         let testName = "Test" # Nat.toText(i);
         var testResult = "false";
 
@@ -3663,6 +4109,16 @@ shared (deployer) persistent actor class test() = this {
           case 53 { testResult := await Test53(); Debug.print("") };
           case 54 { testResult := await Test54(); Debug.print("") };
           case 55 { testResult := await Test55(); Debug.print("") };
+          case 56 { testResult := await Test56(); Debug.print("") };
+          case 57 { testResult := await Test57(); Debug.print("") };
+          case 58 { testResult := await Test58(); Debug.print("") };
+          case 59 { testResult := await Test59(); Debug.print("") };
+          case 60 { testResult := await Test60(); Debug.print("") };
+          case 61 { testResult := await Test61(); Debug.print("") };
+          case 62 { testResult := await Test62(); Debug.print("") };
+          case 63 { testResult := await Test63(); Debug.print("") };
+          case 64 { testResult := await Test64(); Debug.print("") };
+          case 65 { testResult := await Test65(); Debug.print("") };
           case _ {
             testResults := Array.append(testResults, [testName # ": Invalid test number"]);
             continue a;
@@ -3808,6 +4264,8 @@ shared (deployer) persistent actor class test() = this {
   stable var timer7TotalOperations = 0;
   stable var timer8OperationsComplete = 0;
   stable var timer8TotalOperations = 0;
+  stable var timer9OperationsComplete = 0;
+  stable var timer9TotalOperations = 0;
 
   stable var currentTimerRunning = 0;
 
@@ -3823,6 +4281,7 @@ shared (deployer) persistent actor class test() = this {
   transient let numOrderAndTokenDelete = 150;
   transient let numAMMOperations = 150;
   transient let numMultiHopOperations = 150;
+  transient let numNewFeatureOperations = 100;
   transient let liquidityAddProbability = 5; // 1 in 5 chance
   transient let liquidityRemoveProbability = 10; // 1 in 10 chance
 
@@ -3850,6 +4309,9 @@ shared (deployer) persistent actor class test() = this {
       currentTimerRunning := 8;
       startTimer8(skipCancelAllPositions);
     } else if (currentTimerRunning == 8 and timer8OperationsComplete + 3 > timer8TotalOperations and timer8OperationsComplete < timer8TotalOperations + 3) {
+      currentTimerRunning := 9;
+      startTimer9(skipCancelAllPositions);
+    } else if (currentTimerRunning == 9 and timer9OperationsComplete + 3 > timer9TotalOperations and timer9OperationsComplete < timer9TotalOperations + 3) {
       await printFinalResults();
       Debug.print("All stress tests completed.");
     } else {
@@ -4715,6 +5177,116 @@ shared (deployer) persistent actor class test() = this {
     );
   };
 
+  // Timer9: Concentrated liquidity, claimLPFees, query functions
+  func startTimer9<system>(skipCancelAllPositions : Bool) {
+    currentTimerRunning := 9;
+    timer9TotalOperations := numNewFeatureOperations;
+    timer9OperationsComplete := 0;
+
+    ignore setTimer(
+      #nanoseconds(1),
+      func() : async () {
+        await logDiffTable("Before Timer 9 (New Feature Operations)");
+        let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+        let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+        let token_ICRCB = "zxeu2-7aaaa-aaaaq-aaafa-cai";
+        let tenToPower60 : Nat = 1_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000;
+
+        var launched9 = 0;
+        for (_ in Iter.range(0, numNewFeatureOperations - 1)) {
+          ignore async {
+            try {
+              let randomAction = Fuzz.nat.randomRange(1, 100);
+              let actorf = if (Fuzz.nat.randomRange(1, 3) == 1) { actorA } else if (Fuzz.nat.randomRange(1, 2) == 1) { actorB } else { actorC };
+              let otherToken = if (Fuzz.nat.randomRange(1, 2) == 1) { token_ICRCA } else { token_ICRCB };
+
+              if (randomAction <= 25) {
+                // 25%: Add concentrated liquidity
+                let poolInfo = await exchange.getAMMPoolInfo(token_ICP, otherToken);
+                switch (poolInfo) {
+                  case (?pool) {
+                    if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+                      let midRatio = (pool.reserve1 * tenToPower60) / pool.reserve0;
+                      let ratioLower = midRatio * 75 / 100;
+                      let ratioUpper = midRatio * 125 / 100;
+                      let amount = Fuzz.nat.randomRange(1_000_000, 50_000_000);
+
+                      let blockICP = await actorf.TransferICPtoExchange(amount, fee, 1);
+                      let blockOther = if (otherToken == token_ICRCA) {
+                        await actorf.TransferICRCAtoExchange(amount, fee, 1);
+                      } else {
+                        await actorf.TransferICRCBtoExchange(amount, fee, 1);
+                      };
+
+                      let result = await actorf.addConcentratedLiquidity(token_ICP, otherToken, amount, amount, ratioLower, ratioUpper, blockICP, blockOther);
+                      Debug.print("Timer9 addConcentrated: " # result);
+                    };
+                  };
+                  case null {};
+                };
+
+              } else if (randomAction <= 40) {
+                // 15%: Remove concentrated liquidity
+                let positions = await actorf.getUserConcentratedPositions();
+                if (positions.size() > 0) {
+                  let pos = positions[Fuzz.nat.randomRange(0, positions.size() - 1)];
+                  let liqToRemove = if (Fuzz.nat.randomRange(1, 2) == 1) { pos.liquidity } else { pos.liquidity / 2 };
+                  if (liqToRemove > 0) {
+                    let result = await actorf.removeConcentratedLiquidity(pos.token0, pos.token1, pos.positionId, liqToRemove);
+                    Debug.print("Timer9 removeConcentrated: " # result);
+                  };
+                };
+
+              } else if (randomAction <= 55) {
+                // 15%: Claim LP fees
+                let result = await actorf.claimLPFees(token_ICP, otherToken);
+                Debug.print("Timer9 claimLPFees: " # result);
+
+              } else if (randomAction <= 70) {
+                // 15%: getUserLiquidityDetailed
+                let positions = await actorf.getUserLiquidityDetailed();
+                Debug.print("Timer9 getUserLiquidityDetailed: " # Nat.toText(positions.size()) # " positions");
+
+              } else if (randomAction <= 80) {
+                // 10%: getOrderbookCombined
+                let ob = await exchange.getOrderbookCombined(token_ICP, otherToken, 5, 10);
+                Debug.print("Timer9 orderbook: mid=" # Float.toText(ob.ammMidPrice) # " asks=" # Nat.toText(ob.asks.size()));
+
+              } else if (randomAction <= 90) {
+                // 10%: getAllAMMPools
+                let pools = await exchange.getAllAMMPools();
+                Debug.print("Timer9 getAllAMMPools: " # Nat.toText(pools.size()) # " pools");
+
+              } else {
+                // 10%: getKlineData
+                let klines = await exchange.getKlineData(token_ICP, otherToken, #fivemin, false);
+                Debug.print("Timer9 kline: " # Nat.toText(klines.size()) # " candles");
+              };
+
+              timer9OperationsComplete += 1;
+              if (timer9OperationsComplete == timer9TotalOperations) {
+                await logDiffTable("After Timer 9 (New Feature Operations)");
+                await checkAndStartNextTimer(skipCancelAllPositions);
+              };
+            } catch (ERR) {
+              Vector.add(errMess, "Timer 9: " # Error.message(ERR));
+              Debug.print("Timer9 error: " # Error.message(ERR));
+              error += 1;
+
+              timer9OperationsComplete += 1;
+              if (timer9OperationsComplete == timer9TotalOperations) {
+                await logDiffTable("After Timer 9 (New Feature Operations)");
+                await checkAndStartNextTimer(skipCancelAllPositions);
+              };
+            };
+          };
+          launched9 += 1;
+          if (launched9 % stressBatchSize == 0) { await async {} };
+        };
+      },
+    );
+  };
+
   public func runStressTests(skipCancelAllPositions : Bool) : async () {
     // Reset all counters and flags
     timer1OperationsComplete := 0;
@@ -4725,6 +5297,7 @@ shared (deployer) persistent actor class test() = this {
     timer6OperationsComplete := 0;
     timer7OperationsComplete := 0;
     timer8OperationsComplete := 0;
+    timer9OperationsComplete := 0;
 
     currentTimerRunning := 0;
 

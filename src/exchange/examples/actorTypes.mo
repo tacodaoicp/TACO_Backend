@@ -59,6 +59,29 @@ module {
     totalLiquidity : Nat;
   };
 
+  public type DetailedLiquidityPosition = {
+    token0 : Text;
+    token1 : Text;
+    liquidity : Nat;
+    token0Amount : Nat;
+    token1Amount : Nat;
+    shareOfPool : Float;
+    fee0 : Nat;
+    fee1 : Nat;
+  };
+
+  public type ConcentratedPosition = {
+    positionId : Nat;
+    token0 : Text;
+    token1 : Text;
+    liquidity : Nat;
+    ratioLower : Nat;
+    ratioUpper : Nat;
+    lastFeeGrowth0 : Nat;
+    lastFeeGrowth1 : Nat;
+    lastUpdateTime : Int;
+  };
+
   public type TradeHistoryEntry = {
     amount_init : Nat;
     amount_sell : Nat;
@@ -139,5 +162,10 @@ module {
     };
     recoverUnprocessedTokensDAO : shared [(Text, Nat, Nat)] -> async [(Text, Nat, Bool)];
     swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async Text;
+    claimLPFees : shared (Text, Text) -> async Text;
+    getUserLiquidityDetailed : shared () -> async [DetailedLiquidityPosition];
+    addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async Text;
+    removeConcentratedLiquidity : shared (Text, Text, Nat, Nat) -> async Text;
+    getUserConcentratedPositions : shared () -> async [ConcentratedPosition];
   };
 };

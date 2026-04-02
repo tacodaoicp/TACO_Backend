@@ -749,4 +749,37 @@ shared (deployer) persistent actor class testActorA() = this {
   ) : async Text {
     await exchange.swapMultiHop(tokenIn, tokenOut, amountIn, route, minAmountOut, Block);
   };
+
+  public func claimLPFees(token0 : Text, token1 : Text) : async Text {
+    await exchange.claimLPFees(token0, token1);
+  };
+
+  public func getUserLiquidityDetailed() : async [{
+    token0 : Text; token1 : Text; liquidity : Nat;
+    token0Amount : Nat; token1Amount : Nat; shareOfPool : Float;
+    fee0 : Nat; fee1 : Nat;
+  }] {
+    await exchange.getUserLiquidityDetailed();
+  };
+
+  public func addConcentratedLiquidity(
+    t0 : Text, t1 : Text, a0 : Nat, a1 : Nat,
+    pL : Nat, pU : Nat, b0 : Nat, b1 : Nat,
+  ) : async Text {
+    await exchange.addConcentratedLiquidity(t0, t1, a0, a1, pL, pU, b0, b1);
+  };
+
+  public func removeConcentratedLiquidity(
+    t0 : Text, t1 : Text, posId : Nat, liq : Nat,
+  ) : async Text {
+    await exchange.removeConcentratedLiquidity(t0, t1, posId, liq);
+  };
+
+  public func getUserConcentratedPositions() : async [{
+    positionId : Nat; token0 : Text; token1 : Text;
+    liquidity : Nat; ratioLower : Nat; ratioUpper : Nat;
+    lastFeeGrowth0 : Nat; lastFeeGrowth1 : Nat; lastUpdateTime : Int;
+  }] {
+    await exchange.getUserConcentratedPositions();
+  };
 };

@@ -230,14 +230,14 @@ import {
 } "miscHelperFunctions";
 
 shared (deployer) persistent actor class create_trading_canister() = this {
-  stable var treasury_text = "qbnpl-laaaa-aaaan-q52aq-cai"; // Set via parameterManagement after deploy
+  stable var treasury_text = "mbl7t-vyaaa-aaaak-ae5xq-cai"; // Set via parameterManagement after deploy
   stable var treasury_principal = Principal.fromText(treasury_text);
 
   transient let treasury = actor (treasury_text) : treasuryType.Treasury;
   transient let logger = Logger.Logger();
 
   private func isAdmin(caller : Principal) : Bool {
-    AdminAuth.isMasterAdmin(caller, func(_ : Principal) : Bool { false }) or caller == owner2 or caller == owner3 or caller == self or caller == deployer.caller;
+    AdminAuth.isMasterAdmin(caller, func(_ : Principal) : Bool { false }) or caller == self or caller == deployer.caller;
   };
 
   stable var test = false;
@@ -519,6 +519,363 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   stable let AMMpools = Map.new<(Text, Text), AMMPool>();
   // Map to store user's liquidity positions
   stable let userLiquidityPositions = Map.new<Principal, [LiquidityPosition]>();
+
+  // ═══════════════════════════════════════════════════════════════
+  // Concentrated Liquidity (V3) Types and State
+  // ═══════════════════════════════════════════════════════════════
+
+  type RangeData = {
+    liquidityNet : Int;          // net liquidity change when crossing this price (+ for lower bounds, - for upper)
+    liquidityGross : Nat;        // total liquidity referencing this price point
+    feeGrowthOutside0 : Nat;     // fee growth on the other side of this tick
+    feeGrowthOutside1 : Nat;
+  };
+
+  type PoolV3Data = {
+    activeLiquidity : Nat;       // currently active liquidity (sum of in-range positions)
+    currentSqrtRatio : Nat;      // sqrt(price) scaled by tenToPower60
+    feeGrowthGlobal0 : Nat;      // cumulative fee0 per unit of liquidity (scaled by tenToPower60)
+    feeGrowthGlobal1 : Nat;      // cumulative fee1 per unit of liquidity (scaled by tenToPower60)
+    totalFeesCollected0 : Nat;   // actual token0 fees collected (prevents negative drift)
+    totalFeesCollected1 : Nat;
+    totalFeesClaimed0 : Nat;     // token0 fees already claimed by LPs
+    totalFeesClaimed1 : Nat;
+    ranges : RBTree.Tree<Nat, RangeData>; // keyed by ratio value (Nat, price always positive)
+  };
+
+  type ConcentratedPosition = {
+    positionId : Nat;
+    token0 : Text;
+    token1 : Text;
+    liquidity : Nat;             // virtual liquidity within this range
+    ratioLower : Nat;            // lower price bound (ratio scaled by tenToPower60)
+    ratioUpper : Nat;            // upper price bound (ratio scaled by tenToPower60)
+    lastFeeGrowth0 : Nat;        // snapshot of feeGrowthGlobal0 at last update
+    lastFeeGrowth1 : Nat;
+    lastUpdateTime : Int;
+  };
+
+  // 0.1% tick spacing (10 basis points)
+  transient let TICK_SPACING_BPS : Nat = 10;
+
+  // Snap any ratio to nearest 0.1% tick boundary
+  func snapToTick(ratio : Nat) : Nat {
+    let tickSize = ratio * TICK_SPACING_BPS / 10000;
+    if (tickSize == 0) return ratio;
+    (ratio / tickSize) * tickSize;
+  };
+
+  // Full-range boundaries (used for V2-compatible positions)
+  transient let FULL_RANGE_LOWER : Nat = tenToPower20; // sqrtRatio for very low price (~10^-40 in raw terms)
+  transient let FULL_RANGE_UPPER : Nat = tenToPower120;
+
+  // V3 stable state
+  stable var nextPositionId : Nat = 0;
+  stable let poolV3Data = Map.new<(Text, Text), PoolV3Data>();
+  stable let concentratedPositions = Map.new<Principal, [ConcentratedPosition]>();
+  stable var v3Migrated = false;
+  stable var v3MigratedV2 = false; // second pass: re-migrate with sqrtRatio keys
+
+  // ── V3 Math Helpers ──
+
+  // sqrt(ratio * tenToPower60) → result scaled by tenToPower60
+  func ratioToSqrtRatio(ratio : Nat) : Nat {
+    if (ratio == 0) return 0;
+    sqrt(ratio * tenToPower60);
+  };
+
+  // Compute liquidity from token amounts and price range (overflow-safe)
+  func liquidityFromAmounts(amount0 : Nat, amount1 : Nat, sqrtLower : Nat, sqrtUpper : Nat, sqrtCurrent : Nat) : Nat {
+    if (sqrtLower >= sqrtUpper or sqrtLower == 0) return 0;
+    if (sqrtCurrent <= sqrtLower) {
+      // Below range: all token0. L = amount0 * sqrtLower * sqrtUpper / (SCALE * (sqrtUpper - sqrtLower))
+      let denom = safeSub(sqrtUpper, sqrtLower);
+      if (denom == 0) return 0;
+      mulDiv(mulDiv(amount0, sqrtLower, tenToPower60), sqrtUpper, denom);
+    } else if (sqrtCurrent >= sqrtUpper) {
+      // Above range: all token1. L = amount1 * SCALE / (sqrtUpper - sqrtLower)
+      let denom = safeSub(sqrtUpper, sqrtLower);
+      if (denom == 0) return 0;
+      mulDiv(amount1, tenToPower60, denom);
+    } else {
+      // In range: min of both
+      let denomUpper = safeSub(sqrtUpper, sqrtCurrent);
+      let L0 = if (denomUpper > 0) {
+        mulDiv(mulDiv(amount0, sqrtCurrent, tenToPower60), sqrtUpper, denomUpper);
+      } else { 0 };
+      let denomLower = safeSub(sqrtCurrent, sqrtLower);
+      let L1 = if (denomLower > 0) {
+        mulDiv(amount1, tenToPower60, denomLower);
+      } else { 0 };
+      if (L0 == 0) L1 else if (L1 == 0) L0 else Nat.min(L0, L1);
+    };
+  };
+
+  // Compute token amounts from liquidity and price range (overflow-safe)
+  func amountsFromLiquidity(liquidity : Nat, sqrtLower : Nat, sqrtUpper : Nat, sqrtCurrent : Nat) : (Nat, Nat) {
+    if (sqrtLower >= sqrtUpper or liquidity == 0) return (0, 0);
+    if (sqrtCurrent <= sqrtLower) {
+      // Below range: all token0
+      // amount0 = L * SCALE / sqrtLower - L * SCALE / sqrtUpper
+      let t1 = mulDiv(liquidity, tenToPower60, sqrtLower);
+      let t2 = mulDiv(liquidity, tenToPower60, sqrtUpper);
+      (safeSub(t1, t2), 0);
+    } else if (sqrtCurrent >= sqrtUpper) {
+      // Above range: all token1
+      // amount1 = L * (sqrtUpper - sqrtLower) / SCALE
+      let delta = safeSub(sqrtUpper, sqrtLower);
+      (0, mulDiv(liquidity, delta, tenToPower60));
+    } else {
+      // In range: both tokens
+      let t1 = mulDiv(liquidity, tenToPower60, sqrtCurrent);
+      let t2 = mulDiv(liquidity, tenToPower60, sqrtUpper);
+      let amount0 = safeSub(t1, t2);
+      let amount1 = mulDiv(liquidity, safeSub(sqrtCurrent, sqrtLower), tenToPower60);
+      (amount0, amount1);
+    };
+  };
+
+  // Overflow-safe a*b/c: divides the larger factor first to keep intermediates under 2^256
+  func mulDiv(a : Nat, b : Nat, c : Nat) : Nat {
+    if (c == 0 or a == 0 or b == 0) return 0;
+    let (big, small) = if (a >= b) { (a, b) } else { (b, a) };
+    if (big >= c) {
+      (big / c) * small + mulDiv(big % c, small, c);
+    } else {
+      big * small / c;
+    };
+  };
+
+  // Safe Nat subtraction: floors at 0
+  func safeSub(a : Nat, b : Nat) : Nat { if (a >= b) { a - b } else { 0 } };
+
+  // Overflow-safe a*b/c rounded UP (for amountIn — user pays slightly more, pool accumulates dust)
+  func mulDivUp(a : Nat, b : Nat, c : Nat) : Nat {
+    if (c == 0 or a == 0 or b == 0) return 0;
+    mulDiv(a, b, c) + 1;
+  };
+
+  // Compute swap step within a single liquidity range (overflow-safe)
+  // Returns: (amountIn consumed, amountOut produced, new sqrtRatio)
+  func computeSwapStep(sqrtRatioCurrent : Nat, sqrtRatioTarget : Nat, liquidity : Nat, amountRemaining : Nat, zeroForOne : Bool) : (Nat, Nat, Nat) {
+    if (liquidity == 0) return (0, 0, sqrtRatioCurrent);
+
+    if (zeroForOne) {
+      // Selling token0, buying token1: price decreases
+      // Δx = L * SCALE / sqrtTarget - L * SCALE / sqrtCurrent (overflow-safe, round UP for inputs)
+      let maxAmountIn = if (sqrtRatioCurrent > sqrtRatioTarget and sqrtRatioTarget > 0) {
+        let term1 = mulDivUp(liquidity, tenToPower60, sqrtRatioTarget);
+        let term2 = mulDiv(liquidity, tenToPower60, sqrtRatioCurrent);
+        safeSub(term1, term2);
+      } else { 0 };
+
+      if (maxAmountIn == 0) return (0, 0, sqrtRatioCurrent);
+
+      let (actualIn, newSqrt) = if (amountRemaining >= maxAmountIn) {
+        (maxAmountIn, sqrtRatioTarget);
+      } else {
+        // newSqrt = sqrtCurrent * L / (L + amountIn * sqrtCurrent / SCALE)
+        let addend = mulDiv(amountRemaining, sqrtRatioCurrent, tenToPower60);
+        let denominator = liquidity + addend;
+        if (denominator == 0) return (0, 0, sqrtRatioCurrent);
+        let newSqrt2 = mulDiv(sqrtRatioCurrent, liquidity, denominator);
+        (amountRemaining, Nat.max(newSqrt2, sqrtRatioTarget));
+      };
+
+      // Δy = L * (sqrtOld - sqrtNew) / SCALE
+      let amountOut = mulDiv(liquidity, safeSub(sqrtRatioCurrent, newSqrt), tenToPower60);
+      (actualIn, amountOut, newSqrt);
+    } else {
+      // Selling token1, buying token0: price increases
+      // Δy_in = L * (sqrtTarget - sqrtCurrent) / SCALE (round UP for inputs)
+      let maxAmountIn = if (sqrtRatioTarget > sqrtRatioCurrent) {
+        mulDivUp(liquidity, safeSub(sqrtRatioTarget, sqrtRatioCurrent), tenToPower60);
+      } else { 0 };
+
+      if (maxAmountIn == 0) return (0, 0, sqrtRatioCurrent);
+
+      let (actualIn, newSqrt) = if (amountRemaining >= maxAmountIn) {
+        (maxAmountIn, sqrtRatioTarget);
+      } else {
+        // newSqrt = sqrtCurrent + amountIn * SCALE / L
+        let sqrtDelta = mulDiv(amountRemaining, tenToPower60, liquidity);
+        let newSqrt2 = sqrtRatioCurrent + sqrtDelta;
+        (amountRemaining, Nat.min(newSqrt2, sqrtRatioTarget));
+      };
+
+      // Δx_out = L * SCALE / sqrtOld - L * SCALE / sqrtNew
+      let amountOut = if (newSqrt > 0 and sqrtRatioCurrent > 0) {
+        let outTerm1 = mulDiv(liquidity, tenToPower60, sqrtRatioCurrent);
+        let outTerm2 = mulDiv(liquidity, tenToPower60, newSqrt);
+        safeSub(outTerm1, outTerm2);
+      } else { 0 };
+      (actualIn, amountOut, newSqrt);
+    };
+  };
+
+  // Find next initialized tick boundary in the given direction
+  func findNextRange(ranges : RBTree.Tree<Nat, RangeData>, currentSqrtRatio : Nat, ascending : Bool) : ?Nat {
+    if (ascending) {
+      // Find smallest tick > currentSqrtRatio
+      let scan = RBTree.scanLimit(ranges, Nat.compare, currentSqrtRatio + 1, tenToPower120, #fwd, 1);
+      if (scan.results.size() > 0) { ?scan.results[0].0 } else { null };
+    } else {
+      // Find largest tick < currentSqrtRatio
+      let scan = RBTree.scanLimit(ranges, Nat.compare, 0, currentSqrtRatio, #bwd, 1);
+      if (scan.results.size() > 0 and scan.results[0].0 < currentSqrtRatio) { ?scan.results[0].0 } else { null };
+    };
+  };
+
+  // Concentrated swap engine: iterates through tick ranges
+  func swapWithAMMV3(
+    pool : AMMPool, v3 : PoolV3Data, tokenInIsToken0 : Bool, amountIn : Nat, fee : Nat
+  ) : (Nat, Nat, Nat, Nat, AMMPool, PoolV3Data) {
+    // Returns: (totalAmountIn, totalAmountOut, protocolFee, poolFee, updatedPool, updatedV3)
+    var amountRemaining = amountIn;
+    var totalAmountOut : Nat = 0;
+    var totalPoolFee : Nat = 0;
+    var totalProtocolFee : Nat = 0;
+    var currentSqrtRatio = v3.currentSqrtRatio;
+    var currentLiquidity = v3.activeLiquidity;
+    var feeGrowth0 = v3.feeGrowthGlobal0;
+    var feeGrowth1 = v3.feeGrowthGlobal1;
+    var feesCollected0 = v3.totalFeesCollected0;
+    var feesCollected1 = v3.totalFeesCollected1;
+    var updatedRanges = v3.ranges;
+    var iterations = 0;
+    let maxIterations = 2000; // safety cap
+
+    label swapLoop while (amountRemaining > 0 and currentLiquidity > 0 and iterations < maxIterations) {
+      iterations += 1;
+
+      // Find next tick boundary
+      let nextBoundary = findNextRange(updatedRanges, currentSqrtRatio, not tokenInIsToken0);
+      // zeroForOne (token0 in) = price decreasing = scan backward
+      // oneForZero (token1 in) = price increasing = scan forward
+
+      let target = switch (nextBoundary) {
+        case null {
+          // No more ticks: swap within remaining liquidity until exhausted
+          if (tokenInIsToken0) { 1 } else { tenToPower120 };
+        };
+        case (?t) { t };
+      };
+
+      // Compute swap step
+      let stepFeeRate = fee; // basis points
+      let amountBeforeFee = amountRemaining;
+      let stepFee = (amountBeforeFee * stepFeeRate * 70) / (100 * 10000);
+      let stepProtocolFee = (amountBeforeFee * stepFeeRate * 30) / (100 * 10000);
+      let amountAfterFee = if (amountBeforeFee > stepFee + stepProtocolFee) {
+        amountBeforeFee - stepFee - stepProtocolFee;
+      } else { 0 };
+
+      let (stepIn, stepOut, newSqrt) = computeSwapStep(currentSqrtRatio, target, currentLiquidity, amountAfterFee, tokenInIsToken0);
+
+      if (stepIn == 0 and stepOut == 0) {
+        break swapLoop;
+      };
+
+      // Actual fee is proportional to stepIn consumed
+      let actualFee = if (amountAfterFee > 0) { stepFee * stepIn / amountAfterFee } else { 0 };
+      let actualProtocolFee = if (amountAfterFee > 0) { stepProtocolFee * stepIn / amountAfterFee } else { 0 };
+
+      totalPoolFee += actualFee;
+      totalProtocolFee += actualProtocolFee;
+
+      // Update fee growth (overflow-safe)
+      if (currentLiquidity > 0) {
+        if (tokenInIsToken0) {
+          let growth = mulDiv(actualFee, tenToPower60, currentLiquidity);
+          feeGrowth0 += growth;
+          feesCollected0 += actualFee;
+        } else {
+          let growth = mulDiv(actualFee, tenToPower60, currentLiquidity);
+          feeGrowth1 += growth;
+          feesCollected1 += actualFee;
+        };
+      };
+
+      let totalDeducted = stepIn + actualFee + actualProtocolFee;
+      amountRemaining := if (amountRemaining > totalDeducted) { amountRemaining - totalDeducted } else { 0 };
+      totalAmountOut += stepOut;
+      currentSqrtRatio := newSqrt;
+
+      // Cross tick boundary if reached
+      if (nextBoundary != null and newSqrt == target) {
+        switch (RBTree.get(updatedRanges, Nat.compare, target)) {
+          case (?rangeData) {
+            if (tokenInIsToken0) {
+              // Price decreasing: subtract liquidityNet (crossing from right to left)
+              let netChange = rangeData.liquidityNet;
+              if (netChange >= 0) {
+                currentLiquidity := if (currentLiquidity >= Int.abs(netChange)) { currentLiquidity - Int.abs(netChange) } else { 0 };
+              } else {
+                currentLiquidity += Int.abs(netChange);
+              };
+            } else {
+              // Price increasing: add liquidityNet (crossing from left to right)
+              let netChange = rangeData.liquidityNet;
+              if (netChange >= 0) {
+                currentLiquidity += Int.abs(netChange);
+              } else {
+                currentLiquidity := if (currentLiquidity >= Int.abs(netChange)) { currentLiquidity - Int.abs(netChange) } else { 0 };
+              };
+            };
+            // Flip feeGrowthOutside at this tick (saturating subtraction to prevent underflow)
+            let flippedRange = {
+              rangeData with
+              feeGrowthOutside0 = safeSub(feeGrowth0, rangeData.feeGrowthOutside0);
+              feeGrowthOutside1 = safeSub(feeGrowth1, rangeData.feeGrowthOutside1);
+            };
+            updatedRanges := RBTree.put(updatedRanges, Nat.compare, target, flippedRange);
+          };
+          case null {};
+        };
+      };
+    };
+
+    let totalIn = amountIn - amountRemaining;
+
+    // Compute new reserves from sqrtRatio (overflow-safe)
+    let newReserve0 = if (currentSqrtRatio > 0) {
+      mulDiv(currentLiquidity, tenToPower60, currentSqrtRatio);
+    } else { pool.reserve0 };
+    let newReserve1 = mulDiv(currentLiquidity, currentSqrtRatio, tenToPower60);
+
+    let updatedPool = {
+      pool with
+      reserve0 = if (tokenInIsToken0) {
+        let total = pool.reserve0 + totalIn;
+        let fees = totalPoolFee + totalProtocolFee;
+        safeSub(total, fees);
+      } else {
+        safeSub(pool.reserve0, totalAmountOut);
+      };
+      reserve1 = if (tokenInIsToken0) {
+        safeSub(pool.reserve1, totalAmountOut);
+      } else {
+        let total = pool.reserve1 + totalIn;
+        let fees = totalPoolFee + totalProtocolFee;
+        safeSub(total, fees);
+      };
+      lastUpdateTime = Time.now();
+    };
+
+    let updatedV3 = {
+      activeLiquidity = currentLiquidity;
+      currentSqrtRatio = currentSqrtRatio;
+      feeGrowthGlobal0 = feeGrowth0;
+      feeGrowthGlobal1 = feeGrowth1;
+      totalFeesCollected0 = feesCollected0;
+      totalFeesCollected1 = feesCollected1;
+      totalFeesClaimed0 = v3.totalFeesClaimed0;
+      totalFeesClaimed1 = v3.totalFeesClaimed1;
+      ranges = updatedRanges;
+    };
+
+    (totalIn, totalAmountOut, totalProtocolFee, totalPoolFee, updatedPool, updatedV3);
+  };
 
   //Map that indexes trades by accesscode
   type TradeMap = Map.Map<Text, TradePrivate>;
@@ -1222,8 +1579,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let emptyResult = { bids : [{ price : Float; ammAmount : Nat; limitAmount : Nat; limitOrders : Nat }] = []; asks : [{ price : Float; ammAmount : Nat; limitAmount : Nat; limitOrders : Nat }] = []; ammMidPrice : Float = 0.0; spread : Float = 0.0; ammReserve0 : Nat = 0; ammReserve1 : Nat = 0 };
     if (isAllowedQuery(caller) != 1) { return emptyResult };
 
-    let maxLevels = if (numLevels > 50) { 50 } else if (numLevels == 0) { 25 } else { numLevels };
-    let step = if (stepBasisPoints > 500) { 500 } else if (stepBasisPoints == 0) { 10 } else { stepBasisPoints };
+    let maxLevels = if (numLevels > 100) { 100 } else if (numLevels == 0) { 25 } else { numLevels };
+    let step = if (stepBasisPoints > 1000) { 1000 } else if (stepBasisPoints == 0) { 10 } else { stepBasisPoints };
     let poolKey = getPool(token0, token1);
 
     // Get AMM reserves, ensuring token0 maps to res0
@@ -1264,33 +1621,91 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     if (midRatio == 0) { return emptyResult };
-    let midPrice : Float = Float.fromInt(midRatio) / Float.fromInt(tenToPower60);
+    // Decimal-adjust midPrice: midRatio is res1/res0 * 10^60, normalize for display
+    let dec0 = switch (Map.get(tokenInfo, thash, token0)) { case (?i) { i.Decimals }; case null { 8 } };
+    let dec1 = switch (Map.get(tokenInfo, thash, token1)) { case (?i) { i.Decimals }; case null { 8 } };
+    let midPrice : Float = (Float.fromInt(midRatio) * Float.fromInt(10 ** dec0)) / (Float.fromInt(tenToPower60) * Float.fromInt(10 ** dec1));
 
     // Build level vectors
     let askVec = Vector.new<{ price : Float; ammAmount : Nat; limitAmount : Nat; limitOrders : Nat }>();
     let bidVec = Vector.new<{ price : Float; ammAmount : Nat; limitAmount : Nat; limitOrders : Nat }>();
 
     if (hasAMM) {
-      // ASK side: price increases from mid, token0 available decreases
-      var prevR0Ask = res0;
-      for (i in Iter.range(1, maxLevels)) {
-        let factor = 10000 + i * step;
-        let newR0 = sqrt(res0 * res0 * 10000 / factor);
-        let ammAmt = if (prevR0Ask > newR0) { prevR0Ask - newR0 } else { 0 };
-        Vector.add(askVec, { price = midPrice * Float.fromInt(factor) / 10000.0; ammAmount = ammAmt; limitAmount = 0; limitOrders = 0 });
-        prevR0Ask := newR0;
-      };
-      // BID side: price decreases from mid, token0 available increases
-      var prevR0Bid = res0;
-      for (i in Iter.range(1, maxLevels)) {
-        if (i * step >= 10000) {
-          Vector.add(bidVec, { price = 0.0; ammAmount = 0; limitAmount = 0; limitOrders = 0 });
-        } else {
-          let factor = 10000 - i * step;
-          let newR0 = sqrt(res0 * res0 * 10000 / factor);
-          let ammAmt = if (newR0 > prevR0Bid) { newR0 - prevR0Bid } else { 0 };
-          Vector.add(bidVec, { price = midPrice * Float.fromInt(factor) / 10000.0; ammAmount = ammAmt; limitAmount = 0; limitOrders = 0 });
-          prevR0Bid := newR0;
+      // V3-aware depth calculation: use concentrated liquidity ranges if available
+      switch (Map.get(poolV3Data, hashtt, poolKey)) {
+        case (?v3) {
+          // ASK side: price increases, token0 depth per level
+          var prevSqrtAsk = v3.currentSqrtRatio;
+          var askActiveLiq = v3.activeLiquidity;
+          for (i in Iter.range(1, maxLevels)) {
+            let factor = 10000 + i * step;
+            let scaledFactor = sqrt(factor * tenToPower60 / 10000);
+            let levelSqrt = mulDiv(v3.currentSqrtRatio, scaledFactor, tenToPower30);
+
+            // Check tick crossings between prevSqrtAsk and levelSqrt (ascending)
+            let crossedTicks = RBTree.scanLimit(v3.ranges, Nat.compare, prevSqrtAsk + 1, levelSqrt, #fwd, 100);
+            for ((_, tickData) in crossedTicks.results.vals()) {
+              if (tickData.liquidityNet >= 0) { askActiveLiq += Int.abs(tickData.liquidityNet) }
+              else { askActiveLiq := safeSub(askActiveLiq, Int.abs(tickData.liquidityNet)) };
+            };
+
+            // token0 depth = L * SCALE / prevSqrt - L * SCALE / levelSqrt
+            let ammAmt = if (askActiveLiq > 0 and prevSqrtAsk > 0 and levelSqrt > 0) {
+              safeSub(mulDiv(askActiveLiq, tenToPower60, prevSqrtAsk), mulDiv(askActiveLiq, tenToPower60, levelSqrt));
+            } else { 0 };
+            Vector.add(askVec, { price = midPrice * Float.fromInt(factor) / 10000.0; ammAmount = ammAmt; limitAmount = 0; limitOrders = 0 });
+            prevSqrtAsk := levelSqrt;
+          };
+
+          // BID side: price decreases, token0 depth per level
+          var prevSqrtBid = v3.currentSqrtRatio;
+          var bidActiveLiq = v3.activeLiquidity;
+          for (i in Iter.range(1, maxLevels)) {
+            if (i * step >= 10000) {
+              Vector.add(bidVec, { price = 0.0; ammAmount = 0; limitAmount = 0; limitOrders = 0 });
+            } else {
+              let factor = 10000 - i * step;
+              let scaledFactor = sqrt(factor * tenToPower60 / 10000);
+              let levelSqrt = mulDiv(v3.currentSqrtRatio, scaledFactor, tenToPower30);
+
+              // Check tick crossings between levelSqrt and prevSqrtBid (descending)
+              let crossedTicks = RBTree.scanLimit(v3.ranges, Nat.compare, levelSqrt, prevSqrtBid, #bwd, 100);
+              for ((_, tickData) in crossedTicks.results.vals()) {
+                if (tickData.liquidityNet >= 0) { bidActiveLiq := safeSub(bidActiveLiq, Int.abs(tickData.liquidityNet)) }
+                else { bidActiveLiq += Int.abs(tickData.liquidityNet) };
+              };
+
+              // token0 depth = L * SCALE / levelSqrt - L * SCALE / prevSqrtBid
+              let ammAmt = if (bidActiveLiq > 0 and levelSqrt > 0 and prevSqrtBid > 0) {
+                safeSub(mulDiv(bidActiveLiq, tenToPower60, levelSqrt), mulDiv(bidActiveLiq, tenToPower60, prevSqrtBid));
+              } else { 0 };
+              Vector.add(bidVec, { price = midPrice * Float.fromInt(factor) / 10000.0; ammAmount = ammAmt; limitAmount = 0; limitOrders = 0 });
+              prevSqrtBid := levelSqrt;
+            };
+          };
+        };
+        case null {
+          // V2 fallback: constant-product depth calculation
+          var prevR0Ask = res0;
+          for (i in Iter.range(1, maxLevels)) {
+            let factor = 10000 + i * step;
+            let newR0 = sqrt(res0 * res0 * 10000 / factor);
+            let ammAmt = if (prevR0Ask > newR0) { prevR0Ask - newR0 } else { 0 };
+            Vector.add(askVec, { price = midPrice * Float.fromInt(factor) / 10000.0; ammAmount = ammAmt; limitAmount = 0; limitOrders = 0 });
+            prevR0Ask := newR0;
+          };
+          var prevR0Bid = res0;
+          for (i in Iter.range(1, maxLevels)) {
+            if (i * step >= 10000) {
+              Vector.add(bidVec, { price = 0.0; ammAmount = 0; limitAmount = 0; limitOrders = 0 });
+            } else {
+              let factor = 10000 - i * step;
+              let newR0 = sqrt(res0 * res0 * 10000 / factor);
+              let ammAmt = if (newR0 > prevR0Bid) { newR0 - prevR0Bid } else { 0 };
+              Vector.add(bidVec, { price = midPrice * Float.fromInt(factor) / 10000.0; ammAmount = ammAmt; limitAmount = 0; limitOrders = 0 });
+              prevR0Bid := newR0;
+            };
+          };
         };
       };
     } else {
@@ -1305,7 +1720,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
-    // Limit orders — ASK side: orders offering token0, wanting token1
+    // Limit orders — ASK side: orders in liqMapSort((token0, token1))
+    // r = (amount_init_token0 * 1e60) / amount_sell_token1 — INVERTED, needs tenToPower120/r
     switch (Map.get(liqMapSort, hashtt, (token0, token1))) {
       case (null) {};
       case (?tree) {
@@ -1313,8 +1729,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         for ((ratio, orders) in scan.results.vals()) {
           switch (ratio) {
             case (#Value(r)) {
-              if (r >= midRatio) {
-                let idx = (r - midRatio) * 10000 / (midRatio * step);
+              if (r > 0 and midRatio > 0 and step > 0) {
+                let askPriceRatio = tenToPower120 / r;
+                let idx : Nat = if (askPriceRatio >= midRatio) {
+                  (askPriceRatio - midRatio) * 10000 / (midRatio * step);
+                } else {
+                  // Order at or slightly below mid (rounding artifact) — place at level 0 if within 1 step
+                  let diff = midRatio - askPriceRatio;
+                  if (diff * 10000 < midRatio * step) { 0 } else { maxLevels };
+                };
                 if (idx < maxLevels) {
                   var amt : Nat = 0;
                   var cnt : Nat = 0;
@@ -1334,7 +1757,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
-    // Limit orders — BID side: orders offering token1, wanting token0
+    // Limit orders — BID side: orders in liqMapSort((token1, token0))
+    // r = (amount_init_token1 * 1e60) / amount_sell_token0 — ALREADY in orderbook price direction, NO inversion
     switch (Map.get(liqMapSort, hashtt, (token1, token0))) {
       case (null) {};
       case (?tree) {
@@ -1342,20 +1766,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         for ((ratio, orders) in scan.results.vals()) {
           switch (ratio) {
             case (#Value(r)) {
-              if (r > 0) {
-                let bidPriceRatio = tenToPower120 / r;
-                if (midRatio > bidPriceRatio) {
-                  let idx = (midRatio - bidPriceRatio) * 10000 / (midRatio * step);
-                  if (idx < maxLevels) {
-                    var amt : Nat = 0;
-                    var cnt : Nat = 0;
-                    for (o in orders.vals()) {
-                      if (Text.startsWith(o.accesscode, #text "Public")) { amt += o.amount_sell; cnt += 1 };
-                    };
-                    if (cnt > 0) {
-                      let ex = Vector.get(bidVec, idx);
-                      Vector.put(bidVec, idx, { price = ex.price; ammAmount = ex.ammAmount; limitAmount = ex.limitAmount + amt; limitOrders = ex.limitOrders + cnt });
-                    };
+              if (r > 0 and midRatio > 0 and step > 0) {
+                let idx : Nat = if (midRatio > r) {
+                  (midRatio - r) * 10000 / (midRatio * step);
+                } else {
+                  // Order at or slightly above mid (rounding artifact) — place at level 0 if within 1 step
+                  let diff = r - midRatio;
+                  if (diff * 10000 < midRatio * step) { 0 } else { maxLevels };
+                };
+                if (idx < maxLevels) {
+                  var amt : Nat = 0;
+                  var cnt : Nat = 0;
+                  for (o in orders.vals()) {
+                    if (Text.startsWith(o.accesscode, #text "Public")) { amt += o.amount_sell; cnt += 1 };
+                  };
+                  if (cnt > 0) {
+                    let ex = Vector.get(bidVec, idx);
+                    Vector.put(bidVec, idx, { price = ex.price; ammAmount = ex.ammAmount; limitAmount = ex.limitAmount + amt; limitOrders = ex.limitOrders + cnt });
                   };
                 };
               };
@@ -1824,27 +2251,30 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     let priceImpact = if (expectedBuyAmount > 0 and amountSell > 10000) {
       if (multiHopUsed) {
-        let tinySim = simulateMultiHop(multiHopRoute, 10000, caller);
-        let spotRate = Float.fromInt(tinySim.amountOut) / 10000.0;
-        let actualRate = Float.fromInt(expectedBuyAmount) / Float.fromInt(amountSell);
-        if (spotRate > 0.0) { Float.abs(spotRate - actualRate) / spotRate } else { 0.0 };
+        // Multi-hop price impact: sum per-hop impacts from simulation
+        var totalMHImpact = 0.0;
+        for (hd in multiHopDetails.vals()) {
+          totalMHImpact += hd.priceImpact;
+        };
+        totalMHImpact;
       } else {
-        // Spot rate: simulate a tiny trade (10000 units) to get the rate with negligible impact
-        let spotTrade : TradePrivate = {
-          dummyTrade with amount_init = 10000;
-        };
-        let (spotRemaining, _, _, spotTransfers, _) = orderPairing(spotTrade);
-        var spotBuyAmount : Nat = 0;
-        for (tx in spotTransfers.vals()) {
-          if (tx.0 == #principal(caller) and tx.2 == tokenBuy) {
-            spotBuyAmount += tx.1;
+        // Price impact: compare execution rate at full amount vs constant-product mathematical rate
+        // Mathematical output (no fees, no transfer costs): reserveOut * amountIn / (reserveIn + amountIn)
+        let poolKey3 = getPool(tokenSell, tokenBuy);
+        switch (Map.get(AMMpools, hashtt, poolKey3)) {
+          case (?pool) {
+            let (reserveIn, reserveOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+            if (reserveIn > 0 and reserveOut > 0 and amountSell > 0) {
+              // Pure constant-product output (what you'd get with zero fees at this price)
+              let mathOutput = Float.fromInt(reserveOut) * Float.fromInt(amountSell) / Float.fromInt(reserveIn + amountSell);
+              // Spot output (infinitely small trade): reserveOut / reserveIn * amountSell
+              let spotOutput = Float.fromInt(reserveOut) / Float.fromInt(reserveIn) * Float.fromInt(amountSell);
+              // Impact = how much worse the constant-product output is vs spot
+              if (spotOutput > 0.0) { Float.abs(1.0 - mathOutput / spotOutput) } else { 0.0 };
+            } else { 0.0 };
           };
+          case null { 0.0 };
         };
-        if (spotBuyAmount > 0) {
-          let spotRate = Float.fromInt(spotBuyAmount) / 10000.0;
-          let actualRate = Float.fromInt(expectedBuyAmount) / Float.fromInt(amountSell);
-          if (spotRate > 0.0) { Float.abs(spotRate - actualRate) / spotRate } else { 0.0 };
-        } else { 0.0 };
       };
     } else {
       0.0;
@@ -1936,14 +2366,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
-    // Price impact: compare against a tiny swap to get spot rate
-    let priceImpact = if (finalOut > 0 and amountIn > 10000) {
-      let tinySim = simulateMultiHop(finalRoute, 10000, caller);
-      let spotRate = Float.fromInt(tinySim.amountOut) / 10000.0;
-      let actualRate = Float.fromInt(finalOut) / Float.fromInt(amountIn);
-      if (spotRate > 0.0) {
-        Float.abs(spotRate - actualRate) / spotRate;
-      } else { 0.0 };
+    // Price impact: compare against a small swap to get spot rate
+    // Price impact: sum per-hop mathematical impacts from hopDetails
+    let priceImpact = if (finalOut > 0 and amountIn > 0) {
+      var totalImpact = 0.0;
+      for (hd in finalHopDetails.vals()) {
+        totalImpact += hd.priceImpact;
+      };
+      totalImpact;
     } else { 0.0 };
 
     // Build route token list for display
@@ -2142,6 +2572,71 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
+    // Sync V3 data: ensure full-range addLiquidity also creates/updates V3 pool data
+    let poolAfterAdd = switch (Map.get(AMMpools, hashtt, poolKey)) { case (?p) { p }; case null { { token0; token1; reserve0 = 0; reserve1 = 0; totalLiquidity = 0; totalFee0 = 0; totalFee1 = 0; lastUpdateTime = nowVar; providers = TrieSet.empty<Principal>() } } };
+    if (poolAfterAdd.reserve0 > 0 and poolAfterAdd.reserve1 > 0) {
+      let sqrtR = ratioToSqrtRatio((poolAfterAdd.reserve1 * tenToPower60) / poolAfterAdd.reserve0);
+      switch (Map.get(poolV3Data, hashtt, poolKey)) {
+        case null {
+          // Create V3 data for new pool
+          var rangeTree = RBTree.init<Nat, RangeData>();
+          rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_LOWER, {
+            liquidityNet = poolAfterAdd.totalLiquidity; liquidityGross = poolAfterAdd.totalLiquidity;
+            feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
+          });
+          rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_UPPER, {
+            liquidityNet = -poolAfterAdd.totalLiquidity; liquidityGross = poolAfterAdd.totalLiquidity;
+            feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
+          });
+          Map.set(poolV3Data, hashtt, poolKey, {
+            activeLiquidity = poolAfterAdd.totalLiquidity;
+            currentSqrtRatio = sqrtR;
+            feeGrowthGlobal0 = 0; feeGrowthGlobal1 = 0;
+            totalFeesCollected0 = 0; totalFeesCollected1 = 0;
+            totalFeesClaimed0 = 0; totalFeesClaimed1 = 0;
+            ranges = rangeTree;
+          });
+        };
+        case (?v3) {
+          // Update existing V3 data: add liquidity to full range
+          var ranges = v3.ranges;
+          let lData = switch (RBTree.get(ranges, Nat.compare, FULL_RANGE_LOWER)) {
+            case null { { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = 0; feeGrowthOutside1 = 0 } };
+            case (?d) { d };
+          };
+          ranges := RBTree.put(ranges, Nat.compare, FULL_RANGE_LOWER, { lData with liquidityNet = lData.liquidityNet + liquidityMinted; liquidityGross = lData.liquidityGross + liquidityMinted });
+          let uData = switch (RBTree.get(ranges, Nat.compare, FULL_RANGE_UPPER)) {
+            case null { { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = 0; feeGrowthOutside1 = 0 } };
+            case (?d) { d };
+          };
+          ranges := RBTree.put(ranges, Nat.compare, FULL_RANGE_UPPER, { uData with liquidityNet = uData.liquidityNet - liquidityMinted; liquidityGross = uData.liquidityGross + liquidityMinted });
+          Map.set(poolV3Data, hashtt, poolKey, {
+            v3 with
+            activeLiquidity = v3.activeLiquidity + liquidityMinted;
+            currentSqrtRatio = sqrtR;
+            ranges = ranges;
+          });
+        };
+      };
+
+      // Also create concentrated position for this user
+      nextPositionId += 1;
+      let fullRangePos : ConcentratedPosition = {
+        positionId = nextPositionId;
+        token0; token1;
+        liquidity = liquidityMinted;
+        ratioLower = FULL_RANGE_LOWER;
+        ratioUpper = FULL_RANGE_UPPER;
+        lastFeeGrowth0 = switch (Map.get(poolV3Data, hashtt, poolKey)) { case (?v) { v.feeGrowthGlobal0 }; case null { 0 } };
+        lastFeeGrowth1 = switch (Map.get(poolV3Data, hashtt, poolKey)) { case (?v) { v.feeGrowthGlobal1 }; case null { 0 } };
+        lastUpdateTime = nowVar;
+      };
+      let existingConc = switch (Map.get(concentratedPositions, phash, caller)) { case null { [] }; case (?a) { a } };
+      let cVec = Vector.fromArray<ConcentratedPosition>(existingConc);
+      Vector.add(cVec, fullRangePos);
+      Map.set(concentratedPositions, phash, caller, Vector.toArray(cVec));
+    };
+
     if (deleteOld) {
       for (provider in (TrieSet.toArray(oldProviders)).vals()) {
         switch (Map.get(userLiquidityPositions, phash, provider)) {
@@ -2251,6 +2746,394 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     Nat.toText(liquidityMinted);
   };
+
+  // ═══════════════════════════════════════════════════════════════
+  // Concentrated Liquidity: Add and Remove
+  // ═══════════════════════════════════════════════════════════════
+
+  public shared ({ caller }) func addConcentratedLiquidity(
+    token0i : Text, token1i : Text,
+    amount0i : Nat, amount1i : Nat,
+    priceLower : Nat, priceUpper : Nat,
+    block0i : Nat, block1i : Nat,
+  ) : async Text {
+    if (isAllowed(caller) != 1) { return "" };
+    if (Text.size(token0i) > 150 or Text.size(token1i) > 150) {
+      return "Banned for a day for trying to overflood with Text";
+    };
+    assert (token0i != token1i);
+
+    // Snap to tick boundaries
+    let ratioLower = snapToTick(priceLower);
+    let ratioUpper = snapToTick(priceUpper);
+    if (ratioLower >= ratioUpper or ratioLower == 0) {
+      return "Invalid price range: lower must be < upper and > 0";
+    };
+
+    let (token0, token1) = getPool(token0i, token1i);
+    let tType0 = returnType(token0);
+    let tType1 = returnType(token1);
+    let poolKey = (token0, token1);
+    var amount1 = amount1i;
+    var amount0 = amount0i;
+    var block0 = block0i;
+    var block1 = block1i;
+    if (token1i != token1) {
+      amount1 := amount0i; amount0 := amount1i;
+      block0 := block1i; block1 := block0i;
+    };
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
+    var nowVar = Time.now();
+
+    // Validate: base token, not paused, minimums
+    if (
+      (Array.find<Text>(baseTokens, func(t) { t == token0 or t == token1 }) == null) or
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == token0 })) { case null { false }; case (?_) { true } })) or
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == token1 })) { case null { false }; case (?_) { true } })) or
+      ((returnMinimum(token0, amount0, true) and returnMinimum(token1, amount1, true)) == false)
+    ) {
+      // Refund both tokens
+      label a for ((token, Block, tType) in ([(token1, block1, tType1), (token0, block0, tType0)]).vals()) {
+        if (Map.has(BlocksDone, thash, token # ":" #Nat.toText(Block))) { continue a };
+        Map.set(BlocksDone, thash, token # ":" #Nat.toText(Block), nowVar);
+        let blockData = try { await* getBlockData(token, Block, tType) } catch (err) {
+          Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block)); continue a; #ICRC12([]);
+        };
+        Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, Time.now())).1.vals());
+      };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return "Validation failed: paused token, missing base token, or below minimum";
+    };
+
+    // Verify on-chain transfers
+    var receiveBool = true;
+    let receiveTransfersVec = Vector.new<(TransferRecipient, Nat, Text)>();
+    label a for ((token, Block, amount, tType) in ([(token1, block1, amount1, tType1), (token0, block0, amount0, tType0)]).vals()) {
+      if (Map.has(BlocksDone, thash, token # ":" #Nat.toText(Block))) {
+        receiveBool := false; continue a;
+      };
+      Map.set(BlocksDone, thash, token # ":" #Nat.toText(Block), nowVar);
+      let blockData = try { await* getBlockData(token, Block, tType) } catch (err) {
+        Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block)); continue a; #ICRC12([]);
+      };
+      let receiveData = checkReceive(Block, caller, amount, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar);
+      Vector.addFromIter(receiveTransfersVec, receiveData.1.vals());
+      receiveBool := receiveBool and receiveData.0;
+    };
+    Vector.addFromIter(tempTransferQueueLocal, Vector.vals(receiveTransfersVec));
+    if (not receiveBool) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return "Failed as something was not received";
+    };
+
+    // Get or create pool and V3 data
+    var pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
+      case null {
+        let newPool : AMMPool = {
+          token0; token1;
+          reserve0 = 0; reserve1 = 0;
+          totalLiquidity = 0;
+          totalFee0 = 0; totalFee1 = 0;
+          lastUpdateTime = nowVar;
+          providers = TrieSet.empty<Principal>();
+        };
+        Map.set(AMMpools, hashtt, poolKey, newPool);
+        newPool;
+      };
+      case (?p) { p };
+    };
+
+    var v3 = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case null {
+        let sqrtRatio = if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+          ratioToSqrtRatio((pool.reserve1 * tenToPower60) / pool.reserve0);
+        } else if (amount0 > 0 and amount1 > 0) {
+          ratioToSqrtRatio((amount1 * tenToPower60) / amount0);
+        } else { tenToPower60 }; // default 1:1
+        {
+          activeLiquidity = 0;
+          currentSqrtRatio = sqrtRatio;
+          feeGrowthGlobal0 = 0; feeGrowthGlobal1 = 0;
+          totalFeesCollected0 = 0; totalFeesCollected1 = 0;
+          totalFeesClaimed0 = 0; totalFeesClaimed1 = 0;
+          ranges = RBTree.init<Nat, RangeData>();
+        };
+      };
+      case (?v) { v };
+    };
+
+    // Calculate virtual liquidity for this range
+    let sqrtLower = ratioToSqrtRatio(ratioLower);
+    let sqrtUpper = ratioToSqrtRatio(ratioUpper);
+    let sqrtCurrent = v3.currentSqrtRatio;
+    let liquidity = liquidityFromAmounts(amount0, amount1, sqrtLower, sqrtUpper, sqrtCurrent);
+
+    if (liquidity == 0) {
+      // Refund
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return "Liquidity would be zero for this range and amounts";
+    };
+
+    // Update range tree: add liquidityNet at boundaries
+    var ranges = v3.ranges;
+    // Use sqrtRatio as tree keys (not price ratios) for consistency with swap engine
+    let lowerData = switch (RBTree.get(ranges, Nat.compare, sqrtLower)) {
+      case null { { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = 0; feeGrowthOutside1 = 0 } };
+      case (?d) { d };
+    };
+    ranges := RBTree.put(ranges, Nat.compare, sqrtLower, {
+      liquidityNet = lowerData.liquidityNet + liquidity;
+      liquidityGross = lowerData.liquidityGross + liquidity;
+      feeGrowthOutside0 = lowerData.feeGrowthOutside0;
+      feeGrowthOutside1 = lowerData.feeGrowthOutside1;
+    });
+
+    let upperData = switch (RBTree.get(ranges, Nat.compare, sqrtUpper)) {
+      case null { { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = 0; feeGrowthOutside1 = 0 } };
+      case (?d) { d };
+    };
+    ranges := RBTree.put(ranges, Nat.compare, sqrtUpper, {
+      liquidityNet = upperData.liquidityNet - liquidity;
+      liquidityGross = upperData.liquidityGross + liquidity;
+      feeGrowthOutside0 = upperData.feeGrowthOutside0;
+      feeGrowthOutside1 = upperData.feeGrowthOutside1;
+    });
+
+    // Update active liquidity if current price is in range
+    let currentRatio = if (sqrtCurrent > 0) { (sqrtCurrent * sqrtCurrent) / tenToPower60 } else { 0 };
+    let newActiveLiquidity = if (currentRatio >= ratioLower and currentRatio < ratioUpper) {
+      v3.activeLiquidity + liquidity;
+    } else { v3.activeLiquidity };
+
+    // Update pool reserves
+    pool := {
+      pool with
+      reserve0 = pool.reserve0 + amount0;
+      reserve1 = pool.reserve1 + amount1;
+      totalLiquidity = pool.totalLiquidity + liquidity;
+      lastUpdateTime = nowVar;
+      providers = TrieSet.put(pool.providers, caller, Principal.hash(caller), Principal.equal);
+    };
+    Map.set(AMMpools, hashtt, poolKey, pool);
+
+    // Store updated V3 data
+    Map.set(poolV3Data, hashtt, poolKey, {
+      v3 with
+      activeLiquidity = newActiveLiquidity;
+      ranges = ranges;
+    });
+
+    // Store position for user
+    nextPositionId += 1;
+    let newPosition : ConcentratedPosition = {
+      positionId = nextPositionId;
+      token0; token1;
+      liquidity;
+      ratioLower; ratioUpper;
+      lastFeeGrowth0 = v3.feeGrowthGlobal0;
+      lastFeeGrowth1 = v3.feeGrowthGlobal1;
+      lastUpdateTime = nowVar;
+    };
+
+    let existing = switch (Map.get(concentratedPositions, phash, caller)) {
+      case null { [] }; case (?arr) { arr };
+    };
+    let posVec = Vector.fromArray<ConcentratedPosition>(existing);
+    Vector.add(posVec, newPosition);
+    Map.set(concentratedPositions, phash, caller, Vector.toArray(posVec));
+
+    // Record in swap history
+    nextSwapId += 1;
+    recordSwap(caller, {
+      swapId = nextSwapId;
+      tokenIn = token0; tokenOut = token1;
+      amountIn = amount0; amountOut = amount1;
+      route = [token0, token1];
+      fee = 0;
+      swapType = #direct;
+      timestamp = nowVar;
+    });
+
+    doInfoBeforeStep2();
+
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+
+    "concentrated:" # Nat.toText(liquidity) # ":" # Nat.toText(nextPositionId);
+  };
+
+  // Remove concentrated liquidity position
+  public shared ({ caller }) func removeConcentratedLiquidity(
+    token0i : Text, token1i : Text,
+    positionId : Nat,
+    liquidityAmount : Nat,
+  ) : async Text {
+    if (isAllowed(caller) != 1) { return "Not allowed" };
+
+    let (token0, token1) = getPool(token0i, token1i);
+    let poolKey = (token0, token1);
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
+    let nowVar = Time.now();
+
+    // Find user's position
+    let positions = switch (Map.get(concentratedPositions, phash, caller)) {
+      case null { return "No positions found" };
+      case (?arr) { arr };
+    };
+
+    var foundPosition : ?ConcentratedPosition = null;
+    var foundIndex : Nat = 0;
+    label search for (i in Iter.range(0, positions.size() - 1)) {
+      if (positions[i].positionId == positionId and positions[i].token0 == token0 and positions[i].token1 == token1) {
+        foundPosition := ?positions[i];
+        foundIndex := i;
+        break search;
+      };
+    };
+
+    let position = switch (foundPosition) {
+      case null { return "Position not found" };
+      case (?p) { p };
+    };
+
+    let actualLiquidityToRemove = Nat.min(liquidityAmount, position.liquidity);
+    if (actualLiquidityToRemove == 0) { return "Nothing to remove" };
+
+    // Get pool and V3 data
+    let pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
+      case null { return "Pool not found" };
+      case (?p) { p };
+    };
+    var v3 = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case null { return "V3 data not found" };
+      case (?v) { v };
+    };
+
+    // Calculate fees owed (with negative drift protection)
+    let theoreticalFee0 = position.liquidity * (v3.feeGrowthGlobal0 - position.lastFeeGrowth0) / tenToPower60;
+    let maxClaimable0 = if (v3.totalFeesCollected0 > v3.totalFeesClaimed0) { v3.totalFeesCollected0 - v3.totalFeesClaimed0 } else { 0 };
+    let actualFee0 = Nat.min(theoreticalFee0, maxClaimable0);
+
+    let theoreticalFee1 = position.liquidity * (v3.feeGrowthGlobal1 - position.lastFeeGrowth1) / tenToPower60;
+    let maxClaimable1 = if (v3.totalFeesCollected1 > v3.totalFeesClaimed1) { v3.totalFeesCollected1 - v3.totalFeesClaimed1 } else { 0 };
+    let actualFee1 = Nat.min(theoreticalFee1, maxClaimable1);
+
+    // Calculate token amounts based on current price vs range
+    let sqrtLower = ratioToSqrtRatio(position.ratioLower);
+    let sqrtUpper = ratioToSqrtRatio(position.ratioUpper);
+    let sqrtCurrent = v3.currentSqrtRatio;
+
+    let (baseAmount0, baseAmount1) = amountsFromLiquidity(actualLiquidityToRemove, sqrtLower, sqrtUpper, sqrtCurrent);
+
+    let totalAmount0 = baseAmount0 + (actualFee0 * actualLiquidityToRemove / position.liquidity);
+    let totalAmount1 = baseAmount1 + (actualFee1 * actualLiquidityToRemove / position.liquidity);
+
+    // Update range tree: remove liquidity from boundaries
+    var ranges = v3.ranges;
+    switch (RBTree.get(ranges, Nat.compare, sqrtLower)) {
+      case (?d) {
+        let newGross = if (d.liquidityGross > actualLiquidityToRemove) { d.liquidityGross - actualLiquidityToRemove } else { 0 };
+        if (newGross == 0) {
+          ranges := RBTree.delete(ranges, Nat.compare, sqrtLower);
+        } else {
+          ranges := RBTree.put(ranges, Nat.compare, sqrtLower, {
+            d with
+            liquidityNet = d.liquidityNet - actualLiquidityToRemove;
+            liquidityGross = newGross;
+          });
+        };
+      };
+      case null {};
+    };
+    switch (RBTree.get(ranges, Nat.compare, sqrtUpper)) {
+      case (?d) {
+        let newGross = if (d.liquidityGross > actualLiquidityToRemove) { d.liquidityGross - actualLiquidityToRemove } else { 0 };
+        if (newGross == 0) {
+          ranges := RBTree.delete(ranges, Nat.compare, sqrtUpper);
+        } else {
+          ranges := RBTree.put(ranges, Nat.compare, sqrtUpper, {
+            d with
+            liquidityNet = d.liquidityNet + actualLiquidityToRemove; // reverse of add
+            liquidityGross = newGross;
+          });
+        };
+      };
+      case null {};
+    };
+
+    // Update active liquidity if current price is in range
+    let currentRatio = if (sqrtCurrent > 0) { (sqrtCurrent * sqrtCurrent) / tenToPower60 } else { 0 };
+    let newActiveLiquidity = if (currentRatio >= position.ratioLower and currentRatio < position.ratioUpper) {
+      if (v3.activeLiquidity > actualLiquidityToRemove) { v3.activeLiquidity - actualLiquidityToRemove } else { 0 };
+    } else { v3.activeLiquidity };
+
+    // Update pool reserves
+    let newReserve0 = if (pool.reserve0 > totalAmount0) { pool.reserve0 - totalAmount0 } else { 0 };
+    let newReserve1 = if (pool.reserve1 > totalAmount1) { pool.reserve1 - totalAmount1 } else { 0 };
+    let newTotalLiq = if (pool.totalLiquidity > actualLiquidityToRemove) { pool.totalLiquidity - actualLiquidityToRemove } else { 0 };
+
+    Map.set(AMMpools, hashtt, poolKey, {
+      pool with
+      reserve0 = newReserve0; reserve1 = newReserve1;
+      totalLiquidity = newTotalLiq;
+      lastUpdateTime = nowVar;
+    });
+
+    // Update V3 data
+    Map.set(poolV3Data, hashtt, poolKey, {
+      v3 with
+      activeLiquidity = newActiveLiquidity;
+      totalFeesClaimed0 = v3.totalFeesClaimed0 + (actualFee0 * actualLiquidityToRemove / position.liquidity);
+      totalFeesClaimed1 = v3.totalFeesClaimed1 + (actualFee1 * actualLiquidityToRemove / position.liquidity);
+      ranges = ranges;
+    });
+
+    // Update or remove position
+    let newLiquidity = position.liquidity - actualLiquidityToRemove;
+    if (newLiquidity == 0) {
+      // Remove position entirely
+      let filtered = Array.filter<ConcentratedPosition>(positions, func(p) { p.positionId != positionId });
+      if (filtered.size() == 0) {
+        Map.delete(concentratedPositions, phash, caller);
+      } else {
+        Map.set(concentratedPositions, phash, caller, filtered);
+      };
+    } else {
+      // Update with reduced liquidity and reset fee snapshots
+      let updated = Array.map<ConcentratedPosition, ConcentratedPosition>(positions, func(p) {
+        if (p.positionId == positionId) {
+          { p with liquidity = newLiquidity; lastFeeGrowth0 = v3.feeGrowthGlobal0; lastFeeGrowth1 = v3.feeGrowthGlobal1; lastUpdateTime = nowVar };
+        } else { p };
+      });
+      Map.set(concentratedPositions, phash, caller, updated);
+    };
+
+    // Transfer tokens to user
+    let Tfees0 = returnTfees(token0);
+    let Tfees1 = returnTfees(token1);
+    if (totalAmount0 > Tfees0) {
+      Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount0 - Tfees0, token0));
+    };
+    if (totalAmount1 > Tfees1) {
+      Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount1 - Tfees1, token1));
+    };
+
+    doInfoBeforeStep2();
+
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+
+    "removed:" # Nat.toText(totalAmount0) # ":" # Nat.toText(totalAmount1);
+  };
+
   type DetailedLiquidityPosition = {
     token0 : Text;
     token1 : Text;
@@ -2258,6 +3141,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     token0Amount : Nat;
     token1Amount : Nat;
     shareOfPool : Float;
+    fee0 : Nat;
+    fee1 : Nat;
   };
 
   public query ({ caller }) func getUserLiquidityDetailed() : async [DetailedLiquidityPosition] {
@@ -2289,11 +3174,101 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   token0Amount = token0Amount;
                   token1Amount = token1Amount;
                   shareOfPool = shareOfPool;
+                  fee0 = pos.fee0 / tenToPower60;
+                  fee1 = pos.fee1 / tenToPower60;
                 };
               };
             };
           },
         );
+      };
+    };
+  };
+
+  public shared ({ caller }) func claimLPFees(token0i : Text, token1i : Text) : async Text {
+    if (isAllowed(caller) != 1) {
+      return "You are not allowed to perform this action";
+    };
+    if (Text.size(token0i) > 150 or Text.size(token1i) > 150) {
+      return "Invalid token identifier";
+    };
+
+    let pool2 = getPool(token0i, token1i);
+    let token0 = pool2.0;
+    let token1 = pool2.1;
+    let poolKey = (token0, token1);
+
+    let pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
+      case (null) { return "Pool not found" };
+      case (?p) { p };
+    };
+
+    let userPositions = switch (Map.get(userLiquidityPositions, phash, caller)) {
+      case (null) { return "User has no liquidity positions" };
+      case (?p) { p };
+    };
+
+    // Find the matching position
+    var position : ?LiquidityPosition = null;
+    for (p in userPositions.vals()) {
+      if ((p.token0 == token0 and p.token1 == token1) or (p.token0 == token1 and p.token1 == token0)) {
+        position := ?p;
+      };
+    };
+
+    switch (position) {
+      case (null) { return "Position not found for this pair" };
+      case (?pos) {
+        if (pos.fee0 == 0 and pos.fee1 == 0) {
+          return "No fees to claim";
+        };
+
+        let accumulatedFees0 = pos.fee0 / tenToPower60;
+        let accumulatedFees1 = pos.fee1 / tenToPower60;
+        let nowVar = Time.now();
+
+        // Zero out fees on the position (keep liquidity unchanged)
+        let updatedPositions = Array.map<LiquidityPosition, LiquidityPosition>(
+          userPositions,
+          func(p) {
+            if ((p.token0 == token0 and p.token1 == token1) or (p.token0 == token1 and p.token1 == token0)) {
+              { p with fee0 = 0; fee1 = 0; lastUpdateTime = nowVar };
+            } else { p };
+          },
+        );
+        Map.set(userLiquidityPositions, phash, caller, updatedPositions);
+
+        // Deduct from pool's total fees
+        Map.set(AMMpools, hashtt, poolKey, {
+          pool with
+          totalFee0 = pool.totalFee0 - pos.fee0;
+          totalFee1 = pool.totalFee1 - pos.fee1;
+          lastUpdateTime = nowVar;
+        });
+
+        // Queue fee transfers to caller
+        let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
+        let Tfees0 = returnTfees(token0);
+        let Tfees1 = returnTfees(token1);
+
+        if (accumulatedFees0 > Tfees0) {
+          Vector.add(tempTransferQueueLocal, (#principal(caller), accumulatedFees0 - Tfees0, token0));
+        } else if (accumulatedFees0 > 0) {
+          addFees(token0, accumulatedFees0, false, "", nowVar);
+        };
+        if (accumulatedFees1 > Tfees1) {
+          Vector.add(tempTransferQueueLocal, (#principal(caller), accumulatedFees1 - Tfees1, token1));
+        } else if (accumulatedFees1 > 0) {
+          addFees(token1, accumulatedFees1, false, "", nowVar);
+        };
+
+        if (Vector.size(tempTransferQueueLocal) > 0) {
+          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+            Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+          };
+        };
+
+        "claimed:" # Nat.toText(accumulatedFees0) # ":" # Nat.toText(accumulatedFees1);
       };
     };
   };
@@ -2506,13 +3481,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         null;
       };
       case (?pool) {
+        let dec0 = switch (Map.get(tokenInfo, thash, pool.token0)) { case (?i) { i.Decimals }; case null { 8 } };
+        let dec1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?i) { i.Decimals }; case null { 8 } };
         ?{
           token0 = pool.token0;
           token1 = pool.token1;
           reserve0 = pool.reserve0;
           reserve1 = pool.reserve1;
-          price0 = Float.fromInt(pool.reserve1) / Float.fromInt(pool.reserve0); // price of token0 in terms of token1
-          price1 = Float.fromInt(pool.reserve0) / Float.fromInt(pool.reserve1); // price of token1 in terms of token0
+          price0 = (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1));
+          price1 = (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) / (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0));
         };
       };
     };
@@ -2541,6 +3518,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     }>();
     for ((_, pool) in Map.entries(AMMpools)) {
       if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+        let dec0 = switch (Map.get(tokenInfo, thash, pool.token0)) { case (?i) { i.Decimals }; case null { 8 } };
+        let dec1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?i) { i.Decimals }; case null { 8 } };
         Vector.add(
           result,
           {
@@ -2548,8 +3527,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             token1 = pool.token1;
             reserve0 = pool.reserve0;
             reserve1 = pool.reserve1;
-            price0 = Float.fromInt(pool.reserve1) / Float.fromInt(pool.reserve0);
-            price1 = Float.fromInt(pool.reserve0) / Float.fromInt(pool.reserve1);
+            price0 = (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1));
+            price1 = (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) / (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0));
             totalLiquidity = pool.totalLiquidity;
           },
         );
@@ -2560,6 +3539,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   // Function to update kline data with a new trade
   func updateKlineData(token1 : Text, token2 : Text, price : Float, volume : Nat) {
+    if (price <= 0.0) return; // skip zero/negative prices
+
     let pool = getPool(token1, token2);
     let nowVar = Time.now();
     let currentTime = nowVar;
@@ -2594,9 +3575,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         case (?existingKline) {
           {
             timestamp = existingKline.timestamp;
-            open = existingKline.open;
+            open = if (existingKline.open == 0.0) { price } else { existingKline.open };
             high = Float.max(existingKline.high, price);
-            low = Float.min(existingKline.low, price);
+            low = if (existingKline.low == 0.0 or existingKline.low > price) { price } else { existingKline.low };
             close = price;
             volume = existingKline.volume + volume;
           };
@@ -2799,7 +3780,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         case null {
           let previousClose = if (index == 0) {
             switch (lastKline) {
-              case null { 0.0 };
+              case null {
+                // No previous kline — use current pool price instead of 0.0
+                let poolKey2 = (klineKey.0, klineKey.1);
+                switch (Map.get(AMMpools, hashtt, poolKey2)) {
+                  case (?pool) {
+                    if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+                      let d0 = switch (Map.get(tokenInfo, thash, pool.token0)) { case (?i) { i.Decimals }; case null { 8 } };
+                      let d1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?i) { i.Decimals }; case null { 8 } };
+                      (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** d0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** d1));
+                    } else { 0.0 };
+                  };
+                  case null { 0.0 };
+                };
+              };
               case (?kline) { kline.close };
             };
           } else {
@@ -3007,7 +4001,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     return true;
   };
   private func DAOcheck(caller : Principal) : Bool {
-    if (not test and (caller != DAOentry and caller != self and caller != DAOTreasury)) {
+    if (not test and not isAdmin(caller)) {
       dayBan := TrieSet.put(dayBan, caller, Principal.hash(caller), Principal.equal);
       return false;
     };
@@ -3371,12 +4365,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         poolKey := pair;
         if (index < Vector.size(last_traded_price)) {
           if (pair.0 == tokenPair.0 and pair.1 == tokenPair.1) {
-            price := (Float.fromInt(amountSell) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[0].0))) / (Float.fromInt(amountInit) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[0].1)));
+            price := (Float.fromInt(amountSell) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[index].0))) / (Float.fromInt(amountInit) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[index].1)));
             token1 := pair.0;
             token2 := pair.1;
             vol += amountSell;
           } else {
-            price := (Float.fromInt(amountInit) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[0].0))) / (Float.fromInt(amountSell) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[0].1)));
+            price := (Float.fromInt(amountInit) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[index].0))) / (Float.fromInt(amountSell) * Float.fromInt(10 ** nat8ToNat(AllExchangeInfo.asset_decimals[index].1)));
             token1 := pair.1;
             token2 := pair.0;
             vol += amountInit;
@@ -4232,6 +5226,68 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   };
 
   //Function made for people that sent an token to the exchange that is not supported.
+  type RecoveryInput = { identifier : Text; block : Nat; tType : { #ICP; #ICRC12; #ICRC3 } };
+  type RecoveryResult = { identifier : Text; block : Nat; success : Bool; error : Text };
+
+  // Batch recovery: recover up to 20 stuck transfers, 5 in parallel per batch
+  public shared ({ caller }) func recoverBatch(
+    recoveries : [RecoveryInput]
+  ) : async [RecoveryResult] {
+    if (isAllowed(caller) != 1) {
+      return [{ identifier = ""; block = 0; success = false; error = "Not allowed" }];
+    };
+
+    let maxRecoveries = Nat.min(recoveries.size(), 20);
+    let results = Vector.new<RecoveryResult>();
+
+    // Pre-filter: skip blocks already in BlocksDone (no async needed)
+    let toRecover = Vector.new<RecoveryInput>();
+    for (i in Iter.range(0, maxRecoveries - 1)) {
+      let r = recoveries[i];
+      if (Map.has(BlocksDone, thash, r.identifier # ":" # Nat.toText(r.block))) {
+        Vector.add(results, { identifier = r.identifier; block = r.block; success = false; error = "Block already used" });
+      } else {
+        Vector.add(toRecover, r);
+      };
+    };
+
+    let pending = Vector.toArray(toRecover);
+    var idx = 0;
+
+    // Process in batches of 5 in parallel
+    while (idx < pending.size()) {
+      let batchEnd = Nat.min(idx + 5, pending.size());
+
+      // Fire up to 5 futures
+      let f0 = if (idx + 0 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 0].identifier, pending[idx + 0].block, pending[idx + 0].tType)) } else { null };
+      let f1 = if (idx + 1 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 1].identifier, pending[idx + 1].block, pending[idx + 1].tType)) } else { null };
+      let f2 = if (idx + 2 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 2].identifier, pending[idx + 2].block, pending[idx + 2].tType)) } else { null };
+      let f3 = if (idx + 3 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 3].identifier, pending[idx + 3].block, pending[idx + 3].tType)) } else { null };
+      let f4 = if (idx + 4 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 4].identifier, pending[idx + 4].block, pending[idx + 4].tType)) } else { null };
+
+      // Await all in this batch
+      let r0 = switch (f0) { case (?f) { try { await f } catch (_) { false } }; case null { false } };
+      let r1 = switch (f1) { case (?f) { try { await f } catch (_) { false } }; case null { false } };
+      let r2 = switch (f2) { case (?f) { try { await f } catch (_) { false } }; case null { false } };
+      let r3 = switch (f3) { case (?f) { try { await f } catch (_) { false } }; case null { false } };
+      let r4 = switch (f4) { case (?f) { try { await f } catch (_) { false } }; case null { false } };
+
+      let batchResults = [r0, r1, r2, r3, r4];
+      for (j in Iter.range(0, batchEnd - idx - 1)) {
+        Vector.add(results, {
+          identifier = pending[idx + j].identifier;
+          block = pending[idx + j].block;
+          success = batchResults[j];
+          error = if (batchResults[j]) { "" } else { "Recovery failed" };
+        });
+      };
+
+      idx := batchEnd;
+    };
+
+    Vector.toArray(results);
+  };
+
   public shared ({ caller }) func recoverWronglysent(identifier : Text, Block : Nat, tType : { #ICP; #ICRC12; #ICRC3 }) : async Bool {
     if (isAllowed(caller) != 1) {
       return false;
@@ -4951,7 +6007,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Validate route structure (cheap checks before any block processing)
     var validationError : Text = "";
-    if (route.size() < 2 or route.size() > 3) { validationError := "Invalid route: 2-3 hops required" }
+    if (route.size() < 1 or route.size() > 3) { validationError := "Invalid route: 1-3 hops required" }
     else if (route[0].tokenIn != tokenIn) { validationError := "Route mismatch: first hop tokenIn != tokenIn" }
     else if (route[route.size() - 1].tokenOut != tokenOut) { validationError := "Route mismatch: last hop tokenOut != tokenOut" }
     else {
@@ -5281,62 +6337,57 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   func swapWithAMM(pool : AMMPool, tokenInIsToken0 : Bool, amountIn : Nat, orderRatio : Ratio, fee : Nat) : (Nat, Nat, Nat, Nat, Nat, Nat, AMMPool) {
 
+    // V3 path: if pool has concentrated liquidity data, use V3 engine
+    let poolKey = (pool.token0, pool.token1);
+    switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case (?v3) {
+        let (totalIn, totalOut, protocolFee, poolFee, updatedPool, updatedV3) = swapWithAMMV3(pool, v3, tokenInIsToken0, amountIn, fee);
+        Map.set(poolV3Data, hashtt, poolKey, updatedV3);
+        let reserveIn = if (tokenInIsToken0) updatedPool.reserve0 else updatedPool.reserve1;
+        let reserveOut = if (tokenInIsToken0) updatedPool.reserve1 else updatedPool.reserve0;
+        return (totalIn, totalOut, reserveIn, reserveOut, protocolFee, poolFee, updatedPool);
+      };
+      case null {};
+    };
 
-
+    // V2 fallback (for pools without V3 data)
     let reserveIn = if (tokenInIsToken0) pool.reserve0 else pool.reserve1;
     let reserveOut = if (tokenInIsToken0) pool.reserve1 else pool.reserve0;
-
 
     let poolFeeAmount = (amountIn * fee * 70) / (100 * 10000);
     let protocolFeeAmount = (amountIn * fee * 30) / (100 * 10000);
 
-
     let amountInAfterFee = amountIn;
-
 
     let k = reserveIn * reserveOut;
     let targetRatio = switch (orderRatio) {
       case (#Value(r)) r;
-      case (#Zero) 1; // Avoid division by zero
-      case (#Max) tenToPower60; // Use a large number to represent "infinity"
+      case (#Zero) 1;
+      case (#Max) tenToPower60;
     };
 
     let newReserveIn = sqrt((k * tenToPower60) / targetRatio);
     let optimalAmountIn = if (newReserveIn > reserveIn and amountInAfterFee > 0) {
       Nat.min(amountInAfterFee, newReserveIn - reserveIn);
-    } else {
-      0;
-    };
+    } else { 0 };
 
-    let amountOut = if (optimalAmountIn == 0) {
-      0;
-    } else {
+    let amountOut = if (optimalAmountIn == 0) { 0 } else {
       (reserveOut * optimalAmountIn) / (reserveIn + optimalAmountIn);
     };
 
-
     let actualNewReserveIn = reserveIn + optimalAmountIn;
-    let actualNewReserveOut = if (reserveOut > amountOut) {
-      reserveOut - amountOut;
-    } else { 0 };
-
+    let actualNewReserveOut = if (reserveOut > amountOut) { reserveOut - amountOut } else { 0 };
 
     let updatedPool : AMMPool = {
       pool with
       reserve0 = if (tokenInIsToken0) actualNewReserveIn else Nat.max(actualNewReserveOut, if (pool.reserve0 > amountOut) { pool.reserve0 - amountOut } else { Debug.print("!!!!!"); 0 });
       reserve1 = if (tokenInIsToken0) Nat.max(actualNewReserveOut, if (pool.reserve1 > amountOut) { pool.reserve1 - amountOut } else { Debug.print("!!!!!"); 0 }) else actualNewReserveIn;
-      totalFee0 = if (tokenInIsToken0) {
-        pool.totalFee0 + ((tenToPower60) * poolFeeAmount);
-      } else { pool.totalFee0 };
-      totalFee1 = if (tokenInIsToken0) { pool.totalFee1 } else {
-        pool.totalFee1 + ((tenToPower60) * poolFeeAmount);
-      };
+      totalFee0 = if (tokenInIsToken0) { pool.totalFee0 + ((tenToPower60) * poolFeeAmount) } else { pool.totalFee0 };
+      totalFee1 = if (tokenInIsToken0) { pool.totalFee1 } else { pool.totalFee1 + ((tenToPower60) * poolFeeAmount) };
       lastUpdateTime = Time.now();
     };
 
-    let result = (amountIn, amountOut, actualNewReserveIn, actualNewReserveOut, protocolFeeAmount, poolFeeAmount, updatedPool);
-
-    result;
+    (amountIn, amountOut, actualNewReserveIn, actualNewReserveOut, protocolFeeAmount, poolFeeAmount, updatedPool);
   };
   // Pure constant-product AMM simulation — no state modification.
   // Used for ranking multi-hop routes and slippage pre-checks.
@@ -5354,6 +6405,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   };
 
   func updateUserPosition(poolKey : (Text, Text), addedFee0 : Nat, addedFee1 : Nat, providers : [Principal], pool : AMMPool) {
+    // V3 pools: fees tracked via feeGrowthGlobal in swapWithAMMV3, no per-provider iteration needed
+    if (Map.has(poolV3Data, hashtt, poolKey)) { return };
+
     let nowVar = Time.now();
 
     label a for (user in providers.vals()) {
@@ -5436,23 +6490,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
 
-      // Per-hop price impact: compare actual rate vs spot rate from tiny trade
-      let hopPriceImpact : Float = if (hopOutput > 0 and hopAmountIn > 10000) {
-        let tinyTrade : TradePrivate = {
-          syntheticTrade with amount_init = 10000;
-        };
-        let (_, _, _, tinyTransfers, _) = orderPairing(tinyTrade);
-        var tinyOut : Nat = 0;
-        for (tx in tinyTransfers.vals()) {
-          if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
-            tinyOut += tx.1;
+      // Per-hop price impact: mathematical constant-product formula (same as getExpectedReceiveAmount)
+      let hopPriceImpact : Float = if (hopOutput > 0 and hopAmountIn > 0) {
+        let hopPoolKey = getPool(hop.tokenIn, hop.tokenOut);
+        switch (Map.get(AMMpools, hashtt, hopPoolKey)) {
+          case (?hopPool) {
+            let (rIn, rOut) = if (hopPool.token0 == hop.tokenIn) { (hopPool.reserve0, hopPool.reserve1) } else { (hopPool.reserve1, hopPool.reserve0) };
+            if (rIn > 0 and rOut > 0) {
+              let mathOut = Float.fromInt(rOut) * Float.fromInt(hopAmountIn) / Float.fromInt(rIn + hopAmountIn);
+              let spotOut = Float.fromInt(rOut) / Float.fromInt(rIn) * Float.fromInt(hopAmountIn);
+              if (spotOut > 0.0) { Float.abs(1.0 - mathOut / spotOut) } else { 0.0 };
+            } else { 0.0 };
           };
+          case null { 0.0 };
         };
-        if (tinyOut > 0) {
-          let spotRate = Float.fromInt(tinyOut) / 10000.0;
-          let actualRate = Float.fromInt(hopOutput) / Float.fromInt(hopAmountIn);
-          if (spotRate > 0.0) { Float.abs(spotRate - actualRate) / spotRate } else { 0.0 };
-        } else { 0.0 };
       } else { 0.0 };
 
       totalFees += protocolFee + poolFee;
@@ -7228,6 +8279,135 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   transient var currentRunIdFinishSellBatchDAO = 0;
   transient var loggingMapFinishSellBatchDAO = Map.new<Nat, Text>();
 
+  // DAO treasury swap: auto-routes, no separate quote call needed, no trading fee for DAO
+  public shared ({ caller }) func treasurySwap(
+    tokenIn : Text, tokenOut : Text,
+    amountIn : Nat, minAmountOut : Nat,
+    block : Nat,
+  ) : async Text {
+    if (not DAOcheck(caller)) return "Not authorized as DAO";
+    if (not containsToken(tokenIn) or not containsToken(tokenOut)) return "Token not accepted";
+    if (tokenIn == tokenOut) return "Same token";
+
+    let nowVar = Time.now();
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
+
+    // Block validation
+    if (Map.has(BlocksDone, thash, tokenIn # ":" # Nat.toText(block))) {
+      return "Block already used";
+    };
+    Map.set(BlocksDone, thash, tokenIn # ":" # Nat.toText(block), nowVar);
+    let tType = returnType(tokenIn);
+
+    let blockData = try { await* getBlockData(tokenIn, block, tType) } catch (_) {
+      Map.delete(BlocksDone, thash, tokenIn # ":" # Nat.toText(block));
+      return "Failed to get block data";
+    };
+
+    // checkReceive with dao=true — simpler validation, no fee in deposit required
+    let (receiveBool, receiveTransfers) = checkReceive(block, caller, amountIn, tokenIn, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar);
+    Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
+    if (not receiveBool) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return "Funds not received";
+    };
+
+    // Find best route internally (FREE — no inter-canister call)
+    let routes = findRoutes(tokenIn, tokenOut, amountIn);
+    let bestRoute = if (routes.size() > 0 and routes[0].hops.size() >= 1) {
+      routes[0].hops;
+    } else {
+      [{ tokenIn = tokenIn; tokenOut = tokenOut }];
+    };
+
+    // Pre-check: simulate to verify minAmountOut
+    let sim = simulateMultiHop(bestRoute, amountIn, caller);
+    if (sim.amountOut < minAmountOut) {
+      // Refund deposit
+      Vector.add(tempTransferQueueLocal, (#principal(caller), amountIn, tokenIn));
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return "Slippage: estimated " # Nat.toText(sim.amountOut) # " < min " # Nat.toText(minAmountOut);
+    };
+
+    // Execute hops via orderPairing
+    var currentAmount = amountIn;
+    label hopLoop for (hopIndex in Iter.range(0, bestRoute.size() - 1)) {
+      let hop = bestRoute[hopIndex];
+      let isLastHop = hopIndex + 1 == bestRoute.size();
+
+      let syntheticTrade : TradePrivate = {
+        Fee = 0; // DAO pays no trading fee
+        amount_sell = 1; amount_init = currentAmount;
+        token_sell_identifier = hop.tokenOut;
+        token_init_identifier = hop.tokenIn;
+        trade_done = 0; seller_paid = 0; init_paid = 1;
+        seller_paid2 = 0; init_paid2 = 0; trade_number = 0;
+        SellerPrincipal = "0";
+        initPrincipal = Principal.toText(caller);
+        RevokeFee = RevokeFeeNow; OCname = ""; time = nowVar;
+        filledInit = 0; filledSell = 0;
+        allOrNothing = false; strictlyOTC = false;
+      };
+
+      let (_, _, _, transfers, _) = orderPairing(syntheticTrade);
+      var hopOutput : Nat = 0;
+      for (tx in transfers.vals()) {
+        if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
+          hopOutput += tx.1;
+          if (isLastHop) {
+            Vector.add(tempTransferQueueLocal, tx);
+          };
+        } else {
+          Vector.add(tempTransferQueueLocal, tx);
+        };
+      };
+
+      // Handle unfilled portion on first hop
+      let remaining = safeSub(currentAmount, hopOutput);
+      if (remaining > returnTfees(hop.tokenIn) and hopIndex == 0) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), remaining, hop.tokenIn));
+      };
+
+      currentAmount := hopOutput;
+      if (currentAmount == 0) break hopLoop;
+
+      // Add back transfer fee for intermediate hops
+      if (not isLastHop) {
+        currentAmount += returnTfees(hop.tokenOut);
+      };
+    };
+
+    // Record in swap history
+    let routeVec = Vector.new<Text>();
+    Vector.add(routeVec, tokenIn);
+    for (hop in bestRoute.vals()) { Vector.add(routeVec, hop.tokenOut) };
+    nextSwapId += 1;
+    recordSwap(caller, {
+      swapId = nextSwapId; tokenIn; tokenOut;
+      amountIn; amountOut = currentAmount;
+      route = Vector.toArray(routeVec);
+      fee = 0;
+      swapType = #direct;
+      timestamp = nowVar;
+    });
+
+    // Send all transfers
+    doInfoBeforeStep2();
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+
+    if (currentAmount < minAmountOut) {
+      return "Warning: slippage. Got " # Nat.toText(currentAmount) # " < min " # Nat.toText(minAmountOut);
+    };
+
+    "done:" # Nat.toText(currentAmount);
+  };
+
   public shared (msg) func FinishSellBatchDAO(
     trades : [TradeData],
     createOrdersIfNotDone : Bool,
@@ -7676,7 +8856,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           };
 
           // Calculate proportion based on ICP value
-          let proportion = (buyValueICP * tenToPower30) / totalBuyValueICP;
+          let proportion = (buyValueICP * tenToPower60) / totalBuyValueICP;
           var targetSellAmount = (possiblesell * proportion) / tenToPower30;
 
           targetSellAmount := if (targetSellAmount < remainingToDistribute) {
@@ -8159,6 +9339,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         swapType = #limit;
         timestamp = nowVar2;
       });
+
+      // Update kline data for this fill
+      let fillPair = getPool(token_init_identifier, token_sell_identifier);
+      let isForeignPool = Map.has(foreignPools, hashtt, (token_init_identifier, token_sell_identifier)) or
+                          Map.has(foreignPools, hashtt, (token_sell_identifier, token_init_identifier));
+      if (not isForeignPool) {
+        updateLastTradedPrice(fillPair, i.amount_init, i.amount_sell);
+      };
     };
 
     doInfoBeforeStep2();
@@ -8487,8 +9675,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // Sum AMM liquidity
       var ammliquidity : Int = 0;
       for ((poolKey, pool) in Map.entries(AMMpools)) {
-        if (poolKey.0 == token) { ammliquidity += pool.reserve0 + (pool.totalFee0 / tenToPower60) }
-        else if (poolKey.1 == token) { ammliquidity += pool.reserve1 + (pool.totalFee1 / tenToPower60) };
+        if (poolKey.0 == token) {
+          ammliquidity += pool.reserve0 + (pool.totalFee0 / tenToPower60);
+          // V3 unclaimed fees
+          switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
+            case null {};
+          };
+        } else if (poolKey.1 == token) {
+          ammliquidity += pool.reserve1 + (pool.totalFee1 / tenToPower60);
+          switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
+            case null {};
+          };
+        };
       };
 
       // Adjust for minimum liquidity
@@ -8665,12 +9865,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             Vector.add(orderCodesVec, { accessCode = key; identifier = i; poolCanister = (value.token_init_identifier, value.token_sell_identifier) });
           };
         };
-        // Check AMM pools
+        // Check AMM pools (V2 + V3 fees)
         for ((poolKey, pool) in Map.entries(AMMpools)) {
           if (poolKey.0 == i) {
             ammliquidity += pool.reserve0 +(pool.totalFee0 / (tenToPower60));
+            switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
+              case null {};
+            };
           } else if (poolKey.1 == i) {
             ammliquidity += pool.reserve1 +(pool.totalFee1 / (tenToPower60));
+            switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
+              case null {};
+            };
           };
         };
         Vector.add(orderbalanceVec, innie + openorders);
@@ -8750,12 +9958,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             Vector.add(orderCodesVec, { accessCode = key; identifier = i; poolCanister = (value.token_init_identifier, value.token_sell_identifier) });
           };
         };
-        // Check AMM pools
+        // Check AMM pools (V2 + V3 fees)
         for ((poolKey, pool) in Map.entries(AMMpools)) {
           if (poolKey.0 == i) {
             ammliquidity += pool.reserve0 +(pool.totalFee0 / (tenToPower60));
+            switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
+              case null {};
+            };
           } else if (poolKey.1 == i) {
             ammliquidity += pool.reserve1 +(pool.totalFee1 / (tenToPower60));
+            switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
+              case null {};
+            };
           };
         };
         Vector.add(orderbalanceVec, innie + openorders);
@@ -9635,6 +10851,50 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
   };
 
+  // Get concentrated liquidity ranges for a pool (for liquidity distribution chart)
+  public query ({ caller }) func getPoolRanges(token0 : Text, token1 : Text) : async [{
+    ratioLower : Nat;
+    ratioUpper : Nat;
+    liquidity : Nat;
+    token0Locked : Nat;
+    token1Locked : Nat;
+  }] {
+    if (isAllowedQuery(caller) != 1) { return [] };
+    let poolKey = getPool(token0, token1);
+    switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case null { [] };
+      case (?v3) {
+        let result = Vector.new<{ ratioLower : Nat; ratioUpper : Nat; liquidity : Nat; token0Locked : Nat; token1Locked : Nat }>();
+        // Pair each positive liquidityNet (entry) with its matching negative (exit)
+        for ((ratio, data) in RBTree.entries(v3.ranges)) {
+          if (data.liquidityNet > 0) {
+            let sqrtLower = ratioToSqrtRatio(ratio);
+            // Find the corresponding upper bound (scan forward for next negative entry)
+            // For simplicity, output each tick with its gross liquidity
+            let (amt0, amt1) = amountsFromLiquidity(data.liquidityGross, sqrtLower, ratioToSqrtRatio(ratio + ratio * TICK_SPACING_BPS / 10000), v3.currentSqrtRatio);
+            Vector.add(result, {
+              ratioLower = ratio;
+              ratioUpper = ratio + ratio * TICK_SPACING_BPS / 10000;
+              liquidity = data.liquidityGross;
+              token0Locked = amt0;
+              token1Locked = amt1;
+            });
+          };
+        };
+        Vector.toArray(result);
+      };
+    };
+  };
+
+  // Get user's concentrated liquidity positions
+  public query ({ caller }) func getUserConcentratedPositions() : async [ConcentratedPosition] {
+    if (isAllowedQuery(caller) != 1) { return [] };
+    switch (Map.get(concentratedPositions, phash, caller)) {
+      case null { [] };
+      case (?positions) { positions };
+    };
+  };
+
   // Function that returns USD prices for tokens in the exchange.
   // Each token's USD price is calculated based on its trading activity
   // with either ICP or ckUSDC, whichever provides more reliable data.
@@ -10197,6 +11457,97 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     checkAndAggregateAllPools();
   };
 
+  // ═══ V2 → V3 Migration (runs once) ═══
+  if (not v3Migrated) {
+    for ((poolKey, pool) in Map.entries(AMMpools)) {
+      if (pool.reserve0 > 0 and pool.reserve1 > 0 and pool.totalLiquidity > 0) {
+        let sqrtRatio = ratioToSqrtRatio((pool.reserve1 * tenToPower60) / pool.reserve0);
+
+        // Create range tree with full-range boundaries
+        var rangeTree = RBTree.init<Nat, RangeData>();
+        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_LOWER, {
+          liquidityNet = pool.totalLiquidity; // positive = liquidity enters
+          liquidityGross = pool.totalLiquidity;
+          feeGrowthOutside0 = 0;
+          feeGrowthOutside1 = 0;
+        });
+        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_UPPER, {
+          liquidityNet = -pool.totalLiquidity; // negative = liquidity exits
+          liquidityGross = pool.totalLiquidity;
+          feeGrowthOutside0 = 0;
+          feeGrowthOutside1 = 0;
+        });
+
+        Map.set(poolV3Data, hashtt, poolKey, {
+          activeLiquidity = pool.totalLiquidity;
+          currentSqrtRatio = sqrtRatio;
+          feeGrowthGlobal0 = 0;
+          feeGrowthGlobal1 = 0;
+          totalFeesCollected0 = 0;
+          totalFeesCollected1 = 0;
+          totalFeesClaimed0 = 0;
+          totalFeesClaimed1 = 0;
+          ranges = rangeTree;
+        });
+      };
+    };
+
+    // Convert user positions to concentrated (full-range)
+    for ((user, positions) in Map.entries(userLiquidityPositions)) {
+      let converted = Array.map<LiquidityPosition, ConcentratedPosition>(positions, func(p) {
+        nextPositionId += 1;
+        {
+          positionId = nextPositionId;
+          token0 = p.token0; token1 = p.token1;
+          liquidity = p.liquidity;
+          ratioLower = FULL_RANGE_LOWER;
+          ratioUpper = FULL_RANGE_UPPER;
+          lastFeeGrowth0 = 0;
+          lastFeeGrowth1 = 0;
+          lastUpdateTime = p.lastUpdateTime;
+        };
+      });
+      Map.set(concentratedPositions, phash, user, converted);
+    };
+
+    v3Migrated := true;
+  };
+
+  // V3 migration pass 2: re-key range trees with sqrtRatio values
+  if (not v3MigratedV2) {
+    for ((poolKey, pool) in Map.entries(AMMpools)) {
+      if (pool.reserve0 > 0 and pool.reserve1 > 0 and pool.totalLiquidity > 0) {
+        let sqrtRatio = ratioToSqrtRatio((pool.reserve1 * tenToPower60) / pool.reserve0);
+        // Rebuild range tree from scratch with sqrtRatio keys
+        var rangeTree = RBTree.init<Nat, RangeData>();
+        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_LOWER, {
+          liquidityNet = pool.totalLiquidity;
+          liquidityGross = pool.totalLiquidity;
+          feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
+        });
+        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_UPPER, {
+          liquidityNet = -pool.totalLiquidity;
+          liquidityGross = pool.totalLiquidity;
+          feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
+        });
+        // Preserve fee growth data from previous migration
+        let existingV3 = Map.get(poolV3Data, hashtt, poolKey);
+        let feeG0 = switch (existingV3) { case (?v) { v.feeGrowthGlobal0 }; case null { 0 } };
+        let feeG1 = switch (existingV3) { case (?v) { v.feeGrowthGlobal1 }; case null { 0 } };
+        Map.set(poolV3Data, hashtt, poolKey, {
+          activeLiquidity = pool.totalLiquidity;
+          currentSqrtRatio = sqrtRatio;
+          feeGrowthGlobal0 = feeG0;
+          feeGrowthGlobal1 = feeG1;
+          totalFeesCollected0 = 0; totalFeesCollected1 = 0;
+          totalFeesClaimed0 = 0; totalFeesClaimed1 = 0;
+          ranges = rangeTree;
+        });
+      };
+    };
+    v3MigratedV2 := true;
+  };
+
   if (first_time_running_after_upgrade == 1) {
     let timersize = Vector.size(timerIDs);
     if (timersize > 0) {
@@ -10307,10 +11658,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           () ->
             (action : {#Add; #Opposite; #Remove}, added2 : Text,
              minimum : Nat, tType : {#ICP; #ICRC12; #ICRC3});
+        #addConcentratedLiquidity :
+          () ->
+            (token0i : Text, token1i : Text, amount0i : Nat, amount1i : Nat,
+             priceLower : Nat, priceUpper : Nat, block0i : Nat, block1i : Nat);
         #addLiquidity :
           () ->
             (token0i : Text, token1i : Text, amount0i : Nat, amount1i : Nat,
              block0i : Nat, block1i : Nat);
+        #removeConcentratedLiquidity :
+          () ->
+            (token0i : Text, token1i : Text, positionId : Nat, liquidityAmount : Nat);
         #addPosition :
           () ->
             (Block : Nat, amount_sell : Nat, amount_init : Nat,
@@ -10360,6 +11718,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
              stepBasisPoints : Nat);
         #getPausedTokens : () -> ();
         #getPoolHistory : () -> (token1 : Text, token2 : Text, limit : Nat);
+        #recoverBatch : () -> (recoveries : [{ identifier : Text; block : Nat; tType : { #ICP; #ICRC12; #ICRC3 } }]);
+        #getPoolRanges : () -> (token0 : Text, token1 : Text);
         #getPrivateTrade : () -> (pass : Text);
         #getTokenUSDPrices :
           () -> (ICPpriceUSD : Float, ckUSDCpriceUSD : Float);
@@ -10367,6 +11727,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #getUserPreviousTrades : () -> (token1 : Text, token2 : Text);
         #getUserReferralInfo : () -> ();
         #getUserTradeHistory : () -> (limit : Nat);
+        #getUserConcentratedPositions : () -> ();
         #getUserSwapHistory : () -> (limit : Nat);
         #getUserTrades : () -> ();
         #get_cycles : () -> ();
@@ -10393,6 +11754,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #recoverWronglysent :
           () ->
             (identifier : Text, Block : Nat, tType : {#ICP; #ICRC12; #ICRC3});
+        #claimLPFees :
+          () -> (token0i : Text, token1i : Text);
         #removeLiquidity :
           () -> (token0i : Text, token1i : Text, liquidityAmount : Nat);
         #retrieveFundsDao : () -> (trades : [(Text, Nat64)]);
@@ -10407,6 +11770,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           () ->
             (tokenIn : Text, tokenOut : Text, amountIn : Nat,
              route : [SwapHop], minAmountOut : Nat, Block : Nat);
+        #treasurySwap :
+          () ->
+            (tokenIn : Text, tokenOut : Text, amountIn : Nat,
+             minAmountOut : Nat, block : Nat);
     };
   }) : Bool {
 
@@ -10456,6 +11823,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#retrieveFundsDao _) false;
       case (#returncontractprincipal _) true;
       case (#sendDAOInfo _) false;
+      case (#treasurySwap _) callerIsAdmin;
       case (#setTest _) callerIsAdmin or test;
       case (#checkDiffs _) callerIsAdmin or test;
       case (#cleanTokenIds _) callerIsAdmin;
@@ -10479,9 +11847,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#swapMultiHop d) {
         let (tokenIn, tokenOut, _, route, _, _) = d();
         if (not containsToken(tokenIn) or not containsToken(tokenOut)) return false;
-        if (route.size() < 2 or route.size() > 3) return false;
+        if (route.size() < 1 or route.size() > 3) return false; // allow 1-hop direct + 2-3 hop multi
         return true;
       };
+
+      case (#claimLPFees _) true;
 
       case (#getPrivateTrade d) {
         var tid : Text = d();

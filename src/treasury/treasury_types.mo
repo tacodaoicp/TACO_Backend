@@ -127,6 +127,7 @@ module {
   public type ExchangeType = {
     #KongSwap;
     #ICPSwap;
+    #TACO;
   };
 
   // Price source for a token

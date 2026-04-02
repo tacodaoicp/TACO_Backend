@@ -210,6 +210,29 @@ module {
     token0Amount : Nat;
     token1Amount : Nat;
     shareOfPool : Float;
+    fee0 : Nat;
+    fee1 : Nat;
+  };
+
+  public type HopDetail = {
+    tokenIn : Text;
+    tokenOut : Text;
+    amountIn : Nat;
+    amountOut : Nat;
+    fee : Nat;
+    priceImpact : Float;
+  };
+
+  public type ConcentratedPosition = {
+    positionId : Nat;
+    token0 : Text;
+    token1 : Text;
+    liquidity : Nat;
+    ratioLower : Nat;
+    ratioUpper : Nat;
+    lastFeeGrowth0 : Nat;
+    lastFeeGrowth1 : Nat;
+    lastUpdateTime : Int;
   };
 
   type TradePrivate = {
@@ -355,6 +378,7 @@ module {
       routeDescription : Text;
       canFulfillFully : Bool;
       potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
     };
     getLogging : shared query ({ #FinishSellBatchDAO; #addAcceptedToken }, Nat) -> async [(Nat, Text)];
     getExpectedMultiHopAmount : shared query (Text, Text, Nat) -> async {
@@ -364,8 +388,13 @@ module {
       priceImpact : Float;
       hops : Nat;
       routeTokens : [Text];
+      hopDetails : [HopDetail];
     };
     swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async Text;
+    claimLPFees : shared (Text, Text) -> async Text;
+    addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async Text;
+    removeConcentratedLiquidity : shared (Text, Text, Nat, Nat) -> async Text;
+    getUserConcentratedPositions : shared query () -> async [ConcentratedPosition];
     getOrderbookCombined : shared query (Text, Text, Nat, Nat) -> async OrderbookCombinedResult;
     getUserReferralInfo : shared query () -> async ReferralInfo;
     getAllAMMPools : shared query () -> async [AMMPoolSummary];
