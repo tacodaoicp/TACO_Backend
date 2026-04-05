@@ -3,6 +3,11 @@ module {
     tokenIn : Text;
     tokenOut : Text;
   };
+  public type SplitLeg = {
+    amountIn : Nat;
+    route : [SwapHop];
+    minLegOut : Nat;
+  };
   public type TradePrivate = {
     amount_sell : Nat;
     amount_init : Nat;
@@ -162,6 +167,7 @@ module {
     };
     recoverUnprocessedTokensDAO : shared [(Text, Nat, Nat)] -> async [(Text, Nat, Bool)];
     swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async Text;
+    swapSplitRoutes : shared (Text, Text, [SplitLeg], Nat, Nat) -> async Text;
     claimLPFees : shared (Text, Text) -> async Text;
     getUserLiquidityDetailed : shared () -> async [DetailedLiquidityPosition];
     addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async Text;

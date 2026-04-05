@@ -38,8 +38,8 @@ shared (deployer) persistent actor class testActorB() = this {
     account = Utils.accountToText(Utils.principalToAccount(actorPrincipal));
   };
 
-  transient let exchangePrincipal = Principal.fromText("mbl7t-vyaaa-aaaak-ae5xq-cai");
-  transient let exchange = actor ("5kuny-yiaaa-aaaal-acgta-cai") : Exchange.Self;
+  transient let exchangePrincipal = Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai");
+  transient let exchange = actor ("qioex-5iaaa-aaaan-q52ba-cai") : Exchange.Self;
 
   transient let icp = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : ICPLedger.Interface;
   transient let icrcA = actor ("mxzaz-hqaaa-aaaar-qaada-cai") : ICRC1.FullInterface;
@@ -740,6 +740,14 @@ shared (deployer) persistent actor class testActorB() = this {
     minAmountOut : Nat, Block : Nat,
   ) : async Text {
     await exchange.swapMultiHop(tokenIn, tokenOut, amountIn, route, minAmountOut, Block);
+  };
+
+  public func swapSplitRoutes(
+    tokenIn : Text, tokenOut : Text,
+    splits : [{ amountIn : Nat; route : [{ tokenIn : Text; tokenOut : Text }]; minLegOut : Nat }],
+    minAmountOut : Nat, Block : Nat,
+  ) : async Text {
+    await exchange.swapSplitRoutes(tokenIn, tokenOut, splits, minAmountOut, Block);
   };
 
   public func claimLPFees(token0 : Text, token1 : Text) : async Text {

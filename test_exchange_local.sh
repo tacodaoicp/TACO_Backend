@@ -14,8 +14,8 @@
 set -e
 
 # === Canister IDs (must match hardcoded values in test files) ===
-OTC_BACKEND_ID="5kuny-yiaaa-aaaal-acgta-cai"
-EXCHANGE_TREASURY_ID="mbl7t-vyaaa-aaaak-ae5xq-cai"
+OTC_BACKEND_ID="qioex-5iaaa-aaaan-q52ba-cai"
+EXCHANGE_TREASURY_ID="qbnpl-laaaa-aaaan-q52aq-cai"
 TEST_ACTOR_A_ID="hhaaz-2aaaa-aaaaq-aacla-cai"
 TEST_ACTOR_B_ID="qtooy-2yaaa-aaaaq-aabvq-cai"
 TEST_ACTOR_C_ID="aanaa-xaaaa-aaaah-aaeiq-cai"
@@ -49,7 +49,7 @@ echo ""
 echo "--- Step 1: Starting dfx ---"
 dfx stop 2>/dev/null || true
 sleep 1
-dfx start --background --clean --artificial-delay 300
+dfx start --background --clean --artificial-delay 1
 sleep 2
 
 # === Step 2: Set up identities ===
@@ -200,15 +200,7 @@ wait
 echo "--- Step 5: Deploying exchange canisters ---"
 cd "$SCRIPT_DIR"
 
-# Patch treasury_text and canisterOTC in source so the transient actor refs are correct at init
-MAIN_MO="src/exchange/main.mo"
-TREASURY_MO="src/exchange/treasury.mo"
-cp "$MAIN_MO" "${MAIN_MO}.bak"
-cp "$TREASURY_MO" "${TREASURY_MO}.bak"
-sed -i 's|stable var treasury_text = "[^"]*"|stable var treasury_text = "'"${EXCHANGE_TREASURY_ID}"'"|' "$MAIN_MO"
-sed -i 's|stable var canisterOTC = "[^"]*"|stable var canisterOTC = "'"${OTC_BACKEND_ID}"'"|' "$TREASURY_MO"
-echo "Patched treasury_text -> $EXCHANGE_TREASURY_ID"
-echo "Patched canisterOTC -> $OTC_BACKEND_ID"
+# Source code already uses production IDs — no patching needed
 
 # Deploy exchange treasury first
 echo "Deploying exchange_treasury..."

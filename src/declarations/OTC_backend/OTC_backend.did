@@ -119,6 +119,25 @@ type create_trading_canister =
         token1: text;
         totalLiquidity: nat;
       }) query;
+   getAllPoolStats: () ->
+    (vec
+      record {
+        activeLiquidity: nat;
+        decimals0: nat;
+        decimals1: nat;
+        feeRateBps: nat;
+        price0: float64;
+        price1: float64;
+        priceChange24hPct: float64;
+        reserve0: nat;
+        reserve1: nat;
+        symbol0: text;
+        symbol1: text;
+        token0: text;
+        token1: text;
+        totalLiquidity: nat;
+        volume24h: nat;
+      }) query;
    getAllTradesPrivateCostly: () ->
     (opt record {
            vec text;
@@ -245,6 +264,30 @@ type create_trading_canister =
         token0Locked: nat;
         token1Locked: nat;
       }) query;
+   getPoolStats: (token0: text, token1: text) ->
+    (opt
+      record {
+        activeLiquidity: nat;
+        decimals0: nat;
+        decimals1: nat;
+        feeRateBps: nat;
+        feesLifetimeToken0: nat;
+        feesLifetimeToken1: nat;
+        history: vec PoolDailySnapshot;
+        lpFeeSharePct: nat;
+        price0: float64;
+        price1: float64;
+        priceChange24hPct: float64;
+        reserve0: nat;
+        reserve1: nat;
+        symbol0: text;
+        symbol1: text;
+        token0: text;
+        token1: text;
+        totalLiquidity: nat;
+        volume24h: nat;
+        volume7d: nat;
+      }) query;
    getPrivateTrade: (pass: text) -> (opt TradePosition) query;
    getTokenUSDPrices: (ICPpriceUSD: float64, ckUSDCpriceUSD: float64) ->
     (opt
@@ -261,7 +304,8 @@ type create_trading_canister =
           };
         error: bool;
       }) query;
-   getUserConcentratedPositions: () -> (vec ConcentratedPosition) query;
+   getUserConcentratedPositions: () ->
+    (vec ConcentratedPositionDetailed) query;
    getUserLiquidityDetailed: () -> (vec DetailedLiquidityPosition) query;
    getUserPreviousTrades: (token1: text, token2: text) ->
     (vec
@@ -357,6 +401,8 @@ type create_trading_canister =
    setTest: (a: bool) -> ();
    swapMultiHop: (tokenIn: text, tokenOut: text, amountIn: nat, route:
     vec SwapHop, minAmountOut: nat, Block: nat) -> (text);
+   swapSplitRoutes: (tokenIn: text, tokenOut: text, splits: vec SplitLeg,
+    minAmountOut: nat, Block: nat) -> (text);
    treasurySwap: (tokenIn: text, tokenOut: text, amountIn: nat, minAmountOut:
     nat, block: nat) -> (text);
  };
@@ -479,6 +525,12 @@ type SwapHop =
    tokenIn: text;
    tokenOut: text;
  };
+type SplitLeg = 
+ record {
+   amountIn: nat;
+   minLegOut: nat;
+   route: vec SwapHop;
+ };
 type RecoveryResult = 
  record {
    block: nat;
@@ -584,6 +636,15 @@ type PoolLiquidity =
         };
      };
  };
+type PoolDailySnapshot = 
+ record {
+   activeLiquidity: nat;
+   reserve0: nat;
+   reserve1: nat;
+   timestamp: int;
+   totalLiquidity: nat;
+   volume: nat;
+ };
 type LogLevel = 
  variant {
    ERROR;
@@ -636,14 +697,23 @@ type DetailedLiquidityPosition =
    fee0: nat;
    fee1: nat;
    liquidity: nat;
+   positionId: opt nat;
+   positionType: variant {
+                   concentrated;
+                   fullRange;
+                 };
+   ratioLower: opt nat;
+   ratioUpper: opt nat;
    shareOfPool: float64;
    token0: text;
    token0Amount: nat;
    token1: text;
    token1Amount: nat;
  };
-type ConcentratedPosition = 
+type ConcentratedPositionDetailed = 
  record {
+   fee0: nat;
+   fee1: nat;
    lastFeeGrowth0: nat;
    lastFeeGrowth1: nat;
    lastUpdateTime: int;
@@ -652,7 +722,9 @@ type ConcentratedPosition =
    ratioLower: nat;
    ratioUpper: nat;
    token0: text;
+   token0Amount: nat;
    token1: text;
+   token1Amount: nat;
  };
 type BatchProcessResult = 
  record {

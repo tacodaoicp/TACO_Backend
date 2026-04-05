@@ -176,6 +176,14 @@ export const idlFactory = ({ IDL }) => {
     'timestamp' : IDL.Int,
   });
   const Time = IDL.Int;
+  const PoolDailySnapshot = IDL.Record({
+    'totalLiquidity' : IDL.Nat,
+    'reserve0' : IDL.Nat,
+    'reserve1' : IDL.Nat,
+    'volume' : IDL.Nat,
+    'activeLiquidity' : IDL.Nat,
+    'timestamp' : IDL.Int,
+  });
   const TradePosition = IDL.Record({
     'Fee' : IDL.Nat,
     'trade_number' : IDL.Nat,
@@ -192,26 +200,37 @@ export const idlFactory = ({ IDL }) => {
     'token_sell_identifier' : IDL.Text,
     'filledSell' : IDL.Nat,
   });
-  const ConcentratedPosition = IDL.Record({
+  const ConcentratedPositionDetailed = IDL.Record({
     'ratioUpper' : IDL.Nat,
     'lastFeeGrowth0' : IDL.Nat,
     'lastFeeGrowth1' : IDL.Nat,
+    'fee0' : IDL.Nat,
+    'fee1' : IDL.Nat,
     'liquidity' : IDL.Nat,
     'positionId' : IDL.Nat,
     'lastUpdateTime' : IDL.Int,
     'token0' : IDL.Text,
     'token1' : IDL.Text,
+    'token0Amount' : IDL.Nat,
+    'token1Amount' : IDL.Nat,
     'ratioLower' : IDL.Nat,
   });
   const DetailedLiquidityPosition = IDL.Record({
+    'ratioUpper' : IDL.Opt(IDL.Nat),
     'fee0' : IDL.Nat,
     'fee1' : IDL.Nat,
     'liquidity' : IDL.Nat,
     'shareOfPool' : IDL.Float64,
+    'positionType' : IDL.Variant({
+      'concentrated' : IDL.Null,
+      'fullRange' : IDL.Null,
+    }),
+    'positionId' : IDL.Opt(IDL.Nat),
     'token0' : IDL.Text,
     'token1' : IDL.Text,
     'token0Amount' : IDL.Nat,
     'token1Amount' : IDL.Nat,
+    'ratioLower' : IDL.Opt(IDL.Nat),
   });
   const SwapRecord = IDL.Record({
     'fee' : IDL.Nat,
@@ -279,6 +298,11 @@ export const idlFactory = ({ IDL }) => {
     'block' : IDL.Nat,
     'success' : IDL.Bool,
     'identifier' : IDL.Text,
+  });
+  const SplitLeg = IDL.Record({
+    'amountIn' : IDL.Nat,
+    'route' : IDL.Vec(SwapHop),
+    'minLegOut' : IDL.Nat,
   });
   const create_trading_canister = IDL.Service({
     'ChangeReferralFees' : IDL.Func([IDL.Nat], [], []),
@@ -421,6 +445,31 @@ export const idlFactory = ({ IDL }) => {
               'reserve1' : IDL.Nat,
               'token0' : IDL.Text,
               'token1' : IDL.Text,
+              'price0' : IDL.Float64,
+              'price1' : IDL.Float64,
+            })
+          ),
+        ],
+        ['query'],
+      ),
+    'getAllPoolStats' : IDL.Func(
+        [],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'decimals0' : IDL.Nat,
+              'decimals1' : IDL.Nat,
+              'symbol0' : IDL.Text,
+              'symbol1' : IDL.Text,
+              'totalLiquidity' : IDL.Nat,
+              'reserve0' : IDL.Nat,
+              'reserve1' : IDL.Nat,
+              'volume24h' : IDL.Nat,
+              'activeLiquidity' : IDL.Nat,
+              'feeRateBps' : IDL.Nat,
+              'token0' : IDL.Text,
+              'token1' : IDL.Text,
+              'priceChange24hPct' : IDL.Float64,
               'price0' : IDL.Float64,
               'price1' : IDL.Float64,
             })
@@ -595,6 +644,36 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getPoolStats' : IDL.Func(
+        [IDL.Text, IDL.Text],
+        [
+          IDL.Opt(
+            IDL.Record({
+              'decimals0' : IDL.Nat,
+              'decimals1' : IDL.Nat,
+              'symbol0' : IDL.Text,
+              'symbol1' : IDL.Text,
+              'feesLifetimeToken0' : IDL.Nat,
+              'feesLifetimeToken1' : IDL.Nat,
+              'totalLiquidity' : IDL.Nat,
+              'volume7d' : IDL.Nat,
+              'reserve0' : IDL.Nat,
+              'reserve1' : IDL.Nat,
+              'volume24h' : IDL.Nat,
+              'history' : IDL.Vec(PoolDailySnapshot),
+              'activeLiquidity' : IDL.Nat,
+              'feeRateBps' : IDL.Nat,
+              'token0' : IDL.Text,
+              'token1' : IDL.Text,
+              'priceChange24hPct' : IDL.Float64,
+              'lpFeeSharePct' : IDL.Nat,
+              'price0' : IDL.Float64,
+              'price1' : IDL.Float64,
+            })
+          ),
+        ],
+        ['query'],
+      ),
     'getPrivateTrade' : IDL.Func(
         [IDL.Text],
         [IDL.Opt(TradePosition)],
@@ -623,7 +702,7 @@ export const idlFactory = ({ IDL }) => {
       ),
     'getUserConcentratedPositions' : IDL.Func(
         [],
-        [IDL.Vec(ConcentratedPosition)],
+        [IDL.Vec(ConcentratedPositionDetailed)],
         ['query'],
       ),
     'getUserLiquidityDetailed' : IDL.Func(
@@ -777,6 +856,11 @@ export const idlFactory = ({ IDL }) => {
     'setTest' : IDL.Func([IDL.Bool], [], []),
     'swapMultiHop' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Vec(SwapHop), IDL.Nat, IDL.Nat],
+        [IDL.Text],
+        [],
+      ),
+    'swapSplitRoutes' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Vec(SplitLeg), IDL.Nat, IDL.Nat],
         [IDL.Text],
         [],
       ),
