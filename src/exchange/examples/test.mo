@@ -21,6 +21,7 @@ import { setTimer; cancelTimer } = "mo:base/Timer";
 import Buffer "mo:base/Buffer";
 import Time "mo:base/Time";
 import Float "mo:base/Float";
+import Cycles "mo:base/ExperimentalCycles";
 
 shared (deployer) persistent actor class test() = this {
 
@@ -4299,6 +4300,7 @@ shared (deployer) persistent actor class test() = this {
       label a for (i in Iter.range(0, if skipCancelAllPositions { 0 } else { 70 })) {
         let testName = "Test" # Nat.toText(i);
         var testResult = "false";
+        let cyclesBefore = Cycles.balance();
 
         switch (i) {
           case 0 { testResult := await Test0(); Debug.print("") };
@@ -4377,6 +4379,9 @@ shared (deployer) persistent actor class test() = this {
             continue a;
           };
         };
+
+        let cyclesUsed = cyclesBefore - Cycles.balance();
+        Debug.print(testName # " cycles: " # Nat.toText(cyclesUsed));
 
         if (testResult == "true") {
           testResults := Array.append(testResults, [testName # ": Success"]);

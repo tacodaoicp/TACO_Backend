@@ -108,7 +108,7 @@ yes | dfx deploy --specified-id "$ICP_LEDGER_ID" ledger_canister --argument "
       token_name = opt \"Local ICP\";
     }
   })
-" --mode=reinstall
+" --mode=reinstall --with-cycles 1_000_000_000_000_000_000
 
 # Fund test actors with ICP
 echo "Funding test actors with ICP..."
@@ -156,15 +156,15 @@ record {
          cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION};
      };
  }
-})" --mode=reinstall
+})" --mode=reinstall --with-cycles 1_000_000_000_000_000_000
 
 # Token 2 (XMTK2)
 echo "Deploying Token 2..."
-yes | dfx deploy icrc1_ledger_canister2 --specified-id "$TOKEN2_ID" --argument "(variant {Init = record { token_symbol = \"XMTK2\"; token_name = \"My Token2\"; minting_account = record { owner = principal \"${MINTER}\" }; transfer_fee = ${TRANSFER_FEE}; metadata = vec {}; initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${PRE_MINTED_TOKENS}; }; }; archive_options = record { num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE}; trigger_threshold = ${TRIGGER_THRESHOLD}; controller_id = principal \"${ARCHIVE_CONTROLLER}\"; cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION}; }; }})" --mode=reinstall
+yes | dfx deploy icrc1_ledger_canister2 --specified-id "$TOKEN2_ID" --argument "(variant {Init = record { token_symbol = \"XMTK2\"; token_name = \"My Token2\"; minting_account = record { owner = principal \"${MINTER}\" }; transfer_fee = ${TRANSFER_FEE}; metadata = vec {}; initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${PRE_MINTED_TOKENS}; }; }; archive_options = record { num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE}; trigger_threshold = ${TRIGGER_THRESHOLD}; controller_id = principal \"${ARCHIVE_CONTROLLER}\"; cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION}; }; }})" --mode=reinstall --with-cycles 1_000_000_000_000_000_000
 
 # ckUSDC
 echo "Deploying ckUSDC..."
-yes | dfx deploy ckusdc --specified-id "$CKUSDC_ID" --argument "(variant {Init = record { token_symbol = \"USDC\"; token_name = \"USDC\"; minting_account = record { owner = principal \"${MINTER}\" }; transfer_fee = ${TRANSFER_FEE}; metadata = vec {}; initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${PRE_MINTED_TOKENS}; }; }; archive_options = record { num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE}; trigger_threshold = ${TRIGGER_THRESHOLD}; controller_id = principal \"${ARCHIVE_CONTROLLER}\"; cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION}; }; }})" --mode=reinstall
+yes | dfx deploy ckusdc --specified-id "$CKUSDC_ID" --argument "(variant {Init = record { token_symbol = \"USDC\"; token_name = \"USDC\"; minting_account = record { owner = principal \"${MINTER}\" }; transfer_fee = ${TRANSFER_FEE}; metadata = vec {}; initial_balances = vec { record { record { owner = principal \"${DEFAULT}\"; }; ${PRE_MINTED_TOKENS}; }; }; archive_options = record { num_blocks_to_archive = ${NUM_OF_BLOCK_TO_ARCHIVE}; trigger_threshold = ${TRIGGER_THRESHOLD}; controller_id = principal \"${ARCHIVE_CONTROLLER}\"; cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION}; }; }})" --mode=reinstall --with-cycles 1_000_000_000_000_000_000
 
 # TACO Token
 echo "Deploying TACO token..."
@@ -183,7 +183,7 @@ record {
          cycles_for_archive_creation = opt ${CYCLE_FOR_ARCHIVE_CREATION};
      };
  }
-})" --mode=reinstall
+})" --mode=reinstall --with-cycles 1_000_000_000_000_000_000
 
 # Fund test actors with all ICRC1 tokens
 echo "Funding test actors with ICRC1 tokens..."
@@ -205,12 +205,12 @@ cd "$SCRIPT_DIR"
 # Deploy exchange treasury first
 echo "Deploying exchange_treasury..."
 dfx canister create --specified-id "$EXCHANGE_TREASURY_ID" exchange_treasury
-yes | dfx deploy --specified-id "$EXCHANGE_TREASURY_ID" exchange_treasury --with-cycles 10000000000000 --mode=reinstall
+yes | dfx deploy --specified-id "$EXCHANGE_TREASURY_ID" exchange_treasury --with-cycles 10000000000000000 --mode=reinstall
 
 # Deploy OTC backend
 echo "Deploying OTC_backend..."
 dfx canister create --specified-id "$OTC_BACKEND_ID" OTC_backend
-yes | dfx deploy --specified-id "$OTC_BACKEND_ID" OTC_backend --with-cycles 10000000000000 --mode=reinstall
+yes | dfx deploy --specified-id "$OTC_BACKEND_ID" OTC_backend --with-cycles 10000000000000000 --mode=reinstall
 
 # === Step 6: Configure cross-references ===
 echo "--- Step 6: Configuring cross-references ---"
@@ -235,16 +235,16 @@ dfx canister call OTC_backend setTest '(true)'
 echo "--- Step 7: Deploying test actors ---"
 
 dfx canister create --specified-id "$TEST_ACTOR_A_ID" exchange_testActorA
-yes | dfx deploy --specified-id "$TEST_ACTOR_A_ID" exchange_testActorA --with-cycles 10000000000000 --mode=reinstall
+yes | dfx deploy --specified-id "$TEST_ACTOR_A_ID" exchange_testActorA --with-cycles 10000000000000000 --mode=reinstall
 
 dfx canister create --specified-id "$TEST_ACTOR_B_ID" exchange_testActorB
-yes | dfx deploy --specified-id "$TEST_ACTOR_B_ID" exchange_testActorB --with-cycles 10000000000000 --mode=reinstall
+yes | dfx deploy --specified-id "$TEST_ACTOR_B_ID" exchange_testActorB --with-cycles 10000000000000000 --mode=reinstall
 
 dfx canister create --specified-id "$TEST_ACTOR_C_ID" exchange_testActorC
-yes | dfx deploy --specified-id "$TEST_ACTOR_C_ID" exchange_testActorC --with-cycles 10000000000000 --mode=reinstall
+yes | dfx deploy --specified-id "$TEST_ACTOR_C_ID" exchange_testActorC --with-cycles 10000000000000000 --mode=reinstall
 
 dfx canister create --specified-id "$EXCHANGE_TEST_ID" exchange_test
-yes | dfx deploy --specified-id "$EXCHANGE_TEST_ID" exchange_test --with-cycles 10000000000000 --mode=reinstall
+yes | dfx deploy --specified-id "$EXCHANGE_TEST_ID" exchange_test --with-cycles 10000000000000000 --mode=reinstall
 
 # === Step 8: Run tests ===
 echo "--- Step 8: Running tests ---"
