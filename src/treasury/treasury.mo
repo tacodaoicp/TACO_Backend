@@ -118,9 +118,9 @@ import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 import Buffer "mo:base/Buffer";
 
-//import Migration "./migration";
+import Migration "./migration";
 
-//(with migration = Migration.migrate)
+(with migration = Migration.migrate)
 shared (deployer) persistent actor class treasury() = this {
 
   private func this_canister_id() : Principal {
