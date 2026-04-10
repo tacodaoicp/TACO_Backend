@@ -1,3 +1,5 @@
+import ExTypes "../exchangeTypes";
+
 module {
   public type Current_Liquidity = [[{
     time : Int;
@@ -297,10 +299,10 @@ module {
     ChangeRevokefees : shared Nat -> async ();
     ChangeTradingfees : shared Nat -> async ();
     ChangeReferralFees : shared Nat -> async ();
-    FinishSell : shared (Nat64, Text, Nat) -> async Text;
-    FinishSellBatch : shared (Nat64, [Text], [Nat], Text, Text) -> async Text;
+    FinishSell : shared (Nat64, Text, Nat) -> async ExTypes.ActionResult;
+    FinishSellBatch : shared (Nat64, [Text], [Nat], Text, Text) -> async ExTypes.ActionResult;
     FinishSellBatchDAO : shared ([TradeData], Bool, [Nat]) -> async ?BatchProcessResult;
-    FixStuckTX : shared Text -> async Text;
+    FixStuckTX : shared Text -> async ExTypes.ActionResult;
     parameterManagement : shared {
       deleteFromDayBan : ?[Text];
       deleteFromAllTimeBan : ?[Text];
@@ -312,13 +314,13 @@ module {
       treasury_principal : ?Text;
     } -> async ();
     Freeze : shared () -> async ();
-    revokeTrade : shared (Text, { #DAO : [Text]; #Seller; #Initiator }) -> async Text;
-    addAcceptedToken : shared ({ #Add; #Remove; #Opposite }, Text, Nat, { #ICP; #ICRC12; #ICRC3 }) -> async Text;
+    revokeTrade : shared (Text, { #DAO : [Text]; #Seller; #Initiator }) -> async ExTypes.RevokeResult;
+    addAcceptedToken : shared ({ #Add; #Remove; #Opposite }, Text, Nat, { #ICP; #ICRC12; #ICRC3 }) -> async ExTypes.ActionResult;
     addTimer : shared () -> async ();
-    addPosition : shared (Nat, Nat, Nat, Text, Text, Bool, Bool, ?Text, Text, Bool, Bool) -> async Text;
+    addPosition : shared (Nat, Nat, Nat, Text, Text, Bool, Bool, ?Text, Text, Bool, Bool) -> async ExTypes.OrderResult;
     changeOwner2 : shared Principal -> async ();
     changeOwner3 : shared Principal -> async ();
-    collectFees : shared () -> async Text;
+    collectFees : shared () -> async ExTypes.ActionResult;
     exchangeInfo : shared query () -> async ?pool;
     getAcceptedTokens : shared query () -> async ?[Text];
     getAcceptedTokensInfo : shared query () -> async ?[TokenInfo];
@@ -365,8 +367,8 @@ module {
     getCurrentLiquidityForeignPools : shared query (Nat, ?[PoolQuery], Bool) -> async ForeignPoolsResponse;
     checkFeesReferrer : shared query () -> async [(Text, Nat)];
     claimFeesReferrer : shared () -> async [(Text, Nat)];
-    addLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat) -> async Text;
-    removeLiquidity : shared (Text, Text, Nat) -> async Text;
+    addLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat) -> async ExTypes.AddLiquidityResult;
+    removeLiquidity : shared (Text, Text, Nat) -> async ExTypes.RemoveLiquidityResult;
     getPausedTokens : shared query () -> async ?[Text];
     getAMMPoolInfo : shared query (Text, Text) -> async ?{
       token0 : Text;
@@ -386,6 +388,12 @@ module {
       potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
       hopDetails : [HopDetail];
     };
+    getExpectedReceiveAmountBatch : shared query ([{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }]) -> async [{
+      expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
+      routeDescription : Text; canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
+    }];
     getLogging : shared query ({ #FinishSellBatchDAO; #addAcceptedToken }, Nat) -> async [(Nat, Text)];
     getExpectedMultiHopAmount : shared query (Text, Text, Nat) -> async {
       bestRoute : [SwapHop];
@@ -396,15 +404,31 @@ module {
       routeTokens : [Text];
       hopDetails : [HopDetail];
     };
-    swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async Text;
-    swapSplitRoutes : shared (Text, Text, [SplitLeg], Nat, Nat) -> async Text;
-    claimLPFees : shared (Text, Text) -> async Text;
-    addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async Text;
-    removeConcentratedLiquidity : shared (Text, Text, Nat, Nat) -> async Text;
+    swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async ExTypes.SwapResult;
+    swapSplitRoutes : shared (Text, Text, [SplitLeg], Nat, Nat) -> async ExTypes.SwapResult;
+    adminAnalyzeRouteEfficiency : shared query (Text, Nat, Nat) -> async [{
+      route : [SwapHop];
+      outputAmount : Nat;
+      efficiency : Int;
+      efficiencyBps : Int;
+      hopDetails : [HopDetail];
+    }];
+    adminExecuteRouteStrategy : shared (Nat, [SwapHop], Nat, Nat) -> async ExTypes.SwapResult;
+    claimLPFees : shared (Text, Text) -> async ExTypes.ClaimFeesResult;
+    addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async ExTypes.AddConcentratedResult;
+    removeConcentratedLiquidity : shared (Text, Text, Nat, Nat) -> async ExTypes.RemoveConcentratedResult;
     getUserConcentratedPositions : shared query () -> async [ConcentratedPosition];
     getOrderbookCombined : shared query (Text, Text, Nat, Nat) -> async OrderbookCombinedResult;
     getUserReferralInfo : shared query () -> async ReferralInfo;
     getAllAMMPools : shared query () -> async [AMMPoolSummary];
     getUserTradeHistory : shared query Nat -> async [TradeHistoryEntry];
+    getDAOLiquiditySnapshot : shared query () -> async {
+      positions : [{ token0 : Text; token1 : Text; liquidity : Nat; token0Amount : Nat; token1Amount : Nat; shareOfPool : Float; fee0 : Nat; fee1 : Nat }];
+      pools : [{ token0 : Text; token1 : Text; reserve0 : Nat; reserve1 : Nat; totalLiquidity : Nat; price0 : Float; price1 : Float }];
+    };
+    batchClaimAllFees : shared () -> async [{ token0 : Text; token1 : Text; fees0 : Nat; fees1 : Nat; transferred0 : Nat; transferred1 : Nat }];
+    batchAdjustLiquidity : shared ([{ token0 : Text; token1 : Text; action : { #Remove : { liquidityAmount : Nat } } }]) -> async [{ token0 : Text; token1 : Text; success : Bool; result : Text }];
+    addLiquidityDAO : shared (Text, Text, Nat, Nat, Nat, Nat) -> async ExTypes.AddLiquidityResult;
+    getDAOLPPerformance : shared query () -> async [{ token0 : Text; token1 : Text; currentValue0 : Nat; currentValue1 : Nat; totalFeesEarned0 : Nat; totalFeesEarned1 : Nat; shareOfPool : Float; poolVolume24h : Nat }];
   };
 };

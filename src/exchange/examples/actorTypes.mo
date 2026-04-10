@@ -168,6 +168,14 @@ module {
     recoverUnprocessedTokensDAO : shared [(Text, Nat, Nat)] -> async [(Text, Nat, Bool)];
     swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async Text;
     swapSplitRoutes : shared (Text, Text, [SplitLeg], Nat, Nat) -> async Text;
+    adminAnalyzeRouteEfficiency : shared (Text, Nat, Nat) -> async [{
+      route : [{ tokenIn : Text; tokenOut : Text }];
+      outputAmount : Nat;
+      efficiency : Int;
+      efficiencyBps : Int;
+      hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
+    }];
+    adminExecuteRouteStrategy : shared (Nat, [{ tokenIn : Text; tokenOut : Text }], Nat, Nat) -> async Text;
     claimLPFees : shared (Text, Text) -> async Text;
     getUserLiquidityDetailed : shared () -> async [DetailedLiquidityPosition];
     addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async Text;

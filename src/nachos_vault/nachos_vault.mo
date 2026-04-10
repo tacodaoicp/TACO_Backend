@@ -110,7 +110,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // Actor references
   transient let treasury = actor (Principal.toText(TREASURY_ID)) : actor {
     getTokenDetails : shared () -> async [(Principal, TokenDetails)];
-    getTokenDetailsCache : shared () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }] };
+    getTokenDetailsCache : shared () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }]; lpBackingPerToken : [(Principal, Nat)] };
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Principal, Nat8)], Bool) -> async (Bool, ?[(Principal, Nat64)]);
     refreshAllPrices : shared () -> async Result.Result<{ tokensRefreshed : Nat; timestamp : Int; icpPriceUSD : Float }, Text>;
     refreshPricesAndGetDetails : shared () -> async Result.Result<{ tokensRefreshed : Nat; timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)] }, Text>;
@@ -120,8 +120,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // Query-typed actor refs for composite query calls (same canister, query interface)
   transient let treasuryQuery = actor (Principal.toText(TREASURY_ID)) : actor {
     getTokenDetails : shared query () -> async [(Principal, TokenDetails)];
-    getTokenDetailsCache : shared query () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }] };
+    getTokenDetailsCache : shared query () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }]; lpBackingPerToken : [(Principal, Nat)] };
     getAvailableBalancesForBurn : shared query ([Principal]) -> async Result.Result<[(Principal, Nat)], Text>;
+    getLPBackingPerToken : shared query () -> async [(Principal, Nat)];
   };
 
   transient let dao = actor (Principal.toText(DAO_BACKEND_ID)) : actor {
@@ -298,6 +299,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // --- Pending Forward Value Tracker (in-transit mint deposits not yet in treasury) ---
   transient let pendingForwardValueByToken = Map.new<Principal, Nat>(); // token principal → token amount
+
+  // --- LP Backing from Treasury (non-liquid portfolio value for NAV calculation) ---
+  // Populated from treasury.getLPBackingPerToken() before each mint/burn
+  // Includes: lpBacking (in exchange pools) + inTransit (removed, arriving) + depositsInFlight
+  transient let lpBackingFromTreasury = Map.new<Principal, Nat>();
 
   // --- Per-Token History (vault-owned, not overwritten by treasury sync) ---
   stable let tokenPriceHistory = Map.new<Principal, Vector.Vector<(Int, Nat)>>();
@@ -1394,7 +1400,47 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         };
       };
     };
+    // Add LP backing value — non-liquid portfolio value locked in exchange LP pools.
+    // lpBackingFromTreasury includes: lpBacking + inTransit + depositsInFlight.
+    // These tokens are part of the portfolio but NOT in the treasury wallet (hence not
+    // in tokenDetailsMap.balance which is ledger-queried). NAV must include them.
+    for ((token, lpAmount) in Map.entries(lpBackingFromTreasury)) {
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) {
+          if (details.Active and details.priceInICP > 0 and lpAmount > 0) {
+            let lpValueICP = (lpAmount * details.priceInICP) / (10 ** details.tokenDecimals);
+            totalValueE8s += lpValueICP;
+          };
+        };
+        case null {};
+      };
+    };
     totalValueE8s;
+  };
+
+  // Compute liquid-only portfolio value (excludes LP backing, subtracts pending burns)
+  private func getLiquidPortfolioValueICP() : Nat {
+    var total : Nat = 0;
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and details.priceInICP > 0) {
+        let pending = switch (Map.get(pendingBurnValueByToken, phash, token)) { case (?v) v; case null 0 };
+        let available = if (details.balance > pending) { details.balance - pending } else { 0 };
+        total += (available * details.priceInICP) / (10 ** details.tokenDecimals);
+      };
+    };
+    total;
+  };
+
+  // Compute maximum NACHOS that can be burned based on liquid treasury balance
+  private func getLiquidBurnCapNachos() : Nat {
+    let liquidICP = getLiquidPortfolioValueICP();
+    switch (cachedNAV) {
+      case (?nav) {
+        if (nav.navPerTokenE8s > 0) { (liquidICP * ONE_E8S) / nav.navPerTokenE8s }
+        else { 0 };
+      };
+      case null { 0 };
+    };
   };
 
   private func calculateNAV() : async Result.Result<CachedNAV, Text> {
@@ -1735,6 +1781,39 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (refreshed > 0) lastBalanceRefreshTime := now();
     logger.info("BALANCE", "Refreshed " # Nat.toText(refreshed) # "/" # Nat.toText(Vector.size(tokens)) # " token balances from ledgers", "refreshBalancesFromLedgers");
     refreshed;
+  };
+
+  /// Refresh LP backing data from treasury (non-liquid portfolio value for NAV).
+  /// Called in performSharedPreChecks before each mint/burn for accurate NAV.
+  /// Includes lpBacking + inTransit + depositsInFlight from treasury's four-bucket model.
+  private func refreshLPBackingFromTreasury() : async () {
+    try {
+      let backing = await (with timeout = 10) treasuryQuery.getLPBackingPerToken();
+      // Only update if treasury returned non-empty data.
+      // Empty response can mean: (a) treasury transient LP maps not repopulated yet
+      // (post-upgrade, exchange unreachable), or (b) LP legitimately disabled/removed.
+      // We keep cached values in both cases because:
+      // - Case (a): prevents NAV drop to liquid-only which lets minters exploit (2x NACHOS)
+      // - Case (b): stale-high NAV is far safer than cleared-to-zero NAV. Stale values
+      //   naturally decrease as treasury processes LP removals and updateBalances() refreshes
+      //   tokenDetailsMap.balance. The periodic sync (15min) with getTokenDetailsCache()
+      //   will eventually bring non-empty data once treasury LP maps are repopulated.
+      //   Mint/burn fees (1% round-trip) absorb the small stale-high drift.
+      if (backing.size() == 0 and Map.size(lpBackingFromTreasury) > 0) {
+        logger.warn("LP_BACKING", "Treasury returned empty LP backing — keeping cached values to prevent NAV drop", "refreshLPBackingFromTreasury");
+        return;
+      };
+      // Clear old data and populate fresh (only reached when backing is non-empty, or cache was already empty)
+      for ((token, _) in Map.entries(lpBackingFromTreasury)) {
+        Map.delete(lpBackingFromTreasury, phash, token);
+      };
+      for ((token, amount) in backing.vals()) {
+        Map.set(lpBackingFromTreasury, phash, token, amount);
+      };
+    } catch (e) {
+      // Keep cached values on failure — stale LP data is better than no LP data
+      logger.warn("LP_BACKING", "Failed to refresh LP backing from treasury: " # Error.message(e) # " — using cached", "refreshLPBackingFromTreasury");
+    };
   };
 
   private func getPausedPortfolioTokens() : [{ token : Principal; symbol : Text }] {
@@ -2388,6 +2467,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (totalBurned + nachosAmount > maxNachosBurnPer4Hours) {
       return #err(#BurnLimitExceeded({ maxPer4Hours = maxNachosBurnPer4Hours; recentBurns = totalBurned; requested = nachosAmount }));
     };
+    // Dynamic cap: burn limited by liquid treasury balance (excludes LP-locked tokens)
+    let liquidCap = getLiquidBurnCapNachos();
+    if (liquidCap > 0 and liquidCap < maxNachosBurnPer4Hours and totalBurned + nachosAmount > liquidCap) {
+      return #err(#BurnLimitExceeded({ maxPer4Hours = liquidCap; recentBurns = totalBurned; requested = nachosAmount }));
+    };
 
     // Per-user ops limit
     switch (Map.get(userBurnOps, phash, caller)) {
@@ -2544,6 +2628,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           logger.warn("PRE_CHECK", "Balance refresh from ledgers failed: " # Error.message(e) # " — using cached balances", "performSharedPreChecks");
         };
       };
+
+      // LP backing: refresh from treasury for accurate NAV (includes LP + in-transit + in-flight)
+      await refreshLPBackingFromTreasury();
 
       // Circuit breaker: per-token snapshot checks
       if (priceRefreshOk) {
@@ -3709,7 +3796,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
     };
 
-    // ===== Calculate portfolio value using FRESH balances =====
+    // ===== Calculate portfolio value using FRESH balances + LP backing =====
+    // Portfolio VALUE includes both liquid (for distribution) and LP-locked (for NAV accuracy)
     var freshPortfolioValueICP : Nat = 0;
     label portfolioLoop for ((token, details) in Map.entries(tokenDetailsMap)) {
       if (not details.Active or details.priceInICP == 0) { continue portfolioLoop };
@@ -3720,6 +3808,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
       let tokenValueICP = (freshBalance * details.priceInICP) / (10 ** details.tokenDecimals);
       freshPortfolioValueICP += tokenValueICP;
+    };
+    // Add LP backing value (non-liquid portfolio locked in exchange pools)
+    for ((token, lpAmount) in Map.entries(lpBackingFromTreasury)) {
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) {
+          if (details.Active and details.priceInICP > 0 and lpAmount > 0) {
+            freshPortfolioValueICP += (lpAmount * details.priceInICP) / (10 ** details.tokenDecimals);
+          };
+        };
+        case null {};
+      };
     };
 
     // Guard against zero portfolio (should never happen after genesis)
@@ -3735,6 +3834,55 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
       releaseLock(caller);
       return #err(#UnexpectedError("Portfolio value is zero"));
+    };
+
+    // ===== CAP-AT-LIQUID: If netValueICP exceeds liquid-only portfolio, reduce burn =====
+    // With LP, NAV includes LP backing but distribution uses liquid only.
+    // If burn value > liquid capacity, cap to what liquid can support.
+    var liquidOnlyPortfolioICP : Nat = 0;
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and details.priceInICP > 0) {
+        let freshBalance = switch (Map.get(freshBalanceMap, phash, token)) {
+          case (?bal) { bal }; case null { 0 };
+        };
+        liquidOnlyPortfolioICP += (freshBalance * details.priceInICP) / (10 ** details.tokenDecimals);
+      };
+    };
+
+    var nachosAmountVar : Nat = nachosAmount;
+    var netValueICPVar : Nat = netValueICP;
+    if (netValueICP > liquidOnlyPortfolioICP and liquidOnlyPortfolioICP > 0) {
+      // Liquid can't cover full redemption — cap burn to what liquid supports
+      let burnFeeBP : Nat = switch (Map.get(tokenDetailsMap, phash, ICPprincipal)) {
+        case (?_) { burnFeeBasisPoints }; case null { 0 };
+      };
+      // Gross capped value that yields liquidOnlyPortfolioICP after fee
+      let grossCapped = (liquidOnlyPortfolioICP * 10_000) / (10_000 - burnFeeBP);
+      let cappedNachosAmountRaw = (grossCapped * ONE_E8S) / nav.navPerTokenE8s;
+      let cappedNachosAmount = Nat.min(cappedNachosAmountRaw, nachosAmount);
+
+      if (cappedNachosAmount == 0) {
+        // Liquid is essentially zero — abort entire burn
+        if (nachosAmount > NACHOS_FEE) {
+          ignore await returnNachosToUser(caller, nachosAmount - NACHOS_FEE);
+        };
+        releaseLock(caller);
+        logger.warn("BURN", "Cap-at-liquid: zero liquid available for burn — all LP-locked", "redeemNachos");
+        return #err(#InsufficientBalance);
+      };
+
+      let excessNachos = nachosAmount - cappedNachosAmount;
+      if (excessNachos > NACHOS_FEE) {
+        ignore await returnNachosToUser(caller, excessNachos - NACHOS_FEE);
+      };
+
+      // Recalculate with capped amount
+      let cappedRedemptionValue = (cappedNachosAmount * nav.navPerTokenE8s) / ONE_E8S;
+      let cappedFee = calculateFee(caller, cappedRedemptionValue, burnFeeBasisPoints, minBurnFeeICP);
+      nachosAmountVar := cappedNachosAmount;
+      netValueICPVar := cappedRedemptionValue - cappedFee;
+
+      logger.info("BURN", "Capped at liquid: original=" # Nat.toText(nachosAmount) # " capped=" # Nat.toText(cappedNachosAmount) # " returned=" # Nat.toText(excessNachos) # " liquidPortfolio=" # Nat.toText(liquidOnlyPortfolioICP) # " fullPortfolio=" # Nat.toText(freshPortfolioValueICP), "redeemNachos");
     };
 
     // ===== Calculate token distributions using FRESH balances =====
@@ -3756,7 +3904,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       let tokenShareBP = (tokenValueICP * 10_000) / freshPortfolioValueICP;
 
       // Proportional amount of this token to send (fee distributed proportionally)
-      let tokenEntitlementICP = (netValueICP * tokenShareBP) / 10_000;
+      // Uses netValueICPVar which may be capped if liquid < full NAV value
+      let tokenEntitlementICP = (netValueICPVar * tokenShareBP) / 10_000;
       let tokenAmount = (tokenEntitlementICP * (10 ** details.tokenDecimals)) / details.priceInICP;
 
       // Skip dust (less than 3x transfer fee)
@@ -3778,7 +3927,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // burn outflows. This is resilient to refreshBalancesFromLedgers() overwrites since
     // pendingBurnValueByToken is independent of tokenDetailsMap.balance.
     let optPortfolio = calculatePortfolioValueICP();
-    let optSupply = if (nav.nachosSupply > nachosAmount) { nav.nachosSupply - nachosAmount } else { 0 };
+    let optSupply = if (nav.nachosSupply > nachosAmountVar) { nav.nachosSupply - nachosAmountVar } else { 0 };
     cachedNAV := ?{
       navPerTokenE8s = if (optSupply > 0) { (optPortfolio * ONE_E8S) / optSupply } else { INITIAL_NAV_PER_TOKEN_E8S };
       portfolioValueICP = optPortfolio;
@@ -3810,8 +3959,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
                   };
                 };
 
-                if (nachosAmount > NACHOS_FEE) {
-          let returnAmount = nachosAmount - NACHOS_FEE;
+                if (nachosAmountVar > NACHOS_FEE) {
+          let returnAmount = nachosAmountVar - NACHOS_FEE;
           switch (await returnNachosToUser(caller, returnAmount)) {
             case (#ok(_)) {};
             case (#err(msg)) {
@@ -3830,8 +3979,31 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case null {};
     };
 
+    // ===== EMPTY DISTRIBUTION GUARD =====
+    // If no tokens to distribute (all below dust or all insufficient), abort burn entirely.
+    // Without this, NACHOS gets burned but user receives zero tokens = total loss.
+    if (Vector.size(tokensToSend) == 0) {
+      // Release all pending burn reservations
+      for ((token, _) in Map.entries(pendingBurnValueByToken)) {
+        let pendingVal = switch (Map.get(pendingBurnValueByToken, phash, token)) {
+          case (?v) { v }; case null { 0 };
+        };
+        if (pendingVal > 0) releasePendingBurnValue(token, pendingVal);
+      };
+      cachedNAV := ?nav; // Restore pre-burn NAV
+      cachedSupply := nav.nachosSupply;
+      cachedSupplyTime := now();
+      // Return NACHOS to user
+      if (nachosAmountVar > NACHOS_FEE) {
+        ignore await returnNachosToUser(caller, nachosAmountVar - NACHOS_FEE);
+      };
+      releaseLock(caller);
+      logger.warn("BURN", "Empty distribution — no tokens available to send. Burn aborted, NACHOS returned. liquid=" # Nat.toText(liquidOnlyPortfolioICP) # " nachosAmount=" # Nat.toText(nachosAmountVar), "redeemNachos");
+      return #err(#InsufficientBalance);
+    };
+
     // Burn NACHOS tokens
-    let burnTxResult = await burnNachosTokens(nachosAmount);
+    let burnTxResult = await burnNachosTokens(nachosAmountVar);
     let nachosLedgerTxId = switch (burnTxResult) {
       case (#ok(txId)) { ?txId };
       case (#err(e)) {
@@ -3849,8 +4021,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           };
         };
 
-        if (nachosAmount > NACHOS_FEE) {
-          let returnAmount = nachosAmount - NACHOS_FEE;
+        if (nachosAmountVar > NACHOS_FEE) {
+          let returnAmount = nachosAmountVar - NACHOS_FEE;
           switch (await returnNachosToUser(caller, returnAmount)) {
             case (#ok(_)) {};
             case (#err(msg)) {
@@ -3883,11 +4055,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       id = nextBurnId;
       timestamp = now();
       caller;
-      nachosBurned = nachosAmount;
+      nachosBurned = nachosAmountVar;
       navUsed = nav.navPerTokenE8s;
       redemptionValueICP;
       feeValueICP = feeValue;
-      netValueICP;
+      netValueICP = netValueICPVar;
       tokensReceived = Vector.toArray(tokensReceived);
       skippedDustTokens = Vector.toArray(skippedDust);
       nachosLedgerTxId;
@@ -3932,16 +4104,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     releaseLock(caller);
 
-    logger.info("BURN", "Burn #" # Nat.toText(burnId) # " " # Nat.toText(nachosAmount) # " NACHOS redeemed for " # Nat.toText(netValueICP) # " ICP worth", "redeemNachos");
+    logger.info("BURN", "Burn #" # Nat.toText(burnId) # " " # Nat.toText(nachosAmountVar) # " NACHOS redeemed for " # Nat.toText(netValueICPVar) # " ICP worth", "redeemNachos");
 
     #ok({
       success = true;
       burnId;
-      nachosBurned = nachosAmount;
+      nachosBurned = nachosAmountVar;
       navUsed = nav.navPerTokenE8s;
       redemptionValueICP;
       feeValueICP = feeValue;
-      netValueICP;
+      netValueICP = netValueICPVar;
       tokensReceived = Vector.toArray(tokensReceived);
       skippedDustTokens = Vector.toArray(skippedDust);
       nachosLedgerTxId;
@@ -6388,6 +6560,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         maxBurnOps = maxBurnOpsPerUser4Hours;
         maxMintICPPerUser4Hours;
         maxBurnNachosPerUser4Hours;
+        effectiveBurnLimit = do {
+          let liquidCap = getLiquidBurnCapNachos();
+          if (liquidCap > 0 and liquidCap < maxNachosBurnPer4Hours) { liquidCap } else { maxNachosBurnPer4Hours };
+        };
       };
       userTotalMintVolumeICP = uMintVol;
       userTotalBurnVolumeICP = uBurnVol;
@@ -6416,6 +6592,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     globalBurnIn4h : Nat;
     maxMintPer4h : Nat;
     maxBurnPer4h : Nat;
+    effectiveBurnLimit : Nat;
+    liquidPortfolioICP : Nat;
   } {
     var totalMintVol : Nat = 0;
     var icpMints : Nat = 0;
@@ -6487,6 +6665,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       globalBurnIn4h = gBurn;
       maxMintPer4h = maxMintICPWorthPer4Hours;
       maxBurnPer4h = maxNachosBurnPer4Hours;
+      effectiveBurnLimit = do {
+        let liquidCap = getLiquidBurnCapNachos();
+        if (liquidCap > 0 and liquidCap < maxNachosBurnPer4Hours) { liquidCap } else { maxNachosBurnPer4Hours };
+      };
+      liquidPortfolioICP = getLiquidPortfolioValueICP();
     };
   };
 
@@ -6636,6 +6819,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
             };
           };
           treasuryTradingPauses := cached.tradingPauses;
+          // Sync LP backing from treasury cache (populated by treasury's updateBalances)
+          for ((token, _) in Map.entries(lpBackingFromTreasury)) {
+            Map.delete(lpBackingFromTreasury, phash, token);
+          };
+          for ((token, amount) in cached.lpBackingPerToken.vals()) {
+            Map.set(lpBackingFromTreasury, phash, token, amount);
+          };
         } catch (e) {
           logger.warn("TIMER", "Token details sync failed: " # Error.message(e), "periodicSync");
         };
@@ -6910,7 +7100,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // --- Initial timer start (first deploy) ---
   ignore setTimer<system>(#nanoseconds(0), func() : async () {
     startAllTimers();
-    logger.info("LIFECYCLE", "Initial timer startup complete", "init");
+    // Force immediate LP backing sync from treasury on startup/upgrade
+    // Minimizes window where lpBackingFromTreasury is empty (transient, resets on upgrade)
+    await refreshLPBackingFromTreasury();
+    logger.info("LIFECYCLE", "Initial timer startup complete, LP backing synced", "init");
   });
 
 };

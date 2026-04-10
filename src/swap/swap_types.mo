@@ -47,6 +47,15 @@ module {
     #GenericError : { error_code : Nat; message : Text };
   };
 
+  // ICP Ledger (NNS) transfer error type
+  public type ICP_TransferError = {
+    #TxTooOld : { allowed_window_nanos : Nat64 };
+    #BadFee : { expected_fee : { e8s : Nat64 } };
+    #TxDuplicate : { duplicate_of : Nat64 };
+    #TxCreatedInFuture;
+    #InsufficientFunds : { balance : { e8s : Nat64 } };
+  };
+
   public type ICRC1TokenMetadata = {
     fee : Nat;
     decimals : Nat8;
@@ -531,5 +540,52 @@ module {
     slippage : Float;
     route : [Text];
     blockNumber : Nat;
+  };
+
+  // TACO quote with route info (for multi-route detection)
+  public type TACOQuoteReply = {
+    receive_amount : Nat;
+    price : Float;
+    mid_price : Float;
+    slippage : Float;
+    route : [{ tokenIn : Text; tokenOut : Text }];
+    routeDescription : Text;
+    canFulfillFully : Bool;
+  };
+
+  // TACO split leg for swapSplitRoutes execution
+  public type TACOSplitLeg = {
+    amountIn : Nat;
+    route : [{ tokenIn : Text; tokenOut : Text }];
+    minLegOut : Nat;
+  };
+
+  // ═══ LP MANAGEMENT TYPES ═══
+
+  // Matches exchange getUserLiquidityDetailed() return
+  public type DetailedLiquidityPosition = {
+    token0 : Text;
+    token1 : Text;
+    liquidity : Nat;
+    token0Amount : Nat;
+    token1Amount : Nat;
+    shareOfPool : Float;
+    fee0 : Nat;
+    fee1 : Nat;
+    positionType : { #fullRange; #concentrated };
+    positionId : ?Nat;
+    ratioLower : ?Nat;
+    ratioUpper : ?Nat;
+  };
+
+  // Matches exchange getAllAMMPools() return
+  public type AMMPoolInfo = {
+    token0 : Text;
+    token1 : Text;
+    reserve0 : Nat;
+    reserve1 : Nat;
+    price0 : Float;
+    price1 : Float;
+    totalLiquidity : Nat;
   };
 };

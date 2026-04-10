@@ -579,6 +579,14 @@ module {
     #ExecuteTradingCycle;
     #SetTestMode: {isTestMode: Bool};
     #ClearSystemLogs;
+
+    // LP Management
+    #LPAddLiquidity: {pool: Text; details: Text};
+    #LPRemoveLiquidity: {pool: Text; details: Text};
+    #LPClaimFees: {pool: Text; details: Text};
+    #LPEmergencyExit: {positionsRemoved: Nat};
+    #LPConfigUpdate: {details: Text};
+    #LPPoolConfigUpdate: {pool: Text; details: Text};
   };
   
   public type TreasuryAdminActionRecord = {
