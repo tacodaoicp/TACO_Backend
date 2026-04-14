@@ -2359,6 +2359,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     let nowVar = Time.now();
 
+    // Snapshot pre-swap reserves for accurate price impact calculation
+    // (orderPairing mutates AMMpools in-place, even in query context)
+    let preSwapPoolKey = getPool(tokenSell, tokenBuy);
+    let preSwapReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKey)) {
+      case (?pool) {
+        let (rIn, rOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+        ?(rIn, rOut);
+      };
+      case null { null };
+    };
+
     let dummyTrade : TradePrivate = {
       Fee = ICPfee;
       amount_sell = 0; // This will be filled by orderPairing
@@ -2427,18 +2438,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         totalMHImpact;
       } else {
-        // Price impact: compare execution rate at full amount vs constant-product mathematical rate
-        // Mathematical output (no fees, no transfer costs): reserveOut * amountIn / (reserveIn + amountIn)
-        let poolKey3 = getPool(tokenSell, tokenBuy);
-        switch (Map.get(AMMpools, hashtt, poolKey3)) {
-          case (?pool) {
-            let (reserveIn, reserveOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+        // Price impact using PRE-SWAP reserves (before orderPairing mutated the pool)
+        switch (preSwapReserves) {
+          case (?(reserveIn, reserveOut)) {
             if (reserveIn > 0 and reserveOut > 0 and amountSell > 0) {
-              // Pure constant-product output (what you'd get with zero fees at this price)
               let mathOutput = Float.fromInt(reserveOut) * Float.fromInt(amountSell) / Float.fromInt(reserveIn + amountSell);
-              // Spot output (infinitely small trade): reserveOut / reserveIn * amountSell
               let spotOutput = Float.fromInt(reserveOut) / Float.fromInt(reserveIn) * Float.fromInt(amountSell);
-              // Impact = how much worse the constant-product output is vs spot
               if (spotOutput > 0.0) { Float.abs(1.0 - mathOutput / spotOutput) } else { 0.0 };
             } else { 0.0 };
           };
@@ -2525,6 +2530,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         });
       } else {
         // ── Mirror of getExpectedReceiveAmount body ──
+        // Snapshot pre-swap reserves for accurate price impact
+        let preSwapPoolKeyB = getPool(tokenSell, tokenBuy);
+        let preSwapReservesB : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKeyB)) {
+          case (?pool) {
+            let (rIn, rOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+            ?(rIn, rOut);
+          };
+          case null { null };
+        };
+
         let dummyTrade : TradePrivate = {
           Fee = ICPfee;
           amount_sell = 0;
@@ -2584,10 +2599,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             for (hd in multiHopDetails.vals()) { totalMHImpact += hd.priceImpact };
             totalMHImpact;
           } else {
-            let poolKey3 = getPool(tokenSell, tokenBuy);
-            switch (Map.get(AMMpools, hashtt, poolKey3)) {
-              case (?pool) {
-                let (reserveIn, reserveOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+            // Use PRE-SWAP reserves (before orderPairing mutated the pool)
+            switch (preSwapReservesB) {
+              case (?(reserveIn, reserveOut)) {
                 if (reserveIn > 0 and reserveOut > 0 and amountSell > 0) {
                   let mathOutput = Float.fromInt(reserveOut) * Float.fromInt(amountSell) / Float.fromInt(reserveIn + amountSell);
                   let spotOutput = Float.fromInt(reserveOut) / Float.fromInt(reserveIn) * Float.fromInt(amountSell);
@@ -7512,6 +7526,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     for (hop in hops.vals()) {
       let hopAmountIn = currentAmount;
+
+      // Snapshot pre-swap reserves BEFORE orderPairing mutates the pool
+      let hopPoolKey = getPool(hop.tokenIn, hop.tokenOut);
+      let preHopReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, hopPoolKey)) {
+        case (?hopPool) {
+          let (rIn, rOut) = if (hopPool.token0 == hop.tokenIn) { (hopPool.reserve0, hopPool.reserve1) } else { (hopPool.reserve1, hopPool.reserve0) };
+          ?(rIn, rOut);
+        };
+        case null { null };
+      };
+
       let syntheticTrade : TradePrivate = {
         Fee = ICPfee;
         amount_sell = 1;
@@ -7544,12 +7569,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
 
-      // Per-hop price impact: mathematical constant-product formula (same as getExpectedReceiveAmount)
+      // Per-hop price impact using PRE-SWAP reserves (before orderPairing mutated the pool)
       let hopPriceImpact : Float = if (hopOutput > 0 and hopAmountIn > 0) {
-        let hopPoolKey = getPool(hop.tokenIn, hop.tokenOut);
-        switch (Map.get(AMMpools, hashtt, hopPoolKey)) {
-          case (?hopPool) {
-            let (rIn, rOut) = if (hopPool.token0 == hop.tokenIn) { (hopPool.reserve0, hopPool.reserve1) } else { (hopPool.reserve1, hopPool.reserve0) };
+        switch (preHopReserves) {
+          case (?(rIn, rOut)) {
             if (rIn > 0 and rOut > 0) {
               let mathOut = Float.fromInt(rOut) * Float.fromInt(hopAmountIn) / Float.fromInt(rIn + hopAmountIn);
               let spotOut = Float.fromInt(rOut) / Float.fromInt(rIn) * Float.fromInt(hopAmountIn);
