@@ -914,22 +914,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
     // Allow empty allocation [], otherwise validate
     if (newAllocations.size() > 0) {
-      // Check per-token allocation caps with descriptive error messages
-      for (alloc in newAllocations.vals()) {
-        switch (Map.get(tokenMaxAllocationBP, phash, alloc.token)) {
-          case (?maxBP) {
-            if (alloc.basisPoints > maxBP) {
-              let symbol = switch (Map.get(tokenDetailsMap, phash, alloc.token)) {
-                case (?d) { d.tokenSymbol };
-                case null { "unknown" };
-              };
-              return #err(#UnexpectedError("Allocation of " # Nat.toText(alloc.basisPoints) # "bp to " # symbol # " exceeds max of " # Nat.toText(maxBP) # "bp"));
-            };
-          };
-          case null {};
-        };
-      };
-      if (not validateAllocations(newAllocations)) {
+      if (not validateAllocations(newAllocations, initialUserState.allocations)) {
         return #err(#InvalidAllocation);
       };
     };
@@ -2555,9 +2540,9 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     };
   };
 
-  // Validates allocation array. Checks for duplicate tokens, active status, and total = 10000 basis points.
-  // Returns false if any validation fails.
-  private func validateAllocations(allocations : [Allocation]) : Bool {
+  // Validates allocation array. Checks for duplicate tokens, active status, caps (with step-down), and total = 10000 basis points.
+  // previousAllocations: the user's current saved allocations (for step-down rule).
+  private func validateAllocations(allocations : [Allocation], previousAllocations : [Allocation]) : Bool {
     var total : Nat = 0;
 
     // Check if allocation size exceeds available active tokens
@@ -2585,10 +2570,26 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
         case null { return false };
       };
 
-      // Check per-token allocation cap
+      // Check per-token allocation cap with step-down rule for grandfathered positions
       switch (Map.get(tokenMaxAllocationBP, phash, alloc.token)) {
-        case (?maxBP) { if (alloc.basisPoints > maxBP) { return false } };
-        case null {}; // No cap
+        case (?maxBP) {
+          if (alloc.basisPoints > maxBP) {
+            // Find previous allocation for this token
+            var previousBP : Nat = 0;
+            for (prev in previousAllocations.vals()) {
+              if (prev.token == alloc.token) { previousBP := prev.basisPoints };
+            };
+            if (previousBP > maxBP) {
+              // Grandfathered: must reduce by at least 1000bp, but can always go to cap
+              let stepDown = if (previousBP > 1000) { previousBP - 1000 } else { 0 };
+              let maxAllowed = Nat.max(maxBP, stepDown);
+              if (alloc.basisPoints > maxAllowed) { return false };
+            } else {
+              return false; // Was at/below cap, can't go above
+            };
+          };
+        };
+        case null {};
       };
 
       total += alloc.basisPoints;
@@ -4056,7 +4057,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
         // 2. Allocation validation
         if (newAllocations.size() > 0) {
-          if (not validateAllocations(newAllocations)) {
+          if (not validateAllocations(newAllocations, userState.allocations)) {
             return false;
           };
         };

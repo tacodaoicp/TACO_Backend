@@ -580,8 +580,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   stable let poolV3Data = Map.new<(Text, Text), PoolV3Data>();
   stable let concentratedPositions = Map.new<Principal, [ConcentratedPosition]>();
   stable var v3Migrated = false;
-  stable var v3MigratedV2 = false; // second pass: re-migrate with sqrtRatio keys
-  stable var v3MigratedV3 = false; // third pass: V3 as sole source of truth, zero V2 fees
+  stable var v3MigratedV2 = false;
+  stable var v3MigratedV3 = false;
+  // Keep these for stable compat (were added by earlier migrations, can't drop)
+  stable var v3LiquidityFixed = true;
+  stable var predrainCleanupDone = true;
 
   // ── V3 Math Helpers ──
 
@@ -655,6 +658,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   // Safe Nat subtraction: floors at 0
   func safeSub(a : Nat, b : Nat) : Nat { if (a >= b) { a - b } else { 0 } };
+
+  // Sync AMMPool from V3 data: totalLiquidity = v3.activeLiquidity, fees always 0
+  func syncPoolFromV3(poolKey : (Text, Text)) {
+    switch (Map.get(poolV3Data, hashtt, poolKey), Map.get(AMMpools, hashtt, poolKey)) {
+      case (?v3, ?pool) {
+        Map.set(AMMpools, hashtt, poolKey, { pool with totalLiquidity = v3.activeLiquidity; totalFee0 = 0; totalFee1 = 0 });
+      };
+      case _ {};
+    };
+  };
 
   // Overflow-safe a*b/c rounded UP (for amountIn — user pays slightly more, pool accumulates dust)
   func mulDivUp(a : Nat, b : Nat, c : Nat) : Nat {
@@ -843,6 +856,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     let totalIn = amountIn - amountRemaining;
+
+    // Safety clamp: V3 virtual liquidity can produce output exceeding real reserves.
+    // Clamp output to what the pool actually holds.
+    let maxOutput = if (tokenInIsToken0) { pool.reserve1 } else { pool.reserve0 };
+    if (totalAmountOut > maxOutput) {
+      totalAmountOut := maxOutput;
+    };
 
     // Compute new reserves from sqrtRatio (overflow-safe)
     let newReserve0 = if (currentSqrtRatio > 0) {
@@ -1038,6 +1058,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   // In this map the canister saves how many fees are already available to be picked up by the DAO. They can be picked up by calling collectFees()
   stable let feescollectedDAO : feemap = Map.new<Text, Nat>();
+
 
   // Map to check whether a trader was referred, if null 100% of fees go to the DAO and the val will be Null.
   // Entries in this map get set to Null from Text if referrerFeeMap has null as val in referrerFeeMap (the key in referrerFeeMap is the val in userReferrerLink)
@@ -2936,11 +2957,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           let pendingFee1 = old.liquidity * (if (v3Now.feeGrowthGlobal1 > old.lastFeeGrowth1) { v3Now.feeGrowthGlobal1 - old.lastFeeGrowth1 } else { 0 }) / tenToPower60;
           let maxClaim0 = if (v3Now.totalFeesCollected0 > v3Now.totalFeesClaimed0) { v3Now.totalFeesCollected0 - v3Now.totalFeesClaimed0 } else { 0 };
           let maxClaim1 = if (v3Now.totalFeesCollected1 > v3Now.totalFeesClaimed1) { v3Now.totalFeesCollected1 - v3Now.totalFeesClaimed1 } else { 0 };
-          let claimed0 = Nat.min(pendingFee0, maxClaim0);
-          let claimed1 = Nat.min(pendingFee1, maxClaim1);
-          if (claimed0 > 0 or claimed1 > 0) {
-            Map.set(poolV3Data, hashtt, poolKey, { v3Now with totalFeesClaimed0 = v3Now.totalFeesClaimed0 + claimed0; totalFeesClaimed1 = v3Now.totalFeesClaimed1 + claimed1 });
-          };
+          // Don't increment totalFeesClaimed during position merge.
+          // The pending fees remain tracked in the AMM component
+          // (totalFeesCollected - totalFeesClaimed) as permanent pool reserves.
+          // The LP's lastFeeGrowth is updated below, preventing double-claims.
+          // This avoids drift that occurs when totalFeesClaimed increases
+          // but the corresponding tokens stay in the wallet untracked.
           let updated = Array.tabulate<ConcentratedPosition>(existingConc.size(), func(i) {
             if (i == idx) {
               { old with liquidity = old.liquidity + liquidityMinted; lastFeeGrowth0 = v3Now.feeGrowthGlobal0; lastFeeGrowth1 = v3Now.feeGrowthGlobal1; lastUpdateTime = nowVar }
@@ -2968,93 +2990,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
-    if (deleteOld) {
-      for (provider in (TrieSet.toArray(oldProviders)).vals()) {
-        switch (Map.get(userLiquidityPositions, phash, provider)) {
-          case (?positions) {
-            let updatedPositions = Array.filter<LiquidityPosition>(
-              positions,
-              func(pos) {
-                pos.token0 != token0 and pos.token1 != token1
-              },
-            );
-
-            if (Array.size(updatedPositions) == 0) {
-              Map.delete(userLiquidityPositions, phash, provider);
-            } else {
-              Map.set(userLiquidityPositions, phash, provider, updatedPositions);
-            };
-          };
-          case (null) {
-            // No positions for this provider, nothing to do
-          };
-        };
-      };
-    };
-
-    switch (Map.get(userLiquidityPositions, phash, caller)) {
-      case (null) {
-        let pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
-          case (null) {
-            throw Error.reject("Pool not found after creation/update");
-          };
-          case (?p) { p };
-        };
-        Map.set(userLiquidityPositions, phash, caller, [{ token0 = token0; token1 = token1; liquidity = liquidityMinted; fee0 = 0; fee1 = 0; lastUpdateTime = nowVar }]);
-      };
-      case (?positions) {
-        let existingPositionIndex = Array.indexOf<LiquidityPosition>(
-          {
-            liquidity = 0;
-            token0 = token0;
-            token1 = token1;
-            fee0 = 0;
-            fee1 = 0;
-            lastUpdateTime = 0;
-          },
-          positions,
-          func(p, _) { p.token0 == token0 and p.token1 == token1 },
-        );
-
-        let pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
-          case (null) {
-            throw Error.reject("Pool not found after creation/update");
-          };
-          case (?p) { p };
-        };
-
-        let updatedPositions = switch (existingPositionIndex) {
-          case (?index) {
-            Array.tabulate<LiquidityPosition>(
-              positions.size(),
-              func(i) {
-                if (i == index) {
-                  {
-                    token0 = token0;
-                    token1 = token1;
-                    liquidity = if deleteOld { liquidityMinted } else {
-                      positions[i].liquidity + liquidityMinted;
-                    };
-                    fee0 = positions[i].fee0;
-                    fee1 = positions[i].fee1;
-                    lastUpdateTime = nowVar;
-                  };
-                } else {
-                  positions[i];
-                };
-              },
-            );
-          };
-          case (null) {
-            let posVec = Vector.fromArray<LiquidityPosition>(positions);
-            Vector.add(posVec, { token0 = token0; token1 = token1; liquidity = liquidityMinted; fee0 = 0; fee1 = 0; lastUpdateTime = nowVar });
-            Vector.toArray(posVec);
-          };
-        };
-
-        Map.set(userLiquidityPositions, phash, caller, updatedPositions);
-      };
-    };
+    // Sync AMMPool from V3 after liquidity addition
+    syncPoolFromV3(poolKey);
 
     if (refund0 > 0 or refund1 > 0) {
       let Tfees0 = returnTfees(token0);
@@ -3270,6 +3207,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       ranges = ranges;
     });
 
+    // Sync AMMPool from V3
+    syncPoolFromV3(poolKey);
+
     // Store or merge position for user (merge if same pool + same range exists)
     let existingConc = switch (Map.get(concentratedPositions, phash, caller)) {
       case null { [] }; case (?arr) { arr };
@@ -3456,9 +3396,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (v3.activeLiquidity > actualLiquidityToRemove) { v3.activeLiquidity - actualLiquidityToRemove } else { 0 };
     } else { v3.activeLiquidity };
 
-    // Update pool reserves
-    let newReserve0 = if (pool.reserve0 > totalAmount0) { pool.reserve0 - totalAmount0 } else { 0 };
-    let newReserve1 = if (pool.reserve1 > totalAmount1) { pool.reserve1 - totalAmount1 } else { 0 };
+    // Update pool reserves — only subtract base amounts; fee portion comes from
+    // totalFeesCollected (tracked via totalFeesClaimed below)
+    let newReserve0 = if (pool.reserve0 > baseAmount0) { pool.reserve0 - baseAmount0 } else { 0 };
+    let newReserve1 = if (pool.reserve1 > baseAmount1) { pool.reserve1 - baseAmount1 } else { 0 };
     let newTotalLiq = if (pool.totalLiquidity > actualLiquidityToRemove) { pool.totalLiquidity - actualLiquidityToRemove } else { 0 };
 
     Map.set(AMMpools, hashtt, poolKey, {
@@ -3476,6 +3417,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       totalFeesClaimed1 = v3.totalFeesClaimed1 + (actualFee1 * actualLiquidityToRemove / position.liquidity);
       ranges = ranges;
     });
+
+    // Sync AMMPool from V3
+    syncPoolFromV3(poolKey);
+
+    // Clean up pool on full drain
+    if (newActiveLiquidity == 0 and newReserve0 == 0 and newReserve1 == 0) {
+      Map.delete(AMMpools, hashtt, poolKey);
+      Map.delete(poolV3Data, hashtt, poolKey);
+    };
 
     // Update or remove position
     let newLiquidity = position.liquidity - actualLiquidityToRemove;
@@ -3541,42 +3491,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   public query ({ caller }) func getUserLiquidityDetailed() : async [DetailedLiquidityPosition] {
     if (isAllowedQuery(caller) != 1) { return [] };
 
-    // V2 full-range positions
-    let v2Result = switch (Map.get(userLiquidityPositions, phash, caller)) {
-      case (null) { [] };
-      case (?positions) {
-        Array.mapFilter<LiquidityPosition, DetailedLiquidityPosition>(
-          positions,
-          func(pos) {
-            let poolKey = (pos.token0, pos.token1);
-            switch (Map.get(AMMpools, hashtt, poolKey)) {
-              case (null) { null };
-              case (?pool) {
-                if (pool.totalLiquidity == 0) return null;
-                let shareOfPool = Float.fromInt(Int.abs(pos.liquidity)) / Float.fromInt(Int.abs(pool.totalLiquidity));
-                let token0Amount = (pos.liquidity * pool.reserve0) / pool.totalLiquidity;
-                let token1Amount = (pos.liquidity * pool.reserve1) / pool.totalLiquidity;
-
-                ?{
-                  token0 = pos.token0; token1 = pos.token1;
-                  liquidity = pos.liquidity;
-                  token0Amount; token1Amount; shareOfPool;
-                  fee0 = pos.fee0 / tenToPower60;
-                  fee1 = pos.fee1 / tenToPower60;
-                  positionType = #fullRange;
-                  positionId = null;
-                  ratioLower = null;
-                  ratioUpper = null;
-                };
-              };
-            };
-          },
-        );
-      };
-    };
-
     // V3 concentrated positions with computed fees and token amounts
-    let v3Result = switch (Map.get(concentratedPositions, phash, caller)) {
+    switch (Map.get(concentratedPositions, phash, caller)) {
       case null { [] };
       case (?cPositions) {
         Array.mapFilter<ConcentratedPosition, DetailedLiquidityPosition>(
@@ -3617,14 +3533,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         );
       };
     };
-
-    // V3 is primary source of truth. Only include V2 positions that have no matching V3 entry (legacy pre-migration).
-    let v2Only = Array.filter<DetailedLiquidityPosition>(v2Result, func(v2pos) {
-      switch (Array.find<DetailedLiquidityPosition>(v3Result, func(v3pos) {
-        v2pos.token0 == v3pos.token0 and v2pos.token1 == v3pos.token1
-      })) { case (?_) { false }; case null { true } }
-    });
-    Array.append(v2Only, v3Result);
   };
 
   public shared ({ caller }) func claimLPFees(token0i : Text, token1i : Text) : async ExTypes.ClaimFeesResult {
@@ -3675,17 +3583,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   totalFeesClaimed1 = v3.totalFeesClaimed1 + accumulatedFees1;
                 });
 
-                // Zero out V2 fees for consistency
-                switch (Map.get(userLiquidityPositions, phash, caller)) {
-                  case (?positions) {
-                    let updatedV2 = Array.map<LiquidityPosition, LiquidityPosition>(positions, func(p) {
-                      if (p.token0 == token0 and p.token1 == token1) { { p with fee0 = 0; fee1 = 0; lastUpdateTime = nowVar } } else { p }
-                    });
-                    Map.set(userLiquidityPositions, phash, caller, updatedV2);
-                  };
-                  case null {};
-                };
-
                 // Transfer fees
                 let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
                 let Tfees0 = returnTfees(token0);
@@ -3725,94 +3622,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case null {};
     };
 
-    // Legacy V2 path (deprecated — for users without V3 positions)
-    let pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
-      case (null) { return #Err(#PoolNotFound("Pool not found")) };
-      case (?p) { p };
-    };
-
-    let userPositions = switch (Map.get(userLiquidityPositions, phash, caller)) {
-      case (null) { return #Err(#OrderNotFound("No liquidity positions")) };
-      case (?p) { p };
-    };
-
-    var position : ?LiquidityPosition = null;
-    for (p in userPositions.vals()) {
-      if ((p.token0 == token0 and p.token1 == token1) or (p.token0 == token1 and p.token1 == token0)) {
-        position := ?p;
-      };
-    };
-
-    switch (position) {
-      case (null) { return #Err(#OrderNotFound("Position not found for pair")) };
-      case (?pos) {
-        if (pos.fee0 == 0 and pos.fee1 == 0) {
-          return #Err(#InvalidInput("No fees to claim"));
-        };
-
-        let accumulatedFees0 = pos.fee0 / tenToPower60;
-        let accumulatedFees1 = pos.fee1 / tenToPower60;
-        let nowVar = Time.now();
-
-        let updatedPositions = Array.map<LiquidityPosition, LiquidityPosition>(
-          userPositions,
-          func(p) {
-            if ((p.token0 == token0 and p.token1 == token1) or (p.token0 == token1 and p.token1 == token0)) {
-              { p with fee0 = 0; fee1 = 0; lastUpdateTime = nowVar };
-            } else { p };
-          },
-        );
-        Map.set(userLiquidityPositions, phash, caller, updatedPositions);
-
-        Map.set(AMMpools, hashtt, poolKey, {
-          pool with
-          totalFee0 = if (pool.totalFee0 > pos.fee0) { pool.totalFee0 - pos.fee0 } else { 0 };
-          totalFee1 = if (pool.totalFee1 > pos.fee1) { pool.totalFee1 - pos.fee1 } else { 0 };
-          lastUpdateTime = nowVar;
-        });
-
-        switch (Map.get(poolV3Data, hashtt, poolKey)) {
-          case (?v3) {
-            Map.set(poolV3Data, hashtt, poolKey, {
-              v3 with
-              totalFeesClaimed0 = v3.totalFeesClaimed0 + accumulatedFees0;
-              totalFeesClaimed1 = v3.totalFeesClaimed1 + accumulatedFees1;
-            });
-          };
-          case null {};
-        };
-
-        let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
-        let Tfees0 = returnTfees(token0);
-        let Tfees1 = returnTfees(token1);
-
-        if (accumulatedFees0 > Tfees0) {
-          Vector.add(tempTransferQueueLocal, (#principal(caller), accumulatedFees0 - Tfees0, token0));
-        } else if (accumulatedFees0 > 0) {
-          addFees(token0, accumulatedFees0, false, "", nowVar);
-        };
-        if (accumulatedFees1 > Tfees1) {
-          Vector.add(tempTransferQueueLocal, (#principal(caller), accumulatedFees1 - Tfees1, token1));
-        } else if (accumulatedFees1 > 0) {
-          addFees(token1, accumulatedFees1, false, "", nowVar);
-        };
-
-        if (Vector.size(tempTransferQueueLocal) > 0) {
-          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
-            Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
-          };
-        };
-
-        #Ok({
-          fees0 = accumulatedFees0;
-          fees1 = accumulatedFees1;
-          transferred0 = if (accumulatedFees0 > Tfees0) { accumulatedFees0 - Tfees0 } else { 0 };
-          transferred1 = if (accumulatedFees1 > Tfees1) { accumulatedFees1 - Tfees1 } else { 0 };
-          dust0ToDAO = if (accumulatedFees0 > 0 and accumulatedFees0 <= Tfees0) { accumulatedFees0 } else { 0 };
-          dust1ToDAO = if (accumulatedFees1 > 0 and accumulatedFees1 <= Tfees1) { accumulatedFees1 } else { 0 };
-        });
-      };
-    };
+    // No V3 position found for this pair
+    #Err(#OrderNotFound("No liquidity position found for pair"));
   };
 
   public shared ({ caller }) func removeLiquidity(token0i : Text, token1i : Text, liquidityAmount : Nat) : async ExTypes.RemoveLiquidityResult {
@@ -3860,10 +3671,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             let maxClaimable1 = if (v3.totalFeesCollected1 > v3.totalFeesClaimed1) { v3.totalFeesCollected1 - v3.totalFeesClaimed1 } else { 0 };
             let actualFee1 = Nat.min(theoreticalFee1, maxClaimable1);
 
-            // Calculate token amounts
+            // Calculate token amounts using proportional share of actual reserves.
+            // addLiquidity adds exact deposit amounts to reserves, so we must remove
+            // proportionally from reserves (not from V3 math, which rounds differently).
             let sqrtLower = ratioToSqrtRatio(position.ratioLower);
             let sqrtUpper = ratioToSqrtRatio(position.ratioUpper);
-            let (baseAmount0, baseAmount1) = amountsFromLiquidity(removeAmt, sqrtLower, sqrtUpper, v3.currentSqrtRatio);
+            let baseAmount0 = if (pool.totalLiquidity > 0) { mulDiv(removeAmt, pool.reserve0, pool.totalLiquidity) } else { 0 };
+            let baseAmount1 = if (pool.totalLiquidity > 0) { mulDiv(removeAmt, pool.reserve1, pool.totalLiquidity) } else { 0 };
             let totalAmount0 = baseAmount0 + (actualFee0 * removeAmt / position.liquidity);
             let totalAmount1 = baseAmount1 + (actualFee1 * removeAmt / position.liquidity);
 
@@ -3892,11 +3706,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               if (v3.activeLiquidity > removeAmt) { v3.activeLiquidity - removeAmt } else { 0 };
             } else { v3.activeLiquidity };
 
-            // Update pool
+            // Update pool — only subtract base amounts from reserves;
+            // fee portion comes from totalFeesCollected (tracked via totalFeesClaimed below)
             Map.set(AMMpools, hashtt, poolKey, {
               pool with
-              reserve0 = if (pool.reserve0 > totalAmount0) { pool.reserve0 - totalAmount0 } else { 0 };
-              reserve1 = if (pool.reserve1 > totalAmount1) { pool.reserve1 - totalAmount1 } else { 0 };
+              reserve0 = if (pool.reserve0 > baseAmount0) { pool.reserve0 - baseAmount0 } else { 0 };
+              reserve1 = if (pool.reserve1 > baseAmount1) { pool.reserve1 - baseAmount1 } else { 0 };
               totalLiquidity = if (pool.totalLiquidity > removeAmt) { pool.totalLiquidity - removeAmt } else { 0 };
               lastUpdateTime = nowVar;
             });
@@ -3921,20 +3736,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               Map.set(concentratedPositions, phash, caller, updated);
             };
 
-            // Sync V2 position
-            switch (Map.get(userLiquidityPositions, phash, caller)) {
-              case (?positions) {
-                let updatedV2 = Array.map<LiquidityPosition, LiquidityPosition>(positions, func(p) {
-                  if (p.token0 == token0 and p.token1 == token1) {
-                    { p with liquidity = if (p.liquidity > removeAmt) { p.liquidity - removeAmt } else { 0 }; fee0 = 0; fee1 = 0; lastUpdateTime = nowVar }
-                  } else { p }
-                });
-                let filtered = Array.filter<LiquidityPosition>(updatedV2, func(p) { p.liquidity > 1 });
-                if (filtered.size() == 0) { Map.delete(userLiquidityPositions, phash, caller) }
-                else { Map.set(userLiquidityPositions, phash, caller, filtered) };
-              };
-              case null {};
-            };
+            // Sync AMMPool from V3
+            syncPoolFromV3(poolKey);
 
             // Transfer tokens
             let Tfees0 = returnTfees(token0);
@@ -3954,218 +3757,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case null {};
     };
 
-    // Legacy V2 path: for users without V3 positions (pre-migration)
-    switch (Map.get(AMMpools, hashtt, poolKey)) {
-      case (null) { throw Error.reject("Pool does not exist") };
-      case (?pool) {
-        var actualLiquidityToRemove = liquidityAmount;
-        var userPosition : ?LiquidityPosition = null;
-        var userPositions : [LiquidityPosition] = [];
-
-        // Find user's current V2 liquidity position
-        switch (Map.get(userLiquidityPositions, phash, caller)) {
-          case (null) { throw Error.reject("User has no liquidity") };
-          case (?positions) {
-            userPositions := positions;
-            label a for (p in positions.vals()) {
-
-              if ((p.token0 == token0 and p.token1 == token1) or (p.token0 == token1 and p.token1 == token0)) {
-                userPosition := ?p;
-                break a;
-              };
-            };
-          };
-        };
-
-        switch (userPosition) {
-          case (null) { throw Error.reject("User position not found") };
-          case (?position) {
-            if (actualLiquidityToRemove > position.liquidity) {
-              actualLiquidityToRemove := position.liquidity;
-            };
-
-            if (pool.totalLiquidity == 0) {
-              return #Err(#InsufficientFunds("Pool has zero total liquidity"));
-            };
-
-            let amount0 = (actualLiquidityToRemove * pool.reserve0) / pool.totalLiquidity;
-
-
-            let amount1 = (actualLiquidityToRemove * pool.reserve1) / pool.totalLiquidity;
-
-
-            // Calculate accumulated fees
-
-            let accumulatedFees0 = position.fee0 / (tenToPower60);
-
-
-            let accumulatedFees1 = position.fee1 / (tenToPower60);
-
-
-            let amount0WithFees = amount0 + accumulatedFees0;
-
-
-            let amount1WithFees = amount1 + accumulatedFees1;
-
-
-            // Ensure we're not sending more than what's in the pool
-            let finalAmount0 = amount0WithFees;
-
-
-            let finalAmount1 = amount1WithFees;
-
-
-            // Update user's liquidity position
-            let updatedPositions = Array.map<LiquidityPosition, LiquidityPosition>(
-              userPositions,
-              func(p) {
-                if (p.token0 == token0 and p.token1 == token1) {
-                  {
-                    token0 = p.token0;
-                    token1 = p.token1;
-                    liquidity = p.liquidity - actualLiquidityToRemove;
-                    fee0 = 0;
-                    fee1 = 0;
-                    lastUpdateTime = nowVar;
-                  };
-                } else {
-                  p;
-                };
-              },
-            );
-            let matchVec = Vector.new<LiquidityPosition>();
-            let restVec = Vector.new<LiquidityPosition>();
-            for (p in updatedPositions.vals()) {
-              if (p.liquidity > 1) {
-                if (p.token0 == token0 and p.token1 == token1) {
-                  Vector.add(matchVec, p);
-                } else {
-                  Vector.add(restVec, p);
-                };
-              };
-            };
-            let filteredPositions = Vector.toArray(matchVec);
-            let filteredPositionsRest = Vector.toArray(restVec);
-            if (filteredPositions.size() == 0 and filteredPositionsRest.size() == 0) {
-
-              Map.delete(userLiquidityPositions, phash, caller);
-              let updatedPool = {
-                pool with
-                reserve0 = pool.reserve0 - amount0;
-                reserve1 = pool.reserve1 - amount1;
-                totalLiquidity = pool.totalLiquidity - actualLiquidityToRemove;
-                lastUpdateTime = nowVar;
-                totalFee0 = if (pool.totalFee0 > position.fee0) { pool.totalFee0 - position.fee0 } else { 0 };
-                totalFee1 = if (pool.totalFee1 > position.fee1) { pool.totalFee1 - position.fee1 } else { 0 };
-                providers = TrieSet.delete(pool.providers, caller, Principal.hash(caller), Principal.equal);
-
-              };
-              Map.set(AMMpools, hashtt, poolKey, updatedPool);
-            } else if (filteredPositions.size() == 0) {
-              let updatedPool = {
-                pool with
-                reserve0 = pool.reserve0 - amount0;
-                reserve1 = pool.reserve1 - amount1;
-                totalFee0 = if (pool.totalFee0 > position.fee0) { pool.totalFee0 - position.fee0 } else { 0 };
-                totalFee1 = if (pool.totalFee1 > position.fee1) { pool.totalFee1 - position.fee1 } else { 0 };
-                totalLiquidity = pool.totalLiquidity - actualLiquidityToRemove;
-                lastUpdateTime = nowVar;
-                providers = TrieSet.delete(pool.providers, caller, Principal.hash(caller), Principal.equal);
-
-              };
-              Map.set(AMMpools, hashtt, poolKey, updatedPool);
-              Map.set(userLiquidityPositions, phash, caller, filteredPositionsRest);
-            } else if (filteredPositionsRest.size() == 0) {
-              let updatedPool = {
-                pool with
-                reserve0 = pool.reserve0 - amount0;
-                reserve1 = pool.reserve1 - amount1;
-                totalFee0 = if (pool.totalFee0 > position.fee0) { pool.totalFee0 - position.fee0 } else { 0 };
-                totalFee1 = if (pool.totalFee1 > position.fee1) { pool.totalFee1 - position.fee1 } else { 0 };
-                totalLiquidity = pool.totalLiquidity - actualLiquidityToRemove;
-                lastUpdateTime = nowVar;
-
-              };
-              Map.set(AMMpools, hashtt, poolKey, updatedPool);
-              Map.set(userLiquidityPositions, phash, caller, filteredPositions);
-
-            } else {
-              let updatedPool = {
-                pool with
-                reserve0 = pool.reserve0 - amount0;
-                reserve1 = pool.reserve1 - amount1;
-                totalFee0 = if (pool.totalFee0 > position.fee0) { pool.totalFee0 - position.fee0 } else { 0 };
-                totalFee1 = if (pool.totalFee1 > position.fee1) { pool.totalFee1 - position.fee1 } else { 0 };
-                totalLiquidity = pool.totalLiquidity - actualLiquidityToRemove;
-                lastUpdateTime = nowVar;
-
-              };
-              Map.set(AMMpools, hashtt, poolKey, updatedPool);
-              let mergedVec = Vector.fromArray<LiquidityPosition>(filteredPositionsRest);
-              Vector.addFromIter(mergedVec, filteredPositions.vals());
-              Map.set(userLiquidityPositions, phash, caller, Vector.toArray(mergedVec));
-            };
-
-            // Update V3 fee claimed tracking so checkDiffs stays consistent
-            switch (Map.get(poolV3Data, hashtt, poolKey)) {
-              case (?v3) {
-                Map.set(poolV3Data, hashtt, poolKey, {
-                  v3 with
-                  totalFeesClaimed0 = v3.totalFeesClaimed0 + accumulatedFees0;
-                  totalFeesClaimed1 = v3.totalFeesClaimed1 + accumulatedFees1;
-                });
-              };
-              case null {};
-            };
-
-            // Also update corresponding V3 full-range concentrated position (synced from addLiquidity)
-            switch (Map.get(concentratedPositions, phash, caller)) {
-              case (?cPositions) {
-                let updated = Array.map<ConcentratedPosition, ConcentratedPosition>(cPositions, func(cp) {
-                  if (cp.token0 == token0 and cp.token1 == token1 and cp.ratioLower == FULL_RANGE_LOWER and cp.ratioUpper == FULL_RANGE_UPPER) {
-                    let newLiq = if (cp.liquidity > actualLiquidityToRemove) { cp.liquidity - actualLiquidityToRemove } else { 0 };
-                    { cp with liquidity = newLiq; lastUpdateTime = nowVar };
-                  } else { cp }
-                });
-                let filtered = Array.filter<ConcentratedPosition>(updated, func(cp) { cp.liquidity > 0 });
-                if (filtered.size() == 0) {
-                  Map.delete(concentratedPositions, phash, caller);
-                } else {
-                  Map.set(concentratedPositions, phash, caller, filtered);
-                };
-              };
-              case null {};
-            };
-
-            // Transfer tokens back to user
-            let Tfees0 = returnTfees(token0);
-            let Tfees1 = returnTfees(token1);
-            if (finalAmount0 > Tfees0) {
-              Vector.add(tempTransferQueueLocal, (#principal(caller), finalAmount0 - Tfees0, token0));
-            } else {
-              addFees(token0, finalAmount0, false, "", nowVar);
-            };
-            if (finalAmount1 > Tfees1) {
-              Vector.add(tempTransferQueueLocal, (#principal(caller), finalAmount1 - Tfees1, token1));
-            } else {
-              addFees(token1, finalAmount1, false, "", nowVar);
-            };
-
-            // Execute transfers
-            if ((try { await treasury.receiveTransferTasks(Vector.toArray(tempTransferQueueLocal)) } catch (err) { false })) {} else {
-              Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
-            };
-            #Ok({
-              amount0 = finalAmount0;
-              amount1 = finalAmount1;
-              fees0 = accumulatedFees0;
-              fees1 = accumulatedFees1;
-              liquidityBurned = actualLiquidityToRemove;
-            });
-          };
-        };
-      };
-    };
+    // No V3 position found
+    #Err(#OrderNotFound("No liquidity position found"));
   };
 
   public query ({ caller }) func getAMMPoolInfo(token0 : Text, token1 : Text) : async ?{
@@ -4966,6 +4559,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       index += 1;
     };
   };
+  public query func isExchangeFrozen() : async Bool { exchangeState == #Frozen };
+
   // Freeze all exchange activities, only the admin accounts can use this function
   public shared ({ caller }) func Freeze() : async () {
     if (not ownercheck(caller)) {
@@ -5077,6 +4672,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
     };
+  };
+
+  public shared ({ caller }) func clearAllBans() : async () {
+    if (not ownercheck(caller)) { return };
+    dayBan := TrieSet.empty();
+    dayBanRegister := TrieSet.empty();
+    allTimeBan := TrieSet.empty();
+    warnings := TrieSet.empty();
+    logger.info("ADMIN", "clearAllBans called by " # Principal.toText(caller), "clearAllBans");
   };
 
   // function that allows admin to change certain variables
@@ -6584,7 +6188,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let user = Principal.toText(caller);
 
     if (((switch (Array.find<Text>(pausedTokens, func(t) { t == token_sell_identifier })) { case null { false }; case (?_) { true } })) or ((switch (Array.find<Text>(pausedTokens, func(t) { t == token_init_identifier })) { case null { false }; case (?_) { true } }))) {
-      assert (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block)) == false);
+      if (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
       Map.set(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block), nowVar);
 
       let nowVar2 = nowVar;
@@ -6615,7 +6219,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       1;
     } else { amount_sell };
     if (not returnMinimum(token_init_identifier, amount_init, false)) {
-      assert (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block)) == false);
+      if (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
       Map.set(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block), nowVar);
 
       let nowVar2 = nowVar;
@@ -6636,7 +6240,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       return #Err(#InvalidInput("Amount too low"));
     };
-    assert (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block)) == false);
+    if (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block))) {
+      return #Err(#InvalidInput("Block already processed"));
+    };
     Map.set(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block), nowVar);
 
     let nowVar2 = nowVar;
@@ -6758,7 +6364,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let leftAmountInit = thePairing.0;
       Vector.addFromIter(tempTransferQueueLocal, thePairing.3.vals());
       let tfees = returnTfees(token_init_identifier);
-
       if (leftAmountInit != amount_init and leftAmountInit != 0 and tfees < leftAmountInit) {
         if (amount_sell2 > 1) {
 
@@ -6860,10 +6465,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         plsbreak := 1;
       } else if (tfees >= leftAmountInit and leftAmountInit != amount_init and leftAmountInit != 0) {
 
-        let add = ((((((amount_init - leftAmountInit) * ICPfee)) - (((((amount_init - leftAmountInit) * ICPfee) * 100000) / RevokeFeeNow) / 100000)) / 10000) +leftAmountInit);
-        let dustInputTfees = if (thePairing.4) { tfees } else { 0 };
-        if (add + dustInputTfees > 0) {
-          addFees(token_init_identifier, add + dustInputTfees, false, user, nowVar);
+        // For AMM-only swaps, leftAmountInit is a phantom from buyTfees adjustment.
+        // Use full amount_init for fee calculation. Track input Tfees for AMM-only
+        // fills (same as full fill path) since the order's Tfees deposit must be
+        // accounted for after the order is consumed.
+        let matchedForFee = if (thePairing.4) { amount_init } else { amount_init - leftAmountInit };
+        let posInputTfees = if (thePairing.4) { tfees } else { 0 };
+        let add = ((((matchedForFee * ICPfee)) - ((((matchedForFee * ICPfee) * 100000) / RevokeFeeNow) / 100000)) / 10000) + (if (thePairing.4) { posInputTfees } else { leftAmountInit });
+        if (add > 0) {
+          addFees(token_init_identifier, add, false, user, nowVar);
         };
 
         // Record as near-full fill (remainder was dust)
@@ -7111,7 +6721,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let user = Principal.toText(caller);
 
     // 2. Block validation & fund receipt (same pattern as addPosition)
-    assert (Map.has(BlocksDone, thash, tokenIn # ":" #Nat.toText(Block)) == false);
+    if (Map.has(BlocksDone, thash, tokenIn # ":" #Nat.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
     Map.set(BlocksDone, thash, tokenIn # ":" #Nat.toText(Block), nowVar);
     let nowVar2 = nowVar;
     let tType = returnType(tokenIn);
@@ -7463,7 +7073,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
     let user = Principal.toText(caller);
 
-    assert (Map.has(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block)) == false);
+    if (Map.has(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
     Map.set(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block), nowVar);
     let nowVar2 = nowVar;
     let tType = returnType(tokenIn);
@@ -7817,7 +7427,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   func swapWithAMM(pool : AMMPool, tokenInIsToken0 : Bool, amountIn : Nat, orderRatio : Ratio, fee : Nat) : (Nat, Nat, Nat, Nat, Nat, Nat, AMMPool) {
 
-    // V3 path: if pool has concentrated liquidity data, use V3 engine
+    // V3 path: use concentrated liquidity engine
     let poolKey = (pool.token0, pool.token1);
     switch (Map.get(poolV3Data, hashtt, poolKey)) {
       case (?v3) {
@@ -7830,44 +7440,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case null {};
     };
 
-    // V2 fallback (for pools without V3 data)
+    // No V3 data: no swap possible
     let reserveIn = if (tokenInIsToken0) pool.reserve0 else pool.reserve1;
     let reserveOut = if (tokenInIsToken0) pool.reserve1 else pool.reserve0;
-
-    let poolFeeAmount = (amountIn * fee * 70) / (100 * 10000);
-    let protocolFeeAmount = (amountIn * fee * 30) / (100 * 10000);
-
-    let amountInAfterFee = amountIn;
-
-    let k = reserveIn * reserveOut;
-    let targetRatio = switch (orderRatio) {
-      case (#Value(r)) r;
-      case (#Zero) 1;
-      case (#Max) tenToPower60;
-    };
-
-    let newReserveIn = sqrt((k * tenToPower60) / targetRatio);
-    let optimalAmountIn = if (newReserveIn > reserveIn and amountInAfterFee > 0) {
-      Nat.min(amountInAfterFee, newReserveIn - reserveIn);
-    } else { 0 };
-
-    let amountOut = if (optimalAmountIn == 0) { 0 } else {
-      (reserveOut * optimalAmountIn) / (reserveIn + optimalAmountIn);
-    };
-
-    let actualNewReserveIn = reserveIn + optimalAmountIn;
-    let actualNewReserveOut = if (reserveOut > amountOut) { reserveOut - amountOut } else { 0 };
-
-    let updatedPool : AMMPool = {
-      pool with
-      reserve0 = if (tokenInIsToken0) actualNewReserveIn else Nat.max(actualNewReserveOut, if (pool.reserve0 > amountOut) { pool.reserve0 - amountOut } else { Debug.print("!!!!!"); 0 });
-      reserve1 = if (tokenInIsToken0) Nat.max(actualNewReserveOut, if (pool.reserve1 > amountOut) { pool.reserve1 - amountOut } else { Debug.print("!!!!!"); 0 }) else actualNewReserveIn;
-      totalFee0 = if (tokenInIsToken0) { pool.totalFee0 + ((tenToPower60) * poolFeeAmount) } else { pool.totalFee0 };
-      totalFee1 = if (tokenInIsToken0) { pool.totalFee1 } else { pool.totalFee1 + ((tenToPower60) * poolFeeAmount) };
-      lastUpdateTime = Time.now();
-    };
-
-    (amountIn, amountOut, actualNewReserveIn, actualNewReserveOut, protocolFeeAmount, poolFeeAmount, updatedPool);
+    (0, 0, reserveIn, reserveOut, 0, 0, pool);
   };
   // Pure constant-product AMM simulation — no state modification.
   // Used for ranking multi-hop routes and slippage pre-checks.
@@ -7910,43 +7486,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           reserve1 = if (tokenInIsToken0) { safeSub(reserveOut, out) } else { reserveIn + effectiveIn };
         };
         (out, updatedPool, null);
-      };
-    };
-  };
-
-  func updateUserPosition(poolKey : (Text, Text), addedFee0 : Nat, addedFee1 : Nat, providers : [Principal], pool : AMMPool) {
-    // V3 pools track fees via feeGrowthGlobal in swapWithAMMV3 — skip V2 fee writes to avoid double-counting
-    switch (Map.get(poolV3Data, hashtt, poolKey)) {
-      case (?_) { return };
-      case null {};
-    };
-    // Legacy V2 path: only for pools that predate V3 (should be none after migration)
-    if (pool.totalLiquidity == 0) { return };
-
-    let nowVar = Time.now();
-
-    label a for (user in providers.vals()) {
-      switch (Map.get(userLiquidityPositions, phash, user)) {
-        case (null) { continue a };
-        case (?positions) {
-          let updatedPositions = Array.map<LiquidityPosition, LiquidityPosition>(
-            positions,
-            func(p) {
-
-              if (p.token0 == poolKey.0 and p.token1 == poolKey.1) {
-                {
-                  p with
-                  fee0 = p.fee0 +((p.liquidity * (tenToPower60) / pool.totalLiquidity) * addedFee0);
-                  fee1 = p.fee1 +((p.liquidity * (tenToPower60) / pool.totalLiquidity) * addedFee1);
-                  lastUpdateTime = nowVar;
-                };
-              } else {
-                p;
-              };
-            },
-          );
-          Map.set(userLiquidityPositions, phash, user, updatedPositions);
-        };
       };
     };
   };
@@ -8527,7 +8066,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
     let tokenInIsToken0 = data.token_init_identifier == pool.token0;
-    updateUserPosition(poolKey, if (tokenInIsToken0) { totalPoolFeeAmount } else { 0 }, if (tokenInIsToken0) { 0 } else { totalPoolFeeAmount }, TrieSet.toArray(updatedPool.providers), updatedPool);
 
 
     let TradeEntries = Vector.toArray(TradeEntryVector);
@@ -9361,7 +8899,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     user : Text,
     nowVar : Time,
   ) : () {
-
     let currentFee : Nat = switch (Map.get(feescollectedDAO, thash, token)) {
       case (?v) v;
       case null 0;
@@ -9974,7 +9511,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let nowVar = Time.now();
     for (i in Iter.range(0, trades.size() -1)) {
       if (trades[i].amountSell > 0) {
-        assert (Map.has(BlocksDone, thash, trades[i].identifier # ":" # Nat64.toText(trades[i].block)) == false);
+        if (Map.has(BlocksDone, thash, trades[i].identifier # ":" # Nat64.toText(trades[i].block))) { throw Error.reject("Block already processed") };
         Map.set(BlocksDone, thash, trades[i].identifier # ":" # Nat64.toText(trades[i].block), nowVar);
       };
     };
@@ -10624,7 +10161,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       haveToReturn := true;
     };
 
-    assert (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat64.toText(Block)) == false);
+    if (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat64.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
     assert (accesscode.size() != 0);
     let nowVar2 = Time.now();
     Map.set(BlocksDone, thash, token_init_identifier # ":" #Nat64.toText(Block), nowVar2);
@@ -10920,7 +10457,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
-    assert (Map.has(BlocksDone, thash, currentTrades2.token_sell_identifier # ":" #Nat64.toText(Block)) == false);
+    if (Map.has(BlocksDone, thash, currentTrades2.token_sell_identifier # ":" #Nat64.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
     let nowVar2 = Time.now();
     Map.set(BlocksDone, thash, currentTrades2.token_sell_identifier # ":" #Nat64.toText(Block), nowVar2);
 
@@ -12024,6 +11561,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       },
     );
 
+
     label a for (i in difference.vals()) {
       if ((i.0 < 0 or i.0 > 1000) or alwaysShow) {
         error := true;
@@ -12520,13 +12058,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         case null {};
       };
-      switch (pool) {
-        case null {};
-        case (?a) {
-          updateUserPosition(poolKey, if (tokenInIsToken0) { totalPoolFeeAmount } else { 0 }, if (tokenInIsToken0) { 0 } else { totalPoolFeeAmount }, TrieSet.toArray(a.providers), a);
-
-        };
-      };
+      // V3 fee distribution handled via feeGrowthGlobal in swapWithAMMV3 — no per-swap distribution needed
 
       // Update amounts — direct mutation, no array copies
       bufAmountBuy2.put(
@@ -13636,6 +13168,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   system func postupgrade() {
     rebuildPoolIndex();
     checkAndAggregateAllPools();
+    // Reset all bans on every upgrade
+    dayBan := TrieSet.empty();
+    dayBanRegister := TrieSet.empty();
+    allTimeBan := TrieSet.empty();
+    warnings := TrieSet.empty();
   };
 
   // Periodically process tempTransferQueue to avoid tokens getting stuck
@@ -14041,7 +13578,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
 
     // Block check and checkReceive
-    assert (Map.has(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block)) == false);
+    if (Map.has(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
     Map.set(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block), nowVar);
     let nowVar2 = nowVar;
     let tType = returnType(tokenIn);
@@ -14287,7 +13824,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #changeOwner2 : () -> (pri : Principal);
         #changeOwner3 : () -> (pri : Principal);
         #checkDiffs : () -> (returnFees : Bool, alwaysShow : Bool);
+        #clearAllBans : () -> ();
         #cleanTokenIds : () -> ();
+        #isExchangeFrozen : () -> ();
         #refundStuckFunds : () -> ();
         #checkFeesReferrer : () -> ();
         #claimFeesReferrer : () -> ();
@@ -14426,6 +13965,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           case (#pauseToken _) true;
           case (#adminDrainExchange _) true;
           case (#adminDrainStatus _) true;
+          case (#Freeze _) true;
+          case (#clearAllBans _) true;
+          case (#isExchangeFrozen _) true;
           case (_) false;
         }
       ) == false
@@ -14438,6 +13980,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#ChangeRevokefees _) callerIsAdmin;
       case (#ChangeTradingfees _) callerIsAdmin;
       case (#parameterManagement _) callerIsAdmin;
+      case (#clearAllBans _) callerIsAdmin;
       case (#FinishSellBatchDAO _) false;
       case (#Freeze _) callerIsAdmin;
       case (#adminExecuteRouteStrategy _) callerIsAdmin;
@@ -14450,6 +13993,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#addFeeCollector _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
       case (#removeFeeCollector _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
       case (#getFeeCollectors _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
+      case (#isExchangeFrozen _) true;
       case (#exchangeInfo _) true;
       case (#getAllTradesPublic _) callerIsAdmin;
       case (#getAllTradesPrivateCostly _) callerIsAdmin;

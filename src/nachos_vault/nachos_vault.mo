@@ -123,6 +123,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     getTokenDetailsCache : shared query () -> async { timestamp : Int; icpPriceUSD : Float; tokenDetails : [(Principal, TokenDetails)]; tradingPauses : [{ token : Principal; tokenSymbol : Text }]; lpBackingPerToken : [(Principal, Nat)] };
     getAvailableBalancesForBurn : shared query ([Principal]) -> async Result.Result<[(Principal, Nat)], Text>;
     getLPBackingPerToken : shared query () -> async [(Principal, Nat)];
+    isLPEmergencyRecovering : shared query () -> async Bool;
   };
 
   transient let dao = actor (Principal.toText(DAO_BACKEND_ID)) : actor {
@@ -1578,15 +1579,32 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     logger.info("PRICE", "Starting parallel refresh for " # Nat.toText(Vector.size(tokensToRefresh)) # " tokens, icpSwapPoolCache=" # Nat.toText(Map.size(icpSwapPoolCache)), "refreshPricesLocally");
 
-    // ── Fire ALL Kong + ICPSwap futures in parallel (same as treasury) ──
+    // ── Fire ALL Kong + ICPSwap + TACO futures in parallel ──
     let kongFutures = Map.new<Principal, async SwapTypes.SwapAmountsResult>();
     let icpSwapFutures = Map.new<Principal, async Result.Result<SwapTypes.PoolMetadata, SwapTypes.ICPSwapError>>();
+
+    // TACO exchange quote type (inline, same as exchange's getExpectedReceiveAmount return)
+    type TACOQuote = { expectedBuyAmount : Nat; fee : Nat; priceImpact : Float; routeDescription : Text; canFulfillFully : Bool; potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat }; hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }] };
+    let tacoExchange : actor { getExpectedReceiveAmount : shared query (Text, Text, Nat) -> async TACOQuote } = actor (Principal.toText(TACO_SWAP_ID));
+    let tacoFutures = Map.new<Principal, async TACOQuote>();
+
     var kongCount : Nat = 0;
     var icpSwapCount : Nat = 0;
+    var tacoCount : Nat = 0;
+
+    let ICPprincipalText = Principal.toText(ICPprincipal);
 
     for ((token, details) in Vector.vals(tokensToRefresh)) {
-      let oneUnit = 10 ** details.tokenDecimals;
-      let kongFut = kong.swap_amounts("IC." # details.tokenSymbol, oneUnit, "IC.ICP");
+      // Query ~$20 worth (≈8 ICP) of each token instead of 1 full unit.
+      // Avoids overwhelming thin pools (e.g., 1 ckETH = $2300 causes 93% impact on thin pools).
+      let targetICPe8s : Nat = 800_000_000; // 8 ICP ≈ $20
+      let quoteAmount = if (details.priceInICP > 0) {
+        let amount = (targetICPe8s * (10 ** details.tokenDecimals)) / details.priceInICP;
+        if (amount > 0) { amount } else { 10 ** details.tokenDecimals }
+      } else {
+        10 ** details.tokenDecimals // fallback: 1 unit if no prior price
+      };
+      let kongFut = kong.swap_amounts("IC." # details.tokenSymbol, quoteAmount, "IC.ICP");
       Map.set(kongFutures, phash, token, kongFut);
       kongCount += 1;
 
@@ -1599,9 +1617,14 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         };
         case null {};
       };
+
+      // Fire TACO quote (same $20 amount)
+      let tacoFut = (with timeout = 10) tacoExchange.getExpectedReceiveAmount(Principal.toText(token), ICPprincipalText, quoteAmount);
+      Map.set(tacoFutures, phash, token, tacoFut);
+      tacoCount += 1;
     };
 
-    logger.info("PRICE", "Fired " # Nat.toText(kongCount) # " Kong + " # Nat.toText(icpSwapCount) # " ICPSwap futures", "refreshPricesLocally");
+    logger.info("PRICE", "Fired " # Nat.toText(kongCount) # " Kong + " # Nat.toText(icpSwapCount) # " ICPSwap + " # Nat.toText(tacoCount) # " TACO futures", "refreshPricesLocally");
 
     // ── Await all futures and process results per token ──
     label tokenLoop for ((token, details) in Vector.vals(tokensToRefresh)) {
@@ -1609,6 +1632,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       var kongSlippage : ?Float = null;
       var icpSwapPrice : ?Float = null;
       var icpSwapLiquidity : ?Nat = null;
+      var tacoPrice : ?Float = null;
+      var tacoSlippage : ?Float = null;
 
       // Await KongSwap
       switch (Map.get(kongFutures, phash, token)) {
@@ -1617,9 +1642,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
             let result = await kongFut;
             switch (result) {
               case (#Ok(quote)) {
-                if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0) {
+                if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0 and quote.slippage < 1.0) {
                   kongPrice := ?quote.mid_price;
                   kongSlippage := ?quote.slippage;
+                } else if (quote.slippage >= 1.0) {
+                  logger.info("PRICE", details.tokenSymbol # " Kong rejected: slippage " # Float.toText(quote.slippage) # "% >= 1%", "refreshPricesLocally");
                 };
               };
               case (#Err(_)) {};
@@ -1673,45 +1700,113 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         case null {};
       };
 
-      // Merge prices — liquidity-weighted (same as treasury)
-      let finalPrice : ?Float = switch (kongPrice, icpSwapPrice) {
-        case (?kp, ?ip) {
-          // Derive confidence weights from liquidity signals
-          let kongWeight = kongSlippageToWeight(kongSlippage);
-          let icpSwapWeight = icpSwapLiquidityToWeight(icpSwapLiquidity);
-          let totalWeight = kongWeight + icpSwapWeight;
-          if (totalWeight > 0.0) {
-            ?((kp * kongWeight + ip * icpSwapWeight) / totalWeight);
-          } else {
-            ?((kp + ip) / 2.0);
-          };
+      // Await TACO exchange
+      // Recompute quoteAmount for this token (same formula as first loop)
+      let tacoQuoteAmount = if (details.priceInICP > 0) {
+        let amt = (800_000_000 * (10 ** details.tokenDecimals)) / details.priceInICP;
+        if (amt > 0) { amt } else { 10 ** details.tokenDecimals }
+      } else { 10 ** details.tokenDecimals };
+      switch (Map.get(tacoFutures, phash, token)) {
+        case (?tacoFut) {
+          try {
+            let q = await tacoFut;
+            if (q.expectedBuyAmount > 0) {
+              let sellHuman = Float.fromInt(tacoQuoteAmount) / Float.fromInt(10 ** details.tokenDecimals);
+              let buyHuman = Float.fromInt(q.expectedBuyAmount) / Float.fromInt(10 ** 8); // ICP has 8 decimals
+              let executionPrice = if (sellHuman > 0.0) { buyHuman / sellHuman } else { 0.0 };
+              let slippage = q.priceImpact * 100.0; // 0-1 → percentage
+              let spotPrice = if (q.priceImpact >= 0.0 and q.priceImpact < 0.99) {
+                executionPrice / (1.0 - q.priceImpact)
+              } else { executionPrice };
+
+              if (spotPrice > 0.0 and spotPrice <= 100000.0 and slippage < 1.0) {
+                tacoPrice := ?spotPrice;
+                tacoSlippage := ?slippage;
+                logger.info("PRICE", details.tokenSymbol # " TACO: " # Float.toText(spotPrice) # " slip=" # Float.toText(slippage) # "%", "refreshPricesLocally");
+              } else if (slippage >= 1.0) {
+                logger.info("PRICE", details.tokenSymbol # " TACO rejected: slippage " # Float.toText(slippage) # "% >= 1%", "refreshPricesLocally");
+              };
+            };
+          } catch (_) {};
         };
-        case (?kp, null) { if (kp > 0.0) { ?kp } else { null } };
-        case (null, ?ip) { if (ip > 0.0) { ?ip } else { null } };
-        case (null, null) { null };
+        case null {};
       };
 
+      // Outlier rejection: if 2+ sources exist and one deviates >30% from median, reject it
+      var priceCount : Nat = 0;
+      switch (kongPrice) { case (?_) { priceCount += 1 }; case null {} };
+      switch (icpSwapPrice) { case (?_) { priceCount += 1 }; case null {} };
+      switch (tacoPrice) { case (?_) { priceCount += 1 }; case null {} };
+      if (priceCount >= 2) {
+        let priceBuf = Buffer.Buffer<Float>(3);
+        switch (kongPrice) { case (?p) { priceBuf.add(p) }; case null {} };
+        switch (icpSwapPrice) { case (?p) { priceBuf.add(p) }; case null {} };
+        switch (tacoPrice) { case (?p) { priceBuf.add(p) }; case null {} };
+        let sorted = Array.sort<Float>(Buffer.toArray(priceBuf), Float.compare);
+        let median = sorted[sorted.size() / 2];
+        if (median > 0.0) {
+          switch (kongPrice) {
+            case (?p) { if (Float.abs((p - median) / median) > 0.3) {
+              kongPrice := null;
+              logger.info("PRICE", details.tokenSymbol # " Kong outlier: " # Float.toText(p) # " vs median " # Float.toText(median), "refreshPricesLocally");
+            }}; case null {};
+          };
+          switch (icpSwapPrice) {
+            case (?p) { if (Float.abs((p - median) / median) > 0.3) {
+              icpSwapPrice := null;
+              logger.info("PRICE", details.tokenSymbol # " ICPSwap outlier: " # Float.toText(p) # " vs median " # Float.toText(median), "refreshPricesLocally");
+            }}; case null {};
+          };
+          switch (tacoPrice) {
+            case (?p) { if (Float.abs((p - median) / median) > 0.3) {
+              tacoPrice := null;
+              logger.info("PRICE", details.tokenSymbol # " TACO outlier: " # Float.toText(p) # " vs median " # Float.toText(median), "refreshPricesLocally");
+            }}; case null {};
+          };
+        };
+      };
+
+      // Merge prices — N-source liquidity-weighted (Kong + ICPSwap + TACO)
+      var tokenWeightedSum : Float = 0.0;
+      var tokenTotalWeight : Float = 0.0;
+      var tokenSourceCount : Nat = 0;
+      switch (kongPrice) {
+        case (?kp) {
+          let w = kongSlippageToWeight(kongSlippage);
+          tokenWeightedSum += kp * w; tokenTotalWeight += w; tokenSourceCount += 1;
+        }; case null {};
+      };
+      switch (icpSwapPrice) {
+        case (?ip) {
+          let w = icpSwapLiquidityToWeight(icpSwapLiquidity);
+          tokenWeightedSum += ip * w; tokenTotalWeight += w; tokenSourceCount += 1;
+        }; case null {};
+      };
+      switch (tacoPrice) {
+        case (?tp) {
+          let w = kongSlippageToWeight(tacoSlippage); // Same slippage→weight as Kong
+          tokenWeightedSum += tp * w; tokenTotalWeight += w; tokenSourceCount += 1;
+        }; case null {};
+      };
+      let finalPrice : ?Float = if (tokenSourceCount > 0) {
+        if (tokenTotalWeight > 0.0) {
+          ?(tokenWeightedSum / tokenTotalWeight)
+        } else {
+          // All weights zero — simple average
+          var sum = 0.0;
+          switch (kongPrice) { case (?p) { sum += p }; case null {} };
+          switch (icpSwapPrice) { case (?p) { sum += p }; case null {} };
+          switch (tacoPrice) { case (?p) { sum += p }; case null {} };
+          ?(sum / Float.fromInt(tokenSourceCount))
+        }
+      } else { null };
+
       // Debug: log per-token price merge details
-      switch (kongPrice, icpSwapPrice) {
-        case (?kp, ?ip) {
-          let kw = kongSlippageToWeight(kongSlippage);
-          let iw = icpSwapLiquidityToWeight(icpSwapLiquidity);
-          logger.info("PRICE", details.tokenSymbol # " merge: Kong=" # Float.toText(kp) # " slip=" #
-            (switch (kongSlippage) { case (?s) { Float.toText(s) }; case null { "n/a" } }) # " w=" # Float.toText(kw) #
-            " | ICPSwap=" # Float.toText(ip) # " liq=" #
-            (switch (icpSwapLiquidity) { case (?l) { Nat.toText(l) }; case null { "n/a" } }) # " w=" # Float.toText(iw) #
-            " -> final=" # (switch (finalPrice) { case (?f) { Float.toText(f) }; case null { "null" } }),
-            "refreshPricesLocally");
-        };
-        case (?kp, null) {
-          logger.info("PRICE", details.tokenSymbol # " Kong-only: " # Float.toText(kp), "refreshPricesLocally");
-        };
-        case (null, ?ip) {
-          logger.info("PRICE", details.tokenSymbol # " ICPSwap-only: " # Float.toText(ip), "refreshPricesLocally");
-        };
-        case (null, null) {
-          logger.warn("PRICE", details.tokenSymbol # " no price from either DEX", "refreshPricesLocally");
-        };
+      logger.info("PRICE", details.tokenSymbol # " merge: " # Nat.toText(tokenSourceCount) # " sources → " #
+        (switch (finalPrice) { case (?f) { Float.toText(f) }; case null { "null" } }),
+        "refreshPricesLocally");
+      if (tokenSourceCount == 0) {
+        logger.warn("PRICE", details.tokenSymbol # " no price from any DEX", "refreshPricesLocally");
       };
 
       switch (finalPrice) {
@@ -2631,6 +2726,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
       // LP backing: refresh from treasury for accurate NAV (includes LP + in-transit + in-flight)
       await refreshLPBackingFromTreasury();
+
+      // LP emergency exit check: block mints/burns for 30 min after admin_exitAllLP
+      // to let LP data settle before NAV-sensitive operations resume
+      if ((try { await (with timeout = 10) treasuryQuery.isLPEmergencyRecovering() } catch (_) { false })) {
+        releaseLock(caller);
+        return #err(#UnexpectedError("LP emergency exit in progress — mints/burns paused for 30 minutes"));
+      };
 
       // Circuit breaker: per-token snapshot checks
       if (priceRefreshOk) {
@@ -3879,6 +3981,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       // Recalculate with capped amount
       let cappedRedemptionValue = (cappedNachosAmount * nav.navPerTokenE8s) / ONE_E8S;
       let cappedFee = calculateFee(caller, cappedRedemptionValue, burnFeeBasisPoints, minBurnFeeICP);
+      if (cappedFee >= cappedRedemptionValue) {
+        // Fee consumes entire capped value — abort burn, return NACHOS
+        if (cappedNachosAmount > NACHOS_FEE) {
+          ignore await returnNachosToUser(caller, cappedNachosAmount - NACHOS_FEE);
+        };
+        releaseLock(caller);
+        logger.warn("BURN", "Cap-at-liquid: fee >= capped redemption value — burn not worth executing", "redeemNachos");
+        return #err(#BelowMinimumValue);
+      };
       nachosAmountVar := cappedNachosAmount;
       netValueICPVar := cappedRedemptionValue - cappedFee;
 
@@ -3940,7 +4051,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // Per-token slippage check
     switch (minimumValues) {
       case (?mins) {
-        for (minVal in mins.vals()) {
+        label slippageCheck for (minVal in mins.vals()) {
           var found = false;
           for (ts in Vector.vals(tokensToSend)) {
             if (ts.token == minVal.token) {
@@ -3973,6 +4084,29 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
               };
               found := true;
             };
+          };
+          // Token in minimumValues but not in distribution (skipped as dust or insufficient balance)
+          if (not found and minVal.minAmount > 0) {
+            cachedNAV := ?nav;
+            cachedSupply := nav.nachosSupply;
+            cachedSupplyTime := now();
+            for (ts2 in Vector.vals(tokensToSend)) {
+              switch (Map.get(tokenDetailsMap, phash, ts2.token)) {
+                case (?details) { releasePendingBurnValue(ts2.token, ts2.amount + details.tokenTransferFee) };
+                case null {};
+              };
+            };
+            if (nachosAmountVar > NACHOS_FEE) {
+              let returnAmount = nachosAmountVar - NACHOS_FEE;
+              switch (await returnNachosToUser(caller, returnAmount)) {
+                case (#ok(_)) {};
+                case (#err(msg)) {
+                  logger.error("BURN", "CRITICAL: NACHOS return failed for " # Principal.toText(caller) # " amount=" # Nat.toText(returnAmount) # ": " # msg, "redeemNachos");
+                };
+              };
+            };
+            releaseLock(caller);
+            return #err(#SlippageExceeded);
           };
         };
       };
@@ -6820,11 +6954,15 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           };
           treasuryTradingPauses := cached.tradingPauses;
           // Sync LP backing from treasury cache (populated by treasury's updateBalances)
-          for ((token, _) in Map.entries(lpBackingFromTreasury)) {
-            Map.delete(lpBackingFromTreasury, phash, token);
-          };
-          for ((token, amount) in cached.lpBackingPerToken.vals()) {
-            Map.set(lpBackingFromTreasury, phash, token, amount);
+          // Same empty-response guard as refreshLPBackingFromTreasury():
+          // Don't clear cached LP backing if treasury returns empty (post-upgrade/stale)
+          if (cached.lpBackingPerToken.size() > 0 or Map.size(lpBackingFromTreasury) == 0) {
+            for ((token, _) in Map.entries(lpBackingFromTreasury)) {
+              Map.delete(lpBackingFromTreasury, phash, token);
+            };
+            for ((token, amount) in cached.lpBackingPerToken.vals()) {
+              Map.set(lpBackingFromTreasury, phash, token, amount);
+            };
           };
         } catch (e) {
           logger.warn("TIMER", "Token details sync failed: " # Error.message(e), "periodicSync");

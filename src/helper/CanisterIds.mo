@@ -53,8 +53,8 @@ module CanisterId {
             (#Staging, #reward_withdrawal_archive, Principal.fromText("dwczx-faaaa-aaaan-qz5oa-cai")),
             (#Staging, #nachos_vault, Principal.fromText("p4nog-baaaa-aaaad-qkwpa-cai")),
             (#Staging, #taco_swap, Principal.fromText("2uddx-dqaaa-aaaan-q5qja-cai")),
-            (#Staging, #OTC_backend, Principal.fromText("aaaaa-aa")), // Placeholder - update after deploy
-            (#Staging, #exchange_treasury, Principal.fromText("aaaaa-aa")), // Placeholder - update after deploy
+            (#Staging, #OTC_backend, Principal.fromText("qioex-5iaaa-aaaan-q52ba-cai")),
+            (#Staging, #exchange_treasury, Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai")),
 
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),

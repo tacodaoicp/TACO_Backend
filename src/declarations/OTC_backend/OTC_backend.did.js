@@ -1,4 +1,20 @@
 export const idlFactory = ({ IDL }) => {
+  const ExchangeError = IDL.Variant({
+    'InvalidInput' : IDL.Text,
+    'PoolNotFound' : IDL.Text,
+    'SystemError' : IDL.Text,
+    'OrderNotFound' : IDL.Text,
+    'TokenPaused' : IDL.Text,
+    'NotAuthorized' : IDL.Null,
+    'RouteFailed' : IDL.Record({ 'hop' : IDL.Nat, 'reason' : IDL.Text }),
+    'Banned' : IDL.Null,
+    'ExchangeFrozen' : IDL.Null,
+    'TransferFailed' : IDL.Text,
+    'SlippageExceeded' : IDL.Record({ 'got' : IDL.Nat, 'expected' : IDL.Nat }),
+    'TokenNotAccepted' : IDL.Text,
+    'InsufficientFunds' : IDL.Text,
+  });
+  const ActionResult = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : ExchangeError });
   const TradeData = IDL.Record({
     'decimals' : IDL.Nat,
     'transferFee' : IDL.Nat,
@@ -26,6 +42,81 @@ export const idlFactory = ({ IDL }) => {
     ),
     'execMessage' : IDL.Text,
     'processedTrades' : IDL.Vec(ProcessedTrade),
+  });
+  const AddConcentratedOk = IDL.Record({
+    'priceLower' : IDL.Nat,
+    'priceUpper' : IDL.Nat,
+    'liquidity' : IDL.Nat,
+    'amount0Used' : IDL.Nat,
+    'positionId' : IDL.Nat,
+    'token0' : IDL.Text,
+    'token1' : IDL.Text,
+    'refund0' : IDL.Nat,
+    'refund1' : IDL.Nat,
+    'amount1Used' : IDL.Nat,
+  });
+  const AddConcentratedResult = IDL.Variant({
+    'Ok' : AddConcentratedOk,
+    'Err' : ExchangeError,
+  });
+  const AddLiquidityOk = IDL.Record({
+    'liquidityMinted' : IDL.Nat,
+    'amount0Used' : IDL.Nat,
+    'token0' : IDL.Text,
+    'token1' : IDL.Text,
+    'refund0' : IDL.Nat,
+    'refund1' : IDL.Nat,
+    'amount1Used' : IDL.Nat,
+  });
+  const AddLiquidityResult = IDL.Variant({
+    'Ok' : AddLiquidityOk,
+    'Err' : ExchangeError,
+  });
+  const OrderOk = IDL.Record({
+    'buyAmountReceived' : IDL.Nat,
+    'tokenIn' : IDL.Text,
+    'tokenOut' : IDL.Text,
+    'accessCode' : IDL.Text,
+    'amountIn' : IDL.Nat,
+    'filled' : IDL.Nat,
+    'remaining' : IDL.Nat,
+    'isPublic' : IDL.Bool,
+    'swapId' : IDL.Opt(IDL.Nat),
+  });
+  const OrderResult = IDL.Variant({ 'Ok' : OrderOk, 'Err' : ExchangeError });
+  const HopDetail = IDL.Record({
+    'fee' : IDL.Nat,
+    'tokenIn' : IDL.Text,
+    'tokenOut' : IDL.Text,
+    'priceImpact' : IDL.Float64,
+    'amountIn' : IDL.Nat,
+    'amountOut' : IDL.Nat,
+  });
+  const SwapHop = IDL.Record({ 'tokenIn' : IDL.Text, 'tokenOut' : IDL.Text });
+  const SwapOk = IDL.Record({
+    'fee' : IDL.Nat,
+    'tokenIn' : IDL.Text,
+    'tokenOut' : IDL.Text,
+    'hops' : IDL.Nat,
+    'firstHopOrderbookMatch' : IDL.Bool,
+    'amountIn' : IDL.Nat,
+    'amountOut' : IDL.Nat,
+    'swapId' : IDL.Nat,
+    'route' : IDL.Vec(IDL.Text),
+    'lastHopAMMOnly' : IDL.Bool,
+  });
+  const SwapResult = IDL.Variant({ 'Ok' : SwapOk, 'Err' : ExchangeError });
+  const ClaimFeesOk = IDL.Record({
+    'transferred0' : IDL.Nat,
+    'transferred1' : IDL.Nat,
+    'dust1ToDAO' : IDL.Nat,
+    'dust0ToDAO' : IDL.Nat,
+    'fees0' : IDL.Nat,
+    'fees1' : IDL.Nat,
+  });
+  const ClaimFeesResult = IDL.Variant({
+    'Ok' : ClaimFeesOk,
+    'Err' : ExchangeError,
   });
   const pool = IDL.Record({
     'asset_minimum_amount' : IDL.Vec(IDL.Tuple(IDL.Nat, IDL.Nat)),
@@ -139,15 +230,6 @@ export const idlFactory = ({ IDL }) => {
     'nextPoolCursor' : IDL.Opt(PoolQuery),
     'pools' : IDL.Vec(ForeignPoolLiquidity),
   });
-  const HopDetail = IDL.Record({
-    'fee' : IDL.Nat,
-    'tokenIn' : IDL.Text,
-    'tokenOut' : IDL.Text,
-    'priceImpact' : IDL.Float64,
-    'amountIn' : IDL.Nat,
-    'amountOut' : IDL.Nat,
-  });
-  const SwapHop = IDL.Record({ 'tokenIn' : IDL.Text, 'tokenOut' : IDL.Text });
   const TimeFrame = IDL.Variant({
     'day' : IDL.Null,
     'fourHours' : IDL.Null,
@@ -299,6 +381,39 @@ export const idlFactory = ({ IDL }) => {
     'success' : IDL.Bool,
     'identifier' : IDL.Text,
   });
+  const RemoveConcentratedOk = IDL.Record({
+    'liquidityRemaining' : IDL.Nat,
+    'liquidityRemoved' : IDL.Nat,
+    'amount0' : IDL.Nat,
+    'amount1' : IDL.Nat,
+    'fees0' : IDL.Nat,
+    'fees1' : IDL.Nat,
+  });
+  const RemoveConcentratedResult = IDL.Variant({
+    'Ok' : RemoveConcentratedOk,
+    'Err' : ExchangeError,
+  });
+  const RemoveLiquidityOk = IDL.Record({
+    'amount0' : IDL.Nat,
+    'amount1' : IDL.Nat,
+    'liquidityBurned' : IDL.Nat,
+    'fees0' : IDL.Nat,
+    'fees1' : IDL.Nat,
+  });
+  const RemoveLiquidityResult = IDL.Variant({
+    'Ok' : RemoveLiquidityOk,
+    'Err' : ExchangeError,
+  });
+  const RevokeOk = IDL.Record({
+    'accessCode' : IDL.Text,
+    'revokeType' : IDL.Variant({
+      'DAO' : IDL.Null,
+      'Seller' : IDL.Null,
+      'Initiator' : IDL.Null,
+    }),
+    'refunds' : IDL.Vec(IDL.Record({ 'token' : IDL.Text, 'amount' : IDL.Nat })),
+  });
+  const RevokeResult = IDL.Variant({ 'Ok' : RevokeOk, 'Err' : ExchangeError });
   const SplitLeg = IDL.Record({
     'amountIn' : IDL.Nat,
     'route' : IDL.Vec(SwapHop),
@@ -308,10 +423,10 @@ export const idlFactory = ({ IDL }) => {
     'ChangeReferralFees' : IDL.Func([IDL.Nat], [], []),
     'ChangeRevokefees' : IDL.Func([IDL.Nat], [], ['oneway']),
     'ChangeTradingfees' : IDL.Func([IDL.Nat], [], ['oneway']),
-    'FinishSell' : IDL.Func([IDL.Nat64, IDL.Text, IDL.Nat], [IDL.Text], []),
+    'FinishSell' : IDL.Func([IDL.Nat64, IDL.Text, IDL.Nat], [ActionResult], []),
     'FinishSellBatch' : IDL.Func(
         [IDL.Nat64, IDL.Vec(IDL.Text), IDL.Vec(IDL.Nat), IDL.Text, IDL.Text],
-        [IDL.Text],
+        [ActionResult],
         [],
       ),
     'FinishSellBatchDAO' : IDL.Func(
@@ -319,7 +434,7 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Opt(BatchProcessResult)],
         [],
       ),
-    'FixStuckTX' : IDL.Func([IDL.Text], [IDL.Text], []),
+    'FixStuckTX' : IDL.Func([IDL.Text], [ActionResult], []),
     'Freeze' : IDL.Func([], [], []),
     'addAcceptedToken' : IDL.Func(
         [
@@ -336,7 +451,7 @@ export const idlFactory = ({ IDL }) => {
             'ICRC12' : IDL.Null,
           }),
         ],
-        [IDL.Text],
+        [ActionResult],
         [],
       ),
     'addConcentratedLiquidity' : IDL.Func(
@@ -350,12 +465,34 @@ export const idlFactory = ({ IDL }) => {
           IDL.Nat,
           IDL.Nat,
         ],
-        [IDL.Text],
+        [AddConcentratedResult],
         [],
       ),
+    'addFeeCollector' : IDL.Func([IDL.Principal], [ActionResult], []),
     'addLiquidity' : IDL.Func(
-        [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat, IDL.Nat, IDL.Nat],
-        [IDL.Text],
+        [
+          IDL.Text,
+          IDL.Text,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Opt(IDL.Bool),
+        ],
+        [AddLiquidityResult],
+        [],
+      ),
+    'addLiquidityDAO' : IDL.Func(
+        [
+          IDL.Text,
+          IDL.Text,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Nat,
+          IDL.Opt(IDL.Bool),
+        ],
+        [AddLiquidityResult],
         [],
       ),
     'addPosition' : IDL.Func(
@@ -372,10 +509,72 @@ export const idlFactory = ({ IDL }) => {
           IDL.Bool,
           IDL.Bool,
         ],
-        [IDL.Text],
+        [OrderResult],
         [],
       ),
     'addTimer' : IDL.Func([], [], []),
+    'adminAnalyzeRouteEfficiency' : IDL.Func(
+        [IDL.Text, IDL.Nat, IDL.Nat],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'efficiency' : IDL.Int,
+              'hopDetails' : IDL.Vec(HopDetail),
+              'efficiencyBps' : IDL.Int,
+              'outputAmount' : IDL.Nat,
+              'route' : IDL.Vec(SwapHop),
+            })
+          ),
+        ],
+        ['query'],
+      ),
+    'adminDrainExchange' : IDL.Func([IDL.Principal], [IDL.Text], []),
+    'adminDrainStatus' : IDL.Func([], [IDL.Text], ['query']),
+    'adminExecuteRouteStrategy' : IDL.Func(
+        [IDL.Nat, IDL.Vec(SwapHop), IDL.Nat, IDL.Nat],
+        [SwapResult],
+        [],
+      ),
+    'batchAdjustLiquidity' : IDL.Func(
+        [
+          IDL.Vec(
+            IDL.Record({
+              'action' : IDL.Variant({
+                'Remove' : IDL.Record({ 'liquidityAmount' : IDL.Nat }),
+              }),
+              'token0' : IDL.Text,
+              'token1' : IDL.Text,
+            })
+          ),
+        ],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'result' : IDL.Text,
+              'token0' : IDL.Text,
+              'token1' : IDL.Text,
+              'success' : IDL.Bool,
+            })
+          ),
+        ],
+        [],
+      ),
+    'batchClaimAllFees' : IDL.Func(
+        [],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'transferred0' : IDL.Nat,
+              'transferred1' : IDL.Nat,
+              'token0' : IDL.Text,
+              'token1' : IDL.Text,
+              'fees0' : IDL.Nat,
+              'fees1' : IDL.Nat,
+            })
+          ),
+        ],
+        [],
+      ),
     'changeOwner2' : IDL.Func([IDL.Principal], [], []),
     'changeOwner3' : IDL.Func([IDL.Principal], [], []),
     'checkDiffs' : IDL.Func(
@@ -409,9 +608,9 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat))],
         [],
       ),
-    'claimLPFees' : IDL.Func([IDL.Text, IDL.Text], [IDL.Text], []),
-    'cleanTokenIds' : IDL.Func([], [IDL.Text], []),
-    'collectFees' : IDL.Func([], [IDL.Text], []),
+    'claimLPFees' : IDL.Func([IDL.Text, IDL.Text], [ClaimFeesResult], []),
+    'cleanTokenIds' : IDL.Func([], [ActionResult], []),
+    'collectFees' : IDL.Func([], [ActionResult], []),
     'exchangeInfo' : IDL.Func([], [IDL.Opt(pool)], ['query']),
     'getAMMPoolInfo' : IDL.Func(
         [IDL.Text, IDL.Text],
@@ -528,6 +727,55 @@ export const idlFactory = ({ IDL }) => {
         [ForeignPoolsResponse],
         ['query'],
       ),
+    'getDAOLPPerformance' : IDL.Func(
+        [],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'poolVolume24h' : IDL.Nat,
+              'totalFeesEarned0' : IDL.Nat,
+              'totalFeesEarned1' : IDL.Nat,
+              'currentValue0' : IDL.Nat,
+              'currentValue1' : IDL.Nat,
+              'shareOfPool' : IDL.Float64,
+              'token0' : IDL.Text,
+              'token1' : IDL.Text,
+            })
+          ),
+        ],
+        ['query'],
+      ),
+    'getDAOLiquiditySnapshot' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'pools' : IDL.Vec(
+              IDL.Record({
+                'totalLiquidity' : IDL.Nat,
+                'reserve0' : IDL.Nat,
+                'reserve1' : IDL.Nat,
+                'token0' : IDL.Text,
+                'token1' : IDL.Text,
+                'price0' : IDL.Float64,
+                'price1' : IDL.Float64,
+              })
+            ),
+            'positions' : IDL.Vec(
+              IDL.Record({
+                'fee0' : IDL.Nat,
+                'fee1' : IDL.Nat,
+                'liquidity' : IDL.Nat,
+                'shareOfPool' : IDL.Float64,
+                'token0' : IDL.Text,
+                'token1' : IDL.Text,
+                'token0Amount' : IDL.Nat,
+                'token1Amount' : IDL.Nat,
+              })
+            ),
+          }),
+        ],
+        ['query'],
+      ),
     'getExpectedMultiHopAmount' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat],
         [
@@ -560,6 +808,34 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getExpectedReceiveAmountBatch' : IDL.Func(
+        [
+          IDL.Vec(
+            IDL.Record({
+              'tokenBuy' : IDL.Text,
+              'amountSell' : IDL.Nat,
+              'tokenSell' : IDL.Text,
+            })
+          ),
+        ],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'fee' : IDL.Nat,
+              'hopDetails' : IDL.Vec(HopDetail),
+              'routeDescription' : IDL.Text,
+              'canFulfillFully' : IDL.Bool,
+              'priceImpact' : IDL.Float64,
+              'potentialOrderDetails' : IDL.Opt(
+                IDL.Record({ 'amount_init' : IDL.Nat, 'amount_sell' : IDL.Nat })
+              ),
+              'expectedBuyAmount' : IDL.Nat,
+            })
+          ),
+        ],
+        ['query'],
+      ),
+    'getFeeCollectors' : IDL.Func([], [IDL.Vec(IDL.Principal)], ['query']),
     'getKlineData' : IDL.Func(
         [IDL.Text, IDL.Text, TimeFrame, IDL.Bool],
         [IDL.Vec(KlineData)],
@@ -768,6 +1044,7 @@ export const idlFactory = ({ IDL }) => {
     'hmFee' : IDL.Func([], [IDL.Nat], ['query']),
     'hmRefFee' : IDL.Func([], [IDL.Nat], ['query']),
     'hmRevokeFee' : IDL.Func([], [IDL.Nat], ['query']),
+    'isExchangeFrozen' : IDL.Func([], [IDL.Bool], ['query']),
     'p2a' : IDL.Func([], [IDL.Text], ['query']),
     'p2acannister' : IDL.Func([], [IDL.Text], ['query']),
     'p2athird' : IDL.Func([IDL.Text], [IDL.Text], []),
@@ -811,13 +1088,18 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Bool],
         [],
       ),
-    'refundStuckFunds' : IDL.Func([], [IDL.Text], []),
+    'refundStuckFunds' : IDL.Func([], [ActionResult], []),
     'removeConcentratedLiquidity' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat],
-        [IDL.Text],
+        [RemoveConcentratedResult],
         [],
       ),
-    'removeLiquidity' : IDL.Func([IDL.Text, IDL.Text, IDL.Nat], [IDL.Text], []),
+    'removeFeeCollector' : IDL.Func([], [ActionResult], []),
+    'removeLiquidity' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Nat],
+        [RemoveLiquidityResult],
+        [],
+      ),
     'retrieveFundsDao' : IDL.Func(
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat64))],
         [],
@@ -833,7 +1115,7 @@ export const idlFactory = ({ IDL }) => {
             'Initiator' : IDL.Null,
           }),
         ],
-        [IDL.Text],
+        [RevokeResult],
         [],
       ),
     'sendDAOInfo' : IDL.Func(
@@ -856,17 +1138,17 @@ export const idlFactory = ({ IDL }) => {
     'setTest' : IDL.Func([IDL.Bool], [], []),
     'swapMultiHop' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Vec(SwapHop), IDL.Nat, IDL.Nat],
-        [IDL.Text],
+        [SwapResult],
         [],
       ),
     'swapSplitRoutes' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Vec(SplitLeg), IDL.Nat, IDL.Nat],
-        [IDL.Text],
+        [SwapResult],
         [],
       ),
     'treasurySwap' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat, IDL.Nat],
-        [IDL.Text],
+        [SwapResult],
         [],
       ),
   });

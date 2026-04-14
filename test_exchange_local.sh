@@ -246,6 +246,10 @@ yes | dfx deploy --specified-id "$TEST_ACTOR_C_ID" exchange_testActorC --with-cy
 dfx canister create --specified-id "$EXCHANGE_TEST_ID" exchange_test
 yes | dfx deploy --specified-id "$EXCHANGE_TEST_ID" exchange_test --with-cycles 10000000000000000 --mode=reinstall
 
+# Add test canister as fee collector so collectFees() works from tests
+echo "Adding test canister as fee collector..."
+dfx canister call OTC_backend addFeeCollector "(principal \"$EXCHANGE_TEST_ID\")"
+
 # === Step 8: Run tests ===
 echo "--- Step 8: Running tests ---"
 echo ""

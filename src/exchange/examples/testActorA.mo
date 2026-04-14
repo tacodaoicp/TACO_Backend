@@ -13,8 +13,59 @@ import Error "mo:base/Error";
 import DAO "./dao";
 import fuzz "mo:fuzz";
 import Array "mo:base/Array";
+import Nat "mo:base/Nat";
+import ExTypes "../exchangeTypes";
 
 shared (deployer) persistent actor class testActorA() = this {
+
+  // Helpers to unwrap Result types to Text for backward-compatible test assertions
+  func unwrapSwap(r : ExTypes.SwapResult) : Text {
+    switch (r) { case (#Ok(ok)) { "done:" # Nat.toText(ok.amountOut) }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapOrder(r : ExTypes.OrderResult) : Text {
+    switch (r) { case (#Ok(ok)) { if (ok.accessCode != "") { ok.accessCode } else { "done" } }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapAddLiq(r : ExTypes.AddLiquidityResult) : Text {
+    switch (r) { case (#Ok(ok)) { Nat.toText(ok.liquidityMinted) }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapAddConc(r : ExTypes.AddConcentratedResult) : Text {
+    switch (r) { case (#Ok(ok)) { "concentrated:" # Nat.toText(ok.liquidity) # ":" # Nat.toText(ok.positionId) }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapRemoveConc(r : ExTypes.RemoveConcentratedResult) : Text {
+    switch (r) { case (#Ok(ok)) { "removed:" # Nat.toText(ok.amount0) # ":" # Nat.toText(ok.amount1) }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapRemoveLiq(r : ExTypes.RemoveLiquidityResult) : Text {
+    switch (r) { case (#Ok(ok)) { "Liquidity removed successfully: " # Nat.toText(ok.amount0) # " " # Nat.toText(ok.amount1) }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapClaimFees(r : ExTypes.ClaimFeesResult) : Text {
+    switch (r) { case (#Ok(ok)) { "claimed:" # Nat.toText(ok.fees0) # ":" # Nat.toText(ok.fees1) }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapAction(r : ExTypes.ActionResult) : Text {
+    switch (r) { case (#Ok(msg)) { msg }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapRevoke(r : ExTypes.RevokeResult) : Text {
+    switch (r) { case (#Ok(_)) { "Revoked" }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapCollect(r : ExTypes.CollectFeesResult) : Text {
+    switch (r) { case (#Ok(_)) { "done" }; case (#Err(e)) { unwrapErr(e) } };
+  };
+  func unwrapErr(e : ExTypes.ExchangeError) : Text {
+    switch (e) {
+      case (#NotAuthorized) { "Not authorized" };
+      case (#Banned) { "Banned" };
+      case (#InvalidInput(t)) { t };
+      case (#TokenNotAccepted(t)) { "Token not accepted: " # t };
+      case (#TokenPaused(t)) { t };
+      case (#InsufficientFunds(t)) { t };
+      case (#PoolNotFound(t)) { "Pool not found: " # t };
+      case (#SlippageExceeded(s)) { "Slippage: expected " # Nat.toText(s.expected) # " got " # Nat.toText(s.got) };
+      case (#RouteFailed(r)) { "Route failed at hop " # Nat.toText(r.hop) # ": " # r.reason };
+      case (#OrderNotFound(t)) { t };
+      case (#ExchangeFrozen) { "Exchange frozen" };
+      case (#TransferFailed(t)) { t };
+      case (#SystemError(t)) { t };
+    };
+  };
   transient let {
     natToNat64;
     nat64ToNat;
@@ -58,7 +109,7 @@ shared (deployer) persistent actor class testActorA() = this {
   ) : async Text {
 
     // Then call the exchange's addLiquidity function
-    await exchange.addLiquidity(token1, token2, amount1, amount2, block1, block2);
+    unwrapAddLiq(await exchange.addLiquidity(token1, token2, amount1, amount2, block1, block2));
   };
 
   public func removeLiquidity(
@@ -67,8 +118,7 @@ shared (deployer) persistent actor class testActorA() = this {
     liquidity : Nat,
   ) : async Text {
     // Call the exchange's removeLiquidity function
-    let result = await exchange.removeLiquidity(token1, token2, liquidity);
-    result;
+    unwrapRemoveLiq(await exchange.removeLiquidity(token1, token2, liquidity));
   };
 
   public func getUserTrades() : async [{
@@ -207,7 +257,7 @@ shared (deployer) persistent actor class testActorA() = this {
   };
 
   public func CancelPosition(Secret : Text) : async Text {
-    await exchange.revokeTrade(Secret, #Initiator);
+    unwrapRevoke(await exchange.revokeTrade(Secret, #Initiator));
   };
   public func getICPbalance() : async Nat {
     nat64ToNat((await icp.account_balance_dfx(actorAccountText)).e8s);
@@ -360,7 +410,7 @@ shared (deployer) persistent actor class testActorA() = this {
     token_sell_identifier : Text,
     token_init_identifier : Text,
   ) : async Text {
-    await exchange.addPosition(Block, amount_sell, amount_init, token_sell_identifier, token_init_identifier, false, true, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, false);
+    unwrapOrder(await exchange.addPosition(Block, amount_sell, amount_init, token_sell_identifier, token_init_identifier, false, true, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, false));
   };
 
   public func CreatePublicPosition(
@@ -370,7 +420,7 @@ shared (deployer) persistent actor class testActorA() = this {
     token_sell_identifier : Text,
     token_init_identifier : Text,
   ) : async Text {
-    await exchange.addPosition(Block, amount_sell, amount_init, token_sell_identifier, token_init_identifier, true, false, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, false);
+    unwrapOrder(await exchange.addPosition(Block, amount_sell, amount_init, token_sell_identifier, token_init_identifier, true, false, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, false));
   };
   public func CreatePublicPositionOTC(
     Block : Nat,
@@ -379,7 +429,7 @@ shared (deployer) persistent actor class testActorA() = this {
     token_sell_identifier : Text,
     token_init_identifier : Text,
   ) : async Text {
-    await exchange.addPosition(Block, amount_sell, amount_init, token_sell_identifier, token_init_identifier, true, false, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, true);
+    unwrapOrder(await exchange.addPosition(Block, amount_sell, amount_init, token_sell_identifier, token_init_identifier, true, false, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, true));
   };
 
   public func acceptPosition(
@@ -387,7 +437,7 @@ shared (deployer) persistent actor class testActorA() = this {
     Secret : Text,
     amountSelling : Nat,
   ) : async Text {
-    await exchange.FinishSell(natToNat64(Block), Secret, amountSelling);
+    unwrapAction(await exchange.FinishSell(natToNat64(Block), Secret, amountSelling));
   };
 
   public func acceptBatchPositions(
@@ -397,13 +447,13 @@ shared (deployer) persistent actor class testActorA() = this {
     token_sell_identifier : Text,
     token_init_identifier : Text,
   ) : async Text {
-    await exchange.FinishSellBatch(
+    unwrapAction(await exchange.FinishSellBatch(
       Block,
       Secret,
       amount_Sell_by_Reactor,
       token_sell_identifier,
       token_init_identifier,
-    );
+    ));
   };
 
   public func voteOnDAO(vote : [{ token : Text; basisPoints : Nat }]) : async () {
@@ -747,7 +797,7 @@ shared (deployer) persistent actor class testActorA() = this {
     route : [{ tokenIn : Text; tokenOut : Text }],
     minAmountOut : Nat, Block : Nat,
   ) : async Text {
-    await exchange.swapMultiHop(tokenIn, tokenOut, amountIn, route, minAmountOut, Block);
+    unwrapSwap(await exchange.swapMultiHop(tokenIn, tokenOut, amountIn, route, minAmountOut, Block));
   };
 
   public func swapSplitRoutes(
@@ -755,11 +805,28 @@ shared (deployer) persistent actor class testActorA() = this {
     splits : [{ amountIn : Nat; route : [{ tokenIn : Text; tokenOut : Text }]; minLegOut : Nat }],
     minAmountOut : Nat, Block : Nat,
   ) : async Text {
-    await exchange.swapSplitRoutes(tokenIn, tokenOut, splits, minAmountOut, Block);
+    unwrapSwap(await exchange.swapSplitRoutes(tokenIn, tokenOut, splits, minAmountOut, Block));
+  };
+
+  public func adminAnalyzeRouteEfficiency(token : Text, sampleSize : Nat, depth : Nat) : async [{
+    route : [{ tokenIn : Text; tokenOut : Text }];
+    outputAmount : Nat;
+    efficiency : Int;
+    efficiencyBps : Int;
+    hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
+  }] {
+    await exchange.adminAnalyzeRouteEfficiency(token, sampleSize, depth);
+  };
+
+  public func adminExecuteRouteStrategy(
+    amount : Nat, route : [{ tokenIn : Text; tokenOut : Text }],
+    minOutput : Nat, Block : Nat,
+  ) : async Text {
+    unwrapSwap(await exchange.adminExecuteRouteStrategy(amount, route, minOutput, Block));
   };
 
   public func claimLPFees(token0 : Text, token1 : Text) : async Text {
-    await exchange.claimLPFees(token0, token1);
+    unwrapClaimFees(await exchange.claimLPFees(token0, token1));
   };
 
   public func getUserLiquidityDetailed() : async [{
@@ -774,13 +841,13 @@ shared (deployer) persistent actor class testActorA() = this {
     t0 : Text, t1 : Text, a0 : Nat, a1 : Nat,
     pL : Nat, pU : Nat, b0 : Nat, b1 : Nat,
   ) : async Text {
-    await exchange.addConcentratedLiquidity(t0, t1, a0, a1, pL, pU, b0, b1);
+    unwrapAddConc(await exchange.addConcentratedLiquidity(t0, t1, a0, a1, pL, pU, b0, b1));
   };
 
   public func removeConcentratedLiquidity(
     t0 : Text, t1 : Text, posId : Nat, liq : Nat,
   ) : async Text {
-    await exchange.removeConcentratedLiquidity(t0, t1, posId, liq);
+    unwrapRemoveConc(await exchange.removeConcentratedLiquidity(t0, t1, posId, liq));
   };
 
   public func getUserConcentratedPositions() : async [{

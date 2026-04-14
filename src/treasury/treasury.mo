@@ -118,9 +118,9 @@ import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 import Buffer "mo:base/Buffer";
 
-import Migration "./migration";
+//import Migration "./migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 shared (deployer) persistent actor class treasury() = this {
 
   private func this_canister_id() : Principal {
@@ -545,6 +545,9 @@ shared (deployer) persistent actor class treasury() = this {
     customMaxPoolShareBP : ?Nat;
   }>();
 
+  // Timestamp of last emergency LP exit. NACHOS vault blocks mints/burns for 30 min after this.
+  stable var lpEmergencyExitTimestamp : Int = 0;
+
   // Pending LP deposits for crash recovery (survives canister upgrade)
   // Key includes timestamp for uniqueness: "token0:token1:timestampNat"
   stable var lpPendingDeposits = Map.new<Text, {
@@ -561,9 +564,9 @@ shared (deployer) persistent actor class treasury() = this {
   transient var lpBackingPerToken = Map.new<Principal, Nat>();
   // Tokens removed from LP but not yet arrived at treasury wallet
   // Value: (amount, timestamp of removal) — timestamp prevents false-positive arrival detection
-  transient var lpTokensInTransit = Map.new<Principal, (Nat, Int)>();
+  stable var lpTokensInTransit = Map.new<Principal, (Nat, Int)>();
   // Tokens transferred to exchange but not yet confirmed as LP position
-  transient var lpDepositsInFlight = Map.new<Principal, Nat>();
+  stable var lpDepositsInFlight = Map.new<Principal, Nat>();
   // ICP value of each token's LP across all pools (budget tracking)
   transient var lpBudgetUsedPerToken = Map.new<Principal, Nat>();
   // Liquid (wallet) balance per token — NOT including LP
@@ -4181,6 +4184,9 @@ shared (deployer) persistent actor class treasury() = this {
       Debug.print("Not authorized to execute trading cycle: " # debug_show(caller));
       return #err(#ConfigError("Not authorized"));
     };
+    if (rebalanceState.status == #Trading) {
+      return #err(#ConfigError("Trading cycle already in progress"));
+    };
     Debug.print("Starting trading cycle");
 
     await* do_executeTradingCycle();
@@ -4641,10 +4647,18 @@ shared (deployer) persistent actor class treasury() = this {
       if (lpConfig.enabled) {
         // Normal mode: remove overweight LP based on targets
         let lpTargets = computeLPTargets();
+        // Compute portfolio value for 0.5% per-operation cap.
+        // This bounds the between-await race window so NAV drift ≤ 0.5% (= burn fee).
+        var lpCapPortfolioICP : Nat = 0;
+        for ((_, details) in Map.entries(tokenDetailsMap)) {
+          if (details.Active) { lpCapPortfolioICP += (details.balance * details.priceInICP) / (10 ** details.tokenDecimals) };
+        };
+        let maxLPChangePerOp = lpCapPortfolioICP / 200; // 0.5% of portfolio
         let removals = Vector.new<(Text, Principal, Principal, Nat, Nat, Nat)>();
         for ((poolKey, t0, t1, target, current, liq) in lpTargets.vals()) {
           if (current > target) {
-            let excess = current - target;
+            let rawExcess = current - target;
+            let excess = Nat.min(rawExcess, maxLPChangePerOp); // Cap per-operation change
             // Only adjust if above rebalance threshold
             if (current > 0 and (excess * 10_000 / current) > lpConfig.rebalanceThresholdBP) {
               Vector.add(removals, (poolKey, t0, t1, excess, current, liq));
@@ -8594,10 +8608,17 @@ shared (deployer) persistent actor class treasury() = this {
     // Deploy LP to underweight pools using newly bought tokens
     if (lpConfig.enabled and not isNachosHighVolume() and lastLPQueryTimestamp > 0) {
       let lpTargets = computeLPTargets(); // Recompute with post-trade state
+      // Compute portfolio value for 0.5% per-operation cap (same as Step A).
+      var lpCapPortfolioICP_C : Nat = 0;
+      for ((_, details) in Map.entries(tokenDetailsMap)) {
+        if (details.Active) { lpCapPortfolioICP_C += (details.balance * details.priceInICP) / (10 ** details.tokenDecimals) };
+      };
+      let maxLPChangePerOp_C = lpCapPortfolioICP_C / 200; // 0.5% of portfolio
       let additions = Vector.new<(Text, Principal, Principal, Nat)>();
       for ((poolKey, t0, t1, target, current, _) in lpTargets.vals()) {
         if (target > current) {
-          let deficit = target - current;
+          let rawDeficit = target - current;
+          let deficit = Nat.min(rawDeficit, maxLPChangePerOp_C); // Cap per-operation change
           if (target > 0 and (deficit * 10_000 / target) > lpConfig.rebalanceThresholdBP) {
             // deficit/2 = one side's ICP value (pool is 50/50)
             Vector.add(additions, (poolKey, t0, t1, deficit / 2));
@@ -8875,7 +8896,14 @@ shared (deployer) persistent actor class treasury() = this {
     let dec0 : Nat = d0.tokenDecimals;
     let dec1 : Nat = d1.tokenDecimals;
 
-    // Price sanity check: pool price vs treasury consensus
+    // Detect dust pool: pool exists but treasury has no active position (residual from LP removal)
+    let treasuryHasPosition = switch (Array.find<swaptypes.DetailedLiquidityPosition>(cachedLPPositions, func(p) {
+      normalizePoolKeyText(p.token0, p.token1) == poolKey and p.liquidity > 0
+    })) { case (?_) { true }; case null { false } };
+    let isDustPool = not treasuryHasPosition;
+
+    // Price sanity check: pool price vs treasury consensus (skip for dust pools — price is meaningless)
+    if (not isDustPool) {
     for (pool in cachedPoolData.vals()) {
       if (normalizePoolKeyText(pool.token0, pool.token1) == poolKey) {
         if (pool.reserve0 > 0 and d0.priceInICP > 0 and d1.priceInICP > 0 and dec0 > 0 and dec1 > 0) {
@@ -8898,6 +8926,7 @@ shared (deployer) persistent actor class treasury() = this {
         };
       };
     };
+    }; // end if (not isDustPool)
 
     // Convert ICP value to token amounts
     if (d0.priceInICP == 0 or d1.priceInICP == 0 or dec0 == 0 or dec1 == 0) return;
@@ -8976,7 +9005,15 @@ shared (deployer) persistent actor class treasury() = this {
     let block1 = switch (block1Result) {
       case (#ok(b)) { b };
       case (#err(e)) {
-        logger.error("LP_ADD", "Token1 transfer failed: " # e # " — block0=" # Nat.toText(block0) # " saved for recovery", "addLiquidityToPool");
+        // Token0 was transferred but token1 failed — move token0 from inFlight to inTransit
+        // so effective balance stays correct and tokens are tracked for arrival
+        let flight0 = switch (Map.get(lpDepositsInFlight, phash, t0)) { case (?v) v; case null 0 };
+        Map.delete(lpDepositsInFlight, phash, t0);
+        if (flight0 > 0) {
+          let curT = switch (Map.get(lpTokensInTransit, phash, t0)) { case (?(amt, _)) amt; case null 0 };
+          Map.set(lpTokensInTransit, phash, t0, (curT + flight0, now()));
+        };
+        logger.error("LP_ADD", "Token1 transfer failed: " # e # " — block0=" # Nat.toText(block0) # " token0 moved to inTransit for recovery", "addLiquidityToPool");
         return; // lpPendingDeposits has block0 for recovery
       };
     };
@@ -8996,7 +9033,7 @@ shared (deployer) persistent actor class treasury() = this {
 
     // Call addLiquidity on exchange
     try {
-      let result = await (with timeout = 65) TACOSwap.doAddLiquidity(t0Text, t1Text, amount0, amount1, block0, block1);
+      let result = await (with timeout = 65) TACOSwap.doAddLiquidity(t0Text, t1Text, amount0, amount1, block0, block1, if isDustPool { ?true } else { null });
       switch (result) {
         case (#Ok(ok)) {
           // Clear pending deposit and in-flight
@@ -11960,20 +11997,11 @@ shared (deployer) persistent actor class treasury() = this {
     };
   };
 
-  // TACO confidence weight: from AMM totalLiquidity.
-  // Conservatively halved vs ICPSwap (newer, less proven depth).
-  private func tacoLiquidityToWeight(liquidity : ?Nat) : Float {
-    switch (liquidity) {
-      case (?liq) {
-        let l = Float.fromInt(liq);
-        if (l <= 0.0) { 0.0 }
-        else if (l < 1_000_000) { 0.0 }
-        else if (l < 100_000_000) { 0.2 }
-        else if (l < 10_000_000_000) { 0.35 }
-        else { 0.5 };
-      };
-      case null { 0.25 };
-    };
+  // TACO confidence weight: derived from slippage (same logic as Kong).
+  // Uses actual price impact instead of raw LP unit counts, which don't
+  // correlate with real dollar depth (e.g., 11M LP units but $0.06 value).
+  private func tacoSlippageToWeight(slippage : ?Float) : Float {
+    kongSlippageToWeight(slippage) // Same slippage→weight mapping as Kong
   };
 
   private func syncPriceWithDEX() : async* () {
@@ -12080,14 +12108,14 @@ shared (deployer) persistent actor class treasury() = this {
 
     // Await TACO ICP/ckUSDC result
     var tacoICPPrice : ?Float = null;
-    var tacoICPLiquidity : ?Nat = null;
+    var tacoICPSlippage : ?Float = null;
     try {
       let tacoResult = await tacoICPFuture;
       switch (tacoResult) {
         case (#ok(quote)) {
           if (quote.mid_price > 0.0) {
             tacoICPPrice := ?quote.mid_price;
-            tacoICPLiquidity := Map.get(tacoPoolLiquidity, thash, Principal.toText(ckUSDCPrincipal));
+            tacoICPSlippage := ?quote.slippage;
             Debug.print("TACO ICP/ckUSDC mid_price: " # Float.toText(quote.mid_price) # " slippage: " # Float.toText(quote.slippage) # "%");
           } else {
             Debug.print("TACO ICP/ckUSDC zero price; ignoring");
@@ -12118,7 +12146,7 @@ shared (deployer) persistent actor class treasury() = this {
     };
     switch (tacoICPPrice) {
       case (?taco) {
-        let w = tacoLiquidityToWeight(tacoICPLiquidity);
+        let w = tacoSlippageToWeight(tacoICPSlippage);
         icpWeightedSum += taco * w; icpTotalWeight += w; icpSourceCount += 1;
         Debug.print("ICP/USD TACO: " # Float.toText(taco) # " w=" # Float.toText(w));
       }; case null {};
@@ -12169,12 +12197,23 @@ shared (deployer) persistent actor class treasury() = this {
 
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
       if (principal == ICPprincipal) { /* already handled above */ } else {
+        // Compute quote amount: ~$20 worth based on last known price.
+        // Using a small fixed dollar amount avoids overwhelming thin pools
+        // (e.g., 1 ckETH = $2300 causes 93% impact on thin pools, but $20 worth is fine).
+        // Fallback to 1 unit if no prior price data.
+        let quoteAmount = if (details.priceInICP > 0 and finalICPPriceUSD > 0.0) {
+          let twentyDollarsInICP = Int.abs(Float.toInt(20.0 / finalICPPriceUSD * 100000000.0));
+          let amount = (twentyDollarsInICP * (10 ** details.tokenDecimals)) / details.priceInICP;
+          if (amount > 0) { amount } else { 10 ** details.tokenDecimals }
+        } else {
+          10 ** details.tokenDecimals // fallback: 1 unit if no prior price
+        };
+
         // Fire Kong future
-        let oneTokenAmount = 10 ** details.tokenDecimals;
-        let kongFut = (with timeout = 65) KongSwap.getQuote(details.tokenSymbol, "ICP", oneTokenAmount, details.tokenDecimals, 8);
+        let kongFut = (with timeout = 65) KongSwap.getQuote(details.tokenSymbol, "ICP", quoteAmount, details.tokenDecimals, 8);
         Map.set(kongFutures, phash, principal, kongFut);
 
-        // Fire ICPSwap future (only if pool exists)
+        // Fire ICPSwap future (only if pool exists) — uses pool price directly, no amount needed
         let poolKey = (principal, ICPprincipal);
         switch (Map.get(ICPswapPools, hashpp, poolKey)) {
           case (?poolData) {
@@ -12187,7 +12226,7 @@ shared (deployer) persistent actor class treasury() = this {
         };
 
         // Fire TACO quote (multi-hop aggregated price via getExpectedReceiveAmount)
-        let tacoFut = (with timeout = 65) TACOSwap.getQuote(Principal.toText(principal), ICPprincipalText, oneTokenAmount, details.tokenDecimals, 8);
+        let tacoFut = (with timeout = 65) TACOSwap.getQuote(Principal.toText(principal), ICPprincipalText, quoteAmount, details.tokenDecimals, 8);
         Map.set(tacoFutures, phash, principal, tacoFut);
       };
     };
@@ -12209,10 +12248,12 @@ shared (deployer) persistent actor class treasury() = this {
             let kongResult = await kongFut;
             switch (kongResult) {
               case (#ok(quote)) {
-                if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0) {
+                if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0 and quote.slippage < 1.0) {
                   kongTokenPrice := ?quote.mid_price;
                   kongTokenSlippage := ?quote.slippage;
                   Debug.print("Kong " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) # " ICP per " # tokenSymbol # ", slippage: " # Float.toText(quote.slippage) # "% (ACCEPTED)");
+                } else if (quote.slippage >= 1.0) {
+                  Debug.print("Kong " # tokenSymbol # "/ICP rejected: slippage " # Float.toText(quote.slippage) # "% >= 1% (thin liquidity)");
                 } else {
                   Debug.print("Kong " # tokenSymbol # "/ICP returned zero/unreasonable price (" # Float.toText(quote.mid_price) # "); ignoring");
                 };
@@ -12296,22 +12337,23 @@ shared (deployer) persistent actor class treasury() = this {
         case null {};
       };
 
-      // Await TACO result + look up liquidity from cached pools
+      // Await TACO result
       var tacoTokenPrice : ?Float = null;
-      var tacoTokenLiquidity : ?Nat = null;
+      var tacoTokenSlippage : ?Float = null;
       switch (Map.get(tacoFutures, phash, principal)) {
         case (?tacoFut) {
           try {
             let tacoResult = await tacoFut;
             switch (tacoResult) {
               case (#ok(quote)) {
-                if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0) {
+                if (quote.mid_price > 0.0 and quote.mid_price <= 100000.0 and quote.slippage < 1.0) {
                   tacoTokenPrice := ?quote.mid_price;
-                  tacoTokenLiquidity := Map.get(tacoPoolLiquidity, thash, Principal.toText(principal));
+                  tacoTokenSlippage := ?quote.slippage;
                   Debug.print("TACO " # tokenSymbol # "/ICP mid_price: " # Float.toText(quote.mid_price) #
                     " slippage: " # Float.toText(quote.slippage) # "%" #
-                    " liq: " # (switch (tacoTokenLiquidity) { case (?l) Nat.toText(l); case null "none" }) #
                     " (ACCEPTED)");
+                } else if (quote.slippage >= 1.0) {
+                  Debug.print("TACO " # tokenSymbol # "/ICP rejected: slippage " # Float.toText(quote.slippage) # "% >= 1% (thin liquidity)");
                 } else {
                   Debug.print("TACO " # tokenSymbol # "/ICP unreasonable price (" # Float.toText(quote.mid_price) # "); ignoring");
                 };
@@ -12325,6 +12367,40 @@ shared (deployer) persistent actor class treasury() = this {
           };
         };
         case null {};
+      };
+
+      // Outlier rejection: if 2+ sources exist, reject any price >30% from median
+      var priceCount : Nat = 0;
+      switch (kongTokenPrice) { case (?_) { priceCount += 1 }; case null {} };
+      switch (icpSwapTokenPrice) { case (?_) { priceCount += 1 }; case null {} };
+      switch (tacoTokenPrice) { case (?_) { priceCount += 1 }; case null {} };
+      if (priceCount >= 2) {
+        let priceBuf = Buffer.Buffer<Float>(3);
+        switch (kongTokenPrice) { case (?p) { priceBuf.add(p) }; case null {} };
+        switch (icpSwapTokenPrice) { case (?p) { priceBuf.add(p) }; case null {} };
+        switch (tacoTokenPrice) { case (?p) { priceBuf.add(p) }; case null {} };
+        let sorted = Array.sort<Float>(Buffer.toArray(priceBuf), Float.compare);
+        let median = sorted[sorted.size() / 2];
+        if (median > 0.0) {
+          switch (kongTokenPrice) {
+            case (?p) { if (Float.abs((p - median) / median) > 0.3) {
+              kongTokenPrice := null;
+              Debug.print(tokenSymbol # " Kong outlier rejected: " # Float.toText(p) # " vs median " # Float.toText(median));
+            }}; case null {};
+          };
+          switch (icpSwapTokenPrice) {
+            case (?p) { if (Float.abs((p - median) / median) > 0.3) {
+              icpSwapTokenPrice := null;
+              Debug.print(tokenSymbol # " ICPSwap outlier rejected: " # Float.toText(p) # " vs median " # Float.toText(median));
+            }}; case null {};
+          };
+          switch (tacoTokenPrice) {
+            case (?p) { if (Float.abs((p - median) / median) > 0.3) {
+              tacoTokenPrice := null;
+              Debug.print(tokenSymbol # " TACO outlier rejected: " # Float.toText(p) # " vs median " # Float.toText(median));
+            }}; case null {};
+          };
+        };
       };
 
       // Calculate final token price (N-source liquidity-weighted)
@@ -12346,7 +12422,7 @@ shared (deployer) persistent actor class treasury() = this {
       };
       switch (tacoTokenPrice) {
         case (?taco) {
-          let w = tacoLiquidityToWeight(tacoTokenLiquidity);
+          let w = tacoSlippageToWeight(tacoTokenSlippage);
           tokenWeightedSum += taco * w; tokenTotalWeight += w; tokenSourceCount += 1;
         }; case null {};
       };
@@ -12614,6 +12690,12 @@ shared (deployer) persistent actor class treasury() = this {
     Buffer.toArray(result);
   };
 
+  // Query: is the treasury in LP emergency recovery mode? (30 min after admin_exitAllLP)
+  // NACHOS vault checks this to block mints/burns during the recovery window.
+  public shared query ({ caller }) func isLPEmergencyRecovering() : async Bool {
+    lpEmergencyExitTimestamp > 0 and (now() - lpEmergencyExitTimestamp) < 1_800_000_000_000 // 30 min
+  };
+
   /**
    * Update token metadata (name, symbol, decimals, fees)
    *
@@ -12815,9 +12897,13 @@ shared (deployer) persistent actor class treasury() = this {
                 // Balance increased sufficiently and enough time passed — tokens likely arrived
                 Map.delete(lpTokensInTransit, phash, token);
               } else if (elapsed > 600_000_000_000) {
-                // 10 min timeout — clear regardless (exchange transfer should have completed)
-                // Tokens either arrived (liquid will reflect) or are stuck (recovery handles)
+                // 10 min timeout — tokens may not have arrived. Add back to liquid balance
+                // so effective balance stays correct. Next updateBalances() will get actual
+                // wallet balance and self-correct.
+                let curLiquid = switch (Map.get(liquidBalancePerToken, phash, token)) { case (?v) v; case null 0 };
+                Map.set(liquidBalancePerToken, phash, token, curLiquid + inTransitAmount);
                 Map.delete(lpTokensInTransit, phash, token);
+                logger.warn("LP_BALANCE", "In-transit timeout for " # Principal.toText(token) # " amount=" # Nat.toText(inTransitAmount) # " — added back to liquid", "updateBalances");
               };
             };
 
@@ -12998,8 +13084,9 @@ shared (deployer) persistent actor class treasury() = this {
       };
     };
     lpConfig := { lpConfig with enabled = false };
-    logTreasuryAdminAction(caller, #LPEmergencyExit({ positionsRemoved = removed }), "Emergency LP exit: " # Nat.toText(removed) # " positions removed, LP disabled", true, null);
-    #ok("Removed " # Nat.toText(removed) # " LP positions. LP disabled.");
+    lpEmergencyExitTimestamp := now();
+    logTreasuryAdminAction(caller, #LPEmergencyExit({ positionsRemoved = removed }), "Emergency LP exit: " # Nat.toText(removed) # " positions removed, LP disabled, NACHOS paused 30min", true, null);
+    #ok("Removed " # Nat.toText(removed) # " LP positions. LP disabled. NACHOS mints/burns paused for 30 minutes.");
   };
 
   // Remove a specific pool's LP position

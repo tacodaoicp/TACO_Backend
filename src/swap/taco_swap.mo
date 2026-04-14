@@ -639,6 +639,7 @@ module {
     token0 : Text, token1 : Text,
     amount0 : Nat, amount1 : Nat,
     block0 : Nat, block1 : Nat,
+    isInitial : ?Bool,
   ) : async {
     #Ok : {
       liquidityMinted : Nat; token0 : Text; token1 : Text;
@@ -653,7 +654,7 @@ module {
     };
   } {
     let exchange = actor (OTC_BACKEND) : actor {
-      addLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat) -> async {
+      addLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, ?Bool) -> async {
         #Ok : {
           liquidityMinted : Nat; token0 : Text; token1 : Text;
           amount0Used : Nat; amount1Used : Nat; refund0 : Nat; refund1 : Nat;
@@ -668,7 +669,7 @@ module {
       };
     };
     Debug.print("TACO addLiquidity: " # token0 # "/" # token1 # " amounts=" # Nat.toText(amount0) # "/" # Nat.toText(amount1) # " blocks=" # Nat.toText(block0) # "/" # Nat.toText(block1));
-    await exchange.addLiquidity(token0, token1, amount0, amount1, block0, block1);
+    await exchange.addLiquidity(token0, token1, amount0, amount1, block0, block1, isInitial);
   };
 
   // Remove liquidity from a V2 pool (returns tokens via exchange treasury transfer)
