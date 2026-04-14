@@ -257,6 +257,17 @@ echo ""
 if [ "$1" = "skip_stress" ]; then
     echo "Running tests (skipping stress tests)..."
     dfx canister call exchange_test runTests '(false, true)'
+elif [ "$1" = "stress_only" ]; then
+    echo "Running stress tests only (minimal setup)..."
+    dfx canister call exchange_test runOnlyStressTests
+elif [ "$1" = "rebuild_stress" ]; then
+    echo "Rebuilding exchange + test canisters and running stress only..."
+    dfx build OTC_backend 2>&1 | tail -3
+    dfx build exchange_test 2>&1 | tail -3
+    dfx canister install OTC_backend --mode upgrade --wasm-memory-persistence keep 2>&1
+    dfx canister install exchange_test --mode upgrade --wasm-memory-persistence keep 2>&1
+    echo "Running stress tests..."
+    dfx canister call exchange_test runOnlyStressTests
 else
     echo "Running all tests (including stress tests)..."
     dfx canister call exchange_test runTests '(false, false)'

@@ -248,6 +248,33 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let currentTreasury = actor (treasury_text) : treasuryType.Treasury;
     await currentTreasury.setTest(a);
   };
+
+  // Test-only: wipe all exchange state (orders, pools, fees, V3) without transfers.
+  // Call before re-running stress tests to avoid redeployment.
+  public shared ({ caller }) func resetAllState() : async Text {
+    if (not test) return "Not in test mode";
+    if (not ownercheck(caller)) return "Not authorized";
+    // Orders
+    Map.clear(tradeStorePublic);
+    Map.clear(tradeStorePrivate);
+    for (k in Map.keys(liqMapSort)) { ignore Map.remove(liqMapSort, hashtt, k) };
+    for (k in Map.keys(liqMapSortForeign)) { ignore Map.remove(liqMapSortForeign, hashtt, k) };
+    for (k in Map.keys(privateAccessCodes)) { ignore Map.remove(privateAccessCodes, hashtt, k) };
+    // AMM
+    for (k in Map.keys(AMMpools)) { ignore Map.remove(AMMpools, hashtt, k) };
+    for (k in Map.keys(poolV3Data)) { ignore Map.remove(poolV3Data, hashtt, k) };
+    Map.clear(concentratedPositions);
+    Map.clear(userLiquidityPositions);
+    // Fees
+    Map.clear(feescollectedDAO);
+    Map.clear(referrerFeeMap);
+    // Misc
+    Vector.clear(tempTransferQueue);
+    AMMMinimumLiquidityDone := TrieSet.empty();
+    // Reset accepted tokens to base only
+    acceptedTokens := ["ryjl3-tyaaa-aaaaa-aaaba-cai", "xevnm-gaaaa-aaaar-qafnq-cai"];
+    "State reset complete";
+  };
   type hashtt<K> = (
     getHash : (K) -> Nat32,
     areEqual : (K, K) -> Bool,
@@ -339,6 +366,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   //Referralfees. For instance 20 means 20% of the total fees go to the refferer
   stable var ReferralFees : Nat = 20;
   stable var verboseLogging : Bool = true;
+
+  // Unified fee calculation helpers — use these everywhere to ensure consistent integer division.
+  // nonRevokeFee: the portion of the trading fee that is NOT refundable on revoke.
+  // revokeFeeCalc: the portion of the trading fee that IS refundable on revoke.
+  // Total trading fee = nonRevokeFee + revokeFeeCalc = (amount * fee) / 10000  (approx)
+  func nonRevokeFee(amount : Nat, fee : Nat, revokeFee : Nat) : Nat {
+    let totalFee = (amount * fee) / 10000;
+    let revokePortion = totalFee / revokeFee;
+    totalFee - revokePortion;
+  };
+
+  func revokeFeeCalc(amount : Nat, fee : Nat, revokeFee : Nat) : Nat {
+    (amount * fee) / (10000 * revokeFee);
+  };
 
   type BlockData = {
     #ICP : LedgerType.QueryBlocksResponse;
@@ -857,6 +898,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     let totalIn = amountIn - amountRemaining;
 
+    if (test and amountRemaining > 0) {
+      Debug.print("DRIFT_TRACE swapV3: amountIn=" # Nat.toText(amountIn)
+        # " totalIn=" # Nat.toText(totalIn)
+        # " remaining=" # Nat.toText(amountRemaining)
+        # " poolFee=" # Nat.toText(totalPoolFee)
+        # " protocolFee=" # Nat.toText(totalProtocolFee)
+        # " iterations=" # Nat.toText(iterations));
+    };
+
     // Safety clamp: V3 virtual liquidity can produce output exceeding real reserves.
     // Clamp output to what the pool actually holds.
     let maxOutput = if (tokenInIsToken0) { pool.reserve1 } else { pool.reserve0 };
@@ -1058,6 +1108,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   // In this map the canister saves how many fees are already available to be picked up by the DAO. They can be picked up by calling collectFees()
   stable let feescollectedDAO : feemap = Map.new<Text, Nat>();
+
+  // Non-drainable surplus counter: tracks tokens that remain in the wallet after token removal
+  // (order Tfees gaps, V3 protocol fees, reserve rounding dust from pool deletion).
+  // NOT drained by collectFees — included only in checkDiffs equation.
+  // Reset when a token is re-added via addAcceptedToken(#Add).
+  transient let tokenRemovalSurplus = Map.new<Text, Nat>();
+
 
 
   // Map to check whether a trader was referred, if null 100% of fees go to the DAO and the val will be Null.
@@ -5178,6 +5235,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
                   let toBeSent = amount_init + revoke_Fee;
                   Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier));
+                  // The order tracked amount_init + non_revoke + Tfees in checkDiffs.
+                  // Refund sends amount_init + revoke_Fee, and the transfer costs Tfees.
+                  // So wallet loses (amount_init + revoke_Fee + Tfees) and order component
+                  // drops by (amount_init + non_revoke + Tfees). These balance (non_revoke ≈ revoke_Fee).
+                  // No Tfees gap — the order's Tfees exactly covers the transfer cost.
                   logWithRunId("Added refund: " # debug_show ((init_principal, toBeSent, token_init_identifier)));
 
                   let tokenbuy = poolKey.0;
@@ -5263,7 +5325,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     let totalFee = (amount_init) * Fee;
                     let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
                     let toBeSent = amount_init + revoke_Fee;
-                    // As transferfees are preaccounted when someone makes an order, they dont need to be deducted
                     Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier));
 
                     let tokenbuy = poolKey.0;
@@ -5448,6 +5509,91 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   logWithRunId("Updated liquidity positions for user: " # debug_show (user));
                 };
               };
+
+              // Refund concentrated (V3) positions before deleting pool.
+              // Use amountsFromLiquidity (V3 math) instead of proportional reserves,
+              // because activeLiquidity != sum of all position liquidity when
+              // positions are out of range. Proportional math over-refunds.
+              let v3Opt = Map.get(poolV3Data, hashtt, poolKey);
+              let sqrtCurrent = switch (v3Opt) { case (?v3) v3.currentSqrtRatio; case null 0 };
+              // Track cumulative fee claims to prevent over-claiming across positions
+              // and to compute exact pool surplus after all refunds.
+              var cumulativeFee0Claimed : Nat = 0;
+              var cumulativeFee1Claimed : Nat = 0;
+              var totalRefunded0 : Nat = 0;
+              var totalRefunded1 : Nat = 0;
+              for ((user, cPositions) in Map.entries(concentratedPositions)) {
+                let remaining = Vector.new<ConcentratedPosition>();
+                for (pos in cPositions.vals()) {
+                  if ((pos.token0 == poolKey.0 and pos.token1 == poolKey.1) or (pos.token0 == poolKey.1 and pos.token1 == poolKey.0)) {
+                    let sqrtLower = ratioToSqrtRatio(pos.ratioLower);
+                    let sqrtUpper = ratioToSqrtRatio(pos.ratioUpper);
+                    let (base0, base1) = amountsFromLiquidity(pos.liquidity, sqrtLower, sqrtUpper, sqrtCurrent);
+                    // V3 fees — reduce maxClaim by cumulative claims to prevent over-claiming
+                    let fee0 = switch (v3Opt) {
+                      case (?v3) {
+                        let growth = if (v3.feeGrowthGlobal0 > pos.lastFeeGrowth0) { v3.feeGrowthGlobal0 - pos.lastFeeGrowth0 } else { 0 };
+                        let theoretical = pos.liquidity * growth / tenToPower60;
+                        let maxClaim = safeSub(safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0), cumulativeFee0Claimed);
+                        Nat.min(theoretical, maxClaim);
+                      };
+                      case null 0;
+                    };
+                    let fee1 = switch (v3Opt) {
+                      case (?v3) {
+                        let growth = if (v3.feeGrowthGlobal1 > pos.lastFeeGrowth1) { v3.feeGrowthGlobal1 - pos.lastFeeGrowth1 } else { 0 };
+                        let theoretical = pos.liquidity * growth / tenToPower60;
+                        let maxClaim = safeSub(safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1), cumulativeFee1Claimed);
+                        Nat.min(theoretical, maxClaim);
+                      };
+                      case null 0;
+                    };
+                    cumulativeFee0Claimed += fee0;
+                    cumulativeFee1Claimed += fee1;
+                    let total0 = base0 + fee0;
+                    let total1 = base1 + fee1;
+                    totalRefunded0 += total0;
+                    totalRefunded1 += total1;
+                    let tf0 = returnTfees(poolKey.0);
+                    let tf1 = returnTfees(poolKey.1);
+                    if (total0 > tf0) { Vector.add(tempTransferQueueLocal, (#principal(user), total0 - tf0, poolKey.0)) };
+                    // Small refunds: don't add to feescollectedDAO (gets drained by collectFees).
+                    // The pool surplus calculation below will capture these tokens.
+                    if (total1 > tf1) { Vector.add(tempTransferQueueLocal, (#principal(user), total1 - tf1, poolKey.1)) };
+                    logWithRunId("Refunded V3 position for user: " # debug_show (user) # " liq=" # Nat.toText(pos.liquidity));
+                  } else {
+                    Vector.add(remaining, pos);
+                  };
+                };
+                if (Vector.size(remaining) == 0) { Map.delete(concentratedPositions, phash, user) }
+                else { Map.set(concentratedPositions, phash, user, Vector.toArray(remaining)) };
+              };
+
+              // After all LP refunds, remaining = protocol fees (30% of swap fees) + rounding dust.
+              // Add to feescollectedDAO — this is legitimate DAO revenue (protocol fees).
+              // Safe: the pool reserves only contain tokens from AMM operations, not user deposits.
+              // When collectFees drains it, both wallet and fee decrease equally → drift unchanged.
+              let poolTotal0 = pool.reserve0 + (switch (v3Opt) {
+                case (?v3) { safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
+                case null 0;
+              });
+              let poolTotal1 = pool.reserve1 + (switch (v3Opt) {
+                case (?v3) { safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
+                case null 0;
+              });
+              let poolRemainder0 = safeSub(poolTotal0, totalRefunded0);
+              let poolRemainder1 = safeSub(poolTotal1, totalRefunded1);
+              if (poolRemainder0 > 0) {
+                let cur0 = switch (Map.get(feescollectedDAO, thash, poolKey.0)) { case (?v) v; case null 0 };
+                Map.set(feescollectedDAO, thash, poolKey.0, cur0 + poolRemainder0);
+              };
+              if (poolRemainder1 > 0) {
+                let cur1 = switch (Map.get(feescollectedDAO, thash, poolKey.1)) { case (?v) v; case null 0 };
+                Map.set(feescollectedDAO, thash, poolKey.1, cur1 + poolRemainder1);
+              };
+              logWithRunId("Pool deletion remainder (protocol fees + dust) → feescollectedDAO: token0=" # Nat.toText(poolRemainder0) # " token1=" # Nat.toText(poolRemainder1));
+
+              Map.delete(poolV3Data, hashtt, poolKey);
 
               // Remove the pool
               Map.delete(AMMpools, hashtt, poolKey);
@@ -6185,20 +6331,30 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case _ { "" };
     };
 
-    if (token_sell_identifier != "ryjl3-tyaaa-aaaaa-aaaba-cai") {
-      if (containsToken(token_sell_identifier) == false) {
-        return #Err(#TokenNotAccepted(token_init_identifier));
-      };
-    };
-    if (token_init_identifier != "ryjl3-tyaaa-aaaaa-aaaba-cai") {
-      if (containsToken(token_init_identifier) == false) {
-        return #Err(#TokenNotAccepted(token_init_identifier));
-      };
-    };
-
     var nowVar = Time.now();
 
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text)>();
+
+    // Check if tokens are accepted. If not, refund the deposit (the user may have
+    // sent tokens before the token was removed — don't leave them untracked).
+    let tokenNotAccepted = (token_sell_identifier != "ryjl3-tyaaa-aaaaa-aaaba-cai" and containsToken(token_sell_identifier) == false)
+      or (token_init_identifier != "ryjl3-tyaaa-aaaaa-aaaba-cai" and containsToken(token_init_identifier) == false);
+    if (tokenNotAccepted) {
+      if (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block))) { return #Err(#InvalidInput("Block already processed")) };
+      Map.set(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block), nowVar);
+      let nowVar2 = nowVar;
+      let tType = returnType(token_init_identifier);
+      try {
+        let blockData = await* getBlockData(token_init_identifier, Block, tType);
+        Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token_init_identifier, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar2)).1.vals());
+      } catch (err) {
+        Map.delete(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block));
+      };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#TokenNotAccepted(token_init_identifier));
+    };
     let user = Principal.toText(caller);
 
     if (((switch (Array.find<Text>(pausedTokens, func(t) { t == token_sell_identifier })) { case null { false }; case (?_) { true } })) or ((switch (Array.find<Text>(pausedTokens, func(t) { t == token_init_identifier })) { case null { false }; case (?_) { true } }))) {
@@ -6378,6 +6534,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let leftAmountInit = thePairing.0;
       Vector.addFromIter(tempTransferQueueLocal, thePairing.3.vals());
       let tfees = returnTfees(token_init_identifier);
+      if (test) {
+        Debug.print("DRIFT_TRACE addPosition: token=" # token_init_identifier
+          # " amt=" # Nat.toText(amount_init)
+          # " left=" # Nat.toText(leftAmountInit)
+          # " wasAMM=" # debug_show(thePairing.4)
+          # " pFee=" # Nat.toText(thePairing.1)
+          # " poolFee=" # Nat.toText(thePairing.2)
+          # " transfers=" # Nat.toText(thePairing.3.size())
+          # " consumed=" # Nat.toText(thePairing.5));
+      };
       if (leftAmountInit != amount_init and leftAmountInit != 0 and tfees < leftAmountInit) {
         if (amount_sell2 > 1) {
 
@@ -6526,6 +6692,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           // Execute multi-hop for the remaining amount
           var hopAmount = leftAmountInit;
           var hopFailed = false;
+          var lastSuccessfulHopOutput : Nat = 0;
+          var lastSuccessfulHopToken : Text = "";
 
           for (hop in r.hops.vals()) {
             let syntheticTrade : TradePrivate = {
@@ -6561,6 +6729,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 Vector.add(tempTransferQueueLocal, tx);
               };
             };
+            if (thisHopOut > 0) {
+              lastSuccessfulHopOutput := thisHopOut;
+              lastSuccessfulHopToken := hop.tokenOut;
+            };
             hopAmount := thisHopOut;
             if (hopAmount == 0) { hopFailed := true };
           };
@@ -6576,6 +6748,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               addFees(token_init_identifier, add, false, user, nowVar);
             };
             plsbreak := 1;
+          } else if (hopFailed and lastSuccessfulHopOutput > 0) {
+            // Auto-multihop failed AFTER hop 0 succeeded.
+            // - Hop 0 consumed the input tokens via AMM (state already modified)
+            // - Intermediate tokens are in the wallet (AMM released them, no transfer)
+            // - Send the intermediate output to the USER (fair: they deposited input,
+            //   hop 0 converted it — give them what was produced by the successful hop).
+            // - This also fixes accounting: wallet sends intermediate out, matching AMM decrease.
+            let intermediateTransferFee = returnTfees(lastSuccessfulHopToken);
+            if (lastSuccessfulHopOutput > intermediateTransferFee) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), lastSuccessfulHopOutput - intermediateTransferFee, lastSuccessfulHopToken));
+            };
+            // Fee accounting for the consumed input
+            let add = (((((leftAmountInit) * ICPfee)) - (((((leftAmountInit) * ICPfee) * 100000) / RevokeFeeNow) / 100000)) / 10000);
+            if (add > 0) {
+              addFees(token_init_identifier, add, false, user, nowVar);
+            };
+            plsbreak := 1; // Don't place order — input was consumed by AMM
           };
           break routeSearch; // only try best route
         };
@@ -6883,8 +7072,29 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Vector.add(tempTransferQueueLocal, (#principal(caller), remaining, hop.tokenIn));
       };
 
+      let prevCurrentAmount = currentAmount; // Save before overwrite for error path
       currentAmount := hopOutput;
       if (currentAmount == 0) {
+        // No output from this hop — collect first-hop fees that would otherwise be skipped.
+        // For hop 0 failure: amountIn is refunded (line above), so only track the non-revoke
+        // trading fee (NOT inputTfees — the refund transfer costs Tfees which covers it).
+        // For hop 1+ failure: same fee tracking needed.
+        let tradingFee = calculateFee(amountIn, ICPfee, RevokeFeeNow);
+        if (tradingFee > 0) { addFees(tokenIn, tradingFee, false, user, nowVar) };
+
+        // For hop 1+ failures: the intermediate tokens from previous hops are in the
+        // wallet (AMM reserves decreased but tokens weren't transferred out).
+        // Send them to the USER (fair: their input was converted by hop 0, give them
+        // the result). This also fixes accounting: wallet sends intermediate out,
+        // matching the AMM reserve decrease.
+        if (hopIndex > 0 and prevCurrentAmount > 0) {
+          let intermediateToken = route[hopIndex].tokenIn;
+          let intermediateTransferFee = returnTfees(intermediateToken);
+          if (prevCurrentAmount > intermediateTransferFee) {
+            Vector.add(tempTransferQueueLocal, (#principal(caller), prevCurrentAmount - intermediateTransferFee, intermediateToken));
+          };
+        };
+
         // No output from this hop, stop
         if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -8716,6 +8926,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       } else {
         if (((isICP and Text.endsWith(from, #text from2) and Text.endsWith(to, #text to2)) or (not isICP and from == from2 and to == to2)) and howMuchReceived >= ((amount * (fee + 10000)) / 10000) + transferFee and isDefaultSubaccount) {
           addFees(tkn, ((amount * fee) / (10000 * revokefee)), false, Principal.toText(caller), nowVar2);
+          // Debug: track cumulative deposits
+          if (test) {
+            let prevDep = switch (Map.get(debugFeeTracker, thash, "dep_" # tkn)) { case (?v) v; case null 0 };
+            Map.set(debugFeeTracker, thash, "dep_" # tkn, prevDep + howMuchReceived);
+          };
 
           if (howMuchReceived > (((amount * (fee + 10000)) / 10000) + transferFee)) {
             let diff = howMuchReceived - ((amount * (fee + 10000)) / 10000) - transferFee;
@@ -8915,6 +9130,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   };
 
   // Function that adds or deletes fees to the registry. Even before an order is fulfilled, fees get added. This is the revokeFee.
+  // Debug: track cumulative fees added per token (test mode only)
+  transient let debugFeeTracker = Map.new<Text, Nat>();
+
   private func addFees(
     token : Text,
     amount : Nat,
@@ -8932,6 +9150,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       Map.set(feescollectedDAO, thash, token, newFee);
     } else {
       let feeAmount = if (amount > 0) { amount - 1 } else { 0 };
+
+      // Debug tracking
+      if (test) {
+        let prev = switch (Map.get(debugFeeTracker, thash, token)) { case (?v) v; case null 0 };
+        Map.set(debugFeeTracker, thash, token, prev + amount);
+      };
 
       // Check if the user has a referrer
       switch (Map.get(userReferrerLink, thash, user)) {
@@ -11535,7 +11759,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     for (i in acceptedTokens.vals()) {
       let Tfees = returnTfees(i);
-      Vector.add(differenceVec, (balances[i2] - (orderbalance[i2] + ammbalance[i2] + feebalances[i2]), i));
+      let drift = balances[i2] - (orderbalance[i2] + ammbalance[i2] + feebalances[i2]);
+      Vector.add(differenceVec, (drift, i));
+      if (test and (drift > 1000 or drift < 0)) {
+        Debug.print("DRIFT_COMPONENTS " # i # ": bal=" # debug_show(balances[i2])
+          # " ord=" # debug_show(orderbalance[i2])
+          # " amm=" # debug_show(ammbalance[i2])
+          # " fee=" # debug_show(feebalances[i2])
+          # " drift=" # debug_show(drift));
+      };
       i2 += 1;
     };
     i2 := 0;
@@ -13850,6 +14082,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #clearAllBans : () -> ();
         #cleanTokenIds : () -> ();
         #isExchangeFrozen : () -> ();
+        #resetAllState : () -> ();
         #refundStuckFunds : () -> ();
         #checkFeesReferrer : () -> ();
         #claimFeesReferrer : () -> ();
@@ -14004,6 +14237,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#ChangeTradingfees _) callerIsAdmin;
       case (#parameterManagement _) callerIsAdmin;
       case (#clearAllBans _) callerIsAdmin;
+      case (#resetAllState _) callerIsAdmin;
       case (#FinishSellBatchDAO _) false;
       case (#Freeze _) callerIsAdmin;
       case (#adminExecuteRouteStrategy _) callerIsAdmin;

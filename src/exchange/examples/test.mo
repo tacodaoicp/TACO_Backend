@@ -5875,6 +5875,24 @@ shared (deployer) persistent actor class test() = this {
     startTimer1(skipCancelAllPositions);
   };
 
+  public func runOnlyStressTests() : async Text {
+    ignore await exchange.setTest(true);
+    ignore await exchange.resetAllState();
+    await preTest();
+    ignore await Test0();
+    ignore await Test36();
+    ignore await Test46();
+    stressTestStarted := now();
+    diffLogs := [];
+    ignore setTimer(
+      #nanoseconds(10000),
+      func() : async () {
+        ignore await runStressTests(false);
+      },
+    );
+    return "Stress tests started with minimal setup (reset+T0+T36+T46).";
+  };
+
   stable var diffLogs : [Text] = [];
   public query func getDiffLogs() : async [Text] { diffLogs };
   func logDiffTable(stage : Text) : async () {
@@ -5901,7 +5919,7 @@ shared (deployer) persistent actor class test() = this {
   };
 
   public func printFinalResults() : async () {
-    if (currentTimerRunning == 8 and timer8OperationsComplete == timer8TotalOperations) {
+    if (currentTimerRunning == 10 and timer10OperationsComplete == timer10TotalOperations) {
       Debug.print("\n\nAll Difference Tables:\n");
       for (log in diffLogs.vals()) {
         Debug.print(log);
@@ -6110,8 +6128,10 @@ shared (deployer) persistent actor class test() = this {
       #generateDummyData : () -> (TradeEntry, TradePosition, TradePrivate, Nat, Principal);
       #printFinalResults : () -> ();
       #getDiffLogs : () -> ();
+      #runOnlyStressTests : () -> ();
       #runStressTests : () -> Bool;
       #runTests : () -> (Bool, Bool);
+      #resetAndRunStress : () -> ();
     };
   }) : Bool {
     Debug.print(debug_show (arg.size()));

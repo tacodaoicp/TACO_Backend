@@ -363,6 +363,7 @@ module {
     returncontractprincipal : shared query () -> async Text;
     sendDAOInfo : shared query () -> async [(Text, { TransferFee : Nat; Decimals : Nat; Name : Text; Symbol : Text })];
     setTest : shared Bool -> async ();
+    resetAllState : shared () -> async Text;
     checkDiffs : shared (Bool, Bool) -> async ?(Bool, [(Int, Text)], [[{ accessCode : Text; identifier : Text; poolCanister : (Text, Text) }]]);
     getCurrentLiquidityForeignPools : shared query (Nat, ?[PoolQuery], Bool) -> async ForeignPoolsResponse;
     checkFeesReferrer : shared query () -> async [(Text, Nat)];
