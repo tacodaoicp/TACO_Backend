@@ -16,6 +16,9 @@ import { now } = "mo:base/Time";
 import { setTimer; cancelTimer } = "mo:base/Timer";
 import Error "mo:base/Error";
 
+import TreasuryMigration "./treasury_migration";
+
+(with migration = TreasuryMigration.migrate)
 shared (deployer) persistent actor class treasury() = this {
   transient let { thash } = Map;
   transient let {
@@ -61,7 +64,7 @@ shared (deployer) persistent actor class treasury() = this {
     };
   };
 
-  stable let transferQueue = Vector.new<(TransferRecipient, Nat, Text)>();
+  stable let transferQueue = Vector.new<(TransferRecipient, Nat, Text, Text)>();
   transient let ICPprincipalText = "ryjl3-tyaaa-aaaaa-aaaba-cai";
   stable var acceptedTokens : [Text] = ["ryjl3-tyaaa-aaaaa-aaaba-cai", "kknbx-zyaaa-aaaaq-aae4a-cai"];
   stable let tokenInfo = Map.new<Text, { TransferFee : Nat; Decimals : Nat; Name : Text; Symbol : Text }>();
@@ -84,6 +87,20 @@ shared (deployer) persistent actor class treasury() = this {
   stable var lastNonceReset : Int = 0;
   transient var transferTimerRunning = false;
 
+  // Per-transaction idempotency: stores txId → timestamp of successful transfer
+  stable let processedTxIds = Map.new<Text, Int>();
+
+  private func cleanupTxIds<system>() {
+    let cutoff = now() - 30 * 86_400_000_000_000;
+    let toDelete = Vector.new<Text>();
+    for ((k, v) in Map.entries(processedTxIds)) {
+      if (v < cutoff) { Vector.add(toDelete, k) };
+    };
+    for (k in Vector.vals(toDelete)) { Map.delete(processedTxIds, thash, k) };
+    ignore setTimer<system>(#seconds(86400), func() : async () { cleanupTxIds<system>() });
+  };
+  ignore setTimer<system>(#seconds(86400), func() : async () { cleanupTxIds<system>() });
+
   type TokenInfo = {
     address : Text;
     name : Text;
@@ -93,7 +110,7 @@ shared (deployer) persistent actor class treasury() = this {
   };
 
   //This function is called by the exchange each time it has new transfers that have to be done. When not testing, it does not fulfill these transfers directly but instead creates a timer.
-  public shared ({ caller }) func receiveTransferTasks(tempTransferQueue : [(TransferRecipient, Nat, Text)]) : async Bool {
+  public shared ({ caller }) func receiveTransferTasks(tempTransferQueue : [(TransferRecipient, Nat, Text, Text)]) : async Bool {
     assert (caller == canisterOTCPrincipal);
 
     if (tempTransferQueue.size() != 0) {
@@ -134,9 +151,9 @@ shared (deployer) persistent actor class treasury() = this {
   // Function to handle all the transfers. removeLast is a perfect function for this as it removes the last item in the vector while also retuurning that item. If a transfer fails, it gets added to transferQueueTemp, so it can later be readded and retried.
   // Since weve seen token canisters in the past get overflooded with transactions, making each transfer take a long time, ive decided to not await each Transfer, instead adding the future to a Vector, so multiple transfers are sent at once.
   private func transferTimer(all : Bool) : async () {
-    let transferBatch = Vector.new<(TransferRecipient, Nat, Text)>();
-    let transferTasksICP = Vector.new<(async TransferResultICP, (TransferRecipient, Nat, Text))>();
-    let transferTasksICRC1 = Vector.new<(async TransferResultICRC1, (TransferRecipient, Nat, Text))>();
+    let transferBatch = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    let transferTasksICP = Vector.new<(async TransferResultICP, (TransferRecipient, Nat, Text, Text))>();
+    let transferTasksICRC1 = Vector.new<(async TransferResultICRC1, (TransferRecipient, Nat, Text, Text))>();
 
     // Remove the first X entries from transferQueue and add them to transferBatch
     let batchSize = if all { Vector.size(transferQueue) } else { 100 };
@@ -159,9 +176,13 @@ shared (deployer) persistent actor class treasury() = this {
         lastNonceReset := now();
       };
       for (data in Vector.vals(transferBatch)) {
+        // Idempotency: skip transfers already successfully processed
+        let txId = data.3;
+        if (txId != "" and Map.has(processedTxIds, thash, txId)) {
+          // Already processed — skip
+        } else {
         transferNonce += 1;
         nsAdd += 1;
-        //Debug.print("Sending " #debug_show (data.1) # " " #debug_show (data.2) # " to " #debug_show (data.0));
         if (data.2 != ICPprincipalText) {
           // Transfer ICRC1 token
           let token = actor (data.2) : ICRC1.FullInterface;
@@ -191,7 +212,7 @@ shared (deployer) persistent actor class treasury() = this {
             memo = ?Blob.fromArray([1]);
             created_at_time = ?(natToNat64(Int.abs(now())) - transferNonce);
           });
-          Vector.add(transferTasksICRC1, (transferTask, (data.0, data.1, data.2)));
+          Vector.add(transferTasksICRC1, (transferTask, data));
         } else {
           // Transfer ICP
           let ledger = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : Ledger.Interface;
@@ -216,8 +237,9 @@ shared (deployer) persistent actor class treasury() = this {
               timestamp_nanos = natToNat64(Int.abs(now())) - transferNonce;
             };
           });
-          Vector.add(transferTasksICP, (transferTask, (data.0, data.1, data.2)));
+          Vector.add(transferTasksICP, (transferTask, data));
         };
+        }; // end idempotency else
       };
 
       // Process ICRC1 transfer results
@@ -226,16 +248,14 @@ shared (deployer) persistent actor class treasury() = this {
           let result = await transferTask.0;
           switch (result) {
             case (#Ok(_)) {
-              // Transfer successful
+              let tid = transferTask.1.3;
+              if (tid != "") { Map.set(processedTxIds, thash, tid, now()) };
             };
             case (#Err(transferError)) {
-              // Transfer failed, re-queue
               Vector.add(transferQueue, transferTask.1);
             };
-
           };
         } catch (err) {
-          // Transfer failed, re-queue
           Vector.add(transferQueue, transferTask.1);
         };
       };
@@ -246,15 +266,14 @@ shared (deployer) persistent actor class treasury() = this {
           let result = await transferTask.0;
           switch (result) {
             case (#Ok(_)) {
-              // Transfer successful
+              let tid = transferTask.1.3;
+              if (tid != "") { Map.set(processedTxIds, thash, tid, now()) };
             };
             case (#Err(transferError)) {
-              // Transfer failed, re-queue
               Vector.add(transferQueue, transferTask.1);
             };
           };
         } catch (err) {
-          // Transfer failed, re-queue
           Vector.add(transferQueue, transferTask.1);
         };
       };
@@ -552,7 +571,7 @@ shared (deployer) persistent actor class treasury() = this {
       #getPendingTransferCount : () -> ();
       #getTokenInfo : () -> ();
       #receiveTransferTasks :
-        () -> (tempTransferQueue : [(TransferRecipient, Nat, Text)]);
+        () -> (tempTransferQueue : [(TransferRecipient, Nat, Text, Text)]);
       #setOTCCanister : () -> (id : Text);
       #setTest : () -> (a : Bool);
     };

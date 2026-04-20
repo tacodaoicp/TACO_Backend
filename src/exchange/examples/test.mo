@@ -4417,6 +4417,93 @@ shared (deployer) persistent actor class test() = this {
     } catch (err) { "Failed : " # Error.message(err) };
   };
 
+  // Test77: regression for inverted last-traded-price / kline after AMM swap via
+  // orderPairing (bug: reader in updateLastTradedPriceVector canonicaliser was
+  // inverted relative to writer, so kline close was stored as 1/spot).
+  // This test executes a pure AMM swap, then asserts that:
+  //   (a) the latest kline close is within the same order of magnitude as the
+  //       post-swap AMM spot price computed from reserves, AND
+  //   (b) it is NOT within a factor of 10 of the reciprocal of that spot.
+  // The (b) check is the precise failure-mode guard — a generic "close > 0"
+  // assertion would have passed the pre-fix code.
+  func Test77() : async Text {
+    try {
+      Debug.print("Starting Test77: last_traded_price direction regression");
+      let token_ICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+      let token_ICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+      // Pure AMM swap ICRCA -> ICP (no orderbook match expected).
+      let swapAmount = 5_000_000;
+      let block = await actorA.TransferICRCAtoExchange(swapAmount, fee, 1);
+      let route = [{ tokenIn = token_ICRCA; tokenOut = token_ICP }];
+      let swapResult = await actorA.swapMultiHop(token_ICRCA, token_ICP, swapAmount, route, 0, block);
+      if (not Text.contains(swapResult, #text "done")) {
+        throw Error.reject("swapMultiHop should succeed, got: " # swapResult);
+      };
+
+      // Compute post-swap spot from AMM reserves: canonical price = reserve1/reserve0
+      // in human units, i.e. token1 per token0.
+      let pools = await exchange.getAllAMMPools();
+      var spot : Float = 0.0;
+      var foundPool : Bool = false;
+      for (p in pools.vals()) {
+        if ((p.token0 == token_ICP and p.token1 == token_ICRCA) or
+            (p.token0 == token_ICRCA and p.token1 == token_ICP)) {
+          // Both tokens have 8 decimals, so the human-unit formula collapses to
+          // reserve1/reserve0. Use Float.fromInt for a lossy-but-faithful cast.
+          if (p.reserve0 == 0) { throw Error.reject("ICP/ICRCA pool empty") };
+          spot := Float.fromInt(p.reserve1) / Float.fromInt(p.reserve0);
+          foundPool := true;
+        };
+      };
+      if (not foundPool) { throw Error.reject("ICP/ICRCA pool not found") };
+      if (spot <= 0.0) { throw Error.reject("Computed spot must be positive") };
+
+      // Fetch the most recent kline close for this pair.
+      let klines = await exchange.getKlineData(token_ICP, token_ICRCA, #fivemin, false);
+      if (klines.size() == 0) { throw Error.reject("No kline data after swap") };
+      let latest = klines[0];
+      if (latest.close <= 0.0) { throw Error.reject("Kline close should be > 0") };
+
+      Debug.print("Post-swap spot: " # Float.toText(spot) # " | latest close: " # Float.toText(latest.close));
+
+      // (a) close must be within a factor of 10 of the spot (same direction).
+      let closeToSpot = latest.close / spot;
+      if (closeToSpot > 10.0 or closeToSpot < 0.1) {
+        throw Error.reject(
+          "Kline close (" # Float.toText(latest.close) # ") is not within 10x of spot ("
+          # Float.toText(spot) # "). Likely inverted."
+        );
+      };
+
+      // (b) close must NOT be within a factor of 10 of the reciprocal of spot.
+      // A stored-reciprocal bug would pass (a) only if spot ≈ 1; for typical
+      // pools with spot far from 1 the ratio would be orders of magnitude off.
+      // Also explicitly guard 1/spot to catch edge cases where both checks could
+      // satisfy each other (spot near 1).
+      let reciprocal = 1.0 / spot;
+      let reciprocalRatio = latest.close / reciprocal;
+      if (Float.abs(1.0 - spot) > 0.01 and reciprocalRatio > 0.1 and reciprocalRatio < 10.0) {
+        throw Error.reject(
+          "Kline close (" # Float.toText(latest.close) # ") is near 1/spot ("
+          # Float.toText(reciprocal) # "). Inverted kline bug regression."
+        );
+      };
+
+      // Volume sanity: must be in token1/quote units. An inverted recording would
+      // store a token0-denominated volume, which for these tokens would differ by
+      // ~spot. We don't hard-assert since the test harness may aggregate multiple
+      // swaps into the same 5-min bucket; log for manual inspection.
+      Debug.print("Latest kline volume: " # Nat.toText(latest.volume));
+
+      Debug.print("Test77 passed");
+      return "true";
+    } catch (err) {
+      Debug.print("Test77: " # Error.message(err));
+      return "Failed : " # Error.message(err);
+    };
+  };
+
   // Test76: adminExecuteRouteStrategy prevents block replay
   func Test76() : async Text {
     try {
@@ -4457,7 +4544,7 @@ shared (deployer) persistent actor class test() = this {
       poolCanister : (Text, Text);
     }]] = [];
     if true {
-      label a for (i in Iter.range(0, if skipCancelAllPositions { 0 } else { 76 })) {
+      label a for (i in Iter.range(0, if skipCancelAllPositions { 0 } else { 77 })) {
         let testName = "Test" # Nat.toText(i);
         var testResult = "false";
         let cyclesBefore = Cycles.balance();
@@ -4540,6 +4627,7 @@ shared (deployer) persistent actor class test() = this {
           case 74 { testResult := await Test74(); Debug.print("") };
           case 75 { testResult := await Test75(); Debug.print("") };
           case 76 { testResult := await Test76(); Debug.print("") };
+          case 77 { testResult := await Test77(); Debug.print("") };
           case _ {
             testResults := Array.append(testResults, [testName # ": Invalid test number"]);
             continue a;
@@ -4722,7 +4810,7 @@ shared (deployer) persistent actor class test() = this {
     } else if (currentTimerRunning == 3 and timer3OperationsComplete + 3 > timer3TotalOperations and timer3OperationsComplete < timer3TotalOperations + 3) {
       currentTimerRunning := 4;
       startTimer4(skipCancelAllPositions);
-    } else if (currentTimerRunning == 4 and timer4OperationsComplete + 5 >= timer4TotalOperations and timer4OperationsComplete <= timer4TotalOperations + 5) {
+    } else if (currentTimerRunning == 4 and timer4OperationsComplete == timer4TotalOperations) {
       currentTimerRunning := 5;
       startTimer5(skipCancelAllPositions);
     } else if (currentTimerRunning == 5 and timer5OperationsComplete + 3 > timer5TotalOperations and timer5OperationsComplete < timer5TotalOperations + 3) {
@@ -5171,60 +5259,81 @@ shared (deployer) persistent actor class test() = this {
         let allTokens = Array.append(baseTokens, otherTokens);
         var publicOrders = Map.new<Text, [(Text, Nat, Nat, Text)]>();
 
+        // Dispatch all liquidity queries in parallel, then collect.
+        // Previously 20 sequential awaits blocked Timer 5 from starting (see plan Change 1).
+        type LiqTrade = {
+          time : Int;
+          accesscode : Text;
+          amount_init : Nat;
+          amount_sell : Nat;
+          Fee : Nat;
+          RevokeFee : Nat;
+          initPrincipal : Text;
+          OCname : Text;
+          token_init_identifier : Text;
+          token_sell_identifier : Text;
+          strictlyOTC : Bool;
+          allOrNothing : Bool;
+        };
+        type LiqQueryResult = {
+          token : Text;
+          otherToken : Text;
+          dir : { #forward; #backward };
+          liq : [(Exchange.Ratio, [LiqTrade])];
+        };
+
+        let futures = Buffer.Buffer<async LiqQueryResult>(40);
+
         label a for (token in allTokens.vals()) {
           label b for (otherToken in allTokens.vals()) {
             if (token != otherToken and (Array.indexOf(token, baseTokens, Text.equal) != null or Array.indexOf(otherToken, baseTokens, Text.equal) != null)) {
-              let forwardResult = await exchange.getCurrentLiquidity(token, otherToken, #forward, 1500, null);
-
-              switch (forwardResult.liquidity) {
-
-                case (liquidityData) {
-                  var orders = switch (Map.get(publicOrders, thash, token)) {
-                    case (null) { [] };
-                    case (?existingOrders) { existingOrders };
-                  };
-
-                  for ((ratio, trades) in liquidityData.vals()) {
-                    for (trade in trades.vals()) {
-                      if (trade.token_init_identifier == token) {
-                        orders := Array.append(orders, [(trade.accesscode, trade.amount_init, trade.amount_sell, token # otherToken)]);
-                      };
-                    };
-                  };
-
-                  Map.set(publicOrders, thash, token, orders);
+              let fwdToken = token;
+              let fwdOther = otherToken;
+              futures.add(async {
+                try {
+                  let r = await exchange.getCurrentLiquidity(fwdToken, fwdOther, #forward, 1500, null);
+                  { token = fwdToken; otherToken = fwdOther; dir = #forward; liq = r.liquidity };
+                } catch (_e) {
+                  { token = fwdToken; otherToken = fwdOther; dir = #forward; liq = [] };
                 };
-                case (_) {
-                  // No forward liquidity, continue to backward check
+              });
+              let bwdToken = token;
+              let bwdOther = otherToken;
+              futures.add(async {
+                try {
+                  let r = await exchange.getCurrentLiquidity(bwdOther, bwdToken, #backward, 1500, null);
+                  { token = bwdToken; otherToken = bwdOther; dir = #backward; liq = r.liquidity };
+                } catch (_e) {
+                  { token = bwdToken; otherToken = bwdOther; dir = #backward; liq = [] };
                 };
-              };
+              });
+            };
+          };
+        };
 
-              let backwardResult = await exchange.getCurrentLiquidity(otherToken, token, #backward, 1500, null);
-
-              switch (backwardResult.liquidity) {
-
-                case (backwardLiquidityData) {
-                  var orders = switch (Map.get(publicOrders, thash, token)) {
-                    case (null) { [] };
-                    case (?existingOrders) { existingOrders };
+        for (f in futures.vals()) {
+          let result = await f;
+          var orders = switch (Map.get(publicOrders, thash, result.token)) {
+            case (null) { [] };
+            case (?existingOrders) { existingOrders };
+          };
+          for ((_ratio, trades) in result.liq.vals()) {
+            for (trade in trades.vals()) {
+              switch (result.dir) {
+                case (#forward) {
+                  if (trade.token_init_identifier == result.token) {
+                    orders := Array.append(orders, [(trade.accesscode, trade.amount_init, trade.amount_sell, result.token # result.otherToken)]);
                   };
-
-                  for ((ratio, trades) in backwardLiquidityData.vals()) {
-                    for (trade in trades.vals()) {
-                      if (trade.token_init_identifier == otherToken) {
-                        orders := Array.append(orders, [(trade.accesscode, trade.amount_sell, trade.amount_init, otherToken # token)]);
-                      };
-                    };
-                  };
-
-                  Map.set(publicOrders, thash, token, orders);
                 };
-                case (_) {
-                  // No backward liquidity, continue to next token pair
+                case (#backward) {
+                  if (trade.token_init_identifier == result.otherToken) {
+                    orders := Array.append(orders, [(trade.accesscode, trade.amount_sell, trade.amount_init, result.otherToken # result.token)]);
+                  };
                 };
               };
             };
           };
+          Map.set(publicOrders, thash, result.token, orders);
         };
 
         // Now publicOrders contains all the orders for each token

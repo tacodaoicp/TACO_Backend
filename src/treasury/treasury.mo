@@ -586,6 +586,17 @@ shared (deployer) persistent actor class treasury() = this {
   // Post-circuit-breaker: uncap LP adjustments for one cycle after pauses cleared
   transient var lpUncapNextCycle : Bool = false;
 
+  // P1-1: Observable lock for updateBalances. Only short sync timer respects this flag —
+  // all other 31 callers (trading cycle, LP ops, post-upgrade, P1-2) call unconditionally.
+  // Timeout safety net (3 min) prevents stuck flag from a trap leaving it true.
+  transient var updateBalancesRunning : Bool = false;
+  transient var updateBalancesLockTime : Int = 0;
+  transient let UPDATE_BALANCES_LOCK_TIMEOUT_NS : Int = 180_000_000_000; // 3 min auto-expire
+
+  private func isUpdateBalancesRunning() : Bool {
+    updateBalancesRunning and (now() - updateBalancesLockTime < UPDATE_BALANCES_LOCK_TIMEOUT_NS);
+  };
+
   // Timer IDs for scheduling
   var shortSyncTimerId : Nat = 0;
   var longSyncTimerId : Nat = 0;
@@ -9163,6 +9174,10 @@ shared (deployer) persistent actor class treasury() = this {
         logger.error("LP_FEES", "Claim exception for " # poolKey # ": " # Error.message(e), "claimAllLPFees");
       };
     };
+    // P1-2: Refresh balances after fee claims so liquidBalancePerToken reflects the
+    // new fee-tokens in the wallet, and lpBackingPerToken is re-queried from exchange
+    // (no longer counting the just-claimed fees as backing). Keeps NACHOS NAV accurate.
+    try { await updateBalances() } catch (_) {};
   };
 
   //=========================================================================
@@ -11559,7 +11574,11 @@ shared (deployer) persistent actor class treasury() = this {
       func() : async () {
         try {
           await syncFromDAO();
-          await updateBalances();
+          // P1-1: Skip if another updateBalances is already in-flight (avoids wasted concurrent ledger queries).
+          // Trading cycle and other essential callers do NOT check this flag — they always run.
+          if (not isUpdateBalancesRunning()) {
+            await updateBalances();
+          };
           try {
             await* syncPriceWithDEX();
           } catch (e_dex) {
@@ -12767,6 +12786,11 @@ shared (deployer) persistent actor class treasury() = this {
    * Queries all token ledgers for current balances
    */
   private func updateBalances() : async () {
+    // P1-1: Set observable lock with timestamp for trap-safety. Always runs to completion;
+    // this flag is purely an HINT for short sync timer to skip if we're already in-flight.
+    updateBalancesRunning := true;
+    updateBalancesLockTime := now();
+    try {
     let balanceFutures = Map.new<Principal, async Nat>();
 
     let ledger = actor (ICPprincipalText) : Ledger.Interface;
@@ -12975,6 +12999,10 @@ shared (deployer) persistent actor class treasury() = this {
         Map.set(liquidBalancePerToken, phash, token, details.balance);
       };
     };
+    } catch (e) {
+      logger.error("UPDATE_BAL", "updateBalances exception: " # Error.message(e), "updateBalances");
+    };
+    updateBalancesRunning := false;
   };
 
   private func hasAdminPermission(caller : Principal, permission : SpamProtection.AdminFunction) : async Bool {

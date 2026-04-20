@@ -517,7 +517,21 @@ export interface create_trading_canister {
   'claimFeesReferrer' : ActorMethod<[], Array<[string, bigint]>>,
   'claimLPFees' : ActorMethod<[string, string], ClaimFeesResult>,
   'cleanTokenIds' : ActorMethod<[], ActionResult>,
+  'clearAllBans' : ActorMethod<[], undefined>,
+  'clearStuckLocks' : ActorMethod<[[] | [string], [] | [string]], boolean>,
   'collectFees' : ActorMethod<[], ActionResult>,
+  'debugV3Ticks' : ActorMethod<
+    [string, string],
+    {
+      'ticks' : Array<
+        { 'tick' : bigint, 'liquidityNet' : bigint, 'liquidityGross' : bigint }
+      >,
+      'reserveRatio' : bigint,
+      'currentSqrtRatio' : bigint,
+      'activeLiquidity' : bigint,
+      'reserveSqrtRatio' : bigint,
+    }
+  >,
   'exchangeInfo' : ActorMethod<[], [] | [pool]>,
   'getAMMPoolInfo' : ActorMethod<
     [string, string],
@@ -578,6 +592,7 @@ export interface create_trading_canister {
     [],
     [] | [[Array<string>, Array<TradePrivate>]]
   >,
+  'getAllowedCanisters' : ActorMethod<[], Array<string>>,
   'getCurrentLiquidity' : ActorMethod<
     [
       string,
@@ -708,6 +723,10 @@ export interface create_trading_canister {
   'getFeeCollectors' : ActorMethod<[], Array<Principal>>,
   'getKlineData' : ActorMethod<
     [string, string, TimeFrame, boolean],
+    Array<KlineData>
+  >,
+  'getKlineDataRange' : ActorMethod<
+    [string, string, TimeFrame, [] | [bigint], bigint],
     Array<KlineData>
   >,
   'getLogging' : ActorMethod<
@@ -917,6 +936,7 @@ export interface create_trading_canister {
     [string, string, bigint],
     RemoveLiquidityResult
   >,
+  'resetAllState' : ActorMethod<[], string>,
   'retrieveFundsDao' : ActorMethod<[Array<[string, bigint]>], undefined>,
   'returncontractprincipal' : ActorMethod<[], string>,
   'revokeTrade' : ActorMethod<

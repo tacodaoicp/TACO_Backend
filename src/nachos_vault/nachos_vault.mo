@@ -313,6 +313,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   let MAX_HISTORY_PER_TOKEN : Nat = 100;
   let MAX_ALERTS : Nat = 1000;
 
+  // Asymmetric conservative NAV: mint uses 2h-high per portfolio token,
+  // burn uses 2h-low, snapshot uses current spot. Neutralizes DEX-price
+  // manipulation attacks by capping entitlements at the conservative bound.
+  type NavDirection = { #Mint; #Burn; #Snapshot };
+
   // ═══════════════════════════════════════════════════════════════════
   // SECTION 4: CONSTANTS
   // ═══════════════════════════════════════════════════════════════════
@@ -1336,11 +1341,36 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // SECTION 8: NAV CALCULATION & PRICE DISCOVERY
   // ═══════════════════════════════════════════════════════════════════
 
-  private func calculatePortfolioValueICP() : Nat {
+  // Per-token price selector for asymmetric conservative NAV.
+  //   #Snapshot → current DEX-weighted spot (unbiased, for queries / history)
+  //   #Mint     → max(spot, 2h-high). Biases portfolio value UPWARD so mint NAV
+  //               is higher and fewer NACHOS are minted per ICP deposit.
+  //               Neutralizes flash-deflation attacks on portfolio tokens.
+  //   #Burn     → min(spot, 2h-low). Biases portfolio value DOWNWARD so burn NAV
+  //               is lower and less ICP is paid per NACHOS redeemed.
+  //               Neutralizes flash-inflation attacks on portfolio tokens.
+  // In calm markets spot ≈ 2h-high ≈ 2h-low, so all three directions return spot
+  // and the behavior is identical to the pre-fix vault.
+  private func pickPrice(token : Principal, details : TokenDetails, dir : NavDirection) : Nat {
+    switch (dir) {
+      case (#Snapshot) { details.priceInICP };
+      case (#Mint) {
+        let hi = getHistoricalHighPrice(token, PRICE_HISTORY_WINDOW);
+        if (hi > details.priceInICP) hi else details.priceInICP;
+      };
+      case (#Burn) {
+        let lo = getHistoricalLowPrice(token, PRICE_HISTORY_WINDOW);
+        if (lo > 0 and lo < details.priceInICP) lo else details.priceInICP;
+      };
+    };
+  };
+
+  private func calculatePortfolioValueICPDir(dir : NavDirection) : Nat {
     var totalValueE8s : Nat = 0;
     for ((token, details) in Map.entries(tokenDetailsMap)) {
       if (details.Active and details.balance > 0 and details.priceInICP > 0) {
-        let tokenValue = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        let p = pickPrice(token, details, dir);
+        let tokenValue = (details.balance * p) / (10 ** details.tokenDecimals);
         totalValueE8s += tokenValue;
       };
     };
@@ -1360,7 +1390,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       switch (Map.get(tokenDetailsMap, phash, token)) {
         case (?details) {
           if (details.Active and details.priceInICP > 0) {
-            let pendingICP = (pendingVal * details.priceInICP) / (10 ** details.tokenDecimals);
+            let p = pickPrice(token, details, dir);
+            let pendingICP = (pendingVal * p) / (10 ** details.tokenDecimals);
             totalValueE8s := if (totalValueE8s > pendingICP) { totalValueE8s - pendingICP } else { 0 };
           };
         };
@@ -1375,7 +1406,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       switch (Map.get(tokenDetailsMap, phash, token)) {
         case (?details) {
           if (details.Active and details.priceInICP > 0) {
-            let pendingICP = (pendingVal * details.priceInICP) / (10 ** details.tokenDecimals);
+            let p = pickPrice(token, details, dir);
+            let pendingICP = (pendingVal * p) / (10 ** details.tokenDecimals);
             totalValueE8s += pendingICP;
           };
         };
@@ -1392,7 +1424,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           switch (Map.get(tokenDetailsMap, phash, entry.token)) {
             case (?details) {
               if (details.Active and details.priceInICP > 0) {
-                let entryICP = (entry.amount * details.priceInICP) / (10 ** details.tokenDecimals);
+                let p = pickPrice(entry.token, details, dir);
+                let entryICP = (entry.amount * p) / (10 ** details.tokenDecimals);
                 totalValueE8s := if (totalValueE8s > entryICP) { totalValueE8s - entryICP } else { 0 };
               };
             };
@@ -1409,7 +1442,8 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       switch (Map.get(tokenDetailsMap, phash, token)) {
         case (?details) {
           if (details.Active and details.priceInICP > 0 and lpAmount > 0) {
-            let lpValueICP = (lpAmount * details.priceInICP) / (10 ** details.tokenDecimals);
+            let p = pickPrice(token, details, dir);
+            let lpValueICP = (lpAmount * p) / (10 ** details.tokenDecimals);
             totalValueE8s += lpValueICP;
           };
         };
@@ -1417,6 +1451,11 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       };
     };
     totalValueE8s;
+  };
+
+  // Back-compat wrapper: unbiased spot valuation for snapshots, admin queries, history logs.
+  private func calculatePortfolioValueICP() : Nat {
+    calculatePortfolioValueICPDir(#Snapshot);
   };
 
   // Compute liquid-only portfolio value (excludes LP backing, subtracts pending burns)
@@ -1444,7 +1483,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
   };
 
-  private func calculateNAV() : async Result.Result<CachedNAV, Text> {
+  private func calculateNAVDir(dir : NavDirection) : async Result.Result<CachedNAV, Text> {
     let ledger = switch (nachosLedger) {
       case (?l) { l };
       case null { return #err("Nachos ledger not set") };
@@ -1459,7 +1498,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         cachedSupplyTime := now();
         s;
       };
-      let portfolioValue = calculatePortfolioValueICP();
+      let portfolioValue = calculatePortfolioValueICPDir(dir);
 
       let navPerToken : Nat = if (supply == 0) {
         INITIAL_NAV_PER_TOKEN_E8S;
@@ -1474,11 +1513,19 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         timestamp = now();
       };
 
-      cachedNAV := ?nav;
+      // Only cache the unbiased snapshot NAV so that getNAV() / NAV history observers
+      // see a stable, non-directional value. Directional NAVs are transient per-op.
+      if (dir == #Snapshot) { cachedNAV := ?nav };
       #ok(nav);
     } catch (e) {
       #err("NAV calculation failed: " # Error.message(e));
     };
+  };
+
+  // Back-compat wrapper: unbiased snapshot NAV for admin queries, history logging,
+  // and any code path where directional bias is not appropriate.
+  private func calculateNAV() : async Result.Result<CachedNAV, Text> {
+    await calculateNAVDir(#Snapshot);
   };
 
   private func arePricesFresh() : Bool {
@@ -1984,6 +2031,49 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     };
 
     lowest;
+  };
+
+  // Symmetric to getHistoricalLowPrice — tracks the highest price observed for a token
+  // within the given window. Used by pickPrice(#Mint, ...) to bias NAV denominator upward,
+  // neutralizing flash-deflation attacks on portfolio tokens.
+  private func getHistoricalHighPrice(token : Principal, window : Int) : Nat {
+    let cutoff = now() - window;
+
+    var highest : Nat = switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?details) { details.priceInICP };
+      case null { return 0 };
+    };
+
+    var foundInWindow = false;
+
+    switch (Map.get(tokenPriceHistory, phash, token)) {
+      case (?vec) {
+        for (entry in Vector.vals(vec)) {
+          if (entry.0 >= cutoff and entry.1 > 0) {
+            foundInWindow := true;
+            if (entry.1 > highest) {
+              highest := entry.1;
+            };
+          };
+        };
+      };
+      case null {};
+    };
+
+    if (not foundInWindow) {
+      switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?details) {
+          for (pp in details.pastPrices.vals()) {
+            if (pp.time >= cutoff and pp.icpPrice > highest) {
+              highest := pp.icpPrice;
+            };
+          };
+        };
+        case null {};
+      };
+    };
+
+    highest;
   };
 
   // Conservative price: min(treasury, historical low within window). Protects vault from overvalued deposits.
@@ -2986,8 +3076,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     // This ensures concurrent mints see this in-flight deposit in calculatePortfolioValueICP().
     reservePendingMintValue(ICPprincipal, depositAmount);
 
-    // Calculate NAV
-    let nav = switch (await calculateNAV()) {
+    // Calculate NAV — mint direction biases portfolio valuation to the 2h-high so a
+    // flash-deflated portfolio token cannot dilute fair minters.
+    let nav = switch (await calculateNAVDir(#Mint)) {
       case (#ok(n)) { n };
       case (#err(e)) {
         releasePendingMintValue(ICPprincipal, depositAmount);
@@ -3262,8 +3353,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       [{ token = tokenPrincipal; amount = excessAmount; priceUsed = tokenPriceICP; valueICP = (excessAmount * tokenPriceICP) / (10 ** tokenDecimals) }];
     } else { [] : [TokenDeposit] };
 
-    // Calculate NAV
-    let nav = switch (await calculateNAV()) {
+    // Calculate NAV — mint direction biases portfolio valuation to the 2h-high so a
+    // flash-deflated portfolio token cannot dilute fair minters.
+    let nav = switch (await calculateNAVDir(#Mint)) {
       case (#ok(n)) { n };
       case (#err(e)) {
         releasePendingMintValue(tokenPrincipal, reservedValueSpot);
@@ -3581,7 +3673,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ok(())) {};
     };
 
-    let nav = switch (await calculateNAV()) {
+    // Mint direction biases portfolio valuation to the 2h-high so a flash-deflated
+    // portfolio token cannot dilute fair minters.
+    let nav = switch (await calculateNAVDir(#Mint)) {
       case (#ok(n)) { n };
       case (#err(e)) {
         releaseAllPendingReservations();
@@ -3825,8 +3919,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case (#ok(())) {};
     };
 
-    // Calculate NAV
-    let nav = switch (await calculateNAV()) {
+    // Calculate NAV — burn direction biases portfolio valuation to the 2h-low so a
+    // flash-inflated portfolio token cannot be used to over-redeem.
+    let nav = switch (await calculateNAVDir(#Burn)) {
       case (#ok(n)) { n };
       case (#err(e)) {
         if (nachosAmount > NACHOS_FEE) {

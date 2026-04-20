@@ -610,7 +610,32 @@ export const idlFactory = ({ IDL }) => {
       ),
     'claimLPFees' : IDL.Func([IDL.Text, IDL.Text], [ClaimFeesResult], []),
     'cleanTokenIds' : IDL.Func([], [ActionResult], []),
+    'clearAllBans' : IDL.Func([], [], []),
+    'clearStuckLocks' : IDL.Func(
+        [IDL.Opt(IDL.Text), IDL.Opt(IDL.Text)],
+        [IDL.Bool],
+        [],
+      ),
     'collectFees' : IDL.Func([], [ActionResult], []),
+    'debugV3Ticks' : IDL.Func(
+        [IDL.Text, IDL.Text],
+        [
+          IDL.Record({
+            'ticks' : IDL.Vec(
+              IDL.Record({
+                'tick' : IDL.Nat,
+                'liquidityNet' : IDL.Int,
+                'liquidityGross' : IDL.Nat,
+              })
+            ),
+            'reserveRatio' : IDL.Nat,
+            'currentSqrtRatio' : IDL.Nat,
+            'activeLiquidity' : IDL.Nat,
+            'reserveSqrtRatio' : IDL.Nat,
+          }),
+        ],
+        ['query'],
+      ),
     'exchangeInfo' : IDL.Func([], [IDL.Opt(pool)], ['query']),
     'getAMMPoolInfo' : IDL.Func(
         [IDL.Text, IDL.Text],
@@ -686,6 +711,7 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Opt(IDL.Tuple(IDL.Vec(IDL.Text), IDL.Vec(TradePrivate)))],
         ['query'],
       ),
+    'getAllowedCanisters' : IDL.Func([], [IDL.Vec(IDL.Text)], ['query']),
     'getCurrentLiquidity' : IDL.Func(
         [
           IDL.Text,
@@ -838,6 +864,11 @@ export const idlFactory = ({ IDL }) => {
     'getFeeCollectors' : IDL.Func([], [IDL.Vec(IDL.Principal)], ['query']),
     'getKlineData' : IDL.Func(
         [IDL.Text, IDL.Text, TimeFrame, IDL.Bool],
+        [IDL.Vec(KlineData)],
+        ['query'],
+      ),
+    'getKlineDataRange' : IDL.Func(
+        [IDL.Text, IDL.Text, TimeFrame, IDL.Opt(IDL.Int), IDL.Nat],
         [IDL.Vec(KlineData)],
         ['query'],
       ),
@@ -1100,6 +1131,7 @@ export const idlFactory = ({ IDL }) => {
         [RemoveLiquidityResult],
         [],
       ),
+    'resetAllState' : IDL.Func([], [IDL.Text], []),
     'retrieveFundsDao' : IDL.Func(
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat64))],
         [],

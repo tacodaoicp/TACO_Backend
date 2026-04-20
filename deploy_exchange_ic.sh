@@ -158,6 +158,25 @@ dfx canister call OTC_backend parameterManagement "(record {
 echo -e "  ${GREEN}Treasury principal set and cross-reference configured${NC}"
 echo ""
 
+# Authorize DAO treasury and DAO backend so they aren't subject to spam protection.
+# Without this, treasury rebalance cycles trigger rate limiting → bans → broken rebalancing.
+# Production IDs (IC mainnet):
+DAO_TREASURY_ID="v6t5d-6yaaa-aaaan-qzzja-cai"
+DAO_BACKEND_ID="vxqw7-iqaaa-aaaan-qzziq-cai"
+echo "Allowlisting DAO treasury and DAO backend on OTC_backend..."
+dfx canister call OTC_backend parameterManagement "(record {
+  deleteFromDayBan = null;
+  deleteFromAllTimeBan = null;
+  addToAllTimeBan = null;
+  changeAllowedCalls = null;
+  changeallowedSilentWarnings = null;
+  addAllowedCanisters = opt vec { \"${DAO_TREASURY_ID}\"; \"${DAO_BACKEND_ID}\" };
+  deleteAllowedCanisters = null;
+  treasury_principal = null;
+})" $NETWORK_FLAG
+echo -e "  ${GREEN}DAO treasury + DAO backend allowlisted${NC}"
+echo ""
+
 # ---------------------------------------------------------------------------
 # PHASE 7: Verification
 # ---------------------------------------------------------------------------

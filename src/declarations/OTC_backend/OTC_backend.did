@@ -137,7 +137,21 @@ type create_trading_canister =
                                  });
    claimLPFees: (token0i: text, token1i: text) -> (ClaimFeesResult);
    cleanTokenIds: () -> (ActionResult);
+   clearAllBans: () -> ();
+   clearStuckLocks: (accesscode: opt text, blocksDoneKey: opt text) -> (bool);
    collectFees: () -> (ActionResult);
+   debugV3Ticks: (token0: text, token1: text) ->
+    (record {
+       activeLiquidity: nat;
+       currentSqrtRatio: nat;
+       reserveRatio: nat;
+       reserveSqrtRatio: nat;
+       ticks: vec record {
+                    liquidityGross: nat;
+                    liquidityNet: int;
+                    tick: nat;
+                  };
+     }) query;
    exchangeInfo: () -> (opt pool) query;
    getAMMPoolInfo: (token0: text, token1: text) ->
     (opt
@@ -190,6 +204,7 @@ type create_trading_canister =
                                     vec text;
                                     vec TradePrivate;
                                   }) query;
+   getAllowedCanisters: () -> (vec text) query;
    getCurrentLiquidity: (token1: text, token2: text, direction:
     variant {
       backward;
@@ -307,6 +322,8 @@ type create_trading_canister =
    getFeeCollectors: () -> (vec principal) query;
    getKlineData: (token1: text, token2: text, timeFrame: TimeFrame,
     initialGet: bool) -> (vec KlineData) query;
+   getKlineDataRange: (token1: text, token2: text, timeFrame: TimeFrame,
+    before: opt int, limit: nat) -> (vec KlineData) query;
    getLogging: (functionType: variant {
                                 FinishSellBatchDAO;
                                 addAcceptedToken;
@@ -480,6 +497,7 @@ type create_trading_canister =
    removeFeeCollector: () -> (ActionResult);
    removeLiquidity: (token0i: text, token1i: text, liquidityAmount: nat) ->
     (RemoveLiquidityResult);
+   resetAllState: () -> (text);
    retrieveFundsDao: (trades: vec record {
                                     text;
                                     nat64;

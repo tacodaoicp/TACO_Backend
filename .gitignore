@@ -38,6 +38,7 @@ leaderboard.md
 trading_overview.md
 *.md
 sns_canister_source/
+.claude/
 
 
 # NACHOS ledger (cloned from icdevsorg/ICRC_fungible)
