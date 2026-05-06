@@ -45,17 +45,6 @@ type UpdateError =
    SystemInactive;
    UnexpectedError: text;
  };
-type UpdateConfig__1 = 
- record {
-   PRICE_HISTORY_WINDOW: opt int;
-   balanceUpdateInterval: opt int;
-   blockCleanupInterval: opt int;
-   maxPremium: opt float64;
-   maxSlippageBasisPoints: opt nat;
-   minPremium: opt float64;
-   minSwapValueUSD: opt float64;
-   swappingEnabled: opt bool;
- };
 type UpdateConfig = 
  record {
    longSyncIntervalNS: opt nat;
@@ -292,6 +281,28 @@ type RefreshError =
    SystemInactive;
    UnexpectedError: text;
  };
+type PublicTokenDetailsWithMaxAllocationEntry = 
+ record {
+   principal;
+   PublicTokenDetailsWithMaxAllocation;
+ };
+type PublicTokenDetailsWithMaxAllocation = 
+ record {
+   Active: bool;
+   balance: nat;
+   epochAdded: int;
+   isPaused: bool;
+   lastTimeSynced: int;
+   maxAllocationBasisPoints: opt nat;
+   pausedDueToSyncFailure: bool;
+   priceInICP: nat;
+   priceInUSD: float64;
+   tokenDecimals: nat;
+   tokenName: text;
+   tokenSymbol: text;
+   tokenTransferFee: nat;
+   tokenType: TokenType;
+ };
 type PublicTokenDetailsEntry = 
  record {
    principal;
@@ -496,6 +507,33 @@ type ContinuousDAO =
        totalNeuronsWithAllocations: nat;
      }) query;
    getBannedWords: () -> (Result_12);
+   getDashboardData: () ->
+    (opt
+      record {
+        aggregateAllocation: vec record {
+                                   principal;
+                                   nat;
+                                 };
+        snapshotInfo:
+         record {
+           lastSnapshotId: nat;
+           lastSnapshotTime: int;
+           totalVotingPower: nat;
+         };
+        tokenDetails: vec PublicTokenDetailsEntry;
+        tokenMaxAllocations: vec record {
+                                   principal;
+                                   nat;
+                                 };
+        votingPowerMetrics:
+         record {
+           allocatedVotingPower: nat;
+           neuronCount: nat;
+           principalCount: nat;
+           totalVotingPower: nat;
+           totalVotingPowerByHotkeySetters: nat;
+         };
+      }) query;
    getFollowActionsSince: (sinceTimestamp: int, limit: nat) ->
     (Result_11) query;
    getFollowersWithNeuronCounts: () -> (vec record {
@@ -543,11 +581,43 @@ type ContinuousDAO =
                                }) query;
    getTokenDetailsWithoutPastPrices: () ->
     (vec PublicTokenDetailsEntry) query;
+   getTokenDetailsWithoutPastPricesMaxAllocations: () ->
+    (vec PublicTokenDetailsWithMaxAllocationEntry) query;
    getUserAllocation: () -> (opt UserState) query;
    getUserNeurons: ("principal": principal) -> (vec NeuronVP) query;
    getUserRegisteredTokens: () -> (vec principal) query;
    getUsersFollowerInfo: (principals: vec principal) ->
     (vec FollowerInfo) query;
+   getVoteDashboard: (user: opt principal) ->
+    (opt
+      record {
+        aggregateAllocation: vec record {
+                                   principal;
+                                   nat;
+                                 };
+        allocationStats: AllocationStats;
+        historicBalanceAndAllocation:
+         vec record {
+               int;
+               HistoricBalanceAllocation;
+             };
+        snapshotInfo:
+         record {
+           lastSnapshotId: nat;
+           lastSnapshotTime: int;
+           totalVotingPower: nat;
+         };
+        tokenDetails: vec PublicTokenDetailsWithMaxAllocationEntry;
+        userAllocation: opt UserState;
+        votingPowerMetrics:
+         record {
+           allocatedVotingPower: nat;
+           neuronCount: nat;
+           principalCount: nat;
+           totalVotingPower: nat;
+           totalVotingPowerByHotkeySetters: nat;
+         };
+      }) query;
    getVotingPowerChangesSince: (sinceTimestamp: int, limit: nat) ->
     (Result_8) query;
    get_canister_cycles: () -> (record {cycles: nat;}) query;
@@ -563,6 +633,8 @@ type ContinuousDAO =
    removeFollower: (follower: principal) -> (Result_6);
    removeToken: (token: principal, reason: text) -> (Result_1);
    setTacoAddress: (address: principal) -> ();
+   setTokenMaxAllocation: (token: principal, maxBP: opt nat, reason: 
+    text) -> (Result_1);
    set_sns_governance_canister_id: (p: principal) -> ();
    syncTokenDetailsFromTreasury: (tokenDetails:
     vec record {
@@ -574,11 +646,6 @@ type ContinuousDAO =
    unregisterUserToken: (tokenPrincipal: principal) -> (Result_3);
    updateAllocation: (newAllocations: vec Allocation, note: opt text) ->
     (Result_2);
-   /// * Update Minting Vault configuration
-   ///  *
-   ///  * Allows configuration of premium rates, update intervals, and enabling/disabling swapping
-   ///  * Only callable by admins with the updateMintingVaultConfig permission.
-   updateMintingVaultConfig: (config: UpdateConfig__1) -> (Result_1);
    updateSpamParameters: (params:
     record {
       allowedCalls: opt nat;
@@ -665,6 +732,7 @@ type AdminFunction =
    removeToken;
    setTacoAddress;
    setTest;
+   setTokenMaxAllocation;
    startRebalancing;
    stopRebalancing;
    stopToken;
@@ -709,6 +777,12 @@ type AdminActionType =
       viaGovernance: bool;
     };
    TokenDelete: record {token: principal;};
+   TokenMaxAllocationUpdate:
+    record {
+      newMaxBP: opt nat;
+      oldMaxBP: opt nat;
+      token: principal;
+    };
    TokenPause: record {token: principal;};
    TokenRemove: record {token: principal;};
    TokenUnpause: record {token: principal;};

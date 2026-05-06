@@ -47,6 +47,15 @@ module {
     #GenericError : { error_code : Nat; message : Text };
   };
 
+  // ICP Ledger (NNS) transfer error type
+  public type ICP_TransferError = {
+    #TxTooOld : { allowed_window_nanos : Nat64 };
+    #BadFee : { expected_fee : { e8s : Nat64 } };
+    #TxDuplicate : { duplicate_of : Nat64 };
+    #TxCreatedInFuture;
+    #InsufficientFunds : { balance : { e8s : Nat64 } };
+  };
+
   public type ICRC1TokenMetadata = {
     fee : Nat;
     decimals : Nat8;
@@ -125,9 +134,16 @@ module {
     swap : shared (SwapArgs) -> async Result.Result<Nat, ICPSwapError>;
     //swap2 : shared (Principal, SwapArgs) -> async Result.Result<Nat, ICPSwapError>;
     withdraw : shared (WithdrawArgs) -> async Result.Result<Nat, ICPSwapError>;
-    //withdraw2 : shared (Principal, WithdrawArgs) -> async Result.Result<Nat, ICPSwapError>;
+    withdrawToSubaccount : shared (WithdrawToSubaccountArgs) -> async Result.Result<Nat, ICPSwapError>;
     // Combined deposit+swap - reduces 2 calls to 1, saving ~5-8s per trade
     depositAndSwap : shared (DepositAndSwapArgs) -> async Result.Result<Nat, ICPSwapError>;
+  };
+
+  public type WithdrawToSubaccountArgs = {
+    fee : Nat;
+    token : Text;
+    subaccount : Blob;
+    amount : Nat;
   };
 
   public type ICPSwapPriceInfo = {
@@ -506,4 +522,75 @@ module {
 
   public type ClaimsResult = { #Ok : [ClaimsReply]; #Err : Text };
   public type ClaimResult = { #Ok : ClaimReply; #Err : Text };
+
+  // ═══ TACO Exchange Types ═══
+
+  public type TACOSwapParams = {
+    tokenIn : Principal;
+    tokenOut : Principal;
+    amountIn : Nat;
+    minAmountOut : Nat;
+    transferFee : Nat;
+    exchangeTreasuryAccountId : Blob; // 32-byte account ID for ICP legacy transfers
+  };
+
+  public type TACOSwapReply = {
+    amountIn : Nat;
+    amountOut : Nat;
+    slippage : Float;
+    route : [Text];
+    blockNumber : Nat;
+  };
+
+  // TACO quote with route info (for multi-route detection)
+  // routeTokens is the canonical [tokenSell, …intermediates, tokenBuy] form — used by
+  // the treasury scenario builder to identify the same route across different fractions
+  // and to compute pool-key sets for the disjointness filter on TACO×TACO splits.
+  // Empty for legacy single-route quotes; populated by the multi-route batch wrapper.
+  public type TACOQuoteReply = {
+    receive_amount : Nat;
+    price : Float;
+    mid_price : Float;
+    slippage : Float;
+    route : [{ tokenIn : Text; tokenOut : Text }];
+    routeDescription : Text;
+    canFulfillFully : Bool;
+    routeTokens : [Text];
+  };
+
+  // TACO split leg for swapSplitRoutes execution
+  public type TACOSplitLeg = {
+    amountIn : Nat;
+    route : [{ tokenIn : Text; tokenOut : Text }];
+    minLegOut : Nat;
+  };
+
+  // ═══ LP MANAGEMENT TYPES ═══
+
+  // Matches exchange getUserLiquidityDetailed() return
+  public type DetailedLiquidityPosition = {
+    token0 : Text;
+    token1 : Text;
+    liquidity : Nat;
+    token0Amount : Nat;
+    token1Amount : Nat;
+    shareOfPool : Float;
+    fee0 : Nat;
+    fee1 : Nat;
+    positionType : { #fullRange; #concentrated };
+    positionId : ?Nat;
+    ratioLower : ?Nat;
+    ratioUpper : ?Nat;
+  };
+
+  // Matches exchange getAllAMMPools() return
+  public type AMMPoolInfo = {
+    token0 : Text;
+    token1 : Text;
+    reserve0 : Nat;
+    reserve1 : Nat;
+    price0 : Float;
+    price1 : Float;
+    totalLiquidity : Nat;
+  };
 };

@@ -1,4 +1,31 @@
 export const idlFactory = ({ IDL }) => {
+  const ValidationResult = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : IDL.Text });
+  const CircuitBreakerAction = IDL.Variant({
+    'RejectOperation' : IDL.Null,
+    'PauseBoth' : IDL.Null,
+    'PauseBurn' : IDL.Null,
+    'PauseMint' : IDL.Null,
+  });
+  const CircuitBreakerConditionType = IDL.Variant({
+    'DecimalChange' : IDL.Null,
+    'BalanceChange' : IDL.Null,
+    'TokenPaused' : IDL.Null,
+    'NavDrop' : IDL.Null,
+    'PriceChange' : IDL.Null,
+  });
+  const CircuitBreakerConditionInput = IDL.Record({
+    'direction' : IDL.Variant({
+      'Up' : IDL.Null,
+      'Both' : IDL.Null,
+      'Down' : IDL.Null,
+    }),
+    'action' : CircuitBreakerAction,
+    'timeWindowNS' : IDL.Nat,
+    'conditionType' : CircuitBreakerConditionType,
+    'enabled' : IDL.Bool,
+    'thresholdPercent' : IDL.Float64,
+    'applicableTokens' : IDL.Vec(IDL.Principal),
+  });
   const PortfolioDirection = IDL.Variant({
     'Up' : IDL.Null,
     'Down' : IDL.Null,
@@ -7,7 +34,6 @@ export const idlFactory = ({ IDL }) => {
     'ICP' : IDL.Null,
     'USD' : IDL.Null,
   });
-  const ValidationResult = IDL.Variant({ 'Ok' : IDL.Text, 'Err' : IDL.Text });
   const TokenType = IDL.Variant({
     'ICP' : IDL.Null,
     'ICRC3' : IDL.Null,
@@ -26,6 +52,7 @@ export const idlFactory = ({ IDL }) => {
     'maxTradesStored' : IDL.Opt(IDL.Nat),
     'maxTradeValueICP' : IDL.Opt(IDL.Nat),
     'minTradeValueICP' : IDL.Opt(IDL.Nat),
+    'minAllocationDiffBasisPoints' : IDL.Opt(IDL.Nat),
     'portfolioRebalancePeriodNS' : IDL.Opt(IDL.Nat),
     'longSyncIntervalNS' : IDL.Opt(IDL.Nat),
     'maxTradeAttemptsPerInterval' : IDL.Opt(IDL.Nat),
@@ -52,6 +79,21 @@ export const idlFactory = ({ IDL }) => {
     'get_gnsf1_cnt' : IDL.Func([], [IDL.Nat], ['query']),
     'test_gnsf1' : IDL.Func([], [], []),
     'test_gnsf2' : IDL.Func([IDL.Principal], [], []),
+    'validate_addAcceptedMintToken' : IDL.Func(
+        [IDL.Principal],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_addCircuitBreakerCondition' : IDL.Func(
+        [CircuitBreakerConditionInput],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_addFeeExemptPrincipal' : IDL.Func(
+        [IDL.Principal],
+        [ValidationResult],
+        ['query'],
+      ),
     'validate_addPortfolioCircuitBreakerCondition' : IDL.Func(
         [
           IDL.Text,
@@ -60,6 +102,11 @@ export const idlFactory = ({ IDL }) => {
           IDL.Nat,
           PortfolioValueType,
         ],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_addRateLimitExemptPrincipal' : IDL.Func(
+        [IDL.Principal],
         [ValidationResult],
         ['query'],
       ),
@@ -84,13 +131,53 @@ export const idlFactory = ({ IDL }) => {
         [ValidationResult],
         ['query'],
       ),
+    'validate_claimNachosBurnFees' : IDL.Func(
+        [IDL.Principal, IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_claimNachosCancellationFees' : IDL.Func(
+        [IDL.Principal, IDL.Principal, IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_claimNachosMintFees' : IDL.Func(
+        [IDL.Principal, IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
     'validate_clearAllTradingPauses' : IDL.Func(
         [IDL.Opt(IDL.Text)],
         [ValidationResult],
         ['query'],
       ),
+    'validate_enableCircuitBreakerCondition' : IDL.Func(
+        [IDL.Nat, IDL.Bool],
+        [ValidationResult],
+        ['query'],
+      ),
     'validate_executeTradingCycle' : IDL.Func(
         [IDL.Opt(IDL.Text)],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_nachosEmergencyPause' : IDL.Func(
+        [IDL.Text],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_nachosEmergencyUnpause' : IDL.Func(
+        [IDL.Text],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_pauseNachosBurning' : IDL.Func(
+        [IDL.Text],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_pauseNachosMinting' : IDL.Func(
+        [IDL.Text],
         [ValidationResult],
         ['query'],
       ),
@@ -109,6 +196,31 @@ export const idlFactory = ({ IDL }) => {
         [ValidationResult],
         ['query'],
       ),
+    'validate_recoverStuckNachos' : IDL.Func(
+        [IDL.Principal, IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_recoverWronglySentTokens' : IDL.Func(
+        [IDL.Principal, IDL.Nat, IDL.Principal],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_removeAcceptedMintToken' : IDL.Func(
+        [IDL.Principal],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_removeCircuitBreakerCondition' : IDL.Func(
+        [IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_removeFeeExemptPrincipal' : IDL.Func(
+        [IDL.Principal],
+        [ValidationResult],
+        ['query'],
+      ),
     'validate_removeFromRewardSkipList' : IDL.Func(
         [IDL.Vec(IDL.Nat8)],
         [ValidationResult],
@@ -116,6 +228,16 @@ export const idlFactory = ({ IDL }) => {
       ),
     'validate_removePortfolioCircuitBreakerCondition' : IDL.Func(
         [IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_removeRateLimitExemptPrincipal' : IDL.Func(
+        [IDL.Principal],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_removeRewardPenalty' : IDL.Func(
+        [IDL.Vec(IDL.Nat8)],
         [ValidationResult],
         ['query'],
       ),
@@ -129,6 +251,16 @@ export const idlFactory = ({ IDL }) => {
         [ValidationResult],
         ['query'],
       ),
+    'validate_resetNachosCircuitBreaker' : IDL.Func(
+        [IDL.Text],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_retryFailedTransfers' : IDL.Func(
+        [],
+        [ValidationResult],
+        ['query'],
+      ),
     'validate_runManualBatchImport' : IDL.Func(
         [IDL.Principal],
         [ValidationResult],
@@ -136,6 +268,11 @@ export const idlFactory = ({ IDL }) => {
       ),
     'validate_sendToken' : IDL.Func(
         [IDL.Principal, IDL.Nat, IDL.Principal, IDL.Opt(Subaccount)],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_setAcceptedMintTokenEnabled' : IDL.Func(
+        [IDL.Principal, IDL.Bool],
         [ValidationResult],
         ['query'],
       ),
@@ -166,6 +303,16 @@ export const idlFactory = ({ IDL }) => {
       ),
     'validate_setPortfolioCircuitBreakerConditionActive' : IDL.Func(
         [IDL.Nat, IDL.Bool],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_setRewardPenalty' : IDL.Func(
+        [IDL.Vec(IDL.Nat8), IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_setTokenMaxAllocation' : IDL.Func(
+        [IDL.Principal, IDL.Opt(IDL.Nat), IDL.Text],
         [ValidationResult],
         ['query'],
       ),
@@ -247,6 +394,16 @@ export const idlFactory = ({ IDL }) => {
         [ValidationResult],
         ['query'],
       ),
+    'validate_unpauseNachosBurning' : IDL.Func(
+        [IDL.Text],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_unpauseNachosMinting' : IDL.Func(
+        [IDL.Text],
+        [ValidationResult],
+        ['query'],
+      ),
     'validate_unpauseToken' : IDL.Func(
         [IDL.Principal, IDL.Text],
         [ValidationResult],
@@ -257,8 +414,36 @@ export const idlFactory = ({ IDL }) => {
         [ValidationResult],
         ['query'],
       ),
+    'validate_updateCancellationFeeMultiplier' : IDL.Func(
+        [IDL.Nat],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_updateCircuitBreakerCondition' : IDL.Func(
+        [
+          IDL.Nat,
+          IDL.Opt(IDL.Float64),
+          IDL.Opt(IDL.Nat),
+          IDL.Opt(
+            IDL.Variant({
+              'Up' : IDL.Null,
+              'Both' : IDL.Null,
+              'Down' : IDL.Null,
+            })
+          ),
+          IDL.Opt(CircuitBreakerAction),
+          IDL.Opt(IDL.Vec(IDL.Principal)),
+        ],
+        [ValidationResult],
+        ['query'],
+      ),
     'validate_updateMaxPortfolioSnapshots' : IDL.Func(
         [IDL.Nat, IDL.Opt(IDL.Text)],
+        [ValidationResult],
+        ['query'],
+      ),
+    'validate_updateNachosFees' : IDL.Func(
+        [IDL.Opt(IDL.Nat), IDL.Opt(IDL.Nat)],
         [ValidationResult],
         ['query'],
       ),

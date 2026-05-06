@@ -20,7 +20,6 @@ import ICRC1 "mo:icrc1/ICRC1";
 import Treasury "../treasury/treasury_types";
 import BTree "mo:stableheapbtreemap/BTree";
 import Float "mo:base/Float";
-import MintingVault "../minting_vault/minting_vault_types";
 import TreasuryTypes "../treasury/treasury_types";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
@@ -29,9 +28,9 @@ import Buffer "mo:base/Buffer";
 import calcHelp "../neuron_snapshot/VPcalculation";
 import Cycles "mo:base/ExperimentalCycles";
 import Char "mo:base/Char";
-import Migration "./migration";
+//import Migration "./migration";
 
-(with migration = Migration.migrate)
+//(with migration = Migration.migrate)
 
 shared (deployer) persistent actor class ContinuousDAO() = this {
 
@@ -258,6 +257,10 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   // Token info storage
   stable let tokenDetailsMap = Map.new<Principal, TokenDetails>();
 
+  // Per-token maximum allocation cap in basis points (e.g. 5000 = 50%)
+  // Tokens not in this map have no cap. New tokens default to 5000.
+  stable let tokenMaxAllocationBP = Map.new<Principal, Nat>();
+
 
 
   stable var activeTokenCount : Nat = 0;
@@ -266,9 +269,13 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   stable var lastBalanceHistoryUpdate : Int = 0;
 
   activeTokenCount := 0;
-  for ((_, details) in Map.entries(tokenDetailsMap)) {
+  for ((token, details) in Map.entries(tokenDetailsMap)) {
     if (details.Active) {
       activeTokenCount += 1;
+    };
+    // Ensure all existing tokens have a default max allocation cap
+    if (Map.get(tokenMaxAllocationBP, phash, token) == null) {
+      Map.set(tokenMaxAllocationBP, phash, token, 5000);
     };
   };
 
@@ -330,8 +337,6 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
   //let treasury = actor ("z4is7-giaaa-aaaad-qg6uq-cai") : Treasury.Self;
   transient let treasury = actor (Principal.toText(TREASURY_ID)) : Treasury.Self;
   //let nachos = actor (Principal.toText(NACHOS_ID)) : Treasury.Self;
-  //let mintingVault = actor ("ywhqf-eyaaa-aaaad-qg6tq-cai") : MintingVault.Self;
-  transient let mintingVault = actor (Principal.toText(this_canister_id())) : MintingVault.Self;
   //let treasuryPrincipal = Principal.fromText("z4is7-giaaa-aaaad-qg6uq-cai");
   transient let treasuryPrincipal = TREASURY_ID;
   // Timer IDs
@@ -397,6 +402,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
       case (#AdminRemove(details)) "Remove admin " # Principal.toText(details.removedAdmin);
       case (#CanisterStart) "Canister Start";
       case (#CanisterStop) "Canister Stop";
+      case (#TokenMaxAllocationUpdate(details)) "Set max allocation for " # Principal.toText(details.token) # " from " # debug_show(details.oldMaxBP) # " to " # debug_show(details.newMaxBP);
     };
   };
 
@@ -532,6 +538,11 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
         };
       };
       
+      // Set default max allocation cap for new tokens
+      if (Map.get(tokenMaxAllocationBP, phash, token) == null) {
+        Map.set(tokenMaxAllocationBP, phash, token, 5000);
+      };
+
       activeTokenCount := 0;
       for ((_, details) in Map.entries(tokenDetailsMap)) {
         if (details.Active) {
@@ -645,6 +656,9 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
           if (Map.has(aggregateAllocation, phash, token)) {
             Map.delete(aggregateAllocation, phash, token);
           };
+
+          // Remove max allocation cap
+          Map.delete(tokenMaxAllocationBP, phash, token);
         };
       };
       
@@ -772,6 +786,43 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     #ok("Token unpaused successfully");
   };
 
+  // Sets or removes the per-token maximum allocation cap in basis points.
+  // ?bp (1-10000) sets a cap, null removes the cap.
+  public shared ({ caller }) func setTokenMaxAllocation(token : Principal, maxBP : ?Nat, reason : Text) : async Result.Result<Text, AuthorizationError> {
+    if (not isAdmin(caller, #setTokenMaxAllocation)) {
+      return #err(#NotAdmin);
+    };
+
+    if (Text.size(reason) == 0) {
+      return #err(#UnexpectedError("Reason is required"));
+    };
+
+    // Verify token exists
+    switch (Map.get(tokenDetailsMap, phash, token)) {
+      case null { return #err(#UnexpectedError("Token not found")) };
+      case _ {};
+    };
+
+    let oldMaxBP = Map.get(tokenMaxAllocationBP, phash, token);
+
+    switch (maxBP) {
+      case (?bp) {
+        if (bp == 0 or bp > 10000) {
+          return #err(#UnexpectedError("maxAllocationBasisPoints must be between 1 and 10000, or null to remove cap"));
+        };
+        Map.set(tokenMaxAllocationBP, phash, token, bp);
+      };
+      case null {
+        Map.delete(tokenMaxAllocationBP, phash, token);
+      };
+    };
+
+    logAdminAction(caller, #TokenMaxAllocationUpdate({ token; oldMaxBP; newMaxBP = maxBP }), reason, true, null);
+    logger.info("Admin", "Set max allocation for " # Principal.toText(token) # " from " # debug_show(oldMaxBP) # " to " # debug_show(maxBP), "setTokenMaxAllocation");
+
+    #ok("Max allocation updated successfully");
+  };
+
   // Calculates voting power changes when allocations update. Handles empty allocations.
   // Returns array of (token, votingPowerDelta) pairs for aggregate updates.
   private func calculateAllocationDelta(
@@ -863,7 +914,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
     // Allow empty allocation [], otherwise validate
     if (newAllocations.size() > 0) {
-      if (not validateAllocations(newAllocations)) {
+      if (not validateAllocations(newAllocations, initialUserState.allocations)) {
         return #err(#InvalidAllocation);
       };
     };
@@ -2370,36 +2421,22 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
           principalVP += neuron.votingPower;
 
-          let hasAllocations = switch (Map.get(neuronAllocationMap, bhash, neuron.neuronId)) {
-            case (?existingAlloc) { existingAlloc.allocations.size() > 0 and existingAlloc.lastAllocationMaker == principal };
-            case null { false };
-          };
-
-          if (not hasAllocations or Map.has(neuronsSeen, bhash, neuron.neuronId)) {
+          // Dedup: skip neurons already processed (multi-hotkey scenario)
+          if (Map.has(neuronsSeen, bhash, neuron.neuronId)) {
             continue a;
           };
-
           Map.set(neuronsSeen, bhash, neuron.neuronId, null);
 
-          // Handle neuron allocation in the same loop
+          // Carry over or create neuron allocation
           switch (Map.get(neuronAllocationMap, bhash, neuron.neuronId)) {
             case (?existingAlloc) {
+              // Preserve existing allocation, update VP
+              Map.set(newNeuronAllocationMap, bhash, neuron.neuronId, {
+                existingAlloc with votingPower = neuron.votingPower;
+              });
+
+              // Count toward aggregate only if neuron has allocations
               if (existingAlloc.allocations.size() > 0) {
-
-                Debug.print("Adding Neuron ID: " # debug_show(neuron.neuronId) # ", Principal: " # debug_show(principal) # ", Existing allocations: " # debug_show(existingAlloc.allocations.size()) # ", Voting power: " # debug_show(neuron.votingPower));
-
-                // Update neuron allocation with new voting power
-                Map.set(
-                  newNeuronAllocationMap,
-                  bhash,
-                  neuron.neuronId,
-                  {
-                    existingAlloc with
-                    votingPower = neuron.votingPower;
-                  },
-                );
-
-                // Update aggregate allocation
                 for (alloc in existingAlloc.allocations.vals()) {
                   switch (Map.get(tokenDetailsMap, phash, alloc.token)) {
                     case (?details) {
@@ -2415,19 +2452,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
                     case null {};
                   };
                 };
-
                 allocatedVotingPower += neuron.votingPower;
-                
-              } else {
-                Map.set(
-                  newNeuronAllocationMap,
-                  bhash,
-                  neuron.neuronId,
-                  {
-                    existingAlloc with
-                    votingPower = neuron.votingPower;
-                  },
-                );
               };
             };
             case null {
@@ -2515,9 +2540,9 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     };
   };
 
-  // Validates allocation array. Checks for duplicate tokens, active status, and total = 10000 basis points.
-  // Returns false if any validation fails.
-  private func validateAllocations(allocations : [Allocation]) : Bool {
+  // Validates allocation array. Checks for duplicate tokens, active status, caps (with step-down), and total = 10000 basis points.
+  // previousAllocations: the user's current saved allocations (for step-down rule).
+  private func validateAllocations(allocations : [Allocation], previousAllocations : [Allocation]) : Bool {
     var total : Nat = 0;
 
     // Check if allocation size exceeds available active tokens
@@ -2543,6 +2568,28 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
           };
         };
         case null { return false };
+      };
+
+      // Check per-token allocation cap with step-down rule for grandfathered positions
+      switch (Map.get(tokenMaxAllocationBP, phash, alloc.token)) {
+        case (?maxBP) {
+          if (alloc.basisPoints > maxBP) {
+            // Find previous allocation for this token
+            var previousBP : Nat = 0;
+            for (prev in previousAllocations.vals()) {
+              if (prev.token == alloc.token) { previousBP := prev.basisPoints };
+            };
+            if (previousBP > maxBP) {
+              // Grandfathered: must reduce by at least 1000bp, but can always go to cap
+              let stepDown = if (previousBP > 1000) { previousBP - 1000 } else { 0 };
+              let maxAllowed = Nat.max(maxBP, stepDown);
+              if (alloc.basisPoints > maxAllowed) { return false };
+            } else {
+              return false; // Was at/below cap, can't go above
+            };
+          };
+        };
+        case null {};
       };
 
       total += alloc.basisPoints;
@@ -3484,7 +3531,276 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     } else {
       [];
     };
-  };  
+  };
+
+  type PublicTokenDetailsWithMaxAllocation = {
+    Active : Bool;
+    isPaused : Bool;
+    epochAdded : Int;
+    tokenName : Text;
+    tokenSymbol : Text;
+    tokenDecimals : Nat;
+    tokenTransferFee : Nat;
+    balance : Nat;
+    priceInICP : Nat;
+    priceInUSD : Float;
+    tokenType : TokenType;
+    lastTimeSynced : Int;
+    pausedDueToSyncFailure : Bool;
+    maxAllocationBasisPoints : ?Nat;
+  };
+  type PublicTokenDetailsWithMaxAllocationEntry = (Principal, PublicTokenDetailsWithMaxAllocation);
+
+  public query ({ caller }) func getTokenDetailsWithoutPastPricesMaxAllocations() : async [PublicTokenDetailsWithMaxAllocationEntry] {
+    if (isAllowedQuery(caller)) {
+      Iter.toArray(
+        Iter.map(
+          Map.entries(tokenDetailsMap),
+          func((principal : Principal, details : TokenDetails)) : PublicTokenDetailsWithMaxAllocationEntry {
+            (principal, {
+              Active = details.Active;
+              isPaused = details.isPaused;
+              epochAdded = details.epochAdded;
+              tokenName = details.tokenName;
+              tokenSymbol = details.tokenSymbol;
+              tokenDecimals = details.tokenDecimals;
+              tokenTransferFee = details.tokenTransferFee;
+              balance = details.balance;
+              priceInICP = details.priceInICP;
+              priceInUSD = details.priceInUSD;
+              tokenType = details.tokenType;
+              lastTimeSynced = details.lastTimeSynced;
+              pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+              maxAllocationBasisPoints = Map.get(tokenMaxAllocationBP, phash, principal);
+            })
+          }
+        )
+      );
+    } else {
+      [];
+    };
+  };
+
+  // Consolidated dashboard query — replaces getTokenDetailsWithoutPastPrices + getAggregateAllocation + votingPowerMetrics + getSnapshotInfo
+  public query ({ caller }) func getDashboardData() : async ?{
+    tokenDetails : [PublicTokenDetailsEntry];
+    aggregateAllocation : [(Principal, Nat)];
+    tokenMaxAllocations : [(Principal, Nat)];
+    votingPowerMetrics : {
+      allocatedVotingPower : Nat;
+      neuronCount : Nat;
+      principalCount : Nat;
+      totalVotingPower : Nat;
+      totalVotingPowerByHotkeySetters : Nat;
+    };
+    snapshotInfo : {
+      lastSnapshotId : Nat;
+      lastSnapshotTime : Int;
+      totalVotingPower : Nat;
+    };
+  } {
+    if (not isAllowedQuery(caller)) { return null };
+
+    // Token details (same as getTokenDetailsWithoutPastPrices)
+    let tokens = Iter.toArray(
+      Iter.map(
+        Map.entries(tokenDetailsMap),
+        func((principal : Principal, details : TokenDetails)) : PublicTokenDetailsEntry {
+          (principal, {
+            Active = details.Active;
+            isPaused = details.isPaused;
+            epochAdded = details.epochAdded;
+            tokenName = details.tokenName;
+            tokenSymbol = details.tokenSymbol;
+            tokenDecimals = details.tokenDecimals;
+            tokenTransferFee = details.tokenTransferFee;
+            balance = details.balance;
+            priceInICP = details.priceInICP;
+            priceInUSD = details.priceInUSD;
+            tokenType = details.tokenType;
+            lastTimeSynced = details.lastTimeSynced;
+            pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+          });
+        },
+      )
+    );
+
+    // Aggregate allocation (same as getAggregateAllocation)
+    var totalAllocatedVP : Nat = 0;
+    for (vp in Map.vals(aggregateAllocation)) {
+      totalAllocatedVP += vp;
+    };
+    let allocResults = Vector.new<(Principal, Nat)>();
+    if (totalAllocatedVP > 0) {
+      for ((token, vp) in Map.entries(aggregateAllocation)) {
+        Vector.add(allocResults, (token, (vp * 10000) / totalAllocatedVP));
+      };
+    };
+
+    ?{
+      tokenDetails = tokens;
+      aggregateAllocation = Vector.toArray(allocResults);
+      tokenMaxAllocations = Iter.toArray(Map.entries(tokenMaxAllocationBP));
+      votingPowerMetrics = {
+        totalVotingPower;
+        totalVotingPowerByHotkeySetters;
+        allocatedVotingPower;
+        principalCount = Map.size(userStates);
+        neuronCount = Map.size(neuronAllocationMap);
+      };
+      snapshotInfo = {
+        lastSnapshotId;
+        lastSnapshotTime;
+        totalVotingPower;
+      };
+    };
+  };
+
+  // Consolidated VoteView dashboard query — replaces getAggregateAllocation + getTokenDetailsWithoutPastPricesMaxAllocations
+  // + getHistoricBalanceAndAllocation + votingPowerMetrics + getSnapshotInfo + getAllocationStats + getUserAllocation
+  public query ({ caller }) func getVoteDashboard(user : ?Principal) : async ?{
+    aggregateAllocation : [(Principal, Nat)];
+    tokenDetails : [PublicTokenDetailsWithMaxAllocationEntry];
+    historicBalanceAndAllocation : [(Int, HistoricBalanceAllocation)];
+    votingPowerMetrics : {
+      allocatedVotingPower : Nat;
+      neuronCount : Nat;
+      principalCount : Nat;
+      totalVotingPower : Nat;
+      totalVotingPowerByHotkeySetters : Nat;
+    };
+    snapshotInfo : {
+      lastSnapshotId : Nat;
+      lastSnapshotTime : Int;
+      totalVotingPower : Nat;
+    };
+    allocationStats : AllocationStats;
+    userAllocation : ?UserState;
+  } {
+    if (not isAllowedQuery(caller)) { return null };
+
+    // 1. Aggregate allocation in basis points
+    var totalAllocatedVP : Nat = 0;
+    for (vp in Map.vals(aggregateAllocation)) {
+      totalAllocatedVP += vp;
+    };
+    let allocResults = Vector.new<(Principal, Nat)>();
+    if (totalAllocatedVP > 0) {
+      for ((token, vp) in Map.entries(aggregateAllocation)) {
+        Vector.add(allocResults, (token, (vp * 10000) / totalAllocatedVP));
+      };
+    };
+
+    // 2. Token details with max allocation basis points
+    let tokens = Iter.toArray(
+      Iter.map(
+        Map.entries(tokenDetailsMap),
+        func((principal : Principal, details : TokenDetails)) : PublicTokenDetailsWithMaxAllocationEntry {
+          (principal, {
+            Active = details.Active;
+            isPaused = details.isPaused;
+            epochAdded = details.epochAdded;
+            tokenName = details.tokenName;
+            tokenSymbol = details.tokenSymbol;
+            tokenDecimals = details.tokenDecimals;
+            tokenTransferFee = details.tokenTransferFee;
+            balance = details.balance;
+            priceInICP = details.priceInICP;
+            priceInUSD = details.priceInUSD;
+            tokenType = details.tokenType;
+            lastTimeSynced = details.lastTimeSynced;
+            pausedDueToSyncFailure = details.pausedDueToSyncFailure;
+            maxAllocationBasisPoints = Map.get(tokenMaxAllocationBP, phash, principal);
+          });
+        },
+      )
+    );
+
+    // 3. Historic balance and allocation — last 50 snapshots
+    let histResult = BTree.scanLimit(
+      balanceHistory,
+      Int.compare,
+      0,
+      Time.now(),
+      #bwd,
+      50,
+    );
+
+    // 4. Allocation stats
+    var usersWithAlloc = 0;
+    var totalUserVP = 0;
+    var mostRecentUser : Int = 0;
+    var recentUserUpdates = 0;
+
+    let nowNs = Time.now();
+    let thirtyDaysNs = 30 * 24 * 60 * 60 * 1_000_000_000;
+
+    for ((_principal, userState) in Map.entries(userStates)) {
+      if (userState.allocations.size() > 0) {
+        usersWithAlloc += 1;
+        totalUserVP += userState.votingPower;
+        if (userState.lastAllocationUpdate > mostRecentUser) {
+          mostRecentUser := userState.lastAllocationUpdate;
+        };
+        if (nowNs - userState.lastAllocationUpdate < thirtyDaysNs) {
+          recentUserUpdates += 1;
+        };
+      };
+    };
+
+    var neuronsWithAlloc = 0;
+    var totalNeuronVP = 0;
+    var mostRecentNeuron : Int = 0;
+    var recentNeuronUpdates = 0;
+
+    for ((_neuronId, neuronAlloc) in Map.entries(neuronAllocationMap)) {
+      if (neuronAlloc.allocations.size() > 0) {
+        neuronsWithAlloc += 1;
+        totalNeuronVP += neuronAlloc.votingPower;
+        if (neuronAlloc.lastUpdate > mostRecentNeuron) {
+          mostRecentNeuron := neuronAlloc.lastUpdate;
+        };
+        if (nowNs - neuronAlloc.lastUpdate < thirtyDaysNs) {
+          recentNeuronUpdates += 1;
+        };
+      };
+    };
+
+    let mostRecent = if (mostRecentUser > mostRecentNeuron) { mostRecentUser } else { mostRecentNeuron };
+
+    // 5. Optional user state lookup
+    let userState = switch (user) {
+      case (?p) { Map.get(userStates, phash, p) };
+      case (null) { null };
+    };
+
+    ?{
+      aggregateAllocation = Vector.toArray(allocResults);
+      tokenDetails = tokens;
+      historicBalanceAndAllocation = histResult.results;
+      votingPowerMetrics = {
+        totalVotingPower;
+        totalVotingPowerByHotkeySetters;
+        allocatedVotingPower;
+        principalCount = Map.size(userStates);
+        neuronCount = Map.size(neuronAllocationMap);
+      };
+      snapshotInfo = {
+        lastSnapshotId;
+        lastSnapshotTime;
+        totalVotingPower;
+      };
+      allocationStats = {
+        usersWithAllocations = usersWithAlloc;
+        neuronsWithAllocations = neuronsWithAlloc;
+        totalUserVotingPower = totalUserVP;
+        totalNeuronVotingPower = totalNeuronVP;
+        mostRecentUpdateTime = mostRecent;
+        recentUpdatesCount = recentUserUpdates + recentNeuronUpdates;
+      };
+      userAllocation = userState;
+    };
+  };
 
   // Admin method to update spam parameters
   public shared ({ caller }) func updateSpamParameters(
@@ -3619,60 +3935,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     };
   };
 
-  /**
- * Update Minting Vault configuration
- *
- * Allows configuration of premium rates, update intervals, and enabling/disabling swapping
- * Only callable by admins with the updateMintingVaultConfig permission.
- */
-  public shared ({ caller }) func updateMintingVaultConfig(
-    config : MintingVault.UpdateConfig
-  ) : async Result.Result<Text, AuthorizationError> {
-    if (not isAdmin(caller, #updateMintingVaultConfig)) {
-      return #err(#NotAdmin);
-    };
 
-    try {
-      // Update configuration if any parameter is specified
-      if (
-        config.minPremium != null or config.maxPremium != null or
-        config.balanceUpdateInterval != null or config.blockCleanupInterval != null or
-        config.maxSlippageBasisPoints != null or config.PRICE_HISTORY_WINDOW != null
-      ) {
-
-        let configResult = await (with timeout = 65) mintingVault.updateConfiguration({
-          minPremium = config.minPremium;
-          maxPremium = config.maxPremium;
-          balanceUpdateInterval = config.balanceUpdateInterval;
-          blockCleanupInterval = config.blockCleanupInterval;
-          maxSlippageBasisPoints = config.maxSlippageBasisPoints;
-          PRICE_HISTORY_WINDOW = config.PRICE_HISTORY_WINDOW;
-          swappingEnabled = config.swappingEnabled;
-        });
-
-        switch (configResult) {
-          case (#ok()) {};
-          case (#err(e)) { return #err(#UnexpectedError(e)) };
-        };
-      };
-
-      // Update swapping state if provided
-      switch (config.swappingEnabled) {
-        case (?enabled) {
-          let swapResult = await (with timeout = 65) mintingVault.setSwappingEnabled(enabled);
-          switch (swapResult) {
-            case (#ok(_)) {};
-            case (#err(e)) { return #err(#UnexpectedError(e)) };
-          };
-        };
-        case null {};
-      };
-
-      #ok("Minting vault configuration updated successfully");
-    } catch (e) {
-      #err(#UnexpectedError("Error updating minting vault configuration: " # Error.message(e)));
-    };
-  };
 
   // Function to get logs - restricted to controllers only
   // Public query - allows anyone to view logs (read-only transparency)
@@ -3794,7 +4057,7 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
 
         // 2. Allocation validation
         if (newAllocations.size() > 0) {
-          if (not validateAllocations(newAllocations)) {
+          if (not validateAllocations(newAllocations, userState.allocations)) {
             return false;
           };
         };

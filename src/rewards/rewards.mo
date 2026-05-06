@@ -25,9 +25,9 @@ import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
 import Char "mo:base/Char";
 import Service "mo:icrc3-mo/service";
-//import Migration "migration";
+import Migration "migration";
 
-//(with migration = Migration.migrate)
+(with migration = Migration.migrate)
 shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
@@ -148,7 +148,38 @@ shared (deployer) persistent actor class Rewards() = this {
     status: DistributionStatus;
   };
 
+  // Lightweight types for getUserDistributionRewards query (no checkpoints)
+  public type NeuronRewardSummary = {
+    neuronId: Blob;
+    rewardAmount: Nat;
+    performanceScore: Float;
+    votingPower: Nat;
+    rewardScore: Float;
+    performanceScoreICP: ?Float;
+  };
 
+  public type UserDistributionSummary = {
+    distributionId: Nat;
+    distributionTime: Int;
+    startTime: Int;
+    endTime: Int;
+    totalRewardPot: Nat;
+    neuronRewards: [NeuronRewardSummary];
+  };
+
+  public type NeuronDistributionEntry = {
+    neuronId: Blob;
+    distributionId: Nat;
+    distributionTime: Int;
+    startTime: Int;
+    endTime: Int;
+    totalRewardPot: Nat;
+    rewardAmount: Nat;
+    performanceScore: Float;
+    votingPower: Nat;
+    rewardScore: Float;
+    performanceScoreICP: ?Float;
+  };
 
   public type DistributionError = {
     #SystemError: Text;
@@ -186,6 +217,30 @@ shared (deployer) persistent actor class Rewards() = this {
     transactionId: ?Nat; // ICRC1 transaction ID if successful
   };
 
+  // Dashboard bundle type (getRewardsDashboard)
+  public type RewardsDashboard = {
+    balances: [(Blob, Nat)];
+    withdrawals: [WithdrawalRecord];
+    distributions: {
+      total: Nat;
+      hasMore: Bool;
+      records: [UserDistributionSummary];
+    };
+    distributionStatus: {
+      inProgress: Bool;
+      currentDistributionId: ?Nat;
+      lastDistributionTime: Int;
+      nextDistributionTime: Int;
+      distributionEnabled: Bool;
+    };
+    totalDistributed: Nat;
+    withdrawalStats: {
+      totalWithdrawn: Nat;
+      totalWithdrawals: Nat;
+      totalRecordsInHistory: Nat;
+    };
+  };
+
   // Leaderboard types
   public type LeaderboardTimeframe = {
     #OneWeek;      // Latest distribution period (7 days)
@@ -207,6 +262,7 @@ shared (deployer) persistent actor class Rewards() = this {
     distributionsCount: Nat;            // How many distributions in this timeframe
     lastActivity: Int;                  // Timestamp of last allocation change
     displayName: ?Text;                 // Optional user-set display name
+    totalRewardsEarned: Nat;            // Total TACO satoshis earned across all neurons in this timeframe
   };
 
   // Individual neuron/user performance lookup types
@@ -323,8 +379,9 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var rewardPenalties = Map.new<Blob, Nat>(); // neuronId -> multiplier (0-100)
   
   // Reward tracking
-  private transient let { phash; bhash; thash } = Map;
+  private transient let { phash; bhash; thash; nhash } = Map;
   stable var neuronRewardBalances = Map.new<Blob, Nat>(); // neuronId -> accumulated rewards in TACO satoshis
+  stable var neuronDistributionIndex = Map.new<Blob, [NeuronDistributionEntry]>(); // neuronId -> distribution entries (no checkpoints)
   stable var totalDistributed : Nat = 0; // Total amount distributed to users in TACO satoshis (for balance validation)
   
   // Withdrawal tracking
@@ -1509,6 +1566,9 @@ shared (deployer) persistent actor class Rewards() = this {
       return;
     };
 
+    // Safety net: clear any stale recalc caches
+    clearRecalcCaches();
+
     let now = Time.now();
     let endTime = now;
     let startTime = now - distributionPeriodNS;
@@ -1882,6 +1942,45 @@ shared (deployer) persistent actor class Rewards() = this {
     logger.info("Distribution", "Distribution " # Nat.toText(distributionId) # " completed. Processed " # Nat.toText(finalRewards.size()) # " neurons, distributed " # Nat.toText(periodicRewardPot) # " TACO tokens", "calculateAndDistributeRewards");
   };
 
+  // Update neuronDistributionIndex for a single distribution's rewards
+  private func updateNeuronDistributionIndex(dist: DistributionRecord, rewards: [NeuronReward]) {
+    for (reward in rewards.vals()) {
+      let entry : NeuronDistributionEntry = {
+        neuronId = reward.neuronId;
+        distributionId = dist.id;
+        distributionTime = dist.distributionTime;
+        startTime = dist.startTime;
+        endTime = dist.endTime;
+        totalRewardPot = dist.totalRewardPot;
+        rewardAmount = reward.rewardAmount;
+        performanceScore = reward.performanceScore;
+        votingPower = reward.votingPower;
+        rewardScore = reward.rewardScore;
+        performanceScoreICP = reward.performanceScoreICP;
+      };
+      let existing = switch (Map.get(neuronDistributionIndex, bhash, reward.neuronId)) {
+        case (?arr) { arr };
+        case null { [] };
+      };
+      Map.set(neuronDistributionIndex, bhash, reward.neuronId, Array.append(existing, [entry]));
+    };
+  };
+
+  // Backfill neuronDistributionIndex from distributionHistory (since leaderboardCutoffDate)
+  private func buildNeuronDistributionIndex() {
+    // Clear existing index for idempotent re-runs
+    neuronDistributionIndex := Map.new<Blob, [NeuronDistributionEntry]>();
+    let historySize = Vector.size(distributionHistory);
+    var i = 0;
+    while (i < historySize) {
+      let dist = Vector.get(distributionHistory, i);
+      if (dist.distributionTime >= leaderboardCutoffDate) {
+        updateNeuronDistributionIndex(dist, dist.neuronRewards);
+      };
+      i += 1;
+    };
+  };
+
   // Complete the distribution and update records
   private func completeDistribution(
     distributionId: Nat,
@@ -1929,6 +2028,9 @@ shared (deployer) persistent actor class Rewards() = this {
           status = status;
         };
         Vector.put(distributionHistory, historyIndex, finalRecord);
+
+        // Update per-neuron distribution index
+        updateNeuronDistributionIndex(finalRecord, neuronRewards);
       };
     };
 
@@ -2393,6 +2495,7 @@ shared (deployer) persistent actor class Rewards() = this {
         };
 
         Vector.add(distributionHistory, distributionRecord);
+        updateNeuronDistributionIndex(distributionRecord, distributionRecord.neuronRewards);
         periodsCreated += 1;
         backfillPeriodsCompleted := periodsCreated;
         actualEndTime := periodEnd;
@@ -2822,6 +2925,84 @@ shared (deployer) persistent actor class Rewards() = this {
     };
   };
 
+  // Get distribution rewards filtered by specific neuron IDs (lightweight, no checkpoints)
+  public query func getUserDistributionRewards(neuronIds: [Blob], offset: Nat, limit: Nat) : async {
+    total: Nat;
+    hasMore: Bool;
+    records: [UserDistributionSummary];
+  } {
+    if (neuronIds.size() == 0) {
+      return { total = 0; hasMore = false; records = [] };
+    };
+
+    // Collect all entries for all requested neurons and group by distributionId
+    let groups = Map.new<Nat, Buffer.Buffer<NeuronDistributionEntry>>();
+    for (nid in neuronIds.vals()) {
+      switch (Map.get(neuronDistributionIndex, bhash, nid)) {
+        case (?entries) {
+          for (entry in entries.vals()) {
+            switch (Map.get(groups, nhash, entry.distributionId)) {
+              case (?buf) { buf.add(entry) };
+              case null {
+                let buf = Buffer.Buffer<NeuronDistributionEntry>(1);
+                buf.add(entry);
+                Map.set(groups, nhash, entry.distributionId, buf);
+              };
+            };
+          };
+        };
+        case null {};
+      };
+    };
+
+    // Build sorted array of summaries (most recent first)
+    let summaries = Buffer.Buffer<UserDistributionSummary>(Map.size(groups));
+    for ((_, buf) in Map.entries(groups)) {
+      let first = buf.get(0);
+      let neuronRewards = Array.map<NeuronDistributionEntry, NeuronRewardSummary>(
+        Buffer.toArray(buf),
+        func(e) : NeuronRewardSummary {
+          {
+            neuronId = e.neuronId;
+            rewardAmount = e.rewardAmount;
+            performanceScore = e.performanceScore;
+            votingPower = e.votingPower;
+            rewardScore = e.rewardScore;
+            performanceScoreICP = e.performanceScoreICP;
+          };
+        },
+      );
+      summaries.add({
+        distributionId = first.distributionId;
+        distributionTime = first.distributionTime;
+        startTime = first.startTime;
+        endTime = first.endTime;
+        totalRewardPot = first.totalRewardPot;
+        neuronRewards = neuronRewards;
+      });
+    };
+
+    let sorted = Array.sort<UserDistributionSummary>(
+      Buffer.toArray(summaries),
+      func(a, b) { Int.compare(b.distributionTime, a.distributionTime) },
+    );
+
+    let totalMatches = sorted.size();
+    if (offset >= totalMatches) {
+      return { total = totalMatches; hasMore = false; records = [] };
+    };
+
+    let available = totalMatches - offset;
+    let take = Nat.min(limit, available);
+    let result = Array.tabulate<UserDistributionSummary>(take, func(i) { sorted[offset + i] });
+
+    {
+      total = totalMatches;
+      hasMore = offset + take < totalMatches;
+      records = result;
+    };
+  };
+
   // Get current distribution status
   public query func getCurrentDistributionStatus() : async {
     inProgress: Bool;
@@ -3225,6 +3406,38 @@ shared (deployer) persistent actor class Rewards() = this {
     )
   };
 
+  // Consolidated leaderboard query — replaces 8 separate getLeaderboard calls
+  public query func getAllLeaderboards(limit : ?Nat, offset : ?Nat) : async {
+    allTimeUSD : [LeaderboardEntry];
+    allTimeICP : [LeaderboardEntry];
+    oneYearUSD : [LeaderboardEntry];
+    oneYearICP : [LeaderboardEntry];
+    oneMonthUSD : [LeaderboardEntry];
+    oneMonthICP : [LeaderboardEntry];
+    oneWeekUSD : [LeaderboardEntry];
+    oneWeekICP : [LeaderboardEntry];
+  } {
+    let start = switch (offset) { case (?o) o; case null 0 };
+    let count = switch (limit) { case (?l) l; case null leaderboardSize };
+
+    func slice(board : [LeaderboardEntry]) : [LeaderboardEntry] {
+      if (start >= board.size()) { return [] };
+      let end = Nat.min(start + count, board.size());
+      Array.tabulate<LeaderboardEntry>(end - start, func(i) { board[start + i] });
+    };
+
+    {
+      allTimeUSD = slice(leaderboards.allTimeUSD);
+      allTimeICP = slice(leaderboards.allTimeICP);
+      oneYearUSD = slice(leaderboards.oneYearUSD);
+      oneYearICP = slice(leaderboards.oneYearICP);
+      oneMonthUSD = slice(leaderboards.oneMonthUSD);
+      oneMonthICP = slice(leaderboards.oneMonthICP);
+      oneWeekUSD = slice(leaderboards.oneWeekUSD);
+      oneWeekICP = slice(leaderboards.oneWeekICP);
+    };
+  };
+
   // Get leaderboard metadata/info
   public query func getLeaderboardInfo() : async {
     lastUpdate: Int;
@@ -3364,6 +3577,12 @@ shared (deployer) persistent actor class Rewards() = this {
         logger.info("Postupgrade", "No scheduled distribution found, timer not restored", "postupgrade");
       };
     };
+
+    // Backfill neuronDistributionIndex if empty but history exists
+    if (Map.size(neuronDistributionIndex) == 0 and Vector.size(distributionHistory) > 0) {
+      buildNeuronDistributionIndex();
+      logger.info("Postupgrade", "Built neuronDistributionIndex with " # Nat.toText(Map.size(neuronDistributionIndex)) # " neurons", "postupgrade");
+    };
   };
 
   // Get all withdrawal history (admin only)
@@ -3397,7 +3616,7 @@ shared (deployer) persistent actor class Rewards() = this {
   };
 
   // Get user's withdrawal history (authenticated user only)
-  public shared ({ caller }) func getUserWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
+  public shared query ({ caller }) func getUserWithdrawalHistory(limit: ?Nat) : async Result.Result<[WithdrawalRecord], RewardsError> {
     let maxLimit = switch (limit) {
       case (?l) { if (l > 50) { 50 } else { l } }; // Cap at 50 records for users
       case null { 20 }; // Default to 20 records
@@ -3437,6 +3656,136 @@ shared (deployer) persistent actor class Rewards() = this {
       totalWithdrawals = totalWithdrawals;
       totalRecordsInHistory = Vector.size(withdrawalHistory);
     }
+  };
+
+  // Bundled rewards dashboard query — replaces 4-6 separate calls with a single query
+  public shared query ({ caller }) func getRewardsDashboard(
+    neuronIds: [Blob],
+    withdrawalLimit: ?Nat,
+    distributionLimit: ?Nat,
+  ) : async RewardsDashboard {
+
+    // 1. Neuron reward balances (same as getNeuronRewardBalances)
+    let balances = Array.map<Blob, (Blob, Nat)>(neuronIds, func(neuronId) {
+      let balance = switch (Map.get(neuronRewardBalances, bhash, neuronId)) {
+        case (?bal) { bal };
+        case null { 0 };
+      };
+      (neuronId, balance)
+    });
+
+    // 2. User withdrawal history (same as getUserWithdrawalHistory, using caller)
+    let wdLimit = switch (withdrawalLimit) {
+      case (?l) { if (l > 50) { 50 } else { l } };
+      case null { 20 };
+    };
+    let historySize = Vector.size(withdrawalHistory);
+    let userRecords = Buffer.Buffer<WithdrawalRecord>(wdLimit);
+    var wi = historySize;
+    var wFound = 0;
+    while (wi > 0 and wFound < wdLimit) {
+      wi -= 1;
+      switch (Vector.getOpt(withdrawalHistory, wi)) {
+        case (?record) {
+          if (record.caller == caller) {
+            userRecords.add(record);
+            wFound += 1;
+          };
+        };
+        case null {};
+      };
+    };
+
+    // 3. User distribution rewards (same as getUserDistributionRewards, offset=0)
+    let distLimit = switch (distributionLimit) {
+      case (?l) { if (l > 50) { 50 } else { l } };
+      case null { 10 };
+    };
+    let distributions = if (neuronIds.size() == 0) {
+      { total = 0; hasMore = false; records = [] : [UserDistributionSummary] };
+    } else {
+      let groups = Map.new<Nat, Buffer.Buffer<NeuronDistributionEntry>>();
+      for (nid in neuronIds.vals()) {
+        switch (Map.get(neuronDistributionIndex, bhash, nid)) {
+          case (?entries) {
+            for (entry in entries.vals()) {
+              switch (Map.get(groups, nhash, entry.distributionId)) {
+                case (?buf) { buf.add(entry) };
+                case null {
+                  let buf = Buffer.Buffer<NeuronDistributionEntry>(1);
+                  buf.add(entry);
+                  Map.set(groups, nhash, entry.distributionId, buf);
+                };
+              };
+            };
+          };
+          case null {};
+        };
+      };
+
+      let summaries = Buffer.Buffer<UserDistributionSummary>(Map.size(groups));
+      for ((_, buf) in Map.entries(groups)) {
+        let first = buf.get(0);
+        let neuronRewards = Array.map<NeuronDistributionEntry, NeuronRewardSummary>(
+          Buffer.toArray(buf),
+          func(e) : NeuronRewardSummary {
+            {
+              neuronId = e.neuronId;
+              rewardAmount = e.rewardAmount;
+              performanceScore = e.performanceScore;
+              votingPower = e.votingPower;
+              rewardScore = e.rewardScore;
+              performanceScoreICP = e.performanceScoreICP;
+            };
+          },
+        );
+        summaries.add({
+          distributionId = first.distributionId;
+          distributionTime = first.distributionTime;
+          startTime = first.startTime;
+          endTime = first.endTime;
+          totalRewardPot = first.totalRewardPot;
+          neuronRewards = neuronRewards;
+        });
+      };
+
+      let sorted = Array.sort<UserDistributionSummary>(
+        Buffer.toArray(summaries),
+        func(a, b) { Int.compare(b.distributionTime, a.distributionTime) },
+      );
+
+      let totalMatches = sorted.size();
+      let take = Nat.min(distLimit, totalMatches);
+      let records = Array.tabulate<UserDistributionSummary>(take, func(i) { sorted[i] });
+      {
+        total = totalMatches;
+        hasMore = take < totalMatches;
+        records = records;
+      };
+    };
+
+    // 4. Distribution status (same as getCurrentDistributionStatus)
+    let distStatus = {
+      inProgress = switch (currentDistributionId) { case (?_) { true }; case null { false } };
+      currentDistributionId = currentDistributionId;
+      lastDistributionTime = lastDistributionTime;
+      nextDistributionTime = lastDistributionTime + distributionPeriodNS;
+      distributionEnabled = distributionEnabled;
+    };
+
+    // 5 + 6. Assemble dashboard
+    {
+      balances = balances;
+      withdrawals = Buffer.toArray(userRecords);
+      distributions = distributions;
+      distributionStatus = distStatus;
+      totalDistributed = totalDistributed;
+      withdrawalStats = {
+        totalWithdrawn = totalWithdrawn;
+        totalWithdrawals = totalWithdrawals;
+        totalRecordsInHistory = Vector.size(withdrawalHistory);
+      };
+    };
   };
 
   //=========================================================================
@@ -3506,6 +3855,7 @@ shared (deployer) persistent actor class Rewards() = this {
       performanceScores: [Float];  // One per distribution
       distributionCount: Nat;
       lastActivity: Int;
+      totalRewards: Nat;           // Sum of rewardAmount across distributions
     };
 
     let neuronPerformances = Map.new<Blob, NeuronPerformance>();
@@ -3534,6 +3884,7 @@ shared (deployer) persistent actor class Rewards() = this {
               performanceScores = updatedScores;
               distributionCount = existing.distributionCount + 1;
               lastActivity = Int.max(existing.lastActivity, distribution.endTime);
+              totalRewards = existing.totalRewards + neuronReward.rewardAmount;
             });
           };
           case null {
@@ -3543,6 +3894,7 @@ shared (deployer) persistent actor class Rewards() = this {
               performanceScores = [score];
               distributionCount = 1;
               lastActivity = distribution.endTime;
+              totalRewards = neuronReward.rewardAmount;
             });
           };
         };
@@ -3555,6 +3907,7 @@ shared (deployer) persistent actor class Rewards() = this {
       aggregateScore: Float;
       distributionCount: Nat;
       lastActivity: Int;
+      totalRewards: Nat;
     };
 
     let scoredNeurons = Array.map<(Blob, NeuronPerformance), ScoredNeuron>(
@@ -3586,6 +3939,7 @@ shared (deployer) persistent actor class Rewards() = this {
           aggregateScore;
           distributionCount = perf.distributionCount;
           lastActivity = perf.lastActivity;
+          totalRewards = perf.totalRewards;
         }
       }
     );
@@ -3594,6 +3948,7 @@ shared (deployer) persistent actor class Rewards() = this {
     type UserPerformance = {
       principal: Principal;
       bestNeuron: ScoredNeuron;
+      totalRewardsEarned: Nat;
     };
 
     let userPerformances = Map.new<Principal, UserPerformance>();
@@ -3612,10 +3967,18 @@ shared (deployer) persistent actor class Rewards() = this {
                   (scored.distributionCount == existing.bestNeuron.distributionCount and
                    scored.aggregateScore > existing.bestNeuron.aggregateScore);
 
+                // Always accumulate rewards from all neurons, update bestNeuron only if better
                 if (shouldReplace) {
                   Map.set(userPerformances, phash, principal, {
                     principal;
                     bestNeuron = scored;
+                    totalRewardsEarned = existing.totalRewardsEarned + scored.totalRewards;
+                  });
+                } else {
+                  Map.set(userPerformances, phash, principal, {
+                    principal;
+                    bestNeuron = existing.bestNeuron;
+                    totalRewardsEarned = existing.totalRewardsEarned + scored.totalRewards;
                   });
                 };
               };
@@ -3624,6 +3987,7 @@ shared (deployer) persistent actor class Rewards() = this {
                 Map.set(userPerformances, phash, principal, {
                   principal;
                   bestNeuron = scored;
+                  totalRewardsEarned = scored.totalRewards;
                 });
               };
             };
@@ -3654,6 +4018,7 @@ shared (deployer) persistent actor class Rewards() = this {
           distributionsCount = user.bestNeuron.distributionCount;
           lastActivity = user.bestNeuron.lastActivity;
           displayName = Map.get(displayNames, phash, user.principal);
+          totalRewardsEarned = user.totalRewardsEarned;
         }
       }
     );
@@ -4610,7 +4975,13 @@ shared (deployer) persistent actor class Rewards() = this {
 
     // Kick off async recalculation via timer pattern (non-blocking)
     ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
-      await* recalculateDistributionsSequentially<system>(startIndex, totalDistributions, 0, Buffer.Buffer<NeuronReward>(0), 0, startIndex);
+      try {
+        await* recalculateDistributionsSequentially<system>(startIndex, totalDistributions, 0, Buffer.Buffer<NeuronReward>(0), 0, startIndex);
+      } catch (e) {
+        recalcInProgress := false;
+        clearRecalcCaches();
+        logger.error("Admin", "Recalculation failed: " # Error.message(e), "admin_recalculateDistributionPerformance");
+      };
     });
 
     #ok("Started recalculation of " # Nat.toText(distributionsToProcess) # " distributions (" # Nat.toText(startIndex) # " to " # Nat.toText(totalDistributions - 1) # ")")
@@ -4941,6 +5312,233 @@ shared (deployer) persistent actor class Rewards() = this {
     ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
       await* recalculateDistributionsSequentially<system>(
         currentDistIndex, totalDistributions, endIdx, updatedRewardsBuffer, totalNeuronsProcessed + batchSize, startDistIndex
+      );
+    });
+  };
+
+  //=========================================================================
+  // Backfill Missing Neurons in Past Distributions
+  //=========================================================================
+
+  // Admin function to backfill missing neurons into past distribution records.
+  // Calculates performance from archive data and inserts with rewardAmount=0
+  // (display/leaderboard only — no reward redistribution).
+  public shared ({ caller }) func admin_backfillMissingNeurons(
+    neuronIds: [Blob],
+    afterTimestamp: Int
+  ) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+
+    if (recalcInProgress) {
+      return #err(#SystemError("Recalculation or backfill already in progress"));
+    };
+
+    switch (currentDistributionId) {
+      case (?_) { return #err(#SystemError("Distribution in progress, cannot start backfill")) };
+      case null {};
+    };
+
+    if (neuronIds.size() == 0) {
+      return #ok("No neuron IDs provided");
+    };
+
+    if (neuronIds.size() > 100) {
+      return #err(#SystemError("Too many neurons. Max 100 per call."));
+    };
+
+    recalcInProgress := true;
+
+    let totalDistributions = Vector.size(distributionHistory);
+    if (totalDistributions == 0) {
+      recalcInProgress := false;
+      return #ok("No distributions found");
+    };
+
+    var startIndex : Nat = totalDistributions;
+    for (i in Iter.range(0, totalDistributions - 1)) {
+      let record = Vector.get(distributionHistory, i);
+      if (record.startTime >= afterTimestamp and i < startIndex) {
+        startIndex := i;
+      };
+    };
+
+    if (startIndex >= totalDistributions) {
+      recalcInProgress := false;
+      return #ok("No distributions found after timestamp " # Int.toText(afterTimestamp));
+    };
+
+    let distributionsToProcess = totalDistributions - startIndex;
+    logger.info("Admin", "Starting backfill of " # Nat.toText(neuronIds.size()) # " neurons across " # Nat.toText(distributionsToProcess) # " distributions", "admin_backfillMissingNeurons");
+
+    ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+      try {
+        await* backfillDistributionsSequentially<system>(
+          startIndex, totalDistributions, neuronIds, 0, startIndex
+        );
+      } catch (e) {
+        recalcInProgress := false;
+        clearRecalcCaches();
+        logger.error("Admin", "Backfill failed: " # Error.message(e), "admin_backfillMissingNeurons");
+      };
+    });
+
+    #ok("Started backfill of " # Nat.toText(neuronIds.size()) # " neurons across " # Nat.toText(distributionsToProcess) # " distributions (" # Nat.toText(startIndex) # " to " # Nat.toText(totalDistributions - 1) # ")")
+  };
+
+  private func backfillDistributionsSequentially<system>(
+    currentDistIndex: Nat,
+    totalDistributions: Nat,
+    neuronIds: [Blob],
+    totalNeuronsAdded: Nat,
+    startDistIndex: Nat
+  ) : async* () {
+
+    if (currentDistIndex >= totalDistributions) {
+      recalcInProgress := false;
+      clearRecalcCaches();
+      await* computeAllLeaderboards<system>();
+      startLeaderboardTimer<system>();
+      logger.info("Admin", "Backfill complete: " # Nat.toText(totalNeuronsAdded) # " neurons added across " # Nat.toText(totalDistributions - startDistIndex) # " distributions. Leaderboards recomputed.", "backfillDistributionsSequentially");
+      return;
+    };
+
+    let existingRecord = Vector.get(distributionHistory, currentDistIndex);
+
+    // Prefetch allocation data for this distribution's time range
+    await* prefetchAllocationsForDistribution(existingRecord);
+
+    // Find which neurons are missing from this distribution
+    let existingNeuronIds = Map.new<Blob, Null>();
+    for (nr in existingRecord.neuronRewards.vals()) {
+      Map.set(existingNeuronIds, bhash, nr.neuronId, null);
+    };
+    for (fn in existingRecord.failedNeurons.vals()) {
+      Map.set(existingNeuronIds, bhash, fn.neuronId, null);
+    };
+
+    let missingNeurons = Buffer.Buffer<Blob>(neuronIds.size());
+    for (neuronId in neuronIds.vals()) {
+      if (not Map.has(existingNeuronIds, bhash, neuronId)) {
+        missingNeurons.add(neuronId);
+      };
+    };
+
+    if (missingNeurons.size() == 0) {
+      clearRecalcCaches();
+      logger.info("Admin", "Distribution #" # Nat.toText(existingRecord.id) # ": no missing neurons, skipping", "backfillDistributionsSequentially");
+      ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+        await* backfillDistributionsSequentially<system>(
+          currentDistIndex + 1, totalDistributions, neuronIds, totalNeuronsAdded, startDistIndex
+        );
+      });
+      return;
+    };
+
+    // Build updated rewards with existing + new neurons
+    let updatedRewardsBuffer = Buffer.Buffer<NeuronReward>(existingRecord.neuronRewards.size() + missingNeurons.size());
+    for (existing in existingRecord.neuronRewards.vals()) {
+      updatedRewardsBuffer.add(existing);
+    };
+
+    let failedBuffer = Buffer.Buffer<FailedNeuron>(existingRecord.failedNeurons.size());
+    for (existing in existingRecord.failedNeurons.vals()) {
+      failedBuffer.add(existing);
+    };
+
+    var neuronsAdded : Nat = 0;
+
+    // Process missing neurons in batches of 10 (parallel futures)
+    let BATCH_SIZE : Nat = 10;
+    var offset : Nat = 0;
+    let missingArr = Buffer.toArray(missingNeurons);
+
+    while (offset < missingArr.size()) {
+      let batchLen = Nat.min(BATCH_SIZE, missingArr.size() - offset);
+
+      // Launch parallel futures
+      let perfFutures = Buffer.Buffer<async Result.Result<PerformanceResult, RewardsError>>(batchLen);
+      let batchNeuronIds = Buffer.Buffer<Blob>(batchLen);
+
+      var idx = offset;
+      while (idx < offset + batchLen) {
+        let neuronId = missingArr[idx];
+        batchNeuronIds.add(neuronId);
+        perfFutures.add(
+          (with timeout = 65) calculateNeuronPerformance(
+            neuronId, existingRecord.startTime, existingRecord.endTime, #USD
+          )
+        );
+        idx += 1;
+      };
+
+      // Await all futures
+      var futureIdx : Nat = 0;
+      for (future in perfFutures.vals()) {
+        let neuronId = batchNeuronIds.get(futureIdx);
+        try {
+          let performanceResult = await future;
+          switch (performanceResult) {
+            case (#ok(performance)) {
+              let votingPower = getVotingPowerFromPerformance(performance);
+              let performanceICP = if (performance.checkpoints.size() >= 2) {
+                recomputePerformanceFromCheckpointsDerived(performance.checkpoints, performance.performanceScore)
+              } else { null };
+
+              updatedRewardsBuffer.add({
+                neuronId = neuronId;
+                performanceScore = performance.performanceScore;
+                performanceScoreICP = performanceICP;
+                votingPower = votingPower;
+                rewardScore = 0.0;
+                rewardAmount = 0;
+                checkpoints = performance.checkpoints;
+              });
+              neuronsAdded += 1;
+            };
+            case (#err(error)) {
+              failedBuffer.add({
+                neuronId = neuronId;
+                errorMessage = "Backfill: " # debug_show(error);
+              });
+            };
+          };
+        } catch (e) {
+          failedBuffer.add({
+            neuronId = neuronId;
+            errorMessage = "Backfill system error: " # Error.message(e);
+          });
+        };
+        futureIdx += 1;
+      };
+
+      offset += batchLen;
+    };
+
+    // Save updated distribution record
+    let updatedRecord : DistributionRecord = {
+      id = existingRecord.id;
+      startTime = existingRecord.startTime;
+      endTime = existingRecord.endTime;
+      distributionTime = existingRecord.distributionTime;
+      totalRewardPot = existingRecord.totalRewardPot;
+      actualDistributed = existingRecord.actualDistributed;
+      totalRewardScore = existingRecord.totalRewardScore;
+      neuronsProcessed = existingRecord.neuronsProcessed;
+      neuronRewards = Buffer.toArray(updatedRewardsBuffer);
+      failedNeurons = Buffer.toArray(failedBuffer);
+      status = existingRecord.status;
+    };
+    Vector.put(distributionHistory, currentDistIndex, updatedRecord);
+
+    clearRecalcCaches();
+    logger.info("Admin", "Backfilled distribution #" # Nat.toText(existingRecord.id) # ": added " # Nat.toText(neuronsAdded) # " neurons (" # Nat.toText(failedBuffer.size() - existingRecord.failedNeurons.size()) # " failed)", "backfillDistributionsSequentially");
+
+    // Move to next distribution
+    ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
+      await* backfillDistributionsSequentially<system>(
+        currentDistIndex + 1, totalDistributions, neuronIds, totalNeuronsAdded + neuronsAdded, startDistIndex
       );
     });
   };

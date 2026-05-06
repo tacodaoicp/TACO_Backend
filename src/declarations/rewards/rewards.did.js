@@ -85,6 +85,16 @@ export const idlFactory = ({ IDL }) => {
     'ok' : PerformanceResult,
     'err' : RewardsError,
   });
+  const LeaderboardEntry = IDL.Record({
+    'principal' : IDL.Principal,
+    'displayName' : IDL.Opt(IDL.Text),
+    'performanceScore' : IDL.Float64,
+    'lastActivity' : IDL.Int,
+    'rank' : IDL.Nat,
+    'distributionsCount' : IDL.Nat,
+    'totalRewardsEarned' : IDL.Nat,
+    'neuronId' : IDL.Vec(IDL.Nat8),
+  });
   const Account = IDL.Record({
     'owner' : IDL.Principal,
     'subaccount' : IDL.Opt(IDL.Vec(IDL.Nat8)),
@@ -160,15 +170,6 @@ export const idlFactory = ({ IDL }) => {
     'ICP' : IDL.Null,
     'USD' : IDL.Null,
   });
-  const LeaderboardEntry = IDL.Record({
-    'principal' : IDL.Principal,
-    'displayName' : IDL.Opt(IDL.Text),
-    'performanceScore' : IDL.Float64,
-    'lastActivity' : IDL.Int,
-    'rank' : IDL.Nat,
-    'distributionsCount' : IDL.Nat,
-    'neuronId' : IDL.Vec(IDL.Nat8),
-  });
   const LogLevel = IDL.Variant({
     'INFO' : IDL.Null,
     'WARN' : IDL.Null,
@@ -212,6 +213,44 @@ export const idlFactory = ({ IDL }) => {
   const Result__1_5 = IDL.Variant({
     'ok' : IDL.Vec(IDL.Vec(IDL.Nat8)),
     'err' : RewardsError,
+  });
+  const NeuronRewardSummary = IDL.Record({
+    'rewardAmount' : IDL.Nat,
+    'performanceScore' : IDL.Float64,
+    'votingPower' : IDL.Nat,
+    'rewardScore' : IDL.Float64,
+    'neuronId' : IDL.Vec(IDL.Nat8),
+    'performanceScoreICP' : IDL.Opt(IDL.Float64),
+  });
+  const UserDistributionSummary = IDL.Record({
+    'startTime' : IDL.Int,
+    'distributionTime' : IDL.Int,
+    'endTime' : IDL.Int,
+    'totalRewardPot' : IDL.Nat,
+    'distributionId' : IDL.Nat,
+    'neuronRewards' : IDL.Vec(NeuronRewardSummary),
+  });
+  const RewardsDashboard = IDL.Record({
+    'totalDistributed' : IDL.Nat,
+    'distributions' : IDL.Record({
+      'total' : IDL.Nat,
+      'hasMore' : IDL.Bool,
+      'records' : IDL.Vec(UserDistributionSummary),
+    }),
+    'withdrawals' : IDL.Vec(WithdrawalRecord),
+    'distributionStatus' : IDL.Record({
+      'nextDistributionTime' : IDL.Int,
+      'distributionEnabled' : IDL.Bool,
+      'currentDistributionId' : IDL.Opt(IDL.Nat),
+      'lastDistributionTime' : IDL.Int,
+      'inProgress' : IDL.Bool,
+    }),
+    'withdrawalStats' : IDL.Record({
+      'totalRecordsInHistory' : IDL.Nat,
+      'totalWithdrawn' : IDL.Nat,
+      'totalWithdrawals' : IDL.Nat,
+    }),
+    'balances' : IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat)),
   });
   const UserPerformanceResult = IDL.Record({
     'principal' : IDL.Principal,
@@ -296,14 +335,19 @@ export const idlFactory = ({ IDL }) => {
         [Result__1_12],
         [],
       ),
-    'admin_recalculateAllIcpPerformance' : IDL.Func([], [Result__1], []),
-    'admin_recalculateIcpPerformanceForDistribution' : IDL.Func(
-        [IDL.Nat],
+    'admin_backfillMissingNeurons' : IDL.Func(
+        [IDL.Vec(IDL.Vec(IDL.Nat8)), IDL.Int],
         [Result__1],
         [],
       ),
+    'admin_recalculateAllIcpPerformance' : IDL.Func([], [Result__1], []),
     'admin_recalculateDistributionPerformance' : IDL.Func(
         [IDL.Int],
+        [Result__1],
+        [],
+      ),
+    'admin_recalculateIcpPerformanceForDistribution' : IDL.Func(
+        [IDL.Nat],
         [Result__1],
         [],
       ),
@@ -319,6 +363,22 @@ export const idlFactory = ({ IDL }) => {
       ),
     'clearLogs' : IDL.Func([], [], []),
     'deleteMyDisplayName' : IDL.Func([], [Result__1], []),
+    'getAllLeaderboards' : IDL.Func(
+        [IDL.Opt(IDL.Nat), IDL.Opt(IDL.Nat)],
+        [
+          IDL.Record({
+            'oneMonthICP' : IDL.Vec(LeaderboardEntry),
+            'oneMonthUSD' : IDL.Vec(LeaderboardEntry),
+            'oneWeekICP' : IDL.Vec(LeaderboardEntry),
+            'oneWeekUSD' : IDL.Vec(LeaderboardEntry),
+            'oneYearICP' : IDL.Vec(LeaderboardEntry),
+            'oneYearUSD' : IDL.Vec(LeaderboardEntry),
+            'allTimeICP' : IDL.Vec(LeaderboardEntry),
+            'allTimeUSD' : IDL.Vec(LeaderboardEntry),
+          }),
+        ],
+        ['query'],
+      ),
     'getAllNeuronRewardBalances' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Vec(IDL.Nat8), IDL.Nat))],
@@ -496,8 +556,24 @@ export const idlFactory = ({ IDL }) => {
         ['query'],
       ),
     'getRewardSkipList' : IDL.Func([], [Result__1_5], ['query']),
+    'getRewardsDashboard' : IDL.Func(
+        [IDL.Vec(IDL.Vec(IDL.Nat8)), IDL.Opt(IDL.Nat), IDL.Opt(IDL.Nat)],
+        [RewardsDashboard],
+        ['query'],
+      ),
     'getTacoBalance' : IDL.Func([], [IDL.Nat], []),
     'getTotalDistributed' : IDL.Func([], [IDL.Nat], ['query']),
+    'getUserDistributionRewards' : IDL.Func(
+        [IDL.Vec(IDL.Vec(IDL.Nat8)), IDL.Nat, IDL.Nat],
+        [
+          IDL.Record({
+            'total' : IDL.Nat,
+            'hasMore' : IDL.Bool,
+            'records' : IDL.Vec(UserDistributionSummary),
+          }),
+        ],
+        ['query'],
+      ),
     'getUserPerformance' : IDL.Func(
         [IDL.Principal],
         [Result__1_4],
@@ -511,7 +587,7 @@ export const idlFactory = ({ IDL }) => {
     'getUserWithdrawalHistory' : IDL.Func(
         [IDL.Opt(IDL.Nat)],
         [Result__1_2],
-        [],
+        ['query'],
       ),
     'getWithdrawalStats' : IDL.Func(
         [],

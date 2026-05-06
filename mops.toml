@@ -19,3 +19,4 @@ cert = "https://github.com/nomeata/ic-certification#v0.1.3@c403ffec0a60f658a1009
 stable-rbtree = "1.0.0"
 stable-buffer = "1.0.1"
 stableheapbtreemap = "1.5.0"
+sha2 = "0.1.14"

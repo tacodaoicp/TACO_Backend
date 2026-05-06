@@ -38,4 +38,16 @@ leaderboard.md
 trading_overview.md
 *.md
 sns_canister_source/
+.claude/
 
+
+# NACHOS ledger (cloned from icdevsorg/ICRC_fungible)
+nachos_ledger/
+taco-onramp-session/
+
+v3guide.pdf
+
+*.log
+
+# arb bot — local-only Rust workspace, contains keys + state
+arb-bot/

@@ -17,7 +17,50 @@ export interface ClaimsReply {
   'amount' : bigint,
   'symbol' : string,
 }
-export type ExchangeType = { 'KongSwap' : null } |
+export interface EnhancedTreasuryDashboard {
+  'systemParameters' : RebalanceConfigResponse,
+  'portfolioSnapshotStatus' : {
+    'status' : { 'Stopped' : null } |
+      { 'Running' : null },
+    'lastSnapshotTime' : bigint,
+    'intervalMinutes' : bigint,
+  },
+  'longSyncTimerStatus' : {
+    'nextScheduledTime' : bigint,
+    'lastRunTime' : bigint,
+    'intervalNS' : bigint,
+    'timerId' : bigint,
+    'isRunning' : boolean,
+  },
+  'recentSnapshots' : {
+    'totalCount' : bigint,
+    'snapshots' : Array<PortfolioSnapshot>,
+  },
+  'tradingPauses' : TradingPausesResponse,
+  'tradingStatus' : {
+    'executedTrades' : Array<TradeRecord>,
+    'metrics' : {
+      'avgSlippage' : number,
+      'successRate' : number,
+      'lastUpdate' : bigint,
+      'totalTradesExecuted' : bigint,
+      'lastRebalanceAttempt' : bigint,
+      'skipBreakdown' : SkipBreakdown,
+      'skipRate' : number,
+      'totalTradesFailed' : bigint,
+      'totalTradesSkipped' : bigint,
+    },
+    'rebalanceStatus' : RebalanceStatus,
+    'portfolioState' : {
+      'currentAllocations' : Array<[Principal, bigint]>,
+      'totalValueICP' : bigint,
+      'totalValueUSD' : number,
+      'targetAllocations' : Array<[Principal, bigint]>,
+    },
+  },
+}
+export type ExchangeType = { 'TACO' : null } |
+  { 'KongSwap' : null } |
   { 'ICPSwap' : null };
 export interface LogEntry {
   'component' : string,
@@ -136,29 +179,7 @@ export type Result = { 'ok' : string } |
   { 'err' : string };
 export type Result_1 = { 'ok' : string } |
   { 'err' : PriceFailsafeError };
-export type Result_10 = { 'ok' : Array<[Principal, Array<PricePoint>]> } |
-  { 'err' : string };
-export type Result_11 = { 'ok' : PortfolioHistoryResponse } |
-  { 'err' : PortfolioSnapshotError };
-export type Result_12 = { 'ok' : Array<ClaimsReply> } |
-  { 'err' : string };
-export type Result_13 = { 'ok' : bigint } |
-  { 'err' : PriceFailsafeError };
-export type Result_14 = { 'ok' : bigint } |
-  { 'err' : PortfolioCircuitBreakerError };
-export type Result_2 = { 'ok' : string } |
-  { 'err' : RebalanceError };
-export type Result_3 = { 'ok' : string } |
-  { 'err' : PortfolioCircuitBreakerError };
-export type Result_4 = { 'ok' : string } |
-  { 'err' : PortfolioSnapshotError };
-export type Result_5 = { 'ok' : string } |
-  { 'err' : TradingPauseError };
-export type Result_6 = { 'ok' : string } |
-  { 'err' : SyncErrorTreasury };
-export type Result_7 = { 'ok' : TreasuryAdminActionsSinceResponse } |
-  { 'err' : TradingPauseError };
-export type Result_8 = {
+export type Result_10 = {
     'ok' : {
       'executedTrades' : Array<TradeRecord>,
       'metrics' : {
@@ -187,7 +208,7 @@ export type Result_8 = {
     }
   } |
   { 'err' : string };
-export type Result_9 = {
+export type Result_11 = {
     'ok' : {
       'executedTrades' : Array<TradeRecord>,
       'metrics' : {
@@ -217,6 +238,58 @@ export type Result_9 = {
     }
   } |
   { 'err' : string };
+export type Result_12 = { 'ok' : Array<[Principal, Array<PricePoint>]> } |
+  { 'err' : string };
+export type Result_13 = { 'ok' : PortfolioHistoryResponse } |
+  { 'err' : PortfolioSnapshotError };
+export type Result_14 = { 'ok' : EnhancedTreasuryDashboard } |
+  { 'err' : string };
+export type Result_15 = { 'ok' : Array<[Principal, bigint]> } |
+  { 'err' : string };
+export type Result_16 = { 'ok' : Array<[string, bigint, string, bigint]> } |
+  { 'err' : string };
+export type Result_17 = { 'ok' : Array<ClaimsReply> } |
+  { 'err' : string };
+export type Result_18 = { 'ok' : bigint } |
+  { 'err' : PriceFailsafeError };
+export type Result_19 = { 'ok' : bigint } |
+  { 'err' : PortfolioCircuitBreakerError };
+export type Result_2 = { 'ok' : string } |
+  { 'err' : RebalanceError };
+export type Result_3 = { 'ok' : string } |
+  { 'err' : PortfolioCircuitBreakerError };
+export type Result_4 = { 'ok' : string } |
+  { 'err' : PortfolioSnapshotError };
+export type Result_5 = { 'ok' : string } |
+  { 'err' : TradingPauseError };
+export type Result_6 = { 'ok' : string } |
+  { 'err' : SyncErrorTreasury };
+export type Result_7 = {
+    'ok' : {
+      'icpPriceUSD' : number,
+      'tokenDetails' : Array<[Principal, TokenDetails]>,
+      'tokensRefreshed' : bigint,
+      'timestamp' : bigint,
+    }
+  } |
+  { 'err' : string };
+export type Result_8 = {
+    'ok' : {
+      'icpPriceUSD' : number,
+      'tokensRefreshed' : bigint,
+      'timestamp' : bigint,
+    }
+  } |
+  { 'err' : string };
+export type Result_9 = { 'ok' : TreasuryAdminActionsSinceResponse } |
+  { 'err' : TradingPauseError };
+export interface SkipBreakdown {
+  'tokensFiltered' : bigint,
+  'insufficientCandidates' : bigint,
+  'noExecutionPath' : bigint,
+  'noPairsFound' : bigint,
+  'pausedTokens' : bigint,
+}
 export type SnapshotReason = { 'PreTrade' : null } |
   { 'PostTrade' : null } |
   { 'Scheduled' : null } |
@@ -313,6 +386,8 @@ export type TreasuryAdminActionType = { 'StopRebalancing' : null } |
       'oldCondition' : string,
     }
   } |
+  { 'LPRemoveLiquidity' : { 'pool' : string, 'details' : string } } |
+  { 'LPEmergencyExit' : { 'positionsRemoved' : bigint } } |
   { 'ClearAllTradingPauses' : null } |
   { 'UnpauseToken' : { 'token' : Principal } } |
   { 'ExecuteTradingCycle' : null } |
@@ -325,6 +400,8 @@ export type TreasuryAdminActionType = { 'StopRebalancing' : null } |
     }
   } |
   { 'StartRebalancing' : null } |
+  { 'LPConfigUpdate' : { 'details' : string } } |
+  { 'LPClaimFees' : { 'pool' : string, 'details' : string } } |
   { 'SetTestMode' : { 'isTestMode' : boolean } } |
   { 'ClearPortfolioCircuitBreakerLogs' : null } |
   {
@@ -350,7 +427,9 @@ export type TreasuryAdminActionType = { 'StopRebalancing' : null } |
     }
   } |
   { 'UpdateRebalanceConfig' : { 'newConfig' : string, 'oldConfig' : string } } |
+  { 'LPAddLiquidity' : { 'pool' : string, 'details' : string } } |
   { 'StartPortfolioSnapshots' : null } |
+  { 'LPPoolConfigUpdate' : { 'pool' : string, 'details' : string } } |
   {
     'UpdatePortfolioSnapshotInterval' : {
       'newIntervalNS' : bigint,
@@ -437,7 +516,7 @@ export interface treasury {
    */
   'addPortfolioCircuitBreakerCondition' : ActorMethod<
     [string, PortfolioDirection, number, bigint, PortfolioValueType],
-    Result_14
+    Result_19
   >,
   /**
    * / * Add a new price trigger condition
@@ -449,24 +528,115 @@ export interface treasury {
    */
   'addTriggerCondition' : ActorMethod<
     [string, PriceDirection, number, bigint, Array<Principal>],
-    Result_13
+    Result_18
   >,
   /**
    * / * Execute all pending KongSwap claims to recover tokens
    */
   'admin_executeKongClaims' : ActorMethod<[], Result>,
   'admin_executeTradingCycle' : ActorMethod<[[] | [string]], Result_2>,
+  'admin_exitAllLP' : ActorMethod<[], Result>,
   /**
    * / * Query pending KongSwap claims for this treasury
    * /    * Returns list of claims that can be recovered
    */
-  'admin_getKongClaims' : ActorMethod<[], Result_12>,
+  'admin_getKongClaims' : ActorMethod<[], Result_17>,
+  'admin_getLPStatus' : ActorMethod<
+    [],
+    {
+      'pendingDepositsCount' : bigint,
+      'poolConfigs' : Array<
+        [
+          string,
+          {
+            'customLpRatioBP' : [] | [bigint],
+            'enabled' : boolean,
+            'customMaxPoolShareBP' : [] | [bigint],
+          },
+        ]
+      >,
+      'lastQueryAgeSeconds' : bigint,
+      'inTransit' : Array<[string, bigint]>,
+      'budgetUsage' : Array<
+        { 'usedICP' : bigint, 'tokenSymbol' : string, 'budgetICP' : bigint }
+      >,
+      'config' : {
+        'nachosHighVolumeThresholdBP' : bigint,
+        'lpRatioBP' : bigint,
+        'maxAdjustmentsPerCycle' : bigint,
+        'enabled' : boolean,
+        'nachosRedemptionBufferBP' : bigint,
+        'maxPoolShareBP' : bigint,
+        'rebalanceThresholdBP' : bigint,
+        'priceDeviationMaxBP' : bigint,
+        'minLPValueICP' : bigint,
+      },
+      'positions' : Array<
+        {
+          'backing0' : bigint,
+          'backing1' : bigint,
+          'totalFeesEarned0' : bigint,
+          'totalFeesEarned1' : bigint,
+          'liquidity' : bigint,
+          'shareOfPool' : number,
+          'totalWithdrawn0' : bigint,
+          'totalWithdrawn1' : bigint,
+          'unclaimedFees0' : bigint,
+          'unclaimedFees1' : bigint,
+          'token0' : string,
+          'token1' : string,
+          'poolKey' : string,
+          'firstDeployTimestamp' : bigint,
+          'lastFeeClaimTimestamp' : bigint,
+          'totalDeposited0' : bigint,
+          'totalDeposited1' : bigint,
+        }
+      >,
+      'depositsInFlight' : Array<[string, bigint]>,
+    }
+  >,
+  /**
+   * / * Query pending TACO failed swaps tracked for recovery
+   */
+  'admin_getTacoFailedSwaps' : ActorMethod<[], Result_16>,
   'admin_recoverPoolBalances' : ActorMethod<[], Result>,
+  /**
+   * / * Execute recovery of all pending TACO failed swaps
+   */
+  'admin_recoverTacoSwaps' : ActorMethod<[], Result>,
   /**
    * / * Manually refresh ICPSwap pools from factory
    * /    * Use this to pick up newly created pools
    */
   'admin_refreshICPSwapPools' : ActorMethod<[], Result>,
+  'admin_removeLPPosition' : ActorMethod<[string, string, bigint], Result>,
+  'admin_setLPConfig' : ActorMethod<
+    [
+      {
+        'nachosHighVolumeThresholdBP' : [] | [bigint],
+        'lpRatioBP' : [] | [bigint],
+        'maxAdjustmentsPerCycle' : [] | [bigint],
+        'enabled' : [] | [boolean],
+        'nachosRedemptionBufferBP' : [] | [bigint],
+        'maxPoolShareBP' : [] | [bigint],
+        'rebalanceThresholdBP' : [] | [bigint],
+        'priceDeviationMaxBP' : [] | [bigint],
+        'minLPValueICP' : [] | [bigint],
+      },
+    ],
+    Result
+  >,
+  'admin_setPoolLPConfig' : ActorMethod<
+    [
+      string,
+      {
+        'customLpRatioBP' : [] | [bigint],
+        'enabled' : boolean,
+        'customMaxPoolShareBP' : [] | [bigint],
+      },
+    ],
+    Result
+  >,
   /**
    * / * Timer for data synchronization
    * /    *
@@ -502,10 +672,13 @@ export interface treasury {
    * /    * Only callable by admins with appropriate permissions.
    */
   'clearPriceAlerts' : ActorMethod<[], Result_1>,
+  'debugPendingBurnsInTreasury' : ActorMethod<[], Array<[Principal, bigint]>>,
+  'getAvailableBalancesForBurn' : ActorMethod<[Array<Principal>], Result_15>,
   /**
    * / * Get current token allocations in basis points
    */
   'getCurrentAllocations' : ActorMethod<[], Array<[Principal, bigint]>>,
+  'getEnhancedTreasuryDashboard' : ActorMethod<[], Result_14>,
   /**
    * / * Get ICPSwap pool info for a specific token pair
    * /    *
@@ -523,6 +696,7 @@ export interface treasury {
       }
     ]
   >,
+  'getLPBackingPerToken' : ActorMethod<[], Array<[Principal, bigint]>>,
   /**
    * / * Get the last N log entries
    * /    * Only accessible by master admin, controller, or DAO
@@ -598,13 +772,13 @@ export interface treasury {
    * /    * Returns recent portfolio snapshots for analysis and charting.
    * /    * Public query - allows anyone to view portfolio history (read-only transparency).
    */
-  'getPortfolioHistory' : ActorMethod<[bigint], Result_11>,
+  'getPortfolioHistory' : ActorMethod<[bigint], Result_13>,
   /**
    * / * Get portfolio history filtered by timestamp (for archive efficiency)
    * /    * Returns only snapshots newer than the specified timestamp
    * /    * Public query - allows anyone to view portfolio history (read-only transparency).
    */
-  'getPortfolioHistorySince' : ActorMethod<[bigint, bigint], Result_11>,
+  'getPortfolioHistorySince' : ActorMethod<[bigint, bigint], Result_13>,
   /**
    * / * Get portfolio snapshot status
    */
@@ -672,6 +846,16 @@ export interface treasury {
    * / * Get all token details including balances and prices
    */
   'getTokenDetails' : ActorMethod<[], Array<[Principal, TokenDetails]>>,
+  'getTokenDetailsCache' : ActorMethod<
+    [],
+    {
+      'icpPriceUSD' : number,
+      'tokenDetails' : Array<[Principal, TokenDetails]>,
+      'timestamp' : bigint,
+      'tradingPauses' : Array<TradingPauseRecord>,
+      'lpBackingPerToken' : Array<[Principal, bigint]>,
+    }
+  >,
   /**
    * / * Get token details with price history filtered by timestamp (for archive efficiency)
    * /    * Returns only price points newer than the specified timestamp per token
@@ -680,7 +864,7 @@ export interface treasury {
     [bigint],
     Array<[Principal, TokenDetails]>
   >,
-  'getTokenPriceHistory' : ActorMethod<[Array<Principal>], Result_10>,
+  'getTokenPriceHistory' : ActorMethod<[Array<Principal>], Result_12>,
   /**
    * / * Get trading pause record for a specific token
    * /    *
@@ -698,13 +882,13 @@ export interface treasury {
    * /    * - Current vs target allocations
    * /    * - Performance metrics
    */
-  'getTradingStatus' : ActorMethod<[], Result_9>,
+  'getTradingStatus' : ActorMethod<[], Result_11>,
   /**
    * / * Get trading status with trades filtered by timestamp (for archive efficiency)
    * /    * Returns only trades newer than the specified timestamp
    */
-  'getTradingStatusSince' : ActorMethod<[bigint], Result_8>,
-  'getTreasuryAdminActionsSince' : ActorMethod<[bigint, bigint], Result_7>,
+  'getTradingStatusSince' : ActorMethod<[bigint], Result_10>,
+  'getTreasuryAdminActionsSince' : ActorMethod<[bigint, bigint], Result_9>,
   /**
    * / * Get a specific trigger condition by ID
    * /    *
@@ -713,6 +897,7 @@ export interface treasury {
    */
   'getTriggerCondition' : ActorMethod<[bigint], [] | [TriggerCondition]>,
   'get_canister_cycles' : ActorMethod<[], { 'cycles' : bigint }>,
+  'isLPEmergencyRecovering' : ActorMethod<[], boolean>,
   /**
    * / * List all discovered ICPSwap pools
    * /    *
@@ -772,6 +957,13 @@ export interface treasury {
     [Array<[TransferRecipient, bigint, Principal, number]>, boolean],
     [boolean, [] | [Array<[Principal, bigint]>]]
   >,
+  /**
+   * / * Public price refresh function for nachos_vault and authorized callers.
+   * /    * Rate-limited to MIN_PRICE_REFRESH_INTERVAL_NS between calls.
+   * /    * Wraps the private syncPriceWithDEX() function.
+   */
+  'refreshAllPrices' : ActorMethod<[], Result_8>,
+  'refreshPricesAndGetDetails' : ActorMethod<[], Result_7>,
   /**
    * / * Remove a portfolio circuit breaker condition
    */

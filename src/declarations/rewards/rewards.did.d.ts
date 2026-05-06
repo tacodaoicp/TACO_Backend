@@ -79,6 +79,7 @@ export interface LeaderboardEntry {
   'lastActivity' : bigint,
   'rank' : bigint,
   'distributionsCount' : bigint,
+  'totalRewardsEarned' : bigint,
   'neuronId' : Uint8Array | number[],
 }
 export type LeaderboardPriceType = { 'ICP' : null } |
@@ -148,6 +149,14 @@ export interface NeuronReward {
   'neuronId' : Uint8Array | number[],
   'performanceScoreICP' : [] | [number],
 }
+export interface NeuronRewardSummary {
+  'rewardAmount' : bigint,
+  'performanceScore' : number,
+  'votingPower' : bigint,
+  'rewardScore' : number,
+  'neuronId' : Uint8Array | number[],
+  'performanceScoreICP' : [] | [number],
+}
 export interface PerformanceResult {
   'startTime' : bigint,
   'endTime' : bigint,
@@ -207,12 +216,13 @@ export interface Rewards {
     [BackfillConfig],
     Result__1_12
   >,
-  'admin_recalculateAllIcpPerformance' : ActorMethod<[], Result__1>,
-  'admin_recalculateIcpPerformanceForDistribution' : ActorMethod<
-    [bigint],
+  'admin_backfillMissingNeurons' : ActorMethod<
+    [Array<Uint8Array | number[]>, bigint],
     Result__1
   >,
-  'admin_recalculateDistributionPerformance' : ActorMethod<
+  'admin_recalculateAllIcpPerformance' : ActorMethod<[], Result__1>,
+  'admin_recalculateDistributionPerformance' : ActorMethod<[bigint], Result__1>,
+  'admin_recalculateIcpPerformanceForDistribution' : ActorMethod<
     [bigint],
     Result__1
   >,
@@ -229,6 +239,19 @@ export interface Rewards {
    */
   'clearLogs' : ActorMethod<[], undefined>,
   'deleteMyDisplayName' : ActorMethod<[], Result__1>,
+  'getAllLeaderboards' : ActorMethod<
+    [[] | [bigint], [] | [bigint]],
+    {
+      'oneMonthICP' : Array<LeaderboardEntry>,
+      'oneMonthUSD' : Array<LeaderboardEntry>,
+      'oneWeekICP' : Array<LeaderboardEntry>,
+      'oneWeekUSD' : Array<LeaderboardEntry>,
+      'oneYearICP' : Array<LeaderboardEntry>,
+      'oneYearUSD' : Array<LeaderboardEntry>,
+      'allTimeICP' : Array<LeaderboardEntry>,
+      'allTimeUSD' : Array<LeaderboardEntry>,
+    }
+  >,
   'getAllNeuronRewardBalances' : ActorMethod<
     [],
     Array<[Uint8Array | number[], bigint]>
@@ -359,8 +382,20 @@ export interface Rewards {
   'getRewardPenalties' : ActorMethod<[], Result__1_7>,
   'getRewardPenalty' : ActorMethod<[Uint8Array | number[]], Result__1_6>,
   'getRewardSkipList' : ActorMethod<[], Result__1_5>,
+  'getRewardsDashboard' : ActorMethod<
+    [Array<Uint8Array | number[]>, [] | [bigint], [] | [bigint]],
+    RewardsDashboard
+  >,
   'getTacoBalance' : ActorMethod<[], bigint>,
   'getTotalDistributed' : ActorMethod<[], bigint>,
+  'getUserDistributionRewards' : ActorMethod<
+    [Array<Uint8Array | number[]>, bigint, bigint],
+    {
+      'total' : bigint,
+      'hasMore' : boolean,
+      'records' : Array<UserDistributionSummary>,
+    }
+  >,
   'getUserPerformance' : ActorMethod<[Principal], Result__1_4>,
   'getUserPerformanceGraphData' : ActorMethod<
     [Principal, bigint, bigint],
@@ -410,6 +445,28 @@ export interface Rewards {
   >,
   'withdraw' : ActorMethod<[Account, Array<Uint8Array | number[]>], Result>,
 }
+export interface RewardsDashboard {
+  'totalDistributed' : bigint,
+  'distributions' : {
+    'total' : bigint,
+    'hasMore' : boolean,
+    'records' : Array<UserDistributionSummary>,
+  },
+  'withdrawals' : Array<WithdrawalRecord>,
+  'distributionStatus' : {
+    'nextDistributionTime' : bigint,
+    'distributionEnabled' : boolean,
+    'currentDistributionId' : [] | [bigint],
+    'lastDistributionTime' : bigint,
+    'inProgress' : boolean,
+  },
+  'withdrawalStats' : {
+    'totalRecordsInHistory' : bigint,
+    'totalWithdrawn' : bigint,
+    'totalWithdrawals' : bigint,
+  },
+  'balances' : Array<[Uint8Array | number[], bigint]>,
+}
 export type RewardsError = { 'AllocationDataMissing' : null } |
   { 'InvalidDisplayName' : string } |
   { 'SystemError' : string } |
@@ -429,6 +486,14 @@ export type TransferError = {
   { 'CreatedInFuture' : { 'ledger_time' : bigint } } |
   { 'TooOld' : null } |
   { 'InsufficientFunds' : { 'balance' : bigint } };
+export interface UserDistributionSummary {
+  'startTime' : bigint,
+  'distributionTime' : bigint,
+  'endTime' : bigint,
+  'totalRewardPot' : bigint,
+  'distributionId' : bigint,
+  'neuronRewards' : Array<NeuronRewardSummary>,
+}
 export interface UserPerformanceGraphData {
   'timeframe' : { 'startTime' : bigint, 'endTime' : bigint },
   'aggregatedPerformanceICP' : [] | [number],

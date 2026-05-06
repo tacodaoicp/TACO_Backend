@@ -6,6 +6,7 @@ import Float "mo:base/Float";
 import Nat "mo:base/Nat";
 import Nat64 "mo:base/Nat64";
 import Debug "mo:base/Debug";
+import Blob "mo:base/Blob";
 import Types "./swap_types";
 import Utils "./utils";
 import Map "mo:map/Map";
@@ -440,11 +441,11 @@ module {
     };
   };
 
-  public func transferToPoolSubaccount(selfId : Principal, params : Types.ICPSwapDepositParams) : async Result.Result<Nat, Text> {
-    Debug.print("ICPSwap.transferToPoolSubaccount: Starting transfer with params: " # debug_show (params));
+  public func transferToPoolSubaccount(selfId : Principal, params : Types.ICPSwapDepositParams, fromSubaccount : ?[Nat8]) : async Result.Result<Nat, Text> {
+    Debug.print("ICPSwap.transferToPoolSubaccount: Starting transfer with params: " # debug_show (params) # " fromSubaccount: " # debug_show (fromSubaccount));
     try {
       let subaccount = Utils.principalToSubaccount(selfId);
-      Debug.print("ICPSwap.transferToPoolSubaccount: Derived subaccount: " # debug_show (subaccount));
+      Debug.print("ICPSwap.transferToPoolSubaccount: Derived pool subaccount: " # debug_show (subaccount));
       let token : Types.ICRC1 = actor (Principal.toText(params.token));
 
       let transferArgs : Types.ICRC1TransferArgs = {
@@ -454,7 +455,7 @@ module {
         };
         fee = ?params.fee;
         memo = null;
-        from_subaccount = null;
+        from_subaccount = fromSubaccount;
         created_at_time = null;
         amount = params.amount;
       };
@@ -544,7 +545,7 @@ module {
     try {
       // Step 1: Transfer tokens
       Debug.print("ICPSwap.executeTransferAndDeposit: Step 1 - Transferring tokens...");
-      let transferResult = await (with timeout = 65) transferToPoolSubaccount(selfId, params);
+      let transferResult = await (with timeout = 65) transferToPoolSubaccount(selfId, params, null);
       Debug.print("ICPSwap.executeTransferAndDeposit: Transfer result: " # debug_show (transferResult));
 
       switch (transferResult) {
@@ -664,7 +665,7 @@ module {
     try {
       // Step 1: Transfer tokens to pool subaccount
       Debug.print("ICPSwap.executeTransferDepositAndSwap: Step 1 - Transferring tokens...");
-      let transferResult = await (with timeout = 65) transferToPoolSubaccount(selfId, depositParams);
+      let transferResult = await (with timeout = 65) transferToPoolSubaccount(selfId, depositParams, null);
       Debug.print("ICPSwap.executeTransferDepositAndSwap: Transfer result: " # debug_show (transferResult));
 
       switch (transferResult) {
@@ -758,6 +759,150 @@ module {
     } catch (e) {
       Debug.print("ICPSwap.executeWithdraw: Exception: " # Error.message(e));
       #err("Error calling ICPSwap: " # Error.message(e));
+    };
+  };
+
+  // Withdraw tokens from pool to a specific subaccount on the caller (canister)
+  public func executeWithdrawToSubaccount(subaccount : [Nat8], params : Types.ICPSwapWithdrawParams) : async Result.Result<Nat, Text> {
+    Debug.print("ICPSwap.executeWithdrawToSubaccount: Withdrawing to subaccount " # debug_show (subaccount) # " with params: " # debug_show (params));
+    try {
+      let pool : Types.ICPSwapPool = actor (if test { FACTORY_CANISTER_ID } else { Principal.toText(params.poolId) });
+
+      let withdrawArgs : Types.WithdrawToSubaccountArgs = {
+        amount = params.amount;
+        fee = params.fee;
+        token = Principal.toText(params.token);
+        subaccount = Blob.fromArray(subaccount);
+      };
+
+      let result = await (with timeout = 65) pool.withdrawToSubaccount(withdrawArgs);
+      Debug.print("ICPSwap.executeWithdrawToSubaccount: Result: " # debug_show (result));
+
+      switch (result) {
+        case (#ok(tx_id)) {
+          Debug.print("ICPSwap.executeWithdrawToSubaccount: Success, tx_id: " # debug_show (tx_id));
+          #ok(tx_id);
+        };
+        case (#err(e)) {
+          Debug.print("ICPSwap.executeWithdrawToSubaccount: Error: " # debug_show (e));
+          #err("Error executing withdrawToSubaccount: " # debug_show (e));
+        };
+      };
+    } catch (e) {
+      Debug.print("ICPSwap.executeWithdrawToSubaccount: Exception: " # Error.message(e));
+      #err("Error calling ICPSwap withdrawToSubaccount: " # Error.message(e));
+    };
+  };
+
+  // Combined operation: transfer from subaccount → deposit → swap → withdrawToSubaccount → transfer to recipient
+  // Skips consolidation to main account. TACO goes to user's subaccount on canister (attributable),
+  // then transferred to user's principal.
+  public func executeSwapFromSubaccountToRecipient(
+    selfId : Principal,
+    fromSubaccount : [Nat8],
+    depositParams : Types.ICPSwapDepositParams,
+    swapParams : Types.ICPSwapParams,
+    recipient : Principal,
+    outputTokenLedger : Principal,
+    tokenOutFee : Nat,
+  ) : async Result.Result<Types.TransferDepositSwapWithdrawResult, Text> {
+    Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Starting subaccount→pool→withdrawToSubaccount→recipient swap");
+    try {
+      // Step 1: Transfer ICP from user's subaccount to pool's subaccount
+      Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Step 1 - Transfer from subaccount to pool");
+      let transferResult = await (with timeout = 65) transferToPoolSubaccount(selfId, depositParams, ?fromSubaccount);
+
+      switch (transferResult) {
+        case (#ok(_)) {
+          // Step 2: Register deposit with pool
+          Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Step 2 - Registering deposit");
+          let depositResult = await (with timeout = 65) registerPoolDeposit(depositParams);
+
+          switch (depositResult) {
+            case (#ok(_)) {
+              // Step 3: Execute swap (output stays as unused balance — no auto-withdraw)
+              Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Step 3 - Executing swap");
+              let swapResult = await (with timeout = 65) executeSwap(swapParams);
+
+              switch (swapResult) {
+                case (#ok(swapAmount)) {
+                  // Step 4: Withdraw TACO to user's subaccount on canister (attributable per-user)
+                  Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Step 4 - withdrawToSubaccount amount=" # Nat.toText(swapAmount));
+
+                  let withdrawParams : Types.ICPSwapWithdrawParams = {
+                    poolId = swapParams.poolId;
+                    token = outputTokenLedger;
+                    amount = swapAmount;
+                    fee = tokenOutFee;
+                  };
+
+                  let withdrawResult = await (with timeout = 65) executeWithdrawToSubaccount(fromSubaccount, withdrawParams);
+
+                  switch (withdrawResult) {
+                    case (#ok(_)) {
+                      // TACO is now on {owner: canister, subaccount: userSubaccount}
+                      let tacoOnSubaccount = if (swapAmount > tokenOutFee) {
+                        swapAmount - tokenOutFee
+                      } else { 0 };
+
+                      if (tacoOnSubaccount <= tokenOutFee) {
+                        #err("withdrawToSubaccount succeeded but TACO amount too small for transfer fee");
+                      } else {
+                        // Step 5: Transfer TACO from canister's user subaccount to user's principal
+                        Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Step 5 - Transfer " # Nat.toText(tacoOnSubaccount) # " TACO to " # Principal.toText(recipient));
+                        let tacoToSend = tacoOnSubaccount - tokenOutFee;
+
+                        let token : Types.ICRC1 = actor (Principal.toText(outputTokenLedger));
+                        let tacoTransferResult = await (with timeout = 65) token.icrc1_transfer({
+                          from_subaccount = ?fromSubaccount;
+                          to = { owner = recipient; subaccount = null };
+                          amount = tacoToSend;
+                          fee = ?tokenOutFee;
+                          memo = null;
+                          created_at_time = null;
+                        });
+
+                        switch (tacoTransferResult) {
+                          case (#Ok(txId)) {
+                            Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Complete! swapAmount=" # Nat.toText(swapAmount) # " delivered=" # Nat.toText(tacoToSend) # " txId=" # Nat.toText(txId));
+                            #ok({
+                              swapAmount = swapAmount;
+                              receivedAmount = tacoToSend;
+                            });
+                          };
+                          case (#Err(e)) {
+                            Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: TACO transfer to user failed: " # debug_show (e));
+                            #err("TACO transfer failed (TACO on canister user subaccount): " # debug_show (e));
+                          };
+                        };
+                      };
+                    };
+                    case (#err(e)) {
+                      Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: withdrawToSubaccount failed: " # e);
+                      #err("withdrawToSubaccount failed (TACO on pool unused balance): " # e);
+                    };
+                  };
+                };
+                case (#err(e)) {
+                  Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: swap failed: " # e);
+                  #err("Swap failed (ICP on pool unused balance): " # e);
+                };
+              };
+            };
+            case (#err(e)) {
+              Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: deposit failed: " # e);
+              #err("Deposit registration failed (ICP on pool subaccount): " # e);
+            };
+          };
+        };
+        case (#err(e)) {
+          Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: transfer failed: " # e);
+          #err("Transfer to pool failed (ICP still on user subaccount): " # e);
+        };
+      };
+    } catch (e) {
+      Debug.print("ICPSwap.executeSwapFromSubaccountToRecipient: Exception: " # Error.message(e));
+      #err("Exception in swap operation: " # Error.message(e));
     };
   };
 

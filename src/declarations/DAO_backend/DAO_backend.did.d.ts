@@ -31,6 +31,13 @@ export type AdminActionType = {
   { 'TokenPause' : { 'token' : Principal } } |
   { 'AdminRemove' : { 'removedAdmin' : Principal } } |
   {
+    'TokenMaxAllocationUpdate' : {
+      'token' : Principal,
+      'newMaxBP' : [] | [bigint],
+      'oldMaxBP' : [] | [bigint],
+    }
+  } |
+  {
     'SystemStateChange' : { 'oldState' : SystemState, 'newState' : SystemState }
   } |
   {
@@ -60,6 +67,7 @@ export type AdminFunction = { 'removeToken' : null } |
   { 'updateSystemParameter' : null } |
   { 'updateTreasuryConfig' : null } |
   { 'getFollowActions' : null } |
+  { 'setTokenMaxAllocation' : null } |
   { 'updateSpamParameters' : null } |
   { 'addToken' : null } |
   { 'getAdminActions' : null } |
@@ -176,6 +184,28 @@ export interface ContinuousDAO {
     }
   >,
   'getBannedWords' : ActorMethod<[], Result_12>,
+  'getDashboardData' : ActorMethod<
+    [],
+    [] | [
+      {
+        'snapshotInfo' : {
+          'totalVotingPower' : bigint,
+          'lastSnapshotTime' : bigint,
+          'lastSnapshotId' : bigint,
+        },
+        'tokenDetails' : Array<PublicTokenDetailsEntry>,
+        'aggregateAllocation' : Array<[Principal, bigint]>,
+        'votingPowerMetrics' : {
+          'principalCount' : bigint,
+          'totalVotingPower' : bigint,
+          'allocatedVotingPower' : bigint,
+          'totalVotingPowerByHotkeySetters' : bigint,
+          'neuronCount' : bigint,
+        },
+        'tokenMaxAllocations' : Array<[Principal, bigint]>,
+      }
+    ]
+  >,
   'getFollowActionsSince' : ActorMethod<[bigint, bigint], Result_11>,
   'getFollowersWithNeuronCounts' : ActorMethod<[], Array<[Principal, bigint]>>,
   'getHistoricBalanceAndAllocation' : ActorMethod<
@@ -220,10 +250,40 @@ export interface ContinuousDAO {
     [],
     Array<PublicTokenDetailsEntry>
   >,
+  'getTokenDetailsWithoutPastPricesMaxAllocations' : ActorMethod<
+    [],
+    Array<PublicTokenDetailsWithMaxAllocationEntry>
+  >,
   'getUserAllocation' : ActorMethod<[], [] | [UserState]>,
   'getUserNeurons' : ActorMethod<[Principal], Array<NeuronVP>>,
   'getUserRegisteredTokens' : ActorMethod<[], Array<Principal>>,
   'getUsersFollowerInfo' : ActorMethod<[Array<Principal>], Array<FollowerInfo>>,
+  'getVoteDashboard' : ActorMethod<
+    [[] | [Principal]],
+    [] | [
+      {
+        'snapshotInfo' : {
+          'totalVotingPower' : bigint,
+          'lastSnapshotTime' : bigint,
+          'lastSnapshotId' : bigint,
+        },
+        'historicBalanceAndAllocation' : Array<
+          [bigint, HistoricBalanceAllocation]
+        >,
+        'tokenDetails' : Array<PublicTokenDetailsWithMaxAllocationEntry>,
+        'userAllocation' : [] | [UserState],
+        'allocationStats' : AllocationStats,
+        'aggregateAllocation' : Array<[Principal, bigint]>,
+        'votingPowerMetrics' : {
+          'principalCount' : bigint,
+          'totalVotingPower' : bigint,
+          'allocatedVotingPower' : bigint,
+          'totalVotingPowerByHotkeySetters' : bigint,
+          'neuronCount' : bigint,
+        },
+      }
+    ]
+  >,
   'getVotingPowerChangesSince' : ActorMethod<[bigint, bigint], Result_8>,
   'get_canister_cycles' : ActorMethod<[], { 'cycles' : bigint }>,
   'grantAdminPermission' : ActorMethod<
@@ -239,6 +299,10 @@ export interface ContinuousDAO {
   'removeFollower' : ActorMethod<[Principal], Result_6>,
   'removeToken' : ActorMethod<[Principal, string], Result_1>,
   'setTacoAddress' : ActorMethod<[Principal], undefined>,
+  'setTokenMaxAllocation' : ActorMethod<
+    [Principal, [] | [bigint], string],
+    Result_1
+  >,
   'set_sns_governance_canister_id' : ActorMethod<[Principal], undefined>,
   'syncTokenDetailsFromTreasury' : ActorMethod<
     [Array<[Principal, TokenDetails]>],
@@ -251,13 +315,6 @@ export interface ContinuousDAO {
     [Array<Allocation>, [] | [string]],
     Result_2
   >,
-  /**
-   * / * Update Minting Vault configuration
-   * /  *
-   * /  * Allows configuration of premium rates, update intervals, and enabling/disabling swapping
-   * /  * Only callable by admins with the updateMintingVaultConfig permission.
-   */
-  'updateMintingVaultConfig' : ActorMethod<[UpdateConfig__1], Result_1>,
   'updateSpamParameters' : ActorMethod<
     [
       {
@@ -390,6 +447,26 @@ export interface PublicTokenDetails {
   'tokenType' : TokenType,
 }
 export type PublicTokenDetailsEntry = [Principal, PublicTokenDetails];
+export interface PublicTokenDetailsWithMaxAllocation {
+  'lastTimeSynced' : bigint,
+  'balance' : bigint,
+  'isPaused' : boolean,
+  'Active' : boolean,
+  'epochAdded' : bigint,
+  'priceInICP' : bigint,
+  'priceInUSD' : number,
+  'tokenTransferFee' : bigint,
+  'tokenDecimals' : bigint,
+  'tokenSymbol' : string,
+  'tokenName' : string,
+  'pausedDueToSyncFailure' : boolean,
+  'tokenType' : TokenType,
+  'maxAllocationBasisPoints' : [] | [bigint],
+}
+export type PublicTokenDetailsWithMaxAllocationEntry = [
+  Principal,
+  PublicTokenDetailsWithMaxAllocation,
+];
 export type RefreshError = { 'NotAllowed' : null } |
   { 'NoNeuronsFound' : null } |
   { 'SnsGovernanceError' : string } |
@@ -536,16 +613,6 @@ export interface UpdateConfig {
   'longSyncIntervalNS' : [] | [bigint],
   'maxTradeAttemptsPerInterval' : [] | [bigint],
   'maxKongswapAttempts' : [] | [bigint],
-}
-export interface UpdateConfig__1 {
-  'balanceUpdateInterval' : [] | [bigint],
-  'maxSlippageBasisPoints' : [] | [bigint],
-  'blockCleanupInterval' : [] | [bigint],
-  'minSwapValueUSD' : [] | [number],
-  'PRICE_HISTORY_WINDOW' : [] | [bigint],
-  'maxPremium' : [] | [number],
-  'swappingEnabled' : [] | [boolean],
-  'minPremium' : [] | [number],
 }
 export type UpdateError = { 'NotAllowed' : null } |
   { 'UnexpectedError' : string } |

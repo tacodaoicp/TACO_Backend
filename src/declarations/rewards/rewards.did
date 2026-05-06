@@ -43,6 +43,15 @@ type UserPerformanceGraphData =
                 startTime: int;
               };
  };
+type UserDistributionSummary = 
+ record {
+   distributionId: nat;
+   distributionTime: int;
+   endTime: int;
+   neuronRewards: vec NeuronRewardSummary;
+   startTime: int;
+   totalRewardPot: nat;
+ };
 type TransferError = 
  variant {
    BadBurn: record {min_burn_amount: nat;};
@@ -72,6 +81,35 @@ type RewardsError =
                      };
    SystemError: text;
  };
+type RewardsDashboard = 
+ record {
+   balances: vec record {
+                   blob;
+                   nat;
+                 };
+   distributionStatus:
+    record {
+      currentDistributionId: opt nat;
+      distributionEnabled: bool;
+      inProgress: bool;
+      lastDistributionTime: int;
+      nextDistributionTime: int;
+    };
+   distributions:
+    record {
+      hasMore: bool;
+      records: vec UserDistributionSummary;
+      total: nat;
+    };
+   totalDistributed: nat;
+   withdrawalStats:
+    record {
+      totalRecordsInHistory: nat;
+      totalWithdrawals: nat;
+      totalWithdrawn: nat;
+    };
+   withdrawals: vec WithdrawalRecord;
+ };
 type Rewards = 
  service {
    addBannedWords: (words: vec text) -> (Result__1);
@@ -79,10 +117,12 @@ type Rewards =
    adminDeleteDisplayName: (target: principal) -> (Result__1);
    admin_backfillDistributionHistory: (config: BackfillConfig) ->
     (Result__1_12);
+   admin_backfillMissingNeurons: (neuronIds: vec blob, afterTimestamp:
+    int) -> (Result__1);
    admin_recalculateAllIcpPerformance: () -> (Result__1);
-   admin_recalculateIcpPerformanceForDistribution: (distributionId: nat) ->
-    (Result__1);
    admin_recalculateDistributionPerformance: (afterTimestamp: int) ->
+    (Result__1);
+   admin_recalculateIcpPerformanceForDistribution: (distributionId: nat) ->
     (Result__1);
    calculateNeuronPerformance: (neuronId: blob, startTime: int, endTime: 
     int, priceType: PriceType) -> (Result__1_11);
@@ -91,6 +131,17 @@ type Rewards =
    /// * Clear all logs
    clearLogs: () -> ();
    deleteMyDisplayName: () -> (Result__1);
+   getAllLeaderboards: (limit: opt nat, offset: opt nat) ->
+    (record {
+       allTimeICP: vec LeaderboardEntry;
+       allTimeUSD: vec LeaderboardEntry;
+       oneMonthICP: vec LeaderboardEntry;
+       oneMonthUSD: vec LeaderboardEntry;
+       oneWeekICP: vec LeaderboardEntry;
+       oneWeekUSD: vec LeaderboardEntry;
+       oneYearICP: vec LeaderboardEntry;
+       oneYearUSD: vec LeaderboardEntry;
+     }) query;
    getAllNeuronRewardBalances: () -> (vec record {
                                             blob;
                                             nat;
@@ -208,13 +259,22 @@ type Rewards =
    getRewardPenalties: () -> (Result__1_7) query;
    getRewardPenalty: (neuronId: blob) -> (Result__1_6) query;
    getRewardSkipList: () -> (Result__1_5) query;
+   getRewardsDashboard: (neuronIds: vec blob, withdrawalLimit: opt nat,
+    distributionLimit: opt nat) -> (RewardsDashboard) query;
    getTacoBalance: () -> (nat);
    getTotalDistributed: () -> (nat) query;
+   getUserDistributionRewards: (neuronIds: vec blob, offset: nat, limit:
+    nat) ->
+    (record {
+       hasMore: bool;
+       records: vec UserDistributionSummary;
+       total: nat;
+     }) query;
    getUserPerformance: (userPrincipal: principal) ->
     (Result__1_4) composite_query;
    getUserPerformanceGraphData: (userPrincipal: principal, startTime: 
     int, endTime: int) -> (Result__1_3) composite_query;
-   getUserWithdrawalHistory: (limit: opt nat) -> (Result__1_2);
+   getUserWithdrawalHistory: (limit: opt nat) -> (Result__1_2) query;
    getWithdrawalStats: () ->
     (record {
        totalRecordsInHistory: nat;
@@ -349,6 +409,15 @@ type PerformanceResult =
    preTimespanAllocation: opt NeuronAllocationChangeBlockData;
    startTime: int;
  };
+type NeuronRewardSummary = 
+ record {
+   neuronId: blob;
+   performanceScore: float64;
+   performanceScoreICP: opt float64;
+   rewardAmount: nat;
+   rewardScore: float64;
+   votingPower: nat;
+ };
 type NeuronReward = 
  record {
    checkpoints: vec CheckpointData;
@@ -440,6 +509,7 @@ type LeaderboardEntry =
    performanceScore: float64;
    "principal": principal;
    rank: nat;
+   totalRewardsEarned: nat;
  };
 type GraphCheckpointData = 
  record {

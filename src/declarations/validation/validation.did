@@ -12,6 +12,7 @@ type UpdateConfig =
    maxTradeAttemptsPerInterval: opt nat;
    maxTradeValueICP: opt nat;
    maxTradesStored: opt nat;
+   minAllocationDiffBasisPoints: opt nat;
    minTradeValueICP: opt nat;
    portfolioRebalancePeriodNS: opt nat;
    priceUpdateIntervalNS: opt nat;
@@ -59,41 +60,108 @@ type PortfolioDirection =
    Down;
    Up;
  };
+type CircuitBreakerConditionType = 
+ variant {
+   BalanceChange;
+   DecimalChange;
+   NavDrop;
+   PriceChange;
+   TokenPaused;
+ };
+type CircuitBreakerConditionInput = 
+ record {
+   action: CircuitBreakerAction;
+   applicableTokens: vec principal;
+   conditionType: CircuitBreakerConditionType;
+   direction: variant {
+                Both;
+                Down;
+                Up;
+              };
+   enabled: bool;
+   thresholdPercent: float64;
+   timeWindowNS: nat;
+ };
+type CircuitBreakerAction = 
+ variant {
+   PauseBoth;
+   PauseBurn;
+   PauseMint;
+   RejectOperation;
+ };
 service : {
   get_canister_cycles: () -> (record {cycles: nat;}) query;
   get_gnsf1_cnt: () -> (nat) query;
   test_gnsf1: () -> ();
   test_gnsf2: ("principal": principal) -> ();
+  validate_addAcceptedMintToken: (token: principal) ->
+   (ValidationResult) query;
+  validate_addCircuitBreakerCondition: (input:
+   CircuitBreakerConditionInput) -> (ValidationResult) query;
+  validate_addFeeExemptPrincipal: ("principal": principal) ->
+   (ValidationResult) query;
   validate_addPortfolioCircuitBreakerCondition: (name: text, direction:
    PortfolioDirection, percentage: float64, timeWindowNS: nat, valueType:
    PortfolioValueType) -> (ValidationResult) query;
+  validate_addRateLimitExemptPrincipal: ("principal": principal) ->
+   (ValidationResult) query;
   validate_addToRewardSkipList: (neuronId: blob) -> (ValidationResult) query;
   validate_addToken: (token: principal, tokenType: TokenType) ->
    (ValidationResult);
   validate_addTriggerCondition: (name: text, direction: PriceDirection,
    percentage: float64, timeWindowNS: nat, applicableTokens:
    vec principal) -> (ValidationResult) query;
+  validate_claimNachosBurnFees: (recipient: principal, amount: nat) ->
+   (ValidationResult) query;
+  validate_claimNachosCancellationFees: (recipient: principal,
+   tokenPrincipal: principal, amount: nat) -> (ValidationResult) query;
+  validate_claimNachosMintFees: (recipient: principal, amount: nat) ->
+   (ValidationResult) query;
   validate_clearAllTradingPauses: (reason: opt text) ->
    (ValidationResult) query;
+  validate_enableCircuitBreakerCondition: (conditionId: nat, enabled:
+   bool) -> (ValidationResult) query;
   validate_executeTradingCycle: (reason: opt text) ->
    (ValidationResult) query;
+  validate_nachosEmergencyPause: (reason: text) -> (ValidationResult) query;
+  validate_nachosEmergencyUnpause: (reason: text) -> (ValidationResult) query;
+  validate_pauseNachosBurning: (reason: text) -> (ValidationResult) query;
+  validate_pauseNachosMinting: (reason: text) -> (ValidationResult) query;
   validate_pauseToken: (token: principal, reason: text) ->
    (ValidationResult) query;
   validate_pauseTokenFromTradingManual: (token: principal, reason: text) ->
    (ValidationResult) query;
   validate_recoverPoolBalances: () -> (ValidationResult) query;
+  validate_recoverStuckNachos: (recipient: principal, amount: nat) ->
+   (ValidationResult) query;
+  validate_recoverWronglySentTokens: (tokenPrincipal: principal, blockNumber:
+   nat, senderPrincipal: principal) -> (ValidationResult) query;
+  validate_removeAcceptedMintToken: (token: principal) ->
+   (ValidationResult) query;
+  validate_removeCircuitBreakerCondition: (conditionId: nat) ->
+   (ValidationResult) query;
+  validate_removeFeeExemptPrincipal: ("principal": principal) ->
+   (ValidationResult) query;
   validate_removeFromRewardSkipList: (neuronId: blob) ->
    (ValidationResult) query;
   validate_removePortfolioCircuitBreakerCondition: (conditionId: nat) ->
    (ValidationResult) query;
+  validate_removeRateLimitExemptPrincipal: ("principal": principal) ->
+   (ValidationResult) query;
+  validate_removeRewardPenalty: (neuronId: blob) -> (ValidationResult) query;
   validate_removeTriggerCondition: (conditionId: nat) ->
    (ValidationResult) query;
   validate_resetImportTimestamps: (archivePrincipal: principal) ->
    (ValidationResult) query;
+  validate_resetNachosCircuitBreaker: (reason: text) ->
+   (ValidationResult) query;
+  validate_retryFailedTransfers: () -> (ValidationResult) query;
   validate_runManualBatchImport: (archivePrincipal: principal) ->
    (ValidationResult) query;
   validate_sendToken: (token: principal, amount_e8s: nat, to_principal:
    principal, to_subaccount: opt Subaccount) -> (ValidationResult) query;
+  validate_setAcceptedMintTokenEnabled: (token: principal, enabled: bool) ->
+   (ValidationResult) query;
   validate_setDistributionPeriod: (periodNS: nat) -> (ValidationResult) query;
   validate_setMaxInnerLoopIterations: (archivePrincipal: principal,
    iterations: nat) -> (ValidationResult) query;
@@ -104,6 +172,10 @@ service : {
   validate_setPeriodicRewardPot: (amount: nat) -> (ValidationResult) query;
   validate_setPortfolioCircuitBreakerConditionActive: (conditionId: nat,
    isActive: bool) -> (ValidationResult) query;
+  validate_setRewardPenalty: (neuronId: blob, multiplier: nat) ->
+   (ValidationResult) query;
+  validate_setTokenMaxAllocation: (token: principal, maxBP: opt nat, reason:
+   text) -> (ValidationResult) query;
   validate_setTriggerConditionActive: (conditionId: nat, isActive: bool) ->
    (ValidationResult) query;
   validate_setVotingPowerPower: (power: float64) -> (ValidationResult) query;
@@ -130,11 +202,25 @@ service : {
   validate_triggerDistribution: () -> (ValidationResult) query;
   validate_triggerDistributionCustom: (startTime: int, endTime: int,
    priceType: PriceType) -> (ValidationResult) query;
+  validate_unpauseNachosBurning: (reason: text) -> (ValidationResult) query;
+  validate_unpauseNachosMinting: (reason: text) -> (ValidationResult) query;
   validate_unpauseToken: (token: principal, reason: text) ->
    (ValidationResult) query;
   validate_unpauseTokenFromTrading: (token: principal, reason: opt text) ->
    (ValidationResult) query;
+  validate_updateCancellationFeeMultiplier: (multiplier: nat) ->
+   (ValidationResult) query;
+  validate_updateCircuitBreakerCondition: (conditionId: nat,
+   thresholdPercent: opt float64, timeWindowNS: opt nat, direction:
+   opt variant {
+         Both;
+         Down;
+         Up;
+       }, action: opt CircuitBreakerAction, applicableTokens:
+   opt vec principal) -> (ValidationResult) query;
   validate_updateMaxPortfolioSnapshots: (newLimit: nat, reason: opt text) ->
+   (ValidationResult) query;
+  validate_updateNachosFees: (mintFeeBP: opt nat, burnFeeBP: opt nat) ->
    (ValidationResult) query;
   validate_updatePortfolioSnapshotInterval: (intervalMinutes: nat, reason:
    opt text) -> (ValidationResult) query;

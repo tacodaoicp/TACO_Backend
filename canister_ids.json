@@ -3,6 +3,12 @@
     "ic": "vxqw7-iqaaa-aaaan-qzziq-cai",
     "staging": "tisou-7aaaa-aaaai-atiea-cai"
   },
+  "OTC_backend": {
+    "ic": "qioex-5iaaa-aaaan-q52ba-cai"
+  },
+  "buyback_canister": {
+    "ic": "cfl3o-5qaaa-aaaan-q6fga-cai"
+  },
   "dao_admin_archive": {
     "ic": "cspwf-4aaaa-aaaan-qz5ia-cai",
     "staging": "b6ygs-xaaaa-aaaan-qz5ca-cai"
@@ -19,13 +25,27 @@
     "ic": "dnhfs-7yaaa-aaaan-qz5mq-cai",
     "staging": "cajb4-qqaaa-aaaan-qz5la-cai"
   },
+  "exchange_treasury": {
+    "ic": "qbnpl-laaaa-aaaan-q52aq-cai"
+  },
+  "nachos_index": {
+    "ic": "ozme7-gaaaa-aaaan-q6duq-cai"
+  },
+  "nachos_ledger": {
+    "ic": "o6ncl-lyaaa-aaaan-q6dua-cai",
+    "staging": "pabnq-2qaaa-aaaam-qhryq-cai"
+  },
+  "nachos_vault": {
+    "ic": "ptdgf-eqaaa-aaaan-q6dtq-cai",
+    "staging": "p4nog-baaaa-aaaad-qkwpa-cai"
+  },
   "neuronSnapshot": {
     "ic": "vzs3x-taaaa-aaaan-qzzjq-cai",
     "staging": "tgqd4-eqaaa-aaaai-atifa-cai"
   },
   "nns_neuron_controller": {
     "ic": "tpgtx-iqaaa-aaaar-qbugq-cai",
-    "staging": "4xmtl-yiaaa-aaaan-qz7fq-cai"    
+    "staging": "4xmtl-yiaaa-aaaan-qz7fq-cai"
   },
   "portfolio_archive": {
     "ic": "bl7x7-wiaaa-aaaan-qz5bq-cai",
@@ -46,6 +66,9 @@
   "rewards": {
     "ic": "dkgdg-saaaa-aaaan-qz5ma-cai",
     "staging": "cjkka-gyaaa-aaaan-qz5kq-cai"
+  },
+  "taco_swap": {
+    "ic": "2uddx-dqaaa-aaaan-q5qja-cai"
   },
   "trading_archive": {
     "ic": "jmze3-hiaaa-aaaan-qz4xq-cai",

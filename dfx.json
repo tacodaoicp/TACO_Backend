@@ -14,7 +14,8 @@
     },
     "validation": {
       "main": "src/validation/validation.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     },
     "neuronSnapshot": {
       "main": "src/neuron_snapshot/neuronSnapshot.mo",
@@ -67,9 +68,70 @@
     "reward_withdrawal_archive": {
       "main": "src/archives/reward_withdrawal_archive/reward_withdrawal_archive.mo",
       "type": "motoko"
+    },
+    "nachos_vault": {
+      "main": "src/nachos_vault/nachos_vault.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "buyback_canister": {
+      "main": "src/buyback_canister/buyback_canister.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "nachos_ledger": {
+      "type": "custom",
+      "candid": "vendor/icrc_ledger_suite_2026-03-09/ledger.did",
+      "wasm": "vendor/icrc_ledger_suite_2026-03-09/ic-icrc1-ledger.wasm.gz",
+      "build": []
+    },
+    "nachos_index": {
+      "type": "custom",
+      "candid": "vendor/icrc_ledger_suite_2026-03-09/index-ng.did",
+      "wasm": "vendor/icrc_ledger_suite_2026-03-09/ic-icrc1-index-ng.wasm.gz",
+      "build": []
+    },
+    "taco_swap": {
+      "main": "src/taco_swap/taco_swap.mo",
+      "type": "motoko"
+    },
+    "OTC_backend": {
+      "main": "src/exchange/main.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_treasury": {
+      "main": "src/exchange/treasury.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_faucet": {
+      "main": "src/exchange/faucet.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_test": {
+      "main": "src/exchange/examples/test.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_testActorA": {
+      "main": "src/exchange/examples/testActorA.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_testActorB": {
+      "main": "src/exchange/examples/testActorB.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "exchange_testActorC": {
+      "main": "src/exchange/examples/testActorC.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
     }
   },
-  "networks": {
+  "networks":  {
     "staging": {
       "providers": [
         "https://icp0.io"

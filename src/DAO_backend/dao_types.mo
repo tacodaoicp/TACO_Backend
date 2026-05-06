@@ -231,6 +231,7 @@ module {
     #AdminRemove: {removedAdmin: Principal};
     #CanisterStart;
     #CanisterStop;
+    #TokenMaxAllocationUpdate: {token: Principal; oldMaxBP: ?Nat; newMaxBP: ?Nat};
   };
 
   public type AdminActionRecord = {
