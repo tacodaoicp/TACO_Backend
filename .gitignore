@@ -48,3 +48,6 @@ taco-onramp-session/
 v3guide.pdf
 
 *.log
+
+# arb bot — local-only Rust workspace, contains keys + state
+arb-bot/

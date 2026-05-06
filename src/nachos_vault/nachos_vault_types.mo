@@ -386,6 +386,7 @@ module {
     maxBurnNachosPerUser4Hours : ?Nat;
     maxMintAmountICP : ?Nat;
     maxBurnAmountNachos : ?Nat;
+    kongEnabled : ?Bool;
   };
 
 };

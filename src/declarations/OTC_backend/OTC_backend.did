@@ -79,10 +79,46 @@ type create_trading_canister =
         outputAmount: nat;
         route: vec SwapHop;
       }) query;
-   adminDrainExchange: (target: principal) -> (text);
-   adminDrainStatus: () -> (text) query;
+   adminDeleteKlinesBefore: (cutoffNs: int, maxDeletesPerBucket: nat) ->
+    (text);
+   adminDrainTestModeExchange: (target: principal) -> (text);
+   adminDrainTestModeStatus: () -> (text) query;
    adminExecuteRouteStrategy: (amount: nat, route: vec SwapHop, minOutput:
     nat, Block: nat) -> (SwapResult);
+   adminFindOptimalArb: (token: text, minSample: nat, maxSample: nat, depth:
+    nat, probes: nat, tolerancePct: nat) ->
+    (opt
+      record {
+        amount: nat;
+        efficiency: int;
+        efficiencyBps: int;
+        hopDetails: vec HopDetail;
+        outputAmount: nat;
+        probesRun: nat;
+        route: vec SwapHop;
+      }) query;
+   adminFlashArb: (notional: nat, route: vec SwapHop, minProfit: nat) ->
+    (variant {
+       Err: text;
+       Ok:
+        record {
+          capitalSource: variant {
+                           lent;
+                           phantom;
+                         };
+          grossProfit: nat;
+          hops: nat;
+          inputTfees: nat;
+          netProfit: nat;
+          notional: nat;
+          realized: nat;
+          swapId: nat;
+          tradingFee: nat;
+          transferFee: nat;
+        };
+     });
+   adminRepairLastTradedPriceAndKlines: (affectedPoolIndexes: vec nat,
+    alsoRepairVolume24h: bool) -> (text);
    batchAdjustLiquidity: (adjustments:
     vec
      record {
@@ -106,6 +142,7 @@ type create_trading_canister =
         transferred0: nat;
         transferred1: nat;
       });
+   canTradeTokens: (tokenIn: text, tokenOut: text) -> (bool) query;
    changeOwner2: (pri: principal) -> ();
    changeOwner3: (pri: principal) -> ();
    checkDiffs: (returnFees: bool, alwaysShow: bool) ->
@@ -131,6 +168,8 @@ type create_trading_canister =
                                    text;
                                    nat;
                                  }) query;
+   claimAllLPFees: () -> (ClaimAllLPFeesResult);
+   claimConcentratedFees: (positionId: nat) -> (ClaimFeesResult);
    claimFeesReferrer: () -> (vec record {
                                    text;
                                    nat;
@@ -139,6 +178,7 @@ type create_trading_canister =
    cleanTokenIds: () -> (ActionResult);
    clearAllBans: () -> ();
    clearStuckLocks: (accesscode: opt text, blocksDoneKey: opt text) -> (bool);
+   clearTokenArchiveOffset: (token: text) -> (bool);
    collectFees: () -> (ActionResult);
    debugV3Ticks: (token0: text, token1: text) ->
     (record {
@@ -274,6 +314,10 @@ type create_trading_canister =
            token1Amount: nat;
          };
      }) query;
+   getDriftOpTracker: () -> (vec record {
+                                   text;
+                                   int;
+                                 }) query;
    getExpectedMultiHopAmount: (tokenIn: text, tokenOut: text, amountIn:
     nat) ->
     (record {
@@ -318,6 +362,46 @@ type create_trading_canister =
              };
         priceImpact: float64;
         routeDescription: text;
+      }) query;
+   getExpectedReceiveAmountBatchMulti: (requests:
+    vec record {
+          amountSell: nat;
+          tokenBuy: text;
+          tokenSell: text;
+        }, maxRoutesPerRequest: nat) ->
+    (vec
+      record {
+        routes:
+         vec
+          record {
+            canFulfillFully: bool;
+            expectedBuyAmount: nat;
+            fee: nat;
+            hopDetails: vec HopDetail;
+            potentialOrderDetails:
+             opt record {
+                   amount_init: nat;
+                   amount_sell: nat;
+                 };
+            priceImpact: float64;
+            routeDescription: text;
+            routeTokens: vec text;
+          };
+        splitSim:
+         opt
+          record {
+            legs:
+             vec
+              record {
+                amountIn: nat;
+                expectedOut: nat;
+                route: vec record {
+                             tokenIn: text;
+                             tokenOut: text;
+                           };
+              };
+            totalOut: nat;
+          };
       }) query;
    getFeeCollectors: () -> (vec principal) query;
    getKlineData: (token1: text, token2: text, timeFrame: TimeFrame,
@@ -408,6 +492,7 @@ type create_trading_canister =
         volume7d: nat;
       }) query;
    getPrivateTrade: (pass: text) -> (opt TradePosition) query;
+   getTokenArchiveOffset: (token: text) -> (opt nat) query;
    getTokenUSDPrices: (ICPpriceUSD: float64, ckUSDCpriceUSD: float64) ->
     (opt
       record {
@@ -463,6 +548,19 @@ type create_trading_canister =
       }) query;
    getUserTrades: () -> (vec TradePrivate2) query;
    get_cycles: () -> (nat) query;
+   get_token_trends_7d: (tokens: vec principal) ->
+    (variant {
+       err: text;
+       ok:
+        vec
+         record {
+           change_pct_24h: float64;
+           change_pct_7d: float64;
+           points: vec float64;
+           price_now: float64;
+           token: principal;
+         };
+     }) query;
    hmFee: () -> (nat) query;
    hmRefFee: () -> (nat) query;
    hmRevokeFee: () -> (nat) query;
@@ -476,6 +574,7 @@ type create_trading_canister =
       addToAllTimeBan: opt vec text;
       changeAllowedCalls: opt nat;
       changeallowedSilentWarnings: opt nat;
+      daoTreasuryPrincipalsText: opt vec text;
       deleteAllowedCanisters: opt vec text;
       deleteFromAllTimeBan: opt vec text;
       deleteFromDayBan: opt vec text;
@@ -491,13 +590,14 @@ type create_trading_canister =
       ICRC12;
       ICRC3;
     }) -> (bool);
-   refundStuckFunds: () -> (ActionResult);
+   refundStuckFunds: () -> (text);
    removeConcentratedLiquidity: (token0i: text, token1i: text, positionId:
     nat, liquidityAmount: nat) -> (RemoveConcentratedResult);
    removeFeeCollector: () -> (ActionResult);
    removeLiquidity: (token0i: text, token1i: text, liquidityAmount: nat) ->
     (RemoveLiquidityResult);
    resetAllState: () -> (text);
+   resetDriftOpTracker: () -> ();
    retrieveFundsDao: (trades: vec record {
                                     text;
                                     nat64;
@@ -520,13 +620,28 @@ type create_trading_canister =
           TransferFee: nat;
         };
       }) query;
+   setMinimumAmount: (token: text, newMinimum: nat) -> (ActionResult);
    setTest: (a: bool) -> ();
+   simulateSplitRoutes: (splits:
+    vec record {
+          amountIn: nat;
+          route: vec SwapHop;
+        }) -> (record {
+                 error: text;
+                 perLegOut: vec nat;
+                 totalOut: nat;
+               }) query;
    swapMultiHop: (tokenIn: text, tokenOut: text, amountIn: nat, route:
     vec SwapHop, minAmountOut: nat, Block: nat) -> (SwapResult);
    swapSplitRoutes: (tokenIn: text, tokenOut: text, splits: vec SplitLeg,
     minAmountOut: nat, Block: nat) -> (SwapResult);
    treasurySwap: (tokenIn: text, tokenOut: text, amountIn: nat, minAmountOut:
     nat, block: nat) -> (SwapResult);
+   updateTokenType: (token: text, newType: variant {
+                                             ICP;
+                                             ICRC12;
+                                             ICRC3;
+                                           }) -> (ActionResult);
  };
 type TradePrivate2 = 
  record {
@@ -861,6 +976,24 @@ type LogEntry =
    message: text;
    timestamp: int;
  };
+type LPFeeClaimEntry = 
+ record {
+   dust0ToDAO: nat;
+   dust1ToDAO: nat;
+   fees0: nat;
+   fees1: nat;
+   positionId: nat;
+   ratioLower: nat;
+   ratioUpper: nat;
+   source: variant {
+             v2;
+             v3;
+           };
+   token0: text;
+   token1: text;
+   transferred0: nat;
+   transferred1: nat;
+ };
 type KlineData = 
  record {
    close: float64;
@@ -963,6 +1096,25 @@ type ClaimFeesOk =
    fees1: nat;
    transferred0: nat;
    transferred1: nat;
+ };
+type ClaimAllLPFeesResult = 
+ variant {
+   Err: ExchangeError;
+   Ok: ClaimAllLPFeesOk;
+ };
+type ClaimAllLPFeesOk = 
+ record {
+   consolidationSavings: vec record {
+                               text;
+                               nat;
+                             };
+   entries: vec LPFeeClaimEntry;
+   positionsClaimed: nat;
+   positionsScanned: nat;
+   totalsTransferredByToken: vec record {
+                                   text;
+                                   nat;
+                                 };
  };
 type BatchProcessResult = 
  record {

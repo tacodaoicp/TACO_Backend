@@ -112,6 +112,7 @@ module {
     maxPriceHistoryEntries : ?Nat;
     tokenSyncTimeoutNS : ?Nat;
     minAllocationDiffBasisPoints : ?Nat;
+    kongEnabled : ?Bool;
   };
 
   type hash<K> = (
@@ -603,6 +604,7 @@ module {
     actions: [TreasuryAdminActionRecord];
     totalCount: Nat;
   };
+
 
   public type Self = actor {
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Principal, Nat8)], Bool) -> async (Bool, ?[(Principal, Nat64)]);

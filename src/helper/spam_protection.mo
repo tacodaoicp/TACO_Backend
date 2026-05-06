@@ -38,6 +38,16 @@ module {
     #backfillPerformanceData;
     #manageBannedWords;
     #setTokenMaxAllocation;
+    // ── Buyback canister permissions ──────────────────────────────────────
+    // Granted via DAO_backend.GrantAdminPermission. The buyback canister checks
+    // these via DAO.hasAdminPermission, falling through to master admin /
+    // controller (matches treasury's admin flow).
+    #updateBuybackConfig;       // edit any field in BuybackConfig
+    #triggerBuyback;             // run a cycle synchronously outside the timer
+    #syncBuybackTokenDetails;    // pull fresh token details from treasury
+    #buybackAdminBurn;           // trigger burn outside the cycle
+    // (#buybackAdminWithdraw is intentionally omitted — withdraw is controllers-only,
+    //  not a granted permission, since it can drain arbitrary tokens.)
   };
 
   public type AdminPermission = {

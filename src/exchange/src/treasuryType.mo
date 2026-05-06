@@ -10,6 +10,7 @@ module {
     receiveTransferTasks : shared ([(TransferRecipient, Nat, Text, Text)]) -> async Bool;
     drainTransferQueue : shared () -> async ();
     getPendingTransferCount : shared query () -> async Nat;
+    getPendingTransfersByToken : shared query () -> async [(Text, Nat)];
     setTest : shared (Bool) -> async ();
     setOTCCanister : shared (Text) -> async ();
   };

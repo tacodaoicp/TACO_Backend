@@ -8,6 +8,10 @@
       "Read(//home/d/Documents/staging/TACO_Frontend/src/taco_dao_frontend/src/exchange/components/pool/**)",
       "Read(//home/d/Documents/staging/TACO_Frontend/src/declarations/OTC_backend/**)",
       "Read(//home/d/Documents/staging/TACO_Frontend/**)"
+    ],
+    "deny": [
+      "Bash(git checkout:*)",
+      "Bash(git checkout)"
     ]
   }
 }

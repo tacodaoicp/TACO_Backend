@@ -24,6 +24,7 @@ module CanisterId {
         #taco_swap;
         #OTC_backend;
         #exchange_treasury;
+        #buyback_canister;
     };
     
     // Define the environments
@@ -55,6 +56,7 @@ module CanisterId {
             (#Staging, #taco_swap, Principal.fromText("2uddx-dqaaa-aaaan-q5qja-cai")),
             (#Staging, #OTC_backend, Principal.fromText("qioex-5iaaa-aaaan-q52ba-cai")),
             (#Staging, #exchange_treasury, Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai")),
+            // #Staging, #buyback_canister: not deployed to staging (production-only)
 
             // Production environment
             (#Production, #DAO_backend, Principal.fromText("vxqw7-iqaaa-aaaan-qzziq-cai")),
@@ -71,10 +73,11 @@ module CanisterId {
             (#Production, #dao_neuron_allocation_archive, Principal.fromText("dnhfs-7yaaa-aaaan-qz5mq-cai")), // Placeholder ID
             (#Production, #reward_distribution_archive, Principal.fromText("uqkap-jiaaa-aaaan-qz6tq-cai")),
             (#Production, #reward_withdrawal_archive, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai")),
-            (#Production, #nachos_vault, Principal.fromText("v5eeb-gaaaa-aaaan-qz6ua-cai")), // Placeholder - update after deploy
+            (#Production, #nachos_vault, Principal.fromText("ptdgf-eqaaa-aaaan-q6dtq-cai")),
             (#Production, #taco_swap, Principal.fromText("2uddx-dqaaa-aaaan-q5qja-cai")),
-            (#Production, #OTC_backend, Principal.fromText("aaaaa-aa")), // Placeholder - update after deploy
-            (#Production, #exchange_treasury, Principal.fromText("aaaaa-aa")) // Placeholder - update after deploy
+            (#Production, #OTC_backend, Principal.fromText("qioex-5iaaa-aaaan-q52ba-cai")),
+            (#Production, #exchange_treasury, Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai")),
+            (#Production, #buyback_canister, Principal.fromText("cfl3o-5qaaa-aaaan-q6fga-cai"))
         ];
         
         private func getEnvironmentForPrincipal(canisterId: Principal) : ?Environment {

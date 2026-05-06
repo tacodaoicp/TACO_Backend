@@ -151,6 +151,12 @@ module {
 
       Debug.print("TACO quoteWithRoute: out=" # Nat.toText(q.expectedBuyAmount) # " slip=" # Float.toText(slippage) # "% route=" # q.routeDescription # " hops=" # Nat.toText(finalRoute.size()));
 
+      // routeTokens: canonical [tokenA, …intermediates, tokenB] derived from finalRoute hops
+      let routeTokens = Array.tabulate<Text>(
+        finalRoute.size() + 1,
+        func(i) { if (i == 0) { tokenA } else { finalRoute[i - 1].tokenOut } },
+      );
+
       #ok({
         receive_amount = q.expectedBuyAmount;
         price = executionPrice;
@@ -159,6 +165,7 @@ module {
         route = finalRoute;
         routeDescription = q.routeDescription;
         canFulfillFully = q.canFulfillFully;
+        routeTokens;
       });
     } catch (e) {
       Debug.print("TACO getQuoteWithRoute error: " # Error.message(e));
@@ -201,7 +208,8 @@ module {
 
         if (q.expectedBuyAmount == 0) {
           { receive_amount = 0; price = 0.0; mid_price = 0.0; slippage = 0.0;
-            route = []; routeDescription = "No liquidity"; canFulfillFully = false };
+            route = []; routeDescription = "No liquidity"; canFulfillFully = false;
+            routeTokens = [] };
         } else {
           let sellHuman = Float.fromInt(req.amountIn) / Float.fromInt(10 ** sellDecimals);
           let buyHuman = Float.fromInt(q.expectedBuyAmount) / Float.fromInt(10 ** buyDecimals);
@@ -219,15 +227,105 @@ module {
             [{ tokenIn = req.tokenA; tokenOut = req.tokenB }]
           } else { route };
 
+          let routeTokens = Array.tabulate<Text>(
+            finalRoute.size() + 1,
+            func(j) { if (j == 0) { req.tokenA } else { finalRoute[j - 1].tokenOut } },
+          );
+
           { receive_amount = q.expectedBuyAmount; price = executionPrice; mid_price = spotPrice;
             slippage = slippage; route = finalRoute; routeDescription = q.routeDescription;
-            canFulfillFully = q.canFulfillFully };
+            canFulfillFully = q.canFulfillFully; routeTokens };
         };
       });
 
       #ok(replies);
     } catch (e) {
       #err("TACO batch quote failed: " # Error.message(e));
+    };
+  };
+
+  // ═══ MULTI-ROUTE BATCH QUOTE — top-N routes per fraction in 1 inter-canister call ═══
+  // Same call budget as getQuoteWithRouteBatch (single inter-canister query) but the
+  // canister returns up to `maxRoutesPerRequest` routes per fraction with state isolation
+  // between every route simulation. Lets the treasury scenario builder enumerate
+  // TACO×TACO same-DEX splits — provided the pool-disjointness filter is applied
+  // before any sum is admitted to the comparator (otherwise overlapping pools cause
+  // the second leg to execute against the first leg's mutated state and quoted output
+  // is an upper bound). routeTokens on each reply is the canonical pool-set key.
+  public func getQuoteWithRouteBatchMulti(
+    requests : [{ tokenA : Text; tokenB : Text; amountIn : Nat }],
+    sellDecimals : Nat,
+    buyDecimals : Nat,
+    maxRoutesPerRequest : Nat,
+  ) : async Result.Result<[[Types.TACOQuoteReply]], Text> {
+    Debug.print("TACO getQuoteWithRouteBatchMulti: " # Nat.toText(requests.size()) # " quotes × top-" # Nat.toText(maxRoutesPerRequest));
+
+    let exchange = actor (OTC_BACKEND) : actor {
+      getExpectedReceiveAmountBatchMulti : shared query (
+        [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }], Nat
+      ) -> async [{
+        routes : [{
+          expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
+          routeDescription : Text; canFulfillFully : Bool;
+          potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+          hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
+          routeTokens : [Text];
+        }];
+      }];
+    };
+
+    try {
+      let batchReqs = Array.map<{ tokenA : Text; tokenB : Text; amountIn : Nat }, { tokenSell : Text; tokenBuy : Text; amountSell : Nat }>(
+        requests,
+        func(r) { { tokenSell = r.tokenA; tokenBuy = r.tokenB; amountSell = r.amountIn } },
+      );
+
+      let batchResults = await exchange.getExpectedReceiveAmountBatchMulti(batchReqs, maxRoutesPerRequest);
+
+      let bundles = Array.tabulate<[Types.TACOQuoteReply]>(batchResults.size(), func(i) {
+        let bundle = batchResults[i];
+        let req = requests[i];
+
+        Array.map<{
+          expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
+          routeDescription : Text; canFulfillFully : Bool;
+          potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+          hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
+          routeTokens : [Text];
+        }, Types.TACOQuoteReply>(bundle.routes, func(q) {
+          if (q.expectedBuyAmount == 0) {
+            { receive_amount = 0; price = 0.0; mid_price = 0.0; slippage = 0.0;
+              route = []; routeDescription = "No liquidity"; canFulfillFully = false;
+              routeTokens = [] };
+          } else {
+            let sellHuman = Float.fromInt(req.amountIn) / Float.fromInt(10 ** sellDecimals);
+            let buyHuman = Float.fromInt(q.expectedBuyAmount) / Float.fromInt(10 ** buyDecimals);
+            let executionPrice = if (sellHuman > 0.0) { buyHuman / sellHuman } else { 0.0 };
+            let spotPrice = if (q.priceImpact >= 0.0 and q.priceImpact < 0.99) {
+              executionPrice / (1.0 - q.priceImpact)
+            } else { executionPrice };
+            let slippage = q.priceImpact * 100.0;
+
+            let route = Array.map<{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }, { tokenIn : Text; tokenOut : Text }>(
+              q.hopDetails,
+              func(h) { { tokenIn = h.tokenIn; tokenOut = h.tokenOut } },
+            );
+            // For direct routes the canister returns hopDetails = [] AND routeTokens = [tokenSell, tokenBuy]
+            let finalRoute = if (route.size() == 0) {
+              [{ tokenIn = req.tokenA; tokenOut = req.tokenB }]
+            } else { route };
+
+            { receive_amount = q.expectedBuyAmount; price = executionPrice; mid_price = spotPrice;
+              slippage = slippage; route = finalRoute; routeDescription = q.routeDescription;
+              canFulfillFully = q.canFulfillFully; routeTokens = q.routeTokens };
+          };
+        });
+      });
+
+      #ok(bundles);
+    } catch (e) {
+      Debug.print("TACO getQuoteWithRouteBatchMulti error: " # Error.message(e));
+      #err("TACO multi-route batch quote failed: " # Error.message(e));
     };
   };
 
@@ -273,9 +371,11 @@ module {
     let tokenInText = Principal.toText(params.tokenIn);
     let tokenOutText = Principal.toText(params.tokenOut);
 
+    type SwapOk = { amountIn : Nat; amountOut : Nat; tokenIn : Text; tokenOut : Text; route : [Text]; fee : Nat; swapId : Nat; hops : Nat; firstHopOrderbookMatch : Bool; lastHopAMMOnly : Bool };
+    type ExchangeError = { #NotAuthorized; #Banned; #InvalidInput : Text; #TokenNotAccepted : Text; #TokenPaused : Text; #InsufficientFunds : Text; #PoolNotFound : Text; #SlippageExceeded : { expected : Nat; got : Nat }; #RouteFailed : { hop : Nat; reason : Text }; #OrderNotFound : Text; #ExchangeFrozen; #TransferFailed : Text; #SystemError : Text };
     let exchangeActor = actor (OTC_BACKEND) : actor {
       getExpectedMultiHopAmount : shared query (Text, Text, Nat) -> async MultiHopQuoteResult;
-      swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async Text;
+      swapMultiHop : shared (Text, Text, Nat, [SwapHop], Nat, Nat) -> async { #Ok : SwapOk; #Err : ExchangeError };
     };
 
     // Step 1: Get route
@@ -291,11 +391,19 @@ module {
 
     Debug.print("TACO route: " # Nat.toText(routeResult.hops) # " hops, expected=" # Nat.toText(routeResult.expectedAmountOut));
 
-    // Step 2: Calculate deposit (includes exchange fee 5bp)
+    // Step 2: Verify tokens are tradeable before transferring
+    let canTrade = try {
+      await (actor (OTC_BACKEND) : actor { canTradeTokens : shared query (Text, Text) -> async Bool }).canTradeTokens(tokenInText, tokenOutText);
+    } catch (_) { false };
+    if (not canTrade) {
+      return #err("TACO: token not accepted or paused on exchange");
+    };
+
+    // Step 3: Calculate deposit (includes exchange fee 5bp)
     let exchangeFeeBps : Nat = 5;
     let depositAmount = params.amountIn * (exchangeFeeBps + 10000) / 10000 + params.transferFee;
 
-    // Step 3: Transfer to exchange treasury
+    // Step 4: Transfer to exchange treasury
     let blockResult : Result.Result<Nat, Text> = if (tokenInText == "ryjl3-tyaaa-aaaaa-aaaba-cai") {
       // ICP legacy transfer
       let icpLedger = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : actor {
@@ -364,36 +472,25 @@ module {
       return #err("TACO swap call failed [block=" # Nat.toText(blockNumber) # " token=" # tokenInText # "]: " # Error.message(e));
     };
 
-    Debug.print("TACO swap result: " # swapResult);
+    Debug.print("TACO swap result: " # debug_show(swapResult));
 
-    // Step 5: Parse result
-    if (Text.startsWith(swapResult, #text "done:")) {
-      let received = parseNatFromText(swapResult, 5); // skip "done:"
-      let slippage = if (routeResult.expectedAmountOut > 0) {
-        Float.abs(1.0 - Float.fromInt(received) / Float.fromInt(routeResult.expectedAmountOut)) * 100.0;
-      } else { 0.0 };
-
-      Debug.print("TACO success: received=" # Nat.toText(received) # " slip=" # Float.toText(slippage) # "%");
-
-      #ok({
-        amountIn = params.amountIn;
-        amountOut = received;
-        slippage = slippage;
-        route = routeResult.routeTokens;
-        blockNumber = blockNumber;
-      });
-    } else if (Text.contains(swapResult, #text "Warning: slippage")) {
-      // Swap executed but with high slippage
-      let received = parseNatFromText(swapResult, Text.size("Warning: slippage exceeded but swap executed. Got "));
-      #ok({
-        amountIn = params.amountIn;
-        amountOut = received;
-        slippage = 100.0;
-        route = routeResult.routeTokens;
-        blockNumber = blockNumber;
-      });
-    } else {
-      #err("TACO swap failed [block=" # Nat.toText(blockNumber) # " token=" # tokenInText # "]: " # swapResult);
+    switch (swapResult) {
+      case (#Ok(ok)) {
+        let slippage = if (routeResult.expectedAmountOut > 0) {
+          Float.abs(1.0 - Float.fromInt(ok.amountOut) / Float.fromInt(routeResult.expectedAmountOut)) * 100.0;
+        } else { 0.0 };
+        Debug.print("TACO success: received=" # Nat.toText(ok.amountOut) # " slip=" # Float.toText(slippage) # "%");
+        #ok({
+          amountIn = params.amountIn;
+          amountOut = ok.amountOut;
+          slippage = slippage;
+          route = routeResult.routeTokens;
+          blockNumber = blockNumber;
+        });
+      };
+      case (#Err(e)) {
+        #err("TACO swap failed [block=" # Nat.toText(blockNumber) # " token=" # tokenInText # "]: " # debug_show(e));
+      };
     };
   };
 
@@ -443,15 +540,25 @@ module {
     let tokenInText = Principal.toText(params.tokenIn);
     let tokenOutText = Principal.toText(params.tokenOut);
 
+    type SplitSwapOk = { amountIn : Nat; amountOut : Nat; tokenIn : Text; tokenOut : Text; route : [Text]; fee : Nat; swapId : Nat; hops : Nat; firstHopOrderbookMatch : Bool; lastHopAMMOnly : Bool };
+    type SplitExchangeError = { #NotAuthorized; #Banned; #InvalidInput : Text; #TokenNotAccepted : Text; #TokenPaused : Text; #InsufficientFunds : Text; #PoolNotFound : Text; #SlippageExceeded : { expected : Nat; got : Nat }; #RouteFailed : { hop : Nat; reason : Text }; #OrderNotFound : Text; #ExchangeFrozen; #TransferFailed : Text; #SystemError : Text };
     let exchangeActor = actor (OTC_BACKEND) : actor {
-      swapSplitRoutes : shared (Text, Text, [{ amountIn : Nat; route : [SwapHop]; minLegOut : Nat }], Nat, Nat) -> async Text;
+      swapSplitRoutes : shared (Text, Text, [{ amountIn : Nat; route : [SwapHop]; minLegOut : Nat }], Nat, Nat) -> async { #Ok : SplitSwapOk; #Err : SplitExchangeError };
     };
 
-    // Step 1: Calculate deposit (includes exchange fee 5bp)
+    // Step 1: Verify tokens are tradeable before transferring
+    let canTrade = try {
+      await (actor (OTC_BACKEND) : actor { canTradeTokens : shared query (Text, Text) -> async Bool }).canTradeTokens(tokenInText, tokenOutText);
+    } catch (_) { false };
+    if (not canTrade) {
+      return #err("TACO: token not accepted or paused on exchange");
+    };
+
+    // Step 2: Calculate deposit (includes exchange fee 5bp)
     let exchangeFeeBps : Nat = 5;
     let depositAmount = params.amountIn * (exchangeFeeBps + 10000) / 10000 + params.transferFee;
 
-    // Step 2: Transfer to exchange treasury
+    // Step 3: Transfer to exchange treasury
     let blockResult : Result.Result<Nat, Text> = if (tokenInText == "ryjl3-tyaaa-aaaaa-aaaba-cai") {
       let icpLedger = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : actor {
         transfer : shared ({
@@ -532,39 +639,25 @@ module {
       return #err("TACO split routes failed [block=" # Nat.toText(blockNumber) # " token=" # tokenInText # "]: " # Error.message(e));
     };
 
-    Debug.print("TACO multi-route result: " # swapResult);
+    Debug.print("TACO multi-route result: " # debug_show(swapResult));
 
-    // Step 5: Parse result (same format as swapMultiHop)
-    if (Text.startsWith(swapResult, #text "done:")) {
-      let received = parseNatFromText(swapResult, 5);
-      let slippage = if (params.minAmountOut > 0 and received < params.minAmountOut) {
-        100.0
-      } else { 0.0 };
-
-      Debug.print("TACO multi-route success: received=" # Nat.toText(received));
-
-      #ok({
-        amountIn = params.amountIn;
-        amountOut = received;
-        slippage = slippage;
-        route = Array.map<Types.TACOSplitLeg, Text>(legs, func(l) {
-          Array.foldLeft<{ tokenIn : Text; tokenOut : Text }, Text>(l.route, "", func(acc, h) {
-            (if (acc == "") { "" } else { acc # "→" }) # h.tokenIn
-          }) # (if (l.route.size() > 0) { "→" # l.route[l.route.size() - 1].tokenOut } else { "" })
+    switch (swapResult) {
+      case (#Ok(ok)) {
+        let slippage = if (params.minAmountOut > 0 and ok.amountOut < params.minAmountOut) {
+          100.0
+        } else { 0.0 };
+        Debug.print("TACO multi-route success: received=" # Nat.toText(ok.amountOut));
+        #ok({
+          amountIn = params.amountIn;
+          amountOut = ok.amountOut;
+          slippage = slippage;
+          route = ok.route;
+          blockNumber = blockNumber;
         });
-        blockNumber = blockNumber;
-      });
-    } else if (Text.contains(swapResult, #text "Warning: slippage")) {
-      let received = parseNatFromText(swapResult, Text.size("Warning: slippage exceeded but swap executed. Got "));
-      #ok({
-        amountIn = params.amountIn;
-        amountOut = received;
-        slippage = 100.0;
-        route = [];
-        blockNumber = blockNumber;
-      });
-    } else {
-      #err("TACO split routes failed [block=" # Nat.toText(blockNumber) # " token=" # tokenInText # "]: " # swapResult);
+      };
+      case (#Err(e)) {
+        #err("TACO split routes failed [block=" # Nat.toText(blockNumber) # " token=" # tokenInText # "]: " # debug_show(e));
+      };
     };
   };
 
@@ -771,6 +864,14 @@ module {
   ) : async Result.Result<Nat, Text> {
     let tokenText = Principal.toText(tokenPrincipal);
     let exchangeTreasury = Principal.fromText(EXCHANGE_TREASURY);
+
+    // Verify token is accepted and not paused before transferring
+    let canTrade = try {
+      await (actor (OTC_BACKEND) : actor { canTradeTokens : shared query (Text, Text) -> async Bool }).canTradeTokens(tokenText, tokenText);
+    } catch (_) { false };
+    if (not canTrade) {
+      return #err("TACO: token " # tokenText # " not accepted or paused on exchange");
+    };
 
     if (tokenText == "ryjl3-tyaaa-aaaaa-aaaba-cai") {
       // ICP legacy transfer

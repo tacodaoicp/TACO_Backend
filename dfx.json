@@ -74,6 +74,23 @@
       "type": "motoko",
       "args": "--enhanced-orthogonal-persistence"
     },
+    "buyback_canister": {
+      "main": "src/buyback_canister/buyback_canister.mo",
+      "type": "motoko",
+      "args": "--enhanced-orthogonal-persistence"
+    },
+    "nachos_ledger": {
+      "type": "custom",
+      "candid": "vendor/icrc_ledger_suite_2026-03-09/ledger.did",
+      "wasm": "vendor/icrc_ledger_suite_2026-03-09/ic-icrc1-ledger.wasm.gz",
+      "build": []
+    },
+    "nachos_index": {
+      "type": "custom",
+      "candid": "vendor/icrc_ledger_suite_2026-03-09/index-ng.did",
+      "wasm": "vendor/icrc_ledger_suite_2026-03-09/ic-icrc1-index-ng.wasm.gz",
+      "build": []
+    },
     "taco_swap": {
       "main": "src/taco_swap/taco_swap.mo",
       "type": "motoko"

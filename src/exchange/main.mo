@@ -619,10 +619,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // Keep these for stable compat (were added by earlier migrations, can't drop)
   stable var v3LiquidityFixed = true;
   stable var predrainCleanupDone = true;
-  // feeGrowthInside hard-reset migration: set to true on first post-upgrade run after
-  // the concentrated-LP fee-math fix lands. All existing positions' pre-migration unclaimed
-  // fees forfeited to DAO; tick feeGrowthOutside values reset per Uniswap V3 convention;
-  // per-position lastFeeGrowth (now semantically lastFeeGrowthInside) zeroed.
+  // Legacy: kept for stable compat so upgrade doesn't need an explicit migration.
+  stable var refundStuckFundsCalled = true;
+
   stable var feeGrowthInsideMigrated = false;
 
   // ── V3 Math Helpers ──
@@ -801,21 +800,161 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
   };
 
+  // Derive sqrtRatio from reserves, handling one-sided pools correctly.
+  // For a drained pool (reserve1 = 0): price floor (currentSqrtRatio = 1).
+  // For a drained pool (reserve0 = 0): price ceiling (currentSqrtRatio = tenToPower120).
+  // For fully empty pool: keep current value (pool will be deleted elsewhere).
+  // This lets the V3 state self-heal after clamp events without leaving stale currentSqrtRatio.
+  func getPoolPriceV3(poolKey : (Text, Text)) : (Float, Float) {
+    let dec0 = switch (Map.get(tokenInfo, thash, poolKey.0)) { case (?i) { i.Decimals }; case null { 8 } };
+    let dec1 = switch (Map.get(tokenInfo, thash, poolKey.1)) { case (?i) { i.Decimals }; case null { 8 } };
+    switch (Map.get(poolV3Data, hashtt, poolKey), Map.get(AMMpools, hashtt, poolKey)) {
+      case (?v3, ?pool) {
+        if (v3.currentSqrtRatio > 0) {
+          let ratioScaled = (v3.currentSqrtRatio * v3.currentSqrtRatio) / tenToPower60;
+          let price0 = (Float.fromInt(ratioScaled) * Float.fromInt(10 ** dec0)) / (Float.fromInt(tenToPower60) * Float.fromInt(10 ** dec1));
+          let price1 = if (price0 > 0.0) { 1.0 / price0 } else { 0.0 };
+          (price0, price1);
+        } else if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+          let p0 = (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1));
+          let p1 = if (p0 > 0.0) { 1.0 / p0 } else { 0.0 };
+          (p0, p1);
+        } else { (0.0, 0.0) };
+      };
+      case (_, ?pool) {
+        if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+          let p0 = (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1));
+          let p1 = if (p0 > 0.0) { 1.0 / p0 } else { 0.0 };
+          (p0, p1);
+        } else { (0.0, 0.0) };
+      };
+      case _ { (0.0, 0.0) };
+    };
+  };
+
+  func getPoolRatioV3(poolKey : (Text, Text)) : Nat {
+    switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case (?v3) {
+        if (v3.currentSqrtRatio > 0) {
+          (v3.currentSqrtRatio * v3.currentSqrtRatio) / tenToPower60;
+        } else { 0 };
+      };
+      case null { 0 };
+    };
+  };
+
+  // V3-aware overall price impact: |1 − (actualOutput / spotOutputForFullRequest)|.
+  // Compares the actual quote against what the user *would* receive at zero slippage for
+  // the FULL requested amount — so partial fills (e.g. 5000 ckUSDC into a 50-deep pool
+  // returning only ~50 ckUSDT) honestly report ~99% impact, instead of hiding the
+  // missing 4950 behind a per-filled-token weighted average.
+  // CRITICAL: caller must pass the PRE-SWAP V3 ratio (snapshot before orderPairing).
+  // orderPairing mutates v3.currentSqrtRatio during its tick walk; reading getPoolRatioV3
+  // here would return the post-swap ratio, dividing by the (much smaller for outsized
+  // swaps) post-swap spot and producing impact > 1 (= 100%+) — giving readings like
+  // 59,482% for a 999 ICP swap that should be ~68%.
+  // IMPORTANT: spotOut is computed in Nat arithmetic before converting to Float, because
+  // Float (f64) only represents integers up to 2^53 exactly — multiplying 1e60-scale
+  // canonical ratios in Float-space silently loses ~7 orders of magnitude of precision.
+  func computeBlendedAmmImpact(
+    poolKey : (Text, Text),
+    tokenSell : Text,
+    expectedBuyAmount : Nat,
+    amountSell : Nat,
+    preSwapV3Ratio : Nat,           // pre-swap snapshot of getPoolRatioV3(poolKey); 0 if absent
+    preSwapV2 : ?(Nat, Nat),        // (reserveIn, reserveOut) in tokenSell→tokenBuy direction
+  ) : Float {
+    if (amountSell == 0 or expectedBuyAmount == 0) return 0.0;
+    let spotOutNat : Nat = if (preSwapV3Ratio > 0) {
+      if (tokenSell == poolKey.0) {
+        // tokenSell is token0 → output is token1; v3Ratio = (raw_reserve1 × 1e60) / raw_reserve0
+        preSwapV3Ratio * amountSell / tenToPower60;
+      } else {
+        // tokenSell is token1 → output is token0; spot rate is reciprocal
+        tenToPower60 * amountSell / preSwapV3Ratio;
+      };
+    } else {
+      switch (preSwapV2) {
+        case (?(rIn, rOut)) {
+          if (rIn > 0) { rOut * amountSell / rIn } else { 0 };
+        };
+        case null { 0 };
+      };
+    };
+    if (spotOutNat == 0) return 0.0;
+    let actual = Float.fromInt(expectedBuyAmount);
+    let spot = Float.fromInt(spotOutNat);
+    if (spot <= 0.0) return 0.0;
+    Float.abs(1.0 - actual / spot);
+  };
+
+  func sqrtRatioFromReserves(reserve0 : Nat, reserve1 : Nat, fallback : Nat) : Nat {
+    if (reserve0 > 0 and reserve1 > 0) {
+      ratioToSqrtRatio((reserve1 * tenToPower60) / reserve0);
+    } else if (reserve0 > 0 and reserve1 == 0) {
+      1;  // Price floor — pool drained of token1
+    } else if (reserve0 == 0 and reserve1 > 0) {
+      tenToPower120;  // Price ceiling — pool drained of token0
+    } else {
+      fallback;
+    };
+  };
+
   // Recalculate currentSqrtRatio from reserves + activeLiquidity from tick tree.
   // Reserves are ground truth — orderbook fills and LP operations change reserves
   // without updating V3 sqrtRatio, causing drift. This corrects both.
+  // Pure variant of recalculateActiveLiquidity: recomputes sqrtRatio + activeLiquidity
+  // from the given pool's reserves without touching Maps. Safe to use in simulation
+  // chains (simulateSwap) where writes to AMMpools / poolV3Data would corrupt real state.
+  // Fixes the stale-sqrtRatio problem that caused swapV3 clamps during route ranking.
+  // when booking an AMM protocol fee to feescollectedDAO, we must also
+  // increment v3.totalFeesClaimed by the same amount. Otherwise v3.totalFeesCollected -
+  // totalFeesClaimed (= the "outstanding fees in pool" that checkDiffs counts into ammbalance)
+  // still includes the protocol portion — double-counting it with feescollectedDAO.
+  // After this sync: residual = totalCollected - totalClaimed represents ONLY the LP portion
+  // still owed to LPs. The 30% DAO portion is cleanly routed to feescollectedDAO.
+  func claimProtocolFeeInV3(tokenIn : Text, tokenOut : Text, protocolFeeAmt : Nat) {
+    if (protocolFeeAmt == 0) return;
+    let poolKey = getPool(tokenIn, tokenOut);
+    switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case null {};
+      case (?v3) {
+        let isTokenIn0 = (tokenIn == poolKey.0);
+        let updatedV3 = if (isTokenIn0) {
+          { v3 with totalFeesClaimed0 = v3.totalFeesClaimed0 + protocolFeeAmt }
+        } else {
+          { v3 with totalFeesClaimed1 = v3.totalFeesClaimed1 + protocolFeeAmt }
+        };
+        Map.set(poolV3Data, hashtt, poolKey, updatedV3);
+      };
+    };
+  };
+
+  func recalcV3Pure(pool : AMMPool, v3 : PoolV3Data) : (AMMPool, PoolV3Data) {
+    let sqrtCurrent = if (v3.currentSqrtRatio > 0) { v3.currentSqrtRatio } else {
+      sqrtRatioFromReserves(pool.reserve0, pool.reserve1, 0)
+    };
+    var active : Int = 0;
+    for ((tick, data) in RBTree.entries(v3.ranges)) {
+      if (tick <= sqrtCurrent) { active += data.liquidityNet };
+    };
+    let activeLiq = if (active > 0) { Int.abs(active) } else { 0 };
+    (
+      { pool with totalLiquidity = activeLiq; totalFee0 = 0; totalFee1 = 0 },
+      { v3 with activeLiquidity = activeLiq; currentSqrtRatio = sqrtCurrent }
+    );
+  };
+
   func recalculateActiveLiquidity(poolKey : (Text, Text)) {
     switch (Map.get(poolV3Data, hashtt, poolKey), Map.get(AMMpools, hashtt, poolKey)) {
       case (?v3, ?pool) {
-        // Step 1: Recompute currentSqrtRatio from actual reserves
-        let newSqrtRatio = if (pool.reserve0 > 0 and pool.reserve1 > 0) {
-          ratioToSqrtRatio((pool.reserve1 * tenToPower60) / pool.reserve0);
-        } else { v3.currentSqrtRatio };
+        let sqrtCurrent = if (v3.currentSqrtRatio > 0) { v3.currentSqrtRatio } else {
+          sqrtRatioFromReserves(pool.reserve0, pool.reserve1, 0)
+        };
 
-        // Step 2: Walk ticks up to corrected price, sum liquidityNet
         var active : Int = 0;
         for ((tick, data) in RBTree.entries(v3.ranges)) {
-          if (tick <= newSqrtRatio) {
+          if (tick <= sqrtCurrent) {
             active += data.liquidityNet;
           };
         };
@@ -824,7 +963,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Map.set(poolV3Data, hashtt, poolKey, {
           v3 with
           activeLiquidity = activeLiq;
-          currentSqrtRatio = newSqrtRatio;
+          currentSqrtRatio = sqrtCurrent;
         });
         syncPoolFromV3(poolKey);
       };
@@ -919,9 +1058,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   // Concentrated swap engine: iterates through tick ranges
   func swapWithAMMV3(
-    pool : AMMPool, v3 : PoolV3Data, tokenInIsToken0 : Bool, amountIn : Nat, fee : Nat
+    pool : AMMPool, v3 : PoolV3Data, tokenInIsToken0 : Bool, amountIn : Nat, fee : Nat,
+    callerCtx : Text, sqrtPriceLimit : ?Nat
   ) : (Nat, Nat, Nat, Nat, AMMPool, PoolV3Data) {
     // Returns: (totalAmountIn, totalAmountOut, protocolFee, poolFee, updatedPool, updatedV3)
+    // sqrtPriceLimit (optional): stop the swap once V3 currentSqrtRatio reaches this bound.
+    //   - tokenInIsToken0  → price decreasing → limit is a floor (target = max(rawTarget, limit))
+    //   - !tokenInIsToken0 → price increasing → limit is a ceiling (target = min(rawTarget, limit))
+    //   `null` preserves the legacy budget-driven behaviour (no price clamp).
     var amountRemaining = amountIn;
     var totalAmountOut : Nat = 0;
     var totalPoolFee : Nat = 0;
@@ -944,12 +1088,19 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // zeroForOne (token0 in) = price decreasing = scan backward
       // oneForZero (token1 in) = price increasing = scan forward
 
-      let target = switch (nextBoundary) {
+      let rawTarget = switch (nextBoundary) {
         case null {
           // No more ticks: swap within remaining liquidity until exhausted
           if (tokenInIsToken0) { 1 } else { tenToPower120 };
         };
         case (?t) { t };
+      };
+      let target = switch (sqrtPriceLimit) {
+        case null { rawTarget };
+        case (?lim) {
+          if (tokenInIsToken0) { Nat.max(rawTarget, lim) }  // price decreasing — stop at the higher of the two
+          else { Nat.min(rawTarget, lim) };                  // price increasing — stop at the lower
+        };
       };
 
       // Compute swap step
@@ -1037,12 +1188,31 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         # " iterations=" # Nat.toText(iterations));
     };
 
-    // Safety clamp: V3 virtual liquidity can produce output exceeding real reserves.
-    // Clamp output to what the pool actually holds.
+    // Safety clamp: prevents insolvency when output would exceed pool reserves. KEEP THIS —
+    // without it, the transfer would pull tokens from OTHER pools' shared treasury balance,
+    // enabling a drain attack. Goal: fix upstream so this NEVER fires during testing.
+    // The CLAMP_TRIGGERED debug message + logger.error surface the drift instead of hiding it.
     let maxOutput = if (tokenInIsToken0) { pool.reserve1 } else { pool.reserve0 };
-    if (totalAmountOut > maxOutput) {
+    if (totalAmountOut > maxOutput and totalAmountOut > 0) {
+      let originalOut = totalAmountOut;
       totalAmountOut := maxOutput;
+      // Sim-mode callers (e.g. getAMMLiquidity probes, route ranking) can hit this
+      // legitimately during exploration; only escalate for real swaps.
+      if (callerCtx != "sim") {
+        Debug.print("CLAMP_TRIGGERED swapV3 ctx=" # callerCtx # ": tokenInIsToken0=" # debug_show(tokenInIsToken0)
+          # " originalOut=" # Nat.toText(originalOut)
+          # " clampedOut=" # Nat.toText(maxOutput)
+          # " totalIn=" # Nat.toText(totalIn)
+          # " pool.reserve0=" # Nat.toText(pool.reserve0)
+          # " pool.reserve1=" # Nat.toText(pool.reserve1)
+          # " currentSqrtRatio=" # Nat.toText(currentSqrtRatio)
+          # " activeLiquidity=" # Nat.toText(currentLiquidity));
+        logger.error("AMM", "swapV3 CLAMP fired ctx=" # callerCtx # " origOut=" # Nat.toText(originalOut) # " clampedOut=" # Nat.toText(maxOutput) # " reserve0=" # Nat.toText(pool.reserve0) # " reserve1=" # Nat.toText(pool.reserve1), "swapWithAMMV3");
+      };
     };
+
+    // totalInFinal preserved for symmetry with reserve math below
+    let totalInFinal = totalIn;
 
     // Compute new reserves from sqrtRatio (overflow-safe)
     let newReserve0 = if (currentSqrtRatio > 0) {
@@ -1057,8 +1227,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // poolFee → attributable to LPs via feeGrowthGlobal (claimed by claimLPFees / removeConcentratedLiquidity).
       // protocolFee → parked in the (totalFeesCollected - totalFeesClaimed) residual; flushed to
       //               feescollectedDAO only when the pool is deleted (addAcceptedToken #Remove).
+      // Use totalInFinal (post-clamp reduced input) so refunded excess isn't counted.
       reserve0 = if (tokenInIsToken0) {
-        let total = pool.reserve0 + totalIn;
+        let total = pool.reserve0 + totalInFinal;
         let fees = totalPoolFee + totalProtocolFee;
         safeSub(total, fees);
       } else {
@@ -1067,7 +1238,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       reserve1 = if (tokenInIsToken0) {
         safeSub(pool.reserve1, totalAmountOut);
       } else {
-        let total = pool.reserve1 + totalIn;
+        let total = pool.reserve1 + totalInFinal;
         let fees = totalPoolFee + totalProtocolFee;
         safeSub(total, fees);
       };
@@ -1288,6 +1459,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   stable var minimumAmount = [100000, 100000];
   stable var tokenType : [{ #ICP; #ICRC12; #ICRC3 }] = [#ICP, #ICRC12];
 
+  // Cache of position-offset archives: token canister id -> firstIndex.
+  // Some ICRC-1 archives (e.g., CLOWN at iwv6l-6iaaa-aaaal-ajjjq-cai) use
+  // position-based indexing so that archive position N corresponds to global
+  // index N + offset. Auto-populated on first successful probe in getBlockData.
+  stable let tokenArchiveOffset = Map.new<Text, Nat>();
+
   assert (acceptedTokens.size() == minimumAmount.size());
   assert (acceptedTokens.size() > 1);
 
@@ -1306,6 +1483,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   stable var DAOTreasury = Principal.fromText("odoge-dr36c-i3lls-orjen-eapnp-now2f-dj63m-3bdcd-nztox-5gvzy-sqe"); //change in production
   stable var DAOTreasuryText = Principal.toText(DAOTreasury); //change in production
 
+  // Burn / buyback canister principal — used by adminFlashArb (line ~16239) AND
+  // by the same-token reject in addPosition / swapMultiHop / swapSplitRoutes.
+  // Cyclic flash-arb routes are legitimate from this caller; everyone else gets
+  // their deposit refunded with the standard rejection fee.
+  let BUYBACK_CANISTER_ID : Principal = Principal.fromText("cfl3o-5qaaa-aaaan-q6fga-cai");
+
   // variable that stores all the transfer made within 1 exchangeblock. It gets cleared when its sent to the treasury canister.
   // This way, if the intercanister call to the treasury errors out, no funds are lost.
   stable let tempTransferQueue = Vector.new<(TransferRecipient, Nat, Text, Text)>();
@@ -1319,6 +1502,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   // check the function named ownercheck and isAllowed and their description for the following variables.
   stable var allowedCanisters = [treasury_principal, DAOentry, DAOTreasury, owner2, owner3, Principal.fromActor(this)];
+
+  // DAO treasury principals that bypass the public-only orderbook filter when
+  // matching against private orders with excludeDAO=false. Both production and
+  // staging are listed because the exchange canister is shared between networks.
+  // Adminable via parameterManagement.
+  stable var daoTreasuryPrincipalsText : [Text] = [
+    "v6t5d-6yaaa-aaaan-qzzja-cai",  // IC mainnet DAO treasury
+    "tptia-syaaa-aaaai-atieq-cai"   // staging DAO treasury
+  ];
+
   stable let spamCheck = Map.new<Principal, Nat>();
 
   stable let spamCheckOver10 = Map.new<Principal, Nat>();
@@ -1959,7 +2152,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
     let hasAMM = res0 > 0 and res1 > 0;
-    var midRatio : Nat = if (res0 > 0) { res1 * tenToPower60 / res0 } else { 0 };
+    let v3MidRatio = getPoolRatioV3(poolKey);
+    var midRatio : Nat = if (v3MidRatio > 0) { v3MidRatio } else if (res0 > 0) { res1 * tenToPower60 / res0 } else { 0 };
 
     // If no AMM, try to derive mid price from best bid/ask in limit orderbook
     if (midRatio == 0) {
@@ -2546,8 +2740,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     let nowVar = Time.now();
 
-    // Snapshot pre-swap reserves for accurate price impact calculation
-    // (orderPairing mutates AMMpools in-place, even in query context)
+    // Snapshot pre-swap reserves AND V3 sqrtRatio for accurate price impact calculation
+    // (orderPairing mutates both AMMpools and poolV3Data in-place, even in query context)
     let preSwapPoolKey = getPool(tokenSell, tokenBuy);
     let preSwapReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKey)) {
       case (?pool) {
@@ -2556,6 +2750,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       case null { null };
     };
+    let preSwapV3Ratio : Nat = getPoolRatioV3(preSwapPoolKey);
 
     let dummyTrade : TradePrivate = {
       Fee = ICPfee;
@@ -2596,24 +2791,22 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     var totalFee = totalProtocolFeeAmount + totalPoolFeeAmount;
 
-    // Multi-hop fallback: if direct pair has no or insufficient liquidity, try multi-hop routes
+    // Always compare direct vs multi-hop to find the best route
     var multiHopUsed = false;
     var multiHopRoute : [SwapHop] = [];
     var multiHopDetails : [HopDetail] = [];
-    if (expectedBuyAmount == 0 or remainingAmountInit > 10000) {
-      let routes = findRoutes(tokenSell, tokenBuy, amountSell);
-      label routeSearch for (r in routes.vals()) {
-        if (r.hops.size() <= 1) continue routeSearch; // skip direct (already tried above)
-        let sim = simulateMultiHop(r.hops, amountSell, caller);
-        if (sim.amountOut > expectedBuyAmount) {
-          expectedBuyAmount := sim.amountOut;
-          totalFee := sim.totalFees;
-          multiHopUsed := true;
-          multiHopRoute := r.hops;
-          multiHopDetails := sim.hopDetails;
-        };
-        break routeSearch; // only try best multi-hop route
+    let routes = findRoutes(tokenSell, tokenBuy, amountSell);
+    label routeSearch for (r in routes.vals()) {
+      if (r.hops.size() <= 1) continue routeSearch;
+      let sim = simulateMultiHop(r.hops, amountSell, caller);
+      if (sim.amountOut > expectedBuyAmount) {
+        expectedBuyAmount := sim.amountOut;
+        totalFee := sim.totalFees;
+        multiHopUsed := true;
+        multiHopRoute := r.hops;
+        multiHopDetails := sim.hopDetails;
       };
+      break routeSearch;
     };
 
     let priceImpact = if (expectedBuyAmount > 0 and amountSell > 10000) {
@@ -2625,26 +2818,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         totalMHImpact;
       } else {
-        // Blended price impact: only the AMM portion contributes to curve impact
-        let totalFilled = if (amountSell > remainingAmountInit) { amountSell - remainingAmountInit } else { 0 };
-        if (ammAmountIn == 0 or totalFilled == 0) {
-          // Pure orderbook fill — no AMM curve movement
-          0.0;
-        } else {
-          switch (preSwapReserves) {
-            case (?(reserveIn, reserveOut)) {
-              if (reserveIn > 0 and reserveOut > 0) {
-                let mathOutput = Float.fromInt(reserveOut) * Float.fromInt(ammAmountIn) / Float.fromInt(reserveIn + ammAmountIn);
-                let spotOutput = Float.fromInt(reserveOut) / Float.fromInt(reserveIn) * Float.fromInt(ammAmountIn);
-                if (spotOutput > 0.0) {
-                  let ammImpact = Float.abs(1.0 - mathOutput / spotOutput);
-                  ammImpact * Float.fromInt(ammAmountIn) / Float.fromInt(totalFilled);
-                } else { 0.0 };
-              } else { 0.0 };
-            };
-            case null { 0.0 };
-          };
-        };
+        // V3-aware overall price impact: (actual output) vs (spot × full requested input).
+        // Uses pre-swap snapshots — orderPairing already mutated post-swap state.
+        computeBlendedAmmImpact(preSwapPoolKey, tokenSell, expectedBuyAmount, amountSell, preSwapV3Ratio, preSwapReserves);
       };
     } else {
       0.0;
@@ -2706,6 +2882,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (isAllowedQuery(caller) != 1 or requests.size() > 20) { return [] };
     let nowVar = Time.now();
 
+    // Snapshot ALL global state mutated by orderPairing so each batch request runs
+    // against the SAME pre-swap pool state — without this, request N is biased by
+    // the cumulative mutations of requests 0..N-1 within the same query call.
+    let initialSnapshot = snapshotQuoteState();
+
     let results = Vector.new<{
       expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
       routeDescription : Text; canFulfillFully : Bool;
@@ -2714,6 +2895,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     }>();
 
     for (req in requests.vals()) {
+      // Restore to the pre-batch state before each request (no-op for first iteration)
+      restoreQuoteState(initialSnapshot);
       let tokenSell = req.tokenSell;
       let tokenBuy = req.tokenBuy;
       let amountSell = req.amountSell;
@@ -2726,7 +2909,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         });
       } else {
         // ── Mirror of getExpectedReceiveAmount body ──
-        // Snapshot pre-swap reserves for accurate price impact
+        // Snapshot pre-swap reserves AND V3 sqrtRatio for accurate price impact
         let preSwapPoolKeyB = getPool(tokenSell, tokenBuy);
         let preSwapReservesB : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKeyB)) {
           case (?pool) {
@@ -2735,6 +2918,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           };
           case null { null };
         };
+        let preSwapV3RatioB : Nat = getPoolRatioV3(preSwapPoolKeyB);
 
         let dummyTrade : TradePrivate = {
           Fee = ICPfee;
@@ -2773,20 +2957,21 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         var multiHopUsed = false;
         var multiHopRoute : [SwapHop] = [];
         var multiHopDetails : [HopDetail] = [];
-        if (expectedBuyAmount == 0 or remainingAmountInit > 10000) {
-          let routes = findRoutes(tokenSell, tokenBuy, amountSell);
-          label routeSearch for (r in routes.vals()) {
-            if (r.hops.size() <= 1) continue routeSearch;
-            let sim = simulateMultiHop(r.hops, amountSell, caller);
-            if (sim.amountOut > expectedBuyAmount) {
-              expectedBuyAmount := sim.amountOut;
-              totalFee := sim.totalFees;
-              multiHopUsed := true;
-              multiHopRoute := r.hops;
-              multiHopDetails := sim.hopDetails;
-            };
-            break routeSearch;
+        // Restore BEFORE findRoutes + simulateMultiHop — otherwise route enumeration
+        // and simulation read post-direct-swap state, biasing the multi-hop pick.
+        restoreQuoteState(initialSnapshot);
+        let routes = findRoutes(tokenSell, tokenBuy, amountSell);
+        label routeSearch for (r in routes.vals()) {
+          if (r.hops.size() <= 1) continue routeSearch;
+          let sim = simulateMultiHop(r.hops, amountSell, caller);
+          if (sim.amountOut > expectedBuyAmount) {
+            expectedBuyAmount := sim.amountOut;
+            totalFee := sim.totalFees;
+            multiHopUsed := true;
+            multiHopRoute := r.hops;
+            multiHopDetails := sim.hopDetails;
           };
+          break routeSearch;
         };
 
         let priceImpact = if (expectedBuyAmount > 0 and amountSell > 10000) {
@@ -2795,25 +2980,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             for (hd in multiHopDetails.vals()) { totalMHImpact += hd.priceImpact };
             totalMHImpact;
           } else {
-            // Blended price impact: only the AMM portion contributes to curve impact
-            let totalFilled = if (amountSell > remainingAmountInit) { amountSell - remainingAmountInit } else { 0 };
-            if (ammAmountIn == 0 or totalFilled == 0) {
-              0.0;
-            } else {
-              switch (preSwapReservesB) {
-                case (?(reserveIn, reserveOut)) {
-                  if (reserveIn > 0 and reserveOut > 0) {
-                    let mathOutput = Float.fromInt(reserveOut) * Float.fromInt(ammAmountIn) / Float.fromInt(reserveIn + ammAmountIn);
-                    let spotOutput = Float.fromInt(reserveOut) / Float.fromInt(reserveIn) * Float.fromInt(ammAmountIn);
-                    if (spotOutput > 0.0) {
-                      let ammImpact = Float.abs(1.0 - mathOutput / spotOutput);
-                      ammImpact * Float.fromInt(ammAmountIn) / Float.fromInt(totalFilled);
-                    } else { 0.0 };
-                  } else { 0.0 };
-                };
-                case null { 0.0 };
-              };
-            };
+            // V3-aware overall price impact against full requested amount (partial fills surface as impact)
+            computeBlendedAmmImpact(preSwapPoolKeyB, tokenSell, expectedBuyAmount, amountSell, preSwapV3RatioB, preSwapReservesB);
           };
         } else { 0.0 };
 
@@ -2845,6 +3013,211 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     Vector.toArray(results);
+  };
+
+  // Per-request multi-route batch quote: returns the TOP N routes per request, not just
+  // the canister's single-best pick. Lets the frontend construct cross-route splits
+  // (e.g. 50% via direct + 50% via 2-hop) which the single-best batch endpoint can't
+  // express because it silently drops the alternatives. Each request runs against the
+  // SAME pre-batch state via snapshot+restore — both between requests and between the
+  // direct/multi-hop simulations within a single request.
+  public query ({ caller }) func getExpectedReceiveAmountBatchMulti(
+    requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }],
+    maxRoutesPerRequest : Nat,
+  ) : async [{
+    routes : [{
+      expectedBuyAmount : Nat;
+      fee : Nat;
+      priceImpact : Float;
+      routeDescription : Text;
+      canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
+      routeTokens : [Text]; // [tokenSell, …intermediates, tokenBuy] for cross-fraction matching
+    }];
+  }] {
+    if (isAllowedQuery(caller) != 1 or requests.size() > 20) { return [] };
+    let cap : Nat = if (maxRoutesPerRequest == 0) { 5 }
+                    else if (maxRoutesPerRequest > 10) { 10 }
+                    else { maxRoutesPerRequest };
+    let nowVar = Time.now();
+    let initialSnapshot = snapshotQuoteState();
+
+    type QuoteRoute = {
+      expectedBuyAmount : Nat;
+      fee : Nat;
+      priceImpact : Float;
+      routeDescription : Text;
+      canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
+      routeTokens : [Text];
+    };
+    let allResults = Vector.new<{ routes : [QuoteRoute] }>();
+
+    for (req in requests.vals()) {
+      let tokenSell = req.tokenSell;
+      let tokenBuy = req.tokenBuy;
+      let amountSell = req.amountSell;
+
+      if (amountSell == 0) {
+        Vector.add(allResults, { routes = [] });
+      } else {
+        let perRequestRoutes = Vector.new<QuoteRoute>();
+
+        // ── Route 1: direct (single-hop via orderPairing — AMM + orderbook combined) ──
+        restoreQuoteState(initialSnapshot);
+        let preSwapPoolKey = getPool(tokenSell, tokenBuy);
+        let preSwapReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKey)) {
+          case (?pool) {
+            let (rIn, rOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+            ?(rIn, rOut);
+          };
+          case null { null };
+        };
+        let preSwapV3Ratio : Nat = getPoolRatioV3(preSwapPoolKey);
+
+        let dummyTrade : TradePrivate = {
+          Fee = ICPfee;
+          amount_sell = 0;
+          amount_init = amountSell;
+          token_sell_identifier = tokenBuy;
+          token_init_identifier = tokenSell;
+          trade_done = 0;
+          seller_paid = 0;
+          init_paid = 1;
+          trade_number = 0;
+          SellerPrincipal = "0";
+          initPrincipal = Principal.toText(caller);
+          seller_paid2 = 0;
+          init_paid2 = 0;
+          RevokeFee = RevokeFeeNow;
+          OCname = "";
+          time = nowVar;
+          filledInit = 0;
+          filledSell = 0;
+          allOrNothing = false;
+          strictlyOTC = false;
+        };
+        let (remainingAmountInit, totalProtocolFeeAmount, totalPoolFeeAmount, transactions, _, _, ammAmountIn) = orderPairing(dummyTrade);
+
+        var directOut : Nat = 0;
+        for (tx in transactions.vals()) {
+          if (tx.0 == #principal(caller) and tx.2 == tokenBuy) { directOut += tx.1 };
+        };
+
+        if (directOut > 0) {
+          let directImpact = if (amountSell > 10000) {
+            computeBlendedAmmImpact(preSwapPoolKey, tokenSell, directOut, amountSell, preSwapV3Ratio, preSwapReserves);
+          } else { 0.0 };
+          let directFulfillFully = remainingAmountInit < 10001;
+          let directPotential = if (not directFulfillFully and directOut > 0) {
+            ?{ amount_init = amountSell; amount_sell = directOut };
+          } else { null };
+          let directDesc = if (totalPoolFeeAmount > 0 and totalProtocolFeeAmount > 0) { "AMM and Orderbook" }
+                           else if (totalPoolFeeAmount > 0) { "AMM only" }
+                           else { "Orderbook only" };
+          Vector.add(perRequestRoutes, {
+            expectedBuyAmount = directOut;
+            fee = totalProtocolFeeAmount + totalPoolFeeAmount;
+            priceImpact = directImpact;
+            routeDescription = directDesc;
+            canFulfillFully = directFulfillFully;
+            potentialOrderDetails = directPotential;
+            hopDetails = [];
+            routeTokens = [tokenSell, tokenBuy];
+          });
+        };
+
+        // ── Routes 2..N: multi-hop alternatives (each via simulateMultiHop) ──
+        // Restore BEFORE findRoutes too — its internal simulateSwap reads AMMpools/poolV3Data
+        // for route enumeration, so a stale post-direct-swap snapshot would bias route picks.
+        restoreQuoteState(initialSnapshot);
+        let candidateRoutes = findRoutes(tokenSell, tokenBuy, amountSell);
+        for (r in candidateRoutes.vals()) {
+          if (r.hops.size() > 1) {
+            restoreQuoteState(initialSnapshot);
+            let sim = simulateMultiHop(r.hops, amountSell, caller);
+            if (sim.amountOut > 0) {
+              var totalMHImpact = 0.0;
+              for (hd in sim.hopDetails.vals()) { totalMHImpact += hd.priceImpact };
+              let tokenList = Vector.new<Text>();
+              Vector.add(tokenList, tokenSell);
+              for (hop in r.hops.vals()) { Vector.add(tokenList, hop.tokenOut) };
+              var mhDesc = "Multi-hop (" # Nat.toText(r.hops.size()) # " hops): " # tokenSell;
+              for (hop in r.hops.vals()) { mhDesc := mhDesc # " → " # hop.tokenOut };
+              Vector.add(perRequestRoutes, {
+                expectedBuyAmount = sim.amountOut;
+                fee = sim.totalFees;
+                priceImpact = totalMHImpact;
+                routeDescription = mhDesc;
+                canFulfillFully = true;
+                potentialOrderDetails = null;
+                hopDetails = sim.hopDetails;
+                routeTokens = Vector.toArray(tokenList);
+              });
+            };
+          };
+        };
+
+        // Sort by expectedBuyAmount desc, take top `cap`
+        let sorted = Array.sort<QuoteRoute>(Vector.toArray(perRequestRoutes), func(a, b) {
+          if (a.expectedBuyAmount > b.expectedBuyAmount) { #less }
+          else if (a.expectedBuyAmount < b.expectedBuyAmount) { #greater }
+          else { #equal };
+        });
+        let takeN : Nat = Nat.min(sorted.size(), cap);
+        let topN = Array.tabulate<QuoteRoute>(takeN, func(i) { sorted[i] });
+
+        Vector.add(allResults, { routes = topN });
+      };
+    };
+
+    // Final restore — defensive; IC reverts at query end anyway.
+    restoreQuoteState(initialSnapshot);
+
+    Vector.toArray(allResults);
+  };
+
+  // Simulate a multi-leg split — returns the EXACT combined output and per-leg outputs
+  // a real `swapSplitRoutes` call would produce against the current pool/orderbook
+  // state. Mirrors `swapSplitRoutes`'s pre-check loop verbatim: same `simulateMultiHop`
+  // chained sequentially, mutations propagating from leg N to leg N+1, restored at end.
+  // Treasury (or any caller) can use this to know the realistic split output BEFORE
+  // submitting — instead of trying to derive it from per-route independent quotes.
+  public query ({ caller }) func simulateSplitRoutes(
+    splits : [{ amountIn : Nat; route : [SwapHop] }],
+  ) : async { totalOut : Nat; perLegOut : [Nat]; error : Text } {
+    if (isAllowedQuery(caller) != 1) {
+      return { totalOut = 0; perLegOut = []; error = "Not authorized" };
+    };
+    if (splits.size() == 0 or splits.size() > 3) {
+      return { totalOut = 0; perLegOut = []; error = "1-3 splits required" };
+    };
+
+    let snap = snapshotQuoteState();
+    var total : Nat = 0;
+    var err : Text = "";
+    let perLegBuf = Vector.new<Nat>();
+
+    label simLoop for (legIdx in Iter.range(0, splits.size() - 1)) {
+      let leg = splits[legIdx];
+      if (leg.route.size() == 0 or leg.route.size() > 3) {
+        err := "Leg " # Nat.toText(legIdx) # ": 1-3 hops required";
+        Vector.add(perLegBuf, 0);
+        break simLoop;
+      };
+      let res = simulateMultiHop(leg.route, leg.amountIn, caller);
+      Vector.add(perLegBuf, res.amountOut);
+      if (res.amountOut == 0) {
+        err := "Leg " # Nat.toText(legIdx) # ": zero output at simulation";
+        break simLoop;
+      };
+      total += res.amountOut;
+    };
+
+    restoreQuoteState(snap);
+    { totalOut = total; perLegOut = Vector.toArray(perLegBuf); error = err }
   };
 
   // Multi-hop route discovery (query = free on ICP).
@@ -2986,7 +3359,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       return #Err(#TokenPaused("Token paused or below minimum"));
     };
 
-    // FIX 1: Pre-flight check — if the pool needs creation/recreation and the amounts
+    // Pre-flight check — if the pool needs creation/recreation and the amounts
     // are below MINIMUM_LIQUIDITY, fail BEFORE accepting any deposits. This prevents
     // the critical bug where pool math fails AFTER tokens are accepted, losing both.
     let prePoolMinLiq0 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal))) { minimumLiquidity } else { 0 };
@@ -2999,11 +3372,27 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
     if (needsNewPool and (amount0 < prePoolMinLiq0 or amount1 < prePoolMinLiq1)) {
+      // DRIFT FIX: refund both tokens before rejecting. Tokens were transferred
+      // on-chain to the exchange; without refund they strand (treasury ledger
+      // grows, nothing in ord/amm/fee buckets claims them → drift).
+      label a for ((token, Block, tType) in ([(token1, block1, tType1), (token0, block0, tType0)]).vals()) {
+        if (Map.has(BlocksDone, thash, token # ":" # Nat.toText(Block))) { continue a };
+        Map.set(BlocksDone, thash, token # ":" # Nat.toText(Block), nowVar);
+        let blockData = try { await* getBlockData(token, Block, tType) } catch (_) {
+          Map.delete(BlocksDone, thash, token # ":" # Nat.toText(Block));
+          continue a;
+          #ICRC12([]);
+        };
+        Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, Time.now())).1.vals());
+      };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
       return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool (pre-check)"));
     };
 
     var receiveBool = true;
-    // FIX 2: Track per-token acceptance so we can explicitly refund tokens that were
+    // Track per-token acceptance so we can explicitly refund tokens that were
     // accepted when the OTHER token's validation failed. checkReceive with exact amount
     // generates NO refund transfer — an accepted token would be stuck otherwise.
     var token0Accepted = false;
@@ -3040,7 +3429,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     Vector.addFromIter(tempTransferQueueLocal, Vector.vals(receiveTransfersVec));
     if (not receiveBool) {
       logger.error("addLiquidity", "receiveBool=false token0=" # token0 # " token1=" # token1 # " amt0=" # Nat.toText(amount0) # " amt1=" # Nat.toText(amount1) # " blk0=" # Nat.toText(block0) # " blk1=" # Nat.toText(block1), "addLiquidity");
-      // FIX 2: Explicitly refund any accepted token to prevent one-sided deposit loss.
+      // Explicitly refund any accepted token to prevent one-sided deposit loss.
       // checkReceive only generates refund transfers for overpayment; exact amounts produce
       // no transfers, leaving accepted tokens stuck. Queue explicit refunds here.
       if (token0Accepted and amount0 > returnTfees(token0)) {
@@ -3072,6 +3461,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (null) {
         // Create new pool — register pair if not yet in pool_canister
         if (amount0 < MINIMUM_LIQUIDITY0 or amount1 < MINIMUM_LIQUIDITY1) {
+          // DRIFT FIX: tokens have already been checkReceive'd into the treasury.
+          // Refund the full accepted amounts before rejecting; otherwise they
+          // strand (no AMMpools entry to count them in ammbalance).
+          let Tfees0 = returnTfees(token0);
+          let Tfees1 = returnTfees(token1);
+          if (amount0 > Tfees0) {
+            Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - Tfees0, token0, genTxId()));
+          };
+          if (amount1 > Tfees1) {
+            Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - Tfees1, token1, genTxId()));
+          };
+          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+            Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+          };
           return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool"));
         };
         registerPoolPair(token0, token1);
@@ -3120,8 +3523,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         } else {
           addFees(existingPool.token0, existingPool.reserve0, false, "", nowVar);
           addFees(existingPool.token1, existingPool.reserve1, false, "", nowVar);
+          recordOpDrift("addLiq_recreate", existingPool.token0, existingPool.reserve0);
+          recordOpDrift("addLiq_recreate", existingPool.token1, existingPool.reserve1);
           // Recreate pool — register pair if not yet in pool_canister
           if (amount0 < MINIMUM_LIQUIDITY0 or amount1 < MINIMUM_LIQUIDITY1) {
+            // DRIFT FIX: same as new-pool branch above — refund full amounts so
+            // rejected deposits don't strand.
+            let Tfees0 = returnTfees(token0);
+            let Tfees1 = returnTfees(token1);
+            if (amount0 > Tfees0) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - Tfees0, token0, genTxId()));
+            };
+            if (amount1 > Tfees1) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - Tfees1, token1, genTxId()));
+            };
+            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+              Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+            };
             return #Err(#InsufficientFunds("Amounts below minimum liquidity for pool recreation"));
           };
           registerPoolPair(token0, token1);
@@ -3188,7 +3606,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           Map.set(poolV3Data, hashtt, poolKey, {
             v3 with
             activeLiquidity = v3.activeLiquidity + liquidityMinted;
-            currentSqrtRatio = sqrtR;
             ranges = ranges;
           });
         };
@@ -3204,14 +3621,27 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       );
       switch (existingIndex) {
         case (?idx) {
-          // Merge: re-snapshot lastFeeGrowthInside before adding new liquidity.
-          // Existing pending fees are abandoned into the pool (unchanged behavior:
-          // the tokens stay in reserves / totalFeesCollected and become DAO-claimable
-          // on pool deletion). The LP's lastFeeGrowthInside is updated to "now" so
-          // going forward they only earn on the new, merged liquidity from this point.
+          // Merge: auto-claim accrued fees to the user before re-snapshotting lastFeeGrowth,
+          // then add the new liquidity. Matches claimLPFees behavior so the user receives
+          // what they earned instead of abandoning it to feescollectedDAO on pool deletion.
           let old = existingConc[idx];
           let v3Now = switch (Map.get(poolV3Data, hashtt, poolKey)) { case (?v) v; case null { { activeLiquidity = 0; currentSqrtRatio = 0; feeGrowthGlobal0 = 0; feeGrowthGlobal1 = 0; totalFeesCollected0 = 0; totalFeesCollected1 = 0; totalFeesClaimed0 = 0; totalFeesClaimed1 = 0; ranges = RBTree.init<Nat, RangeData>() } } };
           let (insideNow0, insideNow1) = positionFeeGrowthInside(old, v3Now);
+          let pendingFee0 = old.liquidity * safeSub(insideNow0, old.lastFeeGrowth0) / tenToPower60;
+          let pendingFee1 = old.liquidity * safeSub(insideNow1, old.lastFeeGrowth1) / tenToPower60;
+          let maxClaim0 = safeSub(v3Now.totalFeesCollected0, v3Now.totalFeesClaimed0);
+          let maxClaim1 = safeSub(v3Now.totalFeesCollected1, v3Now.totalFeesClaimed1);
+          let claim0 = Nat.min(pendingFee0, maxClaim0);
+          let claim1 = Nat.min(pendingFee1, maxClaim1);
+          let Tfees0 = returnTfees(token0);
+          let Tfees1 = returnTfees(token1);
+          if (claim0 > Tfees0) { Vector.add(tempTransferQueueLocal, (#principal(caller), claim0 - Tfees0, token0, genTxId())) }
+          else if (claim0 > 0) { addFees(token0, claim0, false, "", nowVar) };
+          if (claim1 > Tfees1) { Vector.add(tempTransferQueueLocal, (#principal(caller), claim1 - Tfees1, token1, genTxId())) }
+          else if (claim1 > 0) { addFees(token1, claim1, false, "", nowVar) };
+          if (claim0 > 0 or claim1 > 0) {
+            Map.set(poolV3Data, hashtt, poolKey, { v3Now with totalFeesClaimed0 = v3Now.totalFeesClaimed0 + claim0; totalFeesClaimed1 = v3Now.totalFeesClaimed1 + claim1 });
+          };
           let updated = Array.tabulate<ConcentratedPosition>(existingConc.size(), func(i) {
             if (i == idx) {
               { old with liquidity = old.liquidity + liquidityMinted; lastFeeGrowth0 = insideNow0; lastFeeGrowth1 = insideNow1; lastUpdateTime = nowVar }
@@ -3294,13 +3724,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       return #Err(#InvalidInput("token0 and token1 must be different"));
     };
 
-    // Snap to tick boundaries
-    let ratioLower = snapToTick(priceLower);
-    let ratioUpper = snapToTick(priceUpper);
-    if (ratioLower >= ratioUpper or ratioLower == 0) {
-      return #Err(#InvalidInput("Invalid price range"));
-    };
-
     let (token0, token1) = getPool(token0i, token1i);
     let tType0 = returnType(token0);
     let tType1 = returnType(token1);
@@ -3309,12 +3732,89 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     var amount0 = amount0i;
     var block0 = block0i;
     var block1 = block1i;
+    var priceLowerC = priceLower;
+    var priceUpperC = priceUpper;
     if (token1i != token1) {
       amount1 := amount0i; amount0 := amount1i;
       block0 := block1i; block1 := block0i;
+      // user supplied bounds in "userToken1 per userToken0" — relabel just
+      // flipped the canonical orientation, so price bounds must be inverted (and swapped
+      // because 1/big < 1/small) to remain in canonical "token1 per token0" form.
+      let prevLower = priceLowerC;
+      priceLowerC := if (priceUpperC > 0) { tenToPower120 / priceUpperC } else { 0 };
+      priceUpperC := if (prevLower > 0)   { tenToPower120 / prevLower }   else { tenToPower120 };
     };
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
     var nowVar = Time.now();
+
+    // DRIFT FIX: refund-on-reject helper. Tokens have already been transferred
+    // into the exchange via ICRC-1 (blocks block0/block1). On a reject we must
+    // verify the deposits via checkReceive(amount=0) which queues full-amount
+    // refunds, then flush to treasury. Without this, tokens strand in the
+    // treasury ledger, uncountered by any bookkeeping bucket → drift.
+    func refundAndReject(errMsg : ExTypes.ExchangeError) : async ExTypes.AddConcentratedResult {
+      label a for ((token, Block, tType) in ([(token1, block1, tType1), (token0, block0, tType0)]).vals()) {
+        if (Map.has(BlocksDone, thash, token # ":" # Nat.toText(Block))) { continue a };
+        Map.set(BlocksDone, thash, token # ":" # Nat.toText(Block), nowVar);
+        let blockData = try { await* getBlockData(token, Block, tType) } catch (_) {
+          Map.delete(BlocksDone, thash, token # ":" # Nat.toText(Block));
+          continue a;
+          #ICRC12([]);
+        };
+        Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, Time.now())).1.vals());
+      };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      #Err(errMsg);
+    };
+
+    // reject full-range endpoints. Full-range positions must go through
+    // addLiquidity (V2) so the position's ratioLower/ratioUpper match FULL_RANGE_*
+    // AND the tick-tree key uses the raw constant (see main.mo:771 convention).
+    // If we allowed this path, the position would store ratioLower=FULL_RANGE_LOWER
+    // but its tick-tree entry would be at ratioToSqrtRatio(FULL_RANGE_LOWER), breaking
+    // the conditional lookup in removeConcentratedLiquidity.
+    if (priceLowerC == FULL_RANGE_LOWER or priceUpperC == FULL_RANGE_UPPER) {
+      return await refundAndReject(#InvalidInput("Use addLiquidity for full-range positions"));
+    };
+
+    // decode human price → canonical raw ratio. The user's input represents
+    // (canonicalToken1_human / canonicalToken0_human) × 10^60. Canonical convention is
+    // (raw_reserve1 × 10^60) / raw_reserve0 = human_price × 10^(dec1 − dec0) × 10^60.
+    // Apply 10^(dec1 − dec0) in integer math; default to 8 decimals if tokenInfo missing.
+    let dec0Int = switch (Map.get(tokenInfo, thash, token0)) { case (?i) { i.Decimals }; case null { 8 } };
+    let dec1Int = switch (Map.get(tokenInfo, thash, token1)) { case (?i) { i.Decimals }; case null { 8 } };
+    let (lowerCanonical, upperCanonical) = if (dec0Int == dec1Int) {
+      (priceLowerC, priceUpperC);
+    } else if (dec1Int > dec0Int) {
+      let factor = 10 ** (dec1Int - dec0Int);
+      (priceLowerC * factor, priceUpperC * factor);
+    } else {
+      let factor = 10 ** (dec0Int - dec1Int);
+      if (priceLowerC < factor or priceUpperC < factor) {
+        return await refundAndReject(#InvalidInput("Price below minimum representable for this pair"));
+      };
+      (priceLowerC / factor, priceUpperC / factor);
+    };
+
+    // Snap to tick boundaries
+    let ratioLower = snapToTick(lowerCanonical);
+    let ratioUpper = snapToTick(upperCanonical);
+    if (ratioLower >= ratioUpper or ratioLower == 0) {
+      return await refundAndReject(#InvalidInput("Invalid price range"));
+    };
+    // SECURITY FIX: snapToTick can snap user input just above a sentinel down to the
+    // sentinel itself (e.g. priceLower in (10^20, 10^20+1000] → 10^20). The pre-snap
+    // check above only tests for exact equality to the sentinels. Without this guard
+    // the position would store ratioLower=FULL_RANGE_LOWER while the tick tree is
+    // keyed at ratioToSqrtRatio(FULL_RANGE_LOWER) — so removeConcentratedLiquidity's
+    // `if (ratioLower == FULL_RANGE_LOWER) raw else sqrt` lookup would miss, leaving
+    // phantom liquidity in the tick tree and draining the pool over time. Full-range
+    // positions MUST go through addLiquidity (which writes raw sentinels directly).
+    if (ratioLower == FULL_RANGE_LOWER or ratioUpper == FULL_RANGE_UPPER) {
+      return await refundAndReject(#InvalidInput("Range snaps to full-range sentinel — use addLiquidity for full-range positions"));
+    };
 
     // Validate: not paused, minimums
     if (
@@ -3400,8 +3900,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Calculate virtual liquidity for this range
     let sqrtLower = ratioToSqrtRatio(ratioLower);
     let sqrtUpper = ratioToSqrtRatio(ratioUpper);
-    let sqrtCurrent = v3.currentSqrtRatio;
+    let sqrtCurrent = if (v3.currentSqrtRatio > 0) { v3.currentSqrtRatio } else { sqrtRatioFromReserves(pool.reserve0, pool.reserve1, 0) };
     let liquidity = liquidityFromAmounts(amount0, amount1, sqrtLower, sqrtUpper, sqrtCurrent);
+    let (rawUsed0, rawUsed1) = amountsFromLiquidity(liquidity, sqrtLower, sqrtUpper, sqrtCurrent);
+    let used0 = Nat.min(rawUsed0 + 1, amount0);
+    let used1 = Nat.min(rawUsed1 + 1, amount1);
 
     if (liquidity == 0) {
       // Refund
@@ -3450,18 +3953,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       v3.activeLiquidity + liquidity;
     } else { v3.activeLiquidity };
 
-    // Update pool reserves
+    // Update pool reserves with USED amounts only (excess refunded to user)
     pool := {
       pool with
-      reserve0 = pool.reserve0 + amount0;
-      reserve1 = pool.reserve1 + amount1;
+      reserve0 = pool.reserve0 + used0;
+      reserve1 = pool.reserve1 + used1;
       totalLiquidity = pool.totalLiquidity + liquidity;
       lastUpdateTime = nowVar;
       providers = TrieSet.put(pool.providers, caller, Principal.hash(caller), Principal.equal);
     };
     Map.set(AMMpools, hashtt, poolKey, pool);
 
-    // Store updated V3 data
+    // Store updated V3 data — do NOT update currentSqrtRatio (maintained by swap engine only)
     Map.set(poolV3Data, hashtt, poolKey, {
       v3 with
       activeLiquidity = newActiveLiquidity;
@@ -3494,6 +3997,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         let maxClaim1 = safeSub(v3Now.totalFeesCollected1, v3Now.totalFeesClaimed1);
         let claimed0 = Nat.min(pendingFee0, maxClaim0);
         let claimed1 = Nat.min(pendingFee1, maxClaim1);
+        let Tfees0 = returnTfees(token0);
+        let Tfees1 = returnTfees(token1);
+        if (claimed0 > Tfees0) { Vector.add(tempTransferQueueLocal, (#principal(caller), claimed0 - Tfees0, token0, genTxId())) }
+        else if (claimed0 > 0) { addFees(token0, claimed0, false, "", nowVar) };
+        if (claimed1 > Tfees1) { Vector.add(tempTransferQueueLocal, (#principal(caller), claimed1 - Tfees1, token1, genTxId())) }
+        else if (claimed1 > 0) { addFees(token1, claimed1, false, "", nowVar) };
         if (claimed0 > 0 or claimed1 > 0) {
           Map.set(poolV3Data, hashtt, poolKey, { v3Now with totalFeesClaimed0 = v3Now.totalFeesClaimed0 + claimed0; totalFeesClaimed1 = v3Now.totalFeesClaimed1 + claimed1 });
         };
@@ -3528,17 +4037,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
-    // Record in swap history
-    nextSwapId += 1;
-    recordSwap(caller, {
-      swapId = nextSwapId;
-      tokenIn = token0; tokenOut = token1;
-      amountIn = amount0; amountOut = amount1;
-      route = [token0, token1];
-      fee = 0;
-      swapType = #direct;
-      timestamp = nowVar;
-    });
+    // Refund excess tokens not used by the position
+    let refund0 = if (amount0 > used0) { amount0 - used0 } else { 0 };
+    let refund1 = if (amount1 > used1) { amount1 - used1 } else { 0 };
+    if (refund0 > returnTfees(token0)) {
+      Vector.add(tempTransferQueueLocal, (#principal(caller), refund0 - returnTfees(token0), token0, genTxId()));
+    };
+    if (refund1 > returnTfees(token1)) {
+      Vector.add(tempTransferQueueLocal, (#principal(caller), refund1 - returnTfees(token1), token1, genTxId()));
+    };
 
     doInfoBeforeStep2();
 
@@ -3551,10 +4058,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       positionId = nextPositionId;
       token0 = token0;
       token1 = token1;
-      amount0Used = amount0;
-      amount1Used = amount1;
-      refund0 = 0;
-      refund1 = 0;
+      amount0Used = used0;
+      amount1Used = used1;
+      refund0 = refund0;
+      refund1 = refund1;
       priceLower = priceLower;
       priceUpper = priceUpper;
     });
@@ -3619,12 +4126,31 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let maxClaimable1 = safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1);
     let actualFee1 = Nat.min(theoreticalFee1, maxClaimable1);
 
-    // Calculate token amounts based on current price vs range
-    let sqrtLower = ratioToSqrtRatio(position.ratioLower);
-    let sqrtUpper = ratioToSqrtRatio(position.ratioUpper);
+    // Calculate token amounts based on current price vs range.
+    // Use derived sqrtCurrent from live reserves (self-heals if v3.currentSqrtRatio stale).
+    // DRIFT FIX: full-range positions store FULL_RANGE_LOWER/UPPER directly as BOTH ratio
+    // AND tree key (see main.mo:771, addLiquidity V2 at 3209/3213). Concentrated positions
+    // store the sqrt-converted key. Without this conditional, full-range tick-tree lookups
+    // would miss, leaving the tree stale and causing activeLiquidity to re-inflate via
+    // recalculateActiveLiquidity → LP funds orphan to feescollectedDAO on pool deletion.
+    let sqrtLower = if (position.ratioLower == FULL_RANGE_LOWER) { FULL_RANGE_LOWER } else { ratioToSqrtRatio(position.ratioLower) };
+    let sqrtUpper = if (position.ratioUpper == FULL_RANGE_UPPER) { FULL_RANGE_UPPER } else { ratioToSqrtRatio(position.ratioUpper) };
     let sqrtCurrent = v3.currentSqrtRatio;
 
-    let (baseAmount0, baseAmount1) = amountsFromLiquidity(actualLiquidityToRemove, sqrtLower, sqrtUpper, sqrtCurrent);
+    let (rawBase0, rawBase1) = amountsFromLiquidity(actualLiquidityToRemove, sqrtLower, sqrtUpper, sqrtCurrent);
+
+    // Defense in depth: cap base amounts at actual pool reserves. V3 virtual-liquidity math
+    // can produce amounts exceeding real reserves when the pool has drifted (stale sqrtCurrent,
+    // LP rounding, orderbook-induced drift). Without the cap, removeConcentratedLiquidity would
+    // transfer more than the pool holds, draining from other pools via shared treasury balance.
+    let baseAmount0 = Nat.min(rawBase0, pool.reserve0);
+    let baseAmount1 = Nat.min(rawBase1, pool.reserve1);
+    if (rawBase0 > pool.reserve0 or rawBase1 > pool.reserve1) {
+      Debug.print("LP_REMOVE_CAPPED: position=" # Nat.toText(position.positionId)
+        # " rawBase0=" # Nat.toText(rawBase0) # " reserve0=" # Nat.toText(pool.reserve0)
+        # " rawBase1=" # Nat.toText(rawBase1) # " reserve1=" # Nat.toText(pool.reserve1));
+      logger.warn("AMM", "LP removal capped — upstream drift. posId=" # Nat.toText(position.positionId) # " raw0=" # Nat.toText(rawBase0) # " res0=" # Nat.toText(pool.reserve0) # " raw1=" # Nat.toText(rawBase1) # " res1=" # Nat.toText(pool.reserve1), "removeConcentratedLiquidity");
+    };
 
     let totalAmount0 = baseAmount0 + (actualFee0 * actualLiquidityToRemove / position.liquidity);
     let totalAmount1 = baseAmount1 + (actualFee1 * actualLiquidityToRemove / position.liquidity);
@@ -3644,7 +4170,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           });
         };
       };
-      case null {};
+      case null {
+        if (test) Debug.print("TICK_TREE_MISS removeConcentratedLiquidity lower posId=" # Nat.toText(position.positionId) # " sqrtLower=" # Nat.toText(sqrtLower) # " ratioLower=" # Nat.toText(position.ratioLower));
+        logger.warn("AMM", "removeConcentratedLiquidity lower-tick miss posId=" # Nat.toText(position.positionId) # " ratioLower=" # Nat.toText(position.ratioLower), "removeConcentratedLiquidity");
+      };
     };
     switch (RBTree.get(ranges, Nat.compare, sqrtUpper)) {
       case (?d) {
@@ -3659,7 +4188,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           });
         };
       };
-      case null {};
+      case null {
+        if (test) Debug.print("TICK_TREE_MISS removeConcentratedLiquidity upper posId=" # Nat.toText(position.positionId) # " sqrtUpper=" # Nat.toText(sqrtUpper) # " ratioUpper=" # Nat.toText(position.ratioUpper));
+        logger.warn("AMM", "removeConcentratedLiquidity upper-tick miss posId=" # Nat.toText(position.positionId) # " ratioUpper=" # Nat.toText(position.ratioUpper), "removeConcentratedLiquidity");
+      };
     };
 
     // Update active liquidity if current price is in range
@@ -3668,10 +4200,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (v3.activeLiquidity > actualLiquidityToRemove) { v3.activeLiquidity - actualLiquidityToRemove } else { 0 };
     } else { v3.activeLiquidity };
 
-    // Update pool reserves — only subtract base amounts; fee portion comes from
-    // totalFeesCollected (tracked via totalFeesClaimed below)
-    let newReserve0 = if (pool.reserve0 > baseAmount0) { pool.reserve0 - baseAmount0 } else { 0 };
-    let newReserve1 = if (pool.reserve1 > baseAmount1) { pool.reserve1 - baseAmount1 } else { 0 };
+    // Update pool reserves — subtract total amounts (base + fees)
+    let newReserve0 = if (pool.reserve0 > totalAmount0) { pool.reserve0 - totalAmount0 } else { 0 };
+    let newReserve1 = if (pool.reserve1 > totalAmount1) { pool.reserve1 - totalAmount1 } else { 0 };
     let newTotalLiq = if (pool.totalLiquidity > actualLiquidityToRemove) { pool.totalLiquidity - actualLiquidityToRemove } else { 0 };
 
     Map.set(AMMpools, hashtt, poolKey, {
@@ -3727,9 +4258,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let Tfees1 = returnTfees(token1);
     if (totalAmount0 > Tfees0) {
       Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount0 - Tfees0, token0, genTxId()));
+    } else if (totalAmount0 > 0) {
+      // DRIFT FIX: reserves + v3Resid already dropped by totalAmount0 above.
+      // When the payout is smaller than the ledger fee, send the dust to
+      // feescollectedDAO so the bookkeeping decrement is mirrored. Otherwise
+      // the treasury keeps tokens that no bucket claims (positive drift).
+      addFees(token0, totalAmount0, false, "", nowVar);
     };
     if (totalAmount1 > Tfees1) {
       Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount1 - Tfees1, token1, genTxId()));
+    } else if (totalAmount1 > 0) {
+      addFees(token1, totalAmount1, false, "", nowVar);
     };
 
     doInfoBeforeStep2();
@@ -3903,8 +4442,349 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case null {};
     };
 
-    // No V3 position found for this pair
-    #Err(#OrderNotFound("No liquidity position found for pair"));
+    // No full-range V3 position for this pair. Concentrated positions must use
+    // claimConcentratedFees(positionId) since they are scoped per-position.
+    #Err(#InvalidInput("No full-range position for pair. Use claimConcentratedFees(positionId) for concentrated positions."));
+  };
+
+  // Per-position fee claim for concentrated liquidity. Pays out the position's
+  // unclaimed fees and re-snapshots lastFeeGrowth0/1 to the current feeGrowthInside;
+  // the position's liquidity is left intact. Math is bit-for-bit identical to the
+  // UI-facing query getUserConcentratedPositions so a successful claim drains
+  // exactly the amount the UI showed.
+  public shared ({ caller }) func claimConcentratedFees(positionId : Nat) : async ExTypes.ClaimFeesResult {
+    if (isAllowed(caller) != 1) { return #Err(#NotAuthorized) };
+
+    switch (Map.get(concentratedPositions, phash, caller)) {
+      case null { return #Err(#OrderNotFound("No positions for caller")) };
+      case (?positions) {
+        var target : ?ConcentratedPosition = null;
+        for (p in positions.vals()) {
+          if (p.positionId == positionId and p.liquidity > 0) { target := ?p };
+        };
+        switch (target) {
+          case null { return #Err(#OrderNotFound("Position not found or zero liquidity")) };
+          case (?pos) {
+            let poolKey = (pos.token0, pos.token1);
+            let v3 = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case null { return #Err(#PoolNotFound("V3 data not found")) };
+              case (?v) { v };
+            };
+            let nowVar = Time.now();
+
+            let (insideNow0, insideNow1) = positionFeeGrowthInside(pos, v3);
+            let theoreticalFee0 = pos.liquidity * safeSub(insideNow0, pos.lastFeeGrowth0) / tenToPower60;
+            let theoreticalFee1 = pos.liquidity * safeSub(insideNow1, pos.lastFeeGrowth1) / tenToPower60;
+            let maxClaim0 = safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0);
+            let maxClaim1 = safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1);
+            let fee0 = Nat.min(theoreticalFee0, maxClaim0);
+            let fee1 = Nat.min(theoreticalFee1, maxClaim1);
+
+            if (fee0 == 0 and fee1 == 0) {
+              return #Err(#InvalidInput("No fees to claim"));
+            };
+
+            let updated = Array.map<ConcentratedPosition, ConcentratedPosition>(positions, func(p) {
+              if (p.positionId == positionId) {
+                { p with lastFeeGrowth0 = insideNow0; lastFeeGrowth1 = insideNow1; lastUpdateTime = nowVar }
+              } else { p }
+            });
+            Map.set(concentratedPositions, phash, caller, updated);
+
+            Map.set(poolV3Data, hashtt, poolKey, {
+              v3 with
+              totalFeesClaimed0 = v3.totalFeesClaimed0 + fee0;
+              totalFeesClaimed1 = v3.totalFeesClaimed1 + fee1;
+            });
+
+            let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+            let Tfees0 = returnTfees(pos.token0);
+            let Tfees1 = returnTfees(pos.token1);
+
+            if (fee0 > Tfees0) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), fee0 - Tfees0, pos.token0, genTxId()));
+            } else if (fee0 > 0) {
+              addFees(pos.token0, fee0, false, "", nowVar);
+            };
+            if (fee1 > Tfees1) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), fee1 - Tfees1, pos.token1, genTxId()));
+            } else if (fee1 > 0) {
+              addFees(pos.token1, fee1, false, "", nowVar);
+            };
+
+            if (Vector.size(tempTransferQueueLocal) > 0) {
+              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+                Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+              };
+            };
+
+            return #Ok({
+              fees0 = fee0;
+              fees1 = fee1;
+              transferred0 = if (fee0 > Tfees0) { fee0 - Tfees0 } else { 0 };
+              transferred1 = if (fee1 > Tfees1) { fee1 - Tfees1 } else { 0 };
+              dust0ToDAO = if (fee0 > 0 and fee0 <= Tfees0) { fee0 } else { 0 };
+              dust1ToDAO = if (fee1 > 0 and fee1 <= Tfees1) { fee1 } else { 0 };
+            });
+          };
+        };
+      };
+    };
+  };
+
+  // ────────────────────────────────────────────────────────────────────────
+  // claimAllLPFees — single-call batch claim across both LP storage maps
+  //   - V3 store (concentratedPositions): full-range AND concentrated positions
+  //   - V2 legacy store (userLiquidityPositions): pre-V3 positions still active
+  //
+  // Per-position math is identical to claimLPFees / claimConcentratedFees /
+  // batchClaimAllFees — this function is purely an aggregator. Transfers are
+  // consolidated by (recipient, token) before flush; saved ledger fees are
+  // recovered to feescollectedDAO via addFees (drift-critical).
+  // ────────────────────────────────────────────────────────────────────────
+  public type LPFeeClaimEntry = {
+    source : { #v3; #v2 };
+    positionId : Nat;
+    token0 : Text;
+    token1 : Text;
+    ratioLower : Nat;
+    ratioUpper : Nat;
+    fees0 : Nat;
+    fees1 : Nat;
+    transferred0 : Nat;
+    transferred1 : Nat;
+    dust0ToDAO : Nat;
+    dust1ToDAO : Nat;
+  };
+  public type ClaimAllLPFeesOk = {
+    positionsScanned : Nat;
+    positionsClaimed : Nat;
+    entries : [LPFeeClaimEntry];
+    totalsTransferredByToken : [(Text, Nat)];
+    consolidationSavings : [(Text, Nat)];
+  };
+  public type ClaimAllLPFeesResult = { #Ok : ClaimAllLPFeesOk; #Err : ExTypes.ExchangeError };
+
+  public shared ({ caller }) func claimAllLPFees() : async ClaimAllLPFeesResult {
+    if (isAllowed(caller) != 1) { return #Err(#NotAuthorized) };
+
+    let nowVar = Time.now();
+    let entries = Buffer.Buffer<LPFeeClaimEntry>(8);
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    var positionsScanned : Nat = 0;
+    var positionsClaimed : Nat = 0;
+
+    // ── Phase 1 — V3 unified store ──
+    switch (Map.get(concentratedPositions, phash, caller)) {
+      case null {};
+      case (?v3Positions) {
+        let updatedV3 = Buffer.Buffer<ConcentratedPosition>(v3Positions.size());
+        for (pos in v3Positions.vals()) {
+          positionsScanned += 1;
+          if (pos.liquidity == 0) {
+            updatedV3.add(pos);
+          } else {
+            let poolKey = (pos.token0, pos.token1);
+            switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case null { updatedV3.add(pos) };
+              case (?v3) {
+                let (insideNow0, insideNow1) = positionFeeGrowthInside(pos, v3);
+                let theoretical0 = pos.liquidity * safeSub(insideNow0, pos.lastFeeGrowth0) / tenToPower60;
+                let theoretical1 = pos.liquidity * safeSub(insideNow1, pos.lastFeeGrowth1) / tenToPower60;
+                let max0 = safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0);
+                let max1 = safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1);
+                let fee0 = Nat.min(theoretical0, max0);
+                let fee1 = Nat.min(theoretical1, max1);
+
+                // Mirror claimConcentratedFees:4438-4440 zero-fee early-skip.
+                // Position preserved bit-for-bit; no totalFeesClaimed increment, no snapshot mutation.
+                if (fee0 == 0 and fee1 == 0) {
+                  updatedV3.add(pos);
+                } else {
+                  Map.set(poolV3Data, hashtt, poolKey, {
+                    v3 with
+                    totalFeesClaimed0 = v3.totalFeesClaimed0 + fee0;
+                    totalFeesClaimed1 = v3.totalFeesClaimed1 + fee1;
+                  });
+
+                  updatedV3.add({
+                    pos with
+                    lastFeeGrowth0 = insideNow0;
+                    lastFeeGrowth1 = insideNow1;
+                    lastUpdateTime = nowVar;
+                  });
+
+                  let Tfees0 = returnTfees(pos.token0);
+                  let Tfees1 = returnTfees(pos.token1);
+                  var transferred0 : Nat = 0; var transferred1 : Nat = 0;
+                  var dust0 : Nat = 0; var dust1 : Nat = 0;
+                  if (fee0 > Tfees0) {
+                    transferred0 := fee0 - Tfees0;
+                    Vector.add(tempTransferQueueLocal, (#principal(caller), transferred0, pos.token0, genTxId()));
+                  } else if (fee0 > 0) {
+                    dust0 := fee0;
+                    addFees(pos.token0, fee0, false, "", nowVar);
+                  };
+                  if (fee1 > Tfees1) {
+                    transferred1 := fee1 - Tfees1;
+                    Vector.add(tempTransferQueueLocal, (#principal(caller), transferred1, pos.token1, genTxId()));
+                  } else if (fee1 > 0) {
+                    dust1 := fee1;
+                    addFees(pos.token1, fee1, false, "", nowVar);
+                  };
+
+                  positionsClaimed += 1;
+                  entries.add({
+                    source = #v3;
+                    positionId = pos.positionId;
+                    token0 = pos.token0; token1 = pos.token1;
+                    ratioLower = pos.ratioLower; ratioUpper = pos.ratioUpper;
+                    fees0 = fee0; fees1 = fee1;
+                    transferred0; transferred1;
+                    dust0ToDAO = dust0; dust1ToDAO = dust1;
+                  });
+                };
+              };
+            };
+          };
+        };
+        Map.set(concentratedPositions, phash, caller, Buffer.toArray(updatedV3));
+      };
+    };
+
+    // ── Phase 2 — V2 legacy store ──
+    // V2 path intentionally does NOT apply safeSub cap (mirrors batchClaimAllFees:4815-4865 exactly).
+    // See plan "Inherited limitations" for context.
+    switch (Map.get(userLiquidityPositions, phash, caller)) {
+      case null {};
+      case (?v2Positions) {
+        let updatedV2 = Array.map<LiquidityPosition, LiquidityPosition>(v2Positions, func(pos) {
+          positionsScanned += 1;
+          let accFee0 = pos.fee0 / tenToPower60;
+          let accFee1 = pos.fee1 / tenToPower60;
+          if (accFee0 == 0 and accFee1 == 0) return pos;
+
+          let Tfees0 = returnTfees(pos.token0);
+          let Tfees1 = returnTfees(pos.token1);
+          var transferred0 : Nat = 0; var transferred1 : Nat = 0;
+          var dust0 : Nat = 0; var dust1 : Nat = 0;
+
+          if (accFee0 > Tfees0) {
+            transferred0 := accFee0 - Tfees0;
+            Vector.add(tempTransferQueueLocal, (#principal(caller), transferred0, pos.token0, genTxId()));
+            recordOpDrift("v3Claim_xfer", pos.token0, -accFee0);
+          } else if (accFee0 > 0) {
+            dust0 := accFee0;
+            addFees(pos.token0, accFee0, false, "", nowVar);
+            recordOpDrift("v3Claim_dust", pos.token0, 0);
+          };
+          if (accFee1 > Tfees1) {
+            transferred1 := accFee1 - Tfees1;
+            Vector.add(tempTransferQueueLocal, (#principal(caller), transferred1, pos.token1, genTxId()));
+            recordOpDrift("v3Claim_xfer", pos.token1, -accFee1);
+          } else if (accFee1 > 0) {
+            dust1 := accFee1;
+            addFees(pos.token1, accFee1, false, "", nowVar);
+            recordOpDrift("v3Claim_dust", pos.token1, 0);
+          };
+
+          let poolKey = (pos.token0, pos.token1);
+          switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v3) {
+              Map.set(poolV3Data, hashtt, poolKey, {
+                v3 with
+                totalFeesClaimed0 = v3.totalFeesClaimed0 + accFee0;
+                totalFeesClaimed1 = v3.totalFeesClaimed1 + accFee1;
+              });
+            };
+            case null {};
+          };
+          switch (Map.get(AMMpools, hashtt, poolKey)) {
+            case (?pool) {
+              Map.set(AMMpools, hashtt, poolKey, {
+                pool with
+                totalFee0 = if (pool.totalFee0 > accFee0) { pool.totalFee0 - accFee0 } else { 0 };
+                totalFee1 = if (pool.totalFee1 > accFee1) { pool.totalFee1 - accFee1 } else { 0 };
+              });
+            };
+            case null {};
+          };
+
+          positionsClaimed += 1;
+          entries.add({
+            source = #v2;
+            positionId = 0;
+            token0 = pos.token0; token1 = pos.token1;
+            ratioLower = FULL_RANGE_LOWER; ratioUpper = FULL_RANGE_UPPER;
+            fees0 = accFee0; fees1 = accFee1;
+            transferred0; transferred1;
+            dust0ToDAO = dust0; dust1ToDAO = dust1;
+          });
+
+          { pos with fee0 = 0; fee1 = 0; lastUpdateTime = nowVar };
+        });
+        Map.set(userLiquidityPositions, phash, caller, updatedV2);
+      };
+    };
+
+    // ── Phase 3 — consolidate transfers by (recipient, token) ──
+    // Mirrors adminExecuteRouteStrategy:15915-15945. Drift-critical: recover saved
+    // Tfees back to feescollectedDAO whenever count > 1 for a (recipient, token) bucket.
+    let preCountMap = Map.new<Text, Nat>();
+    for (tx in Vector.vals(tempTransferQueueLocal)) {
+      let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+      let key = rcpt # ":" # tx.2;
+      switch (Map.get(preCountMap, thash, key)) {
+        case (?n) { Map.set(preCountMap, thash, key, n + 1) };
+        case null { Map.set(preCountMap, thash, key, 1) };
+      };
+    };
+    let consolidatedMap = Map.new<Text, (TransferRecipient, Nat, Text, Text)>();
+    for (tx in Vector.vals(tempTransferQueueLocal)) {
+      let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+      let key = rcpt # ":" # tx.2;
+      switch (Map.get(consolidatedMap, thash, key)) {
+        case (?ex) { Map.set(consolidatedMap, thash, key, (tx.0, ex.1 + tx.1, tx.2, tx.3)) };
+        case null { Map.set(consolidatedMap, thash, key, tx) };
+      };
+    };
+    let consolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    for ((_, tx) in Map.entries(consolidatedMap)) { Vector.add(consolidatedVec, tx) };
+
+    let consolidationSavings = Buffer.Buffer<(Text, Nat)>(Map.size(preCountMap));
+    for ((key, count) in Map.entries(preCountMap)) {
+      if (count > 1) {
+        let tkn = switch (Map.get(consolidatedMap, thash, key)) { case (?tx) { tx.2 }; case null { "" } };
+        if (tkn != "") {
+          let savedFees = (count - 1) * returnTfees(tkn);
+          if (savedFees > 0) {
+            addFees(tkn, savedFees, false, "", nowVar);
+            consolidationSavings.add((tkn, savedFees));
+          };
+        };
+      };
+    };
+
+    // Build totalsTransferredByToken from the consolidated queue
+    let totalsTransferredByToken = Buffer.Buffer<(Text, Nat)>(Vector.size(consolidatedVec));
+    for (tx in Vector.vals(consolidatedVec)) {
+      totalsTransferredByToken.add((tx.2, tx.1));
+    };
+
+    // ── Phase 4 — single flush ──
+    if (Vector.size(consolidatedVec) > 0) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
+      };
+    };
+
+    #Ok({
+      positionsScanned;
+      positionsClaimed;
+      entries = Buffer.toArray(entries);
+      totalsTransferredByToken = Buffer.toArray(totalsTransferredByToken);
+      consolidationSavings = Buffer.toArray(consolidationSavings);
+    });
   };
 
   public shared ({ caller }) func removeLiquidity(token0i : Text, token1i : Text, liquidityAmount : Nat) : async ExTypes.RemoveLiquidityResult {
@@ -3956,8 +4836,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             // Calculate token amounts using proportional share of actual reserves.
             // addLiquidity adds exact deposit amounts to reserves, so we must remove
             // proportionally from reserves (not from V3 math, which rounds differently).
-            let sqrtLower = ratioToSqrtRatio(position.ratioLower);
-            let sqrtUpper = ratioToSqrtRatio(position.ratioUpper);
+            // DRIFT FIX: see removeConcentratedLiquidity — same full-range key convention.
+            let sqrtLower = if (position.ratioLower == FULL_RANGE_LOWER) { FULL_RANGE_LOWER } else { ratioToSqrtRatio(position.ratioLower) };
+            let sqrtUpper = if (position.ratioUpper == FULL_RANGE_UPPER) { FULL_RANGE_UPPER } else { ratioToSqrtRatio(position.ratioUpper) };
             let baseAmount0 = if (pool.totalLiquidity > 0) { mulDiv(removeAmt, pool.reserve0, pool.totalLiquidity) } else { 0 };
             let baseAmount1 = if (pool.totalLiquidity > 0) { mulDiv(removeAmt, pool.reserve1, pool.totalLiquidity) } else { 0 };
             let totalAmount0 = baseAmount0 + (actualFee0 * removeAmt / position.liquidity);
@@ -3971,7 +4852,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 if (newGross == 0) { ranges := RBTree.delete(ranges, Nat.compare, sqrtLower) }
                 else { ranges := RBTree.put(ranges, Nat.compare, sqrtLower, { d with liquidityNet = d.liquidityNet - removeAmt; liquidityGross = newGross }) };
               };
-              case null {};
+              case null {
+                if (test) Debug.print("TICK_TREE_MISS removeLiquidity lower posId=" # Nat.toText(position.positionId) # " sqrtLower=" # Nat.toText(sqrtLower) # " ratioLower=" # Nat.toText(position.ratioLower));
+                logger.warn("AMM", "removeLiquidity lower-tick miss posId=" # Nat.toText(position.positionId), "removeLiquidity");
+              };
             };
             switch (RBTree.get(ranges, Nat.compare, sqrtUpper)) {
               case (?d) {
@@ -3979,7 +4863,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 if (newGross == 0) { ranges := RBTree.delete(ranges, Nat.compare, sqrtUpper) }
                 else { ranges := RBTree.put(ranges, Nat.compare, sqrtUpper, { d with liquidityNet = d.liquidityNet + removeAmt; liquidityGross = newGross }) };
               };
-              case null {};
+              case null {
+                if (test) Debug.print("TICK_TREE_MISS removeLiquidity upper posId=" # Nat.toText(position.positionId) # " sqrtUpper=" # Nat.toText(sqrtUpper) # " ratioUpper=" # Nat.toText(position.ratioUpper));
+                logger.warn("AMM", "removeLiquidity upper-tick miss posId=" # Nat.toText(position.positionId), "removeLiquidity");
+              };
             };
 
             // Update active liquidity
@@ -3988,12 +4875,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               if (v3.activeLiquidity > removeAmt) { v3.activeLiquidity - removeAmt } else { 0 };
             } else { v3.activeLiquidity };
 
-            // Update pool — only subtract base amounts from reserves;
-            // fee portion comes from totalFeesCollected (tracked via totalFeesClaimed below)
+            // Update pool — subtract total amounts (base + fees) from reserves
             Map.set(AMMpools, hashtt, poolKey, {
               pool with
-              reserve0 = if (pool.reserve0 > baseAmount0) { pool.reserve0 - baseAmount0 } else { 0 };
-              reserve1 = if (pool.reserve1 > baseAmount1) { pool.reserve1 - baseAmount1 } else { 0 };
+              reserve0 = if (pool.reserve0 > totalAmount0) { pool.reserve0 - totalAmount0 } else { 0 };
+              reserve1 = if (pool.reserve1 > totalAmount1) { pool.reserve1 - totalAmount1 } else { 0 };
               totalLiquidity = if (pool.totalLiquidity > removeAmt) { pool.totalLiquidity - removeAmt } else { 0 };
               lastUpdateTime = nowVar;
             });
@@ -4027,8 +4913,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             // Transfer tokens
             let Tfees0 = returnTfees(token0);
             let Tfees1 = returnTfees(token1);
-            if (totalAmount0 > Tfees0) { Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount0 - Tfees0, token0, genTxId())) };
-            if (totalAmount1 > Tfees1) { Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount1 - Tfees1, token1, genTxId())) };
+            if (totalAmount0 > Tfees0) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount0 - Tfees0, token0, genTxId()));
+            } else if (totalAmount0 > 0) {
+              // DRIFT FIX: see removeConcentratedLiquidity — reserves + v3Resid
+              // were already decremented; mirror that by pushing dust to DAO.
+              addFees(token0, totalAmount0, false, "", nowVar);
+            };
+            if (totalAmount1 > Tfees1) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmount1 - Tfees1, token1, genTxId()));
+            } else if (totalAmount1 > 0) {
+              addFees(token1, totalAmount1, false, "", nowVar);
+            };
 
             doInfoBeforeStep2();
             if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
@@ -4064,15 +4960,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         null;
       };
       case (?pool) {
-        let dec0 = switch (Map.get(tokenInfo, thash, pool.token0)) { case (?i) { i.Decimals }; case null { 8 } };
-        let dec1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?i) { i.Decimals }; case null { 8 } };
+        let (p0, p1) = getPoolPriceV3((pool.token0, pool.token1));
         ?{
           token0 = pool.token0;
           token1 = pool.token1;
           reserve0 = pool.reserve0;
           reserve1 = pool.reserve1;
-          price0 = (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1));
-          price1 = (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) / (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0));
+          price0 = p0;
+          price1 = p1;
         };
       };
     };
@@ -4101,8 +4996,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     }>();
     for ((_, pool) in Map.entries(AMMpools)) {
       if (pool.reserve0 > 0 and pool.reserve1 > 0) {
-        let dec0 = switch (Map.get(tokenInfo, thash, pool.token0)) { case (?i) { i.Decimals }; case null { 8 } };
-        let dec1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?i) { i.Decimals }; case null { 8 } };
+        let (p0, p1) = getPoolPriceV3((pool.token0, pool.token1));
         Vector.add(
           result,
           {
@@ -4110,8 +5004,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             token1 = pool.token1;
             reserve0 = pool.reserve0;
             reserve1 = pool.reserve1;
-            price0 = (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1));
-            price1 = (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) / (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0));
+            price0 = p0;
+            price1 = p1;
             totalLiquidity = pool.totalLiquidity;
           },
         );
@@ -4183,14 +5077,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     }>();
     for ((_, pool) in Map.entries(AMMpools)) {
       if (pool.reserve0 > 0 and pool.reserve1 > 0) {
-        let dec0 = returnDecimals(pool.token0);
-        let dec1 = returnDecimals(pool.token1);
+        let (p0, p1) = getPoolPriceV3((pool.token0, pool.token1));
         Vector.add(poolVec, {
           token0 = pool.token0; token1 = pool.token1;
           reserve0 = pool.reserve0; reserve1 = pool.reserve1;
           totalLiquidity = pool.totalLiquidity;
-          price0 = (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1));
-          price1 = (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) / (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0));
+          price0 = p0;
+          price1 = p1;
         });
       };
     };
@@ -4232,14 +5125,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             if (accFee0 > Tfees0) {
               Vector.add(transferBatch, (#principal(caller), accFee0 - Tfees0, pos.token0, genTxId()));
               transferred0 := accFee0 - Tfees0;
+              recordOpDrift("v3Claim_xfer", pos.token0, -accFee0);
             } else if (accFee0 > 0) {
               addFees(pos.token0, accFee0, false, "", nowVar);
+              recordOpDrift("v3Claim_dust", pos.token0, 0);
             };
             if (accFee1 > Tfees1) {
               Vector.add(transferBatch, (#principal(caller), accFee1 - Tfees1, pos.token1, genTxId()));
               transferred1 := accFee1 - Tfees1;
+              recordOpDrift("v3Claim_xfer", pos.token1, -accFee1);
             } else if (accFee1 > 0) {
               addFees(pos.token1, accFee1, false, "", nowVar);
+              recordOpDrift("v3Claim_dust", pos.token1, 0);
             };
 
             // Update V3 totalFeesClaimed
@@ -4790,6 +5687,135 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
   };
 
+  // Batched 7-day price trend for the Portfolio view.
+  // For each requested token, returns 28 samples (oldest-first, one per 6h across ~7 days),
+  // current USD spot, and 24h/7d percent change — computed server-side so the frontend and
+  // other canisters can't disagree on "what's 24h change?". USD is derived from the token/ICP
+  // and ICP/ckUSDC 4h klines (ckUSDC ≈ $1). Missing samples carry the last known price forward.
+  // A token with no history at all returns an empty `points` array.
+  public query ({ caller }) func get_token_trends_7d(tokens : [Principal]) : async {
+    #ok : [{
+      token : Principal;
+      points : [Float];
+      price_now : Float;
+      change_pct_24h : Float;
+      change_pct_7d : Float;
+    }];
+    #err : Text;
+  } {
+    if (isAllowedQuery(caller) != 1) { return #err("Not authorized") };
+
+    let nowVar = Time.now();
+    let SIX_HOURS_NS : Int = 21_600_000_000_000;
+    let ICP_TEXT : Text = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+    let CKUSDC_TEXT : Text = "xevnm-gaaaa-aaaar-qafnq-cai";
+
+    // 28 target timestamps, oldest-first. points[0] ≈ now - 162h, points[27] = now.
+    // (24h-ago = points[27 - 4] = points[23] — matches change_pct_24h intent.)
+    let targets : [Int] = Array.tabulate<Int>(28, func(i) { nowVar - (27 - i) * SIX_HOURS_NS });
+
+    // Return the latest 4h-kline close at-or-before `ts` for the given pool, or null.
+    func klineCloseAtOrBefore(t0 : Text, t1 : Text, ts : Int) : ?Float {
+      let (pt0, pt1) = getPool(t0, t1);
+      let key : KlineKey = (pt0, pt1, #fourHours);
+      switch (Map.get(klineDataStorage, hashkl, key)) {
+        case null { null };
+        case (?tree) {
+          let r = RBTree.scanLimit(tree, compareTime, 0, ts, #bwd, 1);
+          if (r.results.size() > 0) { ?r.results[0].1.close } else { null };
+        };
+      };
+    };
+
+    // Price of `token` denominated in ICP at `ts`. Handles pool orientation and ICP itself.
+    func tokenInICPAt(token : Text, ts : Int) : ?Float {
+      if (token == ICP_TEXT) { return ?1.0 };
+      let (pt0, pt1) = getPool(token, ICP_TEXT);
+      switch (klineCloseAtOrBefore(token, ICP_TEXT, ts)) {
+        case null { null };
+        case (?close) {
+          if (close <= 0.0) { null }
+          else if (pt1 == ICP_TEXT) { ?close }         // close = ICP per token
+          else { ?(1.0 / close) };                     // close = token per ICP → invert
+        };
+      };
+    };
+
+    // ICP price in USD at `ts`, via ICP/ckUSDC 4h kline (ckUSDC assumed $1).
+    func icpInUSDAt(ts : Int) : ?Float {
+      let (_pt0, pt1) = getPool(ICP_TEXT, CKUSDC_TEXT);
+      switch (klineCloseAtOrBefore(ICP_TEXT, CKUSDC_TEXT, ts)) {
+        case null { null };
+        case (?close) {
+          if (close <= 0.0) { null }
+          else if (pt1 == CKUSDC_TEXT) { ?close }      // close = ckUSDC per ICP
+          else { ?(1.0 / close) };                     // close = ICP per ckUSDC → invert
+        };
+      };
+    };
+
+    // Token price in USD at `ts`.
+    func tokenInUSDAt(token : Text, ts : Int) : ?Float {
+      if (token == CKUSDC_TEXT) { return ?1.0 };
+      switch (icpInUSDAt(ts)) {
+        case null { null };
+        case (?icpUSD) {
+          if (token == ICP_TEXT) { ?icpUSD }
+          else switch (tokenInICPAt(token, ts)) {
+            case null { null };
+            case (?tokenICP) { ?(tokenICP * icpUSD) };
+          };
+        };
+      };
+    };
+
+    let results = Array.map<Principal, {
+      token : Principal;
+      points : [Float];
+      price_now : Float;
+      change_pct_24h : Float;
+      change_pct_7d : Float;
+    }>(tokens, func(tokenPrin) {
+      let tokenText = Principal.toText(tokenPrin);
+
+      // Sample 28 points with carry-forward. anyData tracks whether we ever saw a real quote.
+      var lastKnown : Float = 0.0;
+      var anyData : Bool = false;
+      let pointsBuf = Buffer.Buffer<Float>(28);
+      for (ts in targets.vals()) {
+        switch (tokenInUSDAt(tokenText, ts)) {
+          case (?p) { lastKnown := p; anyData := true; pointsBuf.add(p) };
+          case null { pointsBuf.add(lastKnown) };
+        };
+      };
+      let points : [Float] = if (anyData) { Buffer.toArray(pointsBuf) } else { [] };
+
+      // price_now: sample at now (the 4h kline close ≤ now). Falls back to last carried value.
+      let priceNow : Float = switch (tokenInUSDAt(tokenText, nowVar)) {
+        case (?p) { p };
+        case null { lastKnown };
+      };
+
+      // Percentage changes. points[0] = ~7d ago, points[23] = 24h ago. Guarded against zero.
+      let change24h : Float = if (points.size() > 23 and points[23] > 0.0 and priceNow > 0.0) {
+        ((priceNow - points[23]) / points[23]) * 100.0
+      } else { 0.0 };
+      let change7d : Float = if (points.size() > 0 and points[0] > 0.0 and priceNow > 0.0) {
+        ((priceNow - points[0]) / points[0]) * 100.0
+      } else { 0.0 };
+
+      {
+        token = tokenPrin;
+        points = points;
+        price_now = priceNow;
+        change_pct_24h = change24h;
+        change_pct_7d = change7d;
+      };
+    });
+
+    #ok(results);
+  };
+
   // I could also use a for-loop to remove per-entry. However I think this is more efficient. It keeps between 13000  and 18000 of the newest entries and only starts if size is above 20000
   func trimKlineData() {
     let timeFrames : [TimeFrame] = [#fivemin, #hour, #fourHours, #day, #week];
@@ -5030,6 +6056,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     Array.map<Principal, Text>(allowedCanisters, func(p) { Principal.toText(p) });
   };
 
+  // Legacy stub — kept for Candid compat. Historical one-shot stuck-funds recovery;
+  // superseded by adminDrainExchange. No-op to satisfy clients that still reference it.
+  public shared ({ caller }) func refundStuckFunds() : async Text {
+    if (not ownercheck(caller)) { return "Not authorized" };
+    ignore refundStuckFundsCalled;
+    "refundStuckFunds is deprecated; use adminDrainExchange";
+  };
+
   // Admin safety net: unstick a lock zone entry if a trap or unforeseen error left an
   // accesscode in tradesBeingWorkedOn or a BlocksDone entry set without proper cleanup.
   // This is the fallback for cases where the automatic cleanup in try/catch blocks
@@ -5061,7 +6095,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // which requires a destructive remove+re-add. Floor of 1000 (inclusive).
   public shared ({ caller }) func setMinimumAmount(token : Text, newMinimum : Nat) : async ExTypes.ActionResult {
     if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
-    if (newMinimum < 1000) { return #Err(#InvalidInput("Minimum must be >= 1000")) };
+    if (newMinimum < 100) { return #Err(#InvalidInput("Minimum must be >= 100")) };
 
     let idx = switch (Array.indexOf<Text>(token, acceptedTokens, Text.equal)) {
       case (?i) { i };
@@ -5182,6 +6216,48 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     summary;
   };
 
+  // Admin one-shot: delete every kline entry with timestamp < cutoffNs across all
+  // (token, token, timeframe) buckets in klineDataStorage. Per-bucket deletes are
+  // capped (`maxDeletesPerBucket`, default 5000 when 0 is passed) so a single
+  // message stays under the IC instruction limit; if the returned summary lists
+  // capped > 0, call again with the same cutoff to continue draining.
+  public shared ({ caller }) func adminDeleteKlinesBefore(
+    cutoffNs : Int,
+    maxDeletesPerBucket : Nat,
+  ) : async Text {
+    if (not ownercheck(caller)) { return "NotAuthorized" };
+    let cap = if (maxDeletesPerBucket == 0) { 5000 } else { maxDeletesPerBucket };
+    var totalDeleted : Nat = 0;
+    var bucketsTouched : Nat = 0;
+    var bucketsCapped : Nat = 0;
+    for ((klineKey, tree) in Map.entries(klineDataStorage)) {
+      let scan = RBTree.scanLimit(tree, compareTime, 0, cutoffNs - 1, #fwd, cap);
+      if (scan.results.size() > 0) {
+        var trimmed = tree;
+        for ((ts, _) in scan.results.vals()) {
+          trimmed := RBTree.delete(trimmed, compareTime, ts);
+        };
+        Map.set(klineDataStorage, hashkl, klineKey, trimmed);
+        totalDeleted += scan.results.size();
+        bucketsTouched += 1;
+        if (Option.isSome(scan.nextKey)) { bucketsCapped += 1 };
+      };
+    };
+    let more = bucketsCapped > 0;
+    let summary =
+      "deleted=" # Nat.toText(totalDeleted)
+      # " buckets=" # Nat.toText(bucketsTouched)
+      # " capped=" # Nat.toText(bucketsCapped)
+      # " more=" # (if (more) "true" else "false");
+    logger.info(
+      "ADMIN",
+      "adminDeleteKlinesBefore by " # Principal.toText(caller)
+        # " cutoff=" # Int.toText(cutoffNs) # " [" # summary # "]",
+      "adminDeleteKlinesBefore",
+    );
+    summary;
+  };
+
   // function that allows admin to change certain variables
   public shared ({ caller }) func parameterManagement(
     parameters : {
@@ -5193,6 +6269,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       addAllowedCanisters : ?[Text];
       deleteAllowedCanisters : ?[Text];
       treasury_principal : ?Text;
+      daoTreasuryPrincipalsText : ?[Text];
     }
   ) : async () {
     if (not ownercheck(caller)) {
@@ -5279,6 +6356,19 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       try {
         await treasuryActor.setOTCCanister(Principal.toText(Principal.fromActor(this)));
       } catch (_) {};
+    };
+
+    // Override list of DAO treasury principals eligible for the orderPairing
+    // private-order bypass. Replaces the entire list so operators can prune /
+    // re-order; pre-validates each entry via Principal.fromText (traps on bad input).
+    if (parameters.daoTreasuryPrincipalsText != null) {
+      let newList = switch (parameters.daoTreasuryPrincipalsText) {
+        case (?a) { a };
+        case (null) { [] };
+      };
+      // Validate each principal text by attempting conversion (traps on malformed input)
+      for (p in newList.vals()) { ignore Principal.fromText(p) };
+      daoTreasuryPrincipalsText := newList;
     };
   };
 
@@ -5559,6 +6649,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     return ?acceptedTokensInfo;
   };
 
+  public query func canTradeTokens(tokenIn : Text, tokenOut : Text) : async Bool {
+    containsToken(tokenIn) and containsToken(tokenOut) and
+    Array.find<Text>(pausedTokens, func(t) { t == tokenIn }) == null and
+    Array.find<Text>(pausedTokens, func(t) { t == tokenOut }) == null;
+  };
+
   // Get the tokens that currently can be traded with each other within the exchange.
   public query ({ caller }) func getAcceptedTokens() : async ?[Text] {
     if (isAllowedQuery(caller) != 1) {
@@ -5608,6 +6704,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     logWithRunId("Action: " # debug_show (action) # ", Token: " # added # ", Minimum: " # Nat.toText(minimum) # ", Type: " # debug_show (tType));
 
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    // Per-structure refund sum trackers for drift diagnostics
+    var dbgObRefund0 : Nat = 0;  // orderbook (liqMapSort public) for token0 (added token)
+    var dbgOb1 : Nat = 0;
+    var dbgForeignRefund : Nat = 0;
+    var dbgPrivateRefund : Nat = 0;
+    var dbgV2LpRefund : Nat = 0;
+    var dbgObCount : Nat = 0;
+    var dbgForeignCount : Nat = 0;
+    var dbgPrivateCount : Nat = 0;
+    var dbgV2LpCount : Nat = 0;
     if ((action == #Remove and containsToken(added)) or (containsToken(added) and action == #Opposite)) {
       logWithRunId("Removing token: " # added);
 
@@ -5639,237 +6745,217 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let pools_to_delete = Vector.toArray(pools_to_delete2);
       logWithRunId("Pools to delete: " # debug_show (pools_to_delete));
 
-      for (poolIndex in pools_to_delete.vals()) {
-        logWithRunId("Processing pool for deletion: " # Nat.toText(poolIndex));
-        for (poolKey in [(Vector.get(pool_canister, poolIndex).0, Vector.get(pool_canister, poolIndex).1), (Vector.get(pool_canister, poolIndex).1, Vector.get(pool_canister, poolIndex).0)].vals()) {
-          switch (Map.get(liqMapSort, hashtt, poolKey)) {
-            case (null) {
-              logWithRunId("No liquidity for pool: " # debug_show (poolKey));
-            };
-            case (?poolLiquidity) {
-              for ((ratio, trades) in RBTree.entries(poolLiquidity)) {
-                for (liquidityToDelete in trades.vals()) {
-                  logWithRunId("Processing liquidity: " # debug_show (liquidityToDelete));
-
-                  let accesscode = liquidityToDelete.accesscode;
-                  removeTrade(accesscode, liquidityToDelete.initPrincipal, poolKey);
-                  logWithRunId("Removed trade: " # accesscode);
-
-                  let amount_init = liquidityToDelete.amount_init;
-                  let amount_sell = liquidityToDelete.amount_sell;
-                  let RevokeFee = liquidityToDelete.RevokeFee;
-                  let token_init_identifier = liquidityToDelete.token_init_identifier;
-                  let init_principal = liquidityToDelete.initPrincipal;
-                  let Fee = liquidityToDelete.Fee;
-
-                  let totalFee = (amount_init) * Fee;
-                  let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
-                  let toBeSent = amount_init + revoke_Fee;
-                  Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
-                  // The order tracked amount_init + non_revoke + Tfees in checkDiffs.
-                  // Refund sends amount_init + revoke_Fee, and the transfer costs Tfees.
-                  // So wallet loses (amount_init + revoke_Fee + Tfees) and order component
-                  // drops by (amount_init + non_revoke + Tfees). These balance (non_revoke ≈ revoke_Fee).
-                  // No Tfees gap — the order's Tfees exactly covers the transfer cost.
-                  logWithRunId("Added refund: " # debug_show ((init_principal, toBeSent, token_init_identifier)));
-
-                  let tokenbuy = poolKey.0;
-                  let tokensell = poolKey.1;
-                  let whichCoin = if (tokenbuy == token_init_identifier) {
-                    tokensell;
-                  } else {
-                    tokenbuy;
-                  };
-                  if (not Text.endsWith(accesscode, #text "excl")) {
-                    replaceLiqMap(
-                      true,
-                      false,
-                      token_init_identifier,
-                      whichCoin,
-                      accesscode,
-                      (amount_init, amount_sell, 0, 0, "", liquidityToDelete.OCname, liquidityToDelete.time, liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier, liquidityToDelete.strictlyOTC, liquidityToDelete.allOrNothing),
-                      #Zero,
-                      null,
-                      ?{
-                        amount_init = amount_init;
-                        amount_sell = amount_sell;
-                        init_principal = init_principal;
-                        sell_principal = "";
-                        accesscode = accesscode;
-                        token_init_identifier = token_init_identifier;
-                        filledInit = 0;
-                        filledSell = 0;
-                        strictlyOTC = false;
-                        allOrNothing = false;
-                      },
-                    );
-                    logWithRunId("Updated liquidity map for: " # accesscode);
-                  };
-                };
-              };
-            };
-          };
-
-          ignore Map.remove(liqMapSort, hashtt, poolKey);
-          logWithRunId("Removed pool from liqMapSort: " # debug_show (poolKey));
+      // DRIFT FIX: Iterate liqMapSort DIRECTLY (not via pool_canister index) so we catch
+      // orphan entries whose poolKey is no longer registered in pool_canister.
+      // Orphans arise from concurrent #Opposite toggles: one call removes a pool from
+      // pool_canister while another places orders into liqMapSort under a key that
+      // gets de-registered shortly after. The old per-index iteration would miss those.
+      let orphanKeysPublic = Vector.new<(Text, Text)>();
+      for ((poolKey, _) in Map.entries(liqMapSort)) {
+        if (poolKey.0 == added or poolKey.1 == added) {
+          Vector.add(orphanKeysPublic, poolKey);
         };
       };
+      for (poolKey in Vector.vals(orphanKeysPublic)) {
+        logWithRunId("Processing liqMapSort entry: " # debug_show(poolKey));
+        switch (Map.get(liqMapSort, hashtt, poolKey)) {
+          case (null) {};
+          case (?poolLiquidity) {
+            for ((ratio, trades) in RBTree.entries(poolLiquidity)) {
+              for (liquidityToDelete in trades.vals()) {
+                logWithRunId("Processing liquidity: " # debug_show (liquidityToDelete));
 
-      // Handle foreign pools
-      for (pks in Map.keys(foreignPools)) {
-        if (pks.0 == added or pks.1 == added) {
-          logWithRunId("Processing foreign pool: " # debug_show (pks));
-          for (poolKey in [(pks.0, pks.1), (pks.1, pks.0)].vals()) {
-            switch (Map.get(liqMapSortForeign, hashtt, poolKey)) {
-              case (null) {
-                logWithRunId("No liquidity for foreign pool: " # debug_show (poolKey));
-              };
-              case (?poolLiquidity) {
-                for ((ratio, trades) in RBTree.entries(poolLiquidity)) {
-                  for (liquidityToDelete in trades.vals()) {
-                    logWithRunId("Processing foreign pool liquidity: " # debug_show (liquidityToDelete));
-                    logWithRunId("Time: " # debug_show (liquidityToDelete.time));
-                    logWithRunId("amount_init: " # debug_show (liquidityToDelete.amount_init));
-                    logWithRunId("amount_sell: " # debug_show (liquidityToDelete.amount_sell));
-                    logWithRunId("init_principal: " # debug_show (liquidityToDelete.initPrincipal));
-                    logWithRunId("accesscode: " # debug_show (liquidityToDelete.accesscode));
-                    logWithRunId("Fee: " # debug_show (liquidityToDelete.Fee));
-                    logWithRunId("RevokeFee: " # debug_show (liquidityToDelete.RevokeFee));
-                    logWithRunId("token_init_identifier: " # debug_show (liquidityToDelete.token_init_identifier));
+                let accesscode = liquidityToDelete.accesscode;
+                removeTrade(accesscode, liquidityToDelete.initPrincipal, poolKey);
+                logWithRunId("Removed trade: " # accesscode);
 
-                    let accesscode = liquidityToDelete.accesscode;
-                    removeTrade(accesscode, liquidityToDelete.initPrincipal, poolKey);
+                let amount_init = liquidityToDelete.amount_init;
+                let amount_sell = liquidityToDelete.amount_sell;
+                let RevokeFee = liquidityToDelete.RevokeFee;
+                let token_init_identifier = liquidityToDelete.token_init_identifier;
+                let init_principal = liquidityToDelete.initPrincipal;
+                let Fee = liquidityToDelete.Fee;
 
-                    let amount_init = liquidityToDelete.amount_init;
-                    let amount_sell = liquidityToDelete.amount_sell;
-                    let RevokeFee = liquidityToDelete.RevokeFee;
-                    let token_init_identifier = liquidityToDelete.token_init_identifier;
-                    let init_principal = liquidityToDelete.initPrincipal;
-                    let Fee = liquidityToDelete.Fee;
+                let totalFee = (amount_init) * Fee;
+                let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
+                let toBeSent = amount_init + revoke_Fee;
+                Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
+                dbgObCount += 1;
+                if (token_init_identifier == added) { dbgObRefund0 += toBeSent } else { dbgOb1 += toBeSent };
+                logWithRunId("Added refund: " # debug_show ((init_principal, toBeSent, token_init_identifier)));
 
-                    // As you may have already read, the fee consists of a part that is paid once the order is fulfilled (Fee-RevokeFee) and a part that is paid in any case (RevokeFee).
-                    // The number the RevokeFee shows tells the contract what part of the total fee/ Fee is the revoke fee. So if RevokeFee is 6, it tells us that 1/6th of the Fee== RevokeFee
-                    // In this calculation, the revokeFee is kept, however the rest of the fee has to go back to the initiator as we are deleting the order.
-                    // Keep in mind that it is impossible for RevokeFee to be lower than 3 (same for Fee).
-
-                    //totalFee *10000
-                    let totalFee = (amount_init) * Fee;
-                    let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
-                    let toBeSent = amount_init + revoke_Fee;
-                    Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
-
-                    let tokenbuy = poolKey.0;
-                    let tokensell = poolKey.1;
-                    let whichCoin = if (tokenbuy == token_init_identifier) {
-                      tokensell;
-                    } else {
-                      tokenbuy;
-                    };
-                    if (not Text.endsWith(accesscode, #text "excl")) {
-                      replaceLiqMap(
-                        true,
-                        false,
-                        token_init_identifier,
-                        whichCoin,
-                        accesscode,
-                        (amount_init, amount_sell, 0, 0, "", liquidityToDelete.OCname, liquidityToDelete.time, liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier, liquidityToDelete.strictlyOTC, liquidityToDelete.allOrNothing),
-                        #Zero,
-                        null,
-                        ?{
-                          amount_init = amount_init;
-                          amount_sell = amount_sell;
-                          init_principal = init_principal;
-                          sell_principal = "";
-                          accesscode = accesscode;
-                          token_init_identifier = token_init_identifier;
-                          filledInit = 0;
-                          filledSell = 0;
-                          strictlyOTC = false;
-                          allOrNothing = false;
-                        },
-                      );
-                    };
-                  };
+                let tokenbuy = poolKey.0;
+                let tokensell = poolKey.1;
+                let whichCoin = if (tokenbuy == token_init_identifier) {
+                  tokensell;
+                } else {
+                  tokenbuy;
+                };
+                if (not Text.endsWith(accesscode, #text "excl")) {
+                  replaceLiqMap(
+                    true,
+                    false,
+                    token_init_identifier,
+                    whichCoin,
+                    accesscode,
+                    (amount_init, amount_sell, 0, 0, "", liquidityToDelete.OCname, liquidityToDelete.time, liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier, liquidityToDelete.strictlyOTC, liquidityToDelete.allOrNothing),
+                    #Zero,
+                    null,
+                    ?{
+                      amount_init = amount_init;
+                      amount_sell = amount_sell;
+                      init_principal = init_principal;
+                      sell_principal = "";
+                      accesscode = accesscode;
+                      token_init_identifier = token_init_identifier;
+                      filledInit = 0;
+                      filledSell = 0;
+                      strictlyOTC = false;
+                      allOrNothing = false;
+                    },
+                  );
+                  logWithRunId("Updated liquidity map for: " # accesscode);
                 };
               };
             };
-            ignore Map.remove(liqMapSortForeign, hashtt, poolKey);
-            logWithRunId("Removed foreign pool from liqMapSortForeign: " # debug_show (poolKey));
           };
         };
+        ignore Map.remove(liqMapSort, hashtt, poolKey);
+        logWithRunId("Removed pool from liqMapSort: " # debug_show (poolKey));
       };
 
-      // Handle private pools
-      for (pks in Map.keys(foreignPrivatePools)) {
-        if (pks.0 == added or pks.1 == added) {
-          logWithRunId("Processing private pool: " # debug_show (pks));
-          for (poolKey in [(pks.0, pks.1), (pks.1, pks.0)].vals()) {
-            switch (Map.get(privateAccessCodes, hashtt, poolKey)) {
-              case null {
-                logWithRunId("No private access codes for pool: " # debug_show (poolKey));
-              };
-              case (?a) {
-                label privateOrders for (accesscode in (TrieSet.toArray(a)).vals()) {
-                  let liquidityToDelete = switch (Map.get(tradeStorePrivate, thash, accesscode)) {
-                    case null {
-                      logWithRunId("Private trade not found: " # accesscode);
-                      continue privateOrders;
-                      Faketrade;
-                    };
-                    case (?a) { a };
-                  };
-                  if (liquidityToDelete.trade_done == 1) {
-                    Vector.addFromIter(tempTransferQueueLocal, (syncFixStuckTX(accesscode, liquidityToDelete.initPrincipal)).vals());
-                    logWithRunId("Fixed stuck transaction for: " # accesscode);
-                    continue privateOrders;
-                  };
+      // DRIFT FIX: Iterate liqMapSortForeign DIRECTLY (not via foreignPools map).
+      // foreignPools counter can fall out of sync with actual liqMapSortForeign entries
+      // during concurrent operations, leaving orphaned orders. Direct iteration is authoritative.
+      let orphanKeysForeign = Vector.new<(Text, Text)>();
+      for ((poolKey, _) in Map.entries(liqMapSortForeign)) {
+        if (poolKey.0 == added or poolKey.1 == added) {
+          Vector.add(orphanKeysForeign, poolKey);
+        };
+      };
+      for (poolKey in Vector.vals(orphanKeysForeign)) {
+        logWithRunId("Processing liqMapSortForeign entry: " # debug_show(poolKey));
+        switch (Map.get(liqMapSortForeign, hashtt, poolKey)) {
+          case (null) {};
+          case (?poolLiquidity) {
+            for ((ratio, trades) in RBTree.entries(poolLiquidity)) {
+              for (liquidityToDelete in trades.vals()) {
+                let accesscode = liquidityToDelete.accesscode;
+                removeTrade(accesscode, liquidityToDelete.initPrincipal, poolKey);
 
-                  // Process private order deletion (similar to public orders)
-                  logWithRunId("Removing private order: " # accesscode);
-                  let amount_init = liquidityToDelete.amount_init;
-                  let amount_sell = liquidityToDelete.amount_sell;
-                  let RevokeFee = liquidityToDelete.RevokeFee;
-                  let token_init_identifier = liquidityToDelete.token_init_identifier;
-                  let init_principal = liquidityToDelete.initPrincipal;
-                  let Fee = liquidityToDelete.Fee;
+                let amount_init = liquidityToDelete.amount_init;
+                let amount_sell = liquidityToDelete.amount_sell;
+                let RevokeFee = liquidityToDelete.RevokeFee;
+                let token_init_identifier = liquidityToDelete.token_init_identifier;
+                let init_principal = liquidityToDelete.initPrincipal;
+                let Fee = liquidityToDelete.Fee;
 
-                  let totalFee = (amount_init) * Fee;
-                  let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
-                  let toBeSent = amount_init + revoke_Fee;
+                let totalFee = (amount_init) * Fee;
+                let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
+                let toBeSent = amount_init + revoke_Fee;
+                Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
+                dbgForeignCount += 1;
+                if (token_init_identifier == added) { dbgForeignRefund += toBeSent };
 
-                  Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
-
-                  removeTrade(accesscode, liquidityToDelete.initPrincipal, (liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier));
-                  if (not Text.endsWith(accesscode, #text "excl")) {
-                    replaceLiqMap(
-                      true,
-                      false,
-                      token_init_identifier,
-                      liquidityToDelete.token_sell_identifier,
-                      accesscode,
-                      (amount_init, amount_sell, 0, 0, "", liquidityToDelete.OCname, liquidityToDelete.time, liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier, liquidityToDelete.strictlyOTC, liquidityToDelete.allOrNothing),
-                      #Zero,
-                      null,
-                      ?{
-                        amount_init = amount_init;
-                        amount_sell = amount_sell;
-                        init_principal = init_principal;
-                        sell_principal = "";
-                        accesscode = accesscode;
-                        token_init_identifier = token_init_identifier;
-                        filledInit = 0;
-                        filledSell = 0;
-                        strictlyOTC = false;
-                        allOrNothing = false;
-                      },
-                    );
-                  };
+                let tokenbuy = poolKey.0;
+                let tokensell = poolKey.1;
+                let whichCoin = if (tokenbuy == token_init_identifier) {
+                  tokensell;
+                } else {
+                  tokenbuy;
                 };
-                ignore Map.remove(privateAccessCodes, hashtt, poolKey);
-                logWithRunId("Removed private pool access codes: " # debug_show (poolKey));
+                if (not Text.endsWith(accesscode, #text "excl")) {
+                  replaceLiqMap(
+                    true,
+                    false,
+                    token_init_identifier,
+                    whichCoin,
+                    accesscode,
+                    (amount_init, amount_sell, 0, 0, "", liquidityToDelete.OCname, liquidityToDelete.time, liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier, liquidityToDelete.strictlyOTC, liquidityToDelete.allOrNothing),
+                    #Zero,
+                    null,
+                    ?{
+                      amount_init = amount_init;
+                      amount_sell = amount_sell;
+                      init_principal = init_principal;
+                      sell_principal = "";
+                      accesscode = accesscode;
+                      token_init_identifier = token_init_identifier;
+                      filledInit = 0;
+                      filledSell = 0;
+                      strictlyOTC = false;
+                      allOrNothing = false;
+                    },
+                  );
+                };
               };
             };
           };
+        };
+        ignore Map.remove(liqMapSortForeign, hashtt, poolKey);
+        logWithRunId("Removed foreign pool from liqMapSortForeign: " # debug_show (poolKey));
+      };
+
+      // DRIFT FIX: Iterate tradeStorePrivate DIRECTLY (not via foreignPrivatePools+privateAccessCodes
+      // indirection). Those indexes can fall out of sync, orphaning trades. Direct iteration is
+      // authoritative for finding every private order that mentions the removed token.
+      let orphanPrivateCodes = Vector.new<Text>();
+      for ((accesscode, trade) in Map.entries(tradeStorePrivate)) {
+        if (trade.token_init_identifier == added or trade.token_sell_identifier == added) {
+          Vector.add(orphanPrivateCodes, accesscode);
+        };
+      };
+      label privateOrders for (accesscode in Vector.vals(orphanPrivateCodes)) {
+        let liquidityToDelete = switch (Map.get(tradeStorePrivate, thash, accesscode)) {
+          case null { continue privateOrders };
+          case (?a) { a };
+        };
+        if (liquidityToDelete.trade_done == 1) {
+          Vector.addFromIter(tempTransferQueueLocal, (syncFixStuckTX(accesscode, liquidityToDelete.initPrincipal)).vals());
+          logWithRunId("Fixed stuck transaction for: " # accesscode);
+          continue privateOrders;
+        };
+
+        logWithRunId("Removing private order: " # accesscode);
+        let amount_init = liquidityToDelete.amount_init;
+        let amount_sell = liquidityToDelete.amount_sell;
+        let RevokeFee = liquidityToDelete.RevokeFee;
+        let token_init_identifier = liquidityToDelete.token_init_identifier;
+        let init_principal = liquidityToDelete.initPrincipal;
+        let Fee = liquidityToDelete.Fee;
+
+        let totalFee = (amount_init) * Fee;
+        let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
+        let toBeSent = amount_init + revoke_Fee;
+
+        Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
+        dbgPrivateCount += 1;
+        if (token_init_identifier == added) { dbgPrivateRefund += toBeSent };
+
+        removeTrade(accesscode, liquidityToDelete.initPrincipal, (liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier));
+        if (not Text.endsWith(accesscode, #text "excl")) {
+          replaceLiqMap(
+            true,
+            false,
+            token_init_identifier,
+            liquidityToDelete.token_sell_identifier,
+            accesscode,
+            (amount_init, amount_sell, 0, 0, "", liquidityToDelete.OCname, liquidityToDelete.time, liquidityToDelete.token_init_identifier, liquidityToDelete.token_sell_identifier, liquidityToDelete.strictlyOTC, liquidityToDelete.allOrNothing),
+            #Zero,
+            null,
+            ?{
+              amount_init = amount_init;
+              amount_sell = amount_sell;
+              init_principal = init_principal;
+              sell_principal = "";
+              accesscode = accesscode;
+              token_init_identifier = token_init_identifier;
+              filledInit = 0;
+              filledSell = 0;
+              strictlyOTC = false;
+              allOrNothing = false;
+            },
+          );
         };
       };
       // Handle AMM pools
@@ -5908,6 +6994,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     let tFees0 = returnTfees(poolKey.0);
                     if (amount0 > tFees0) {
                       Vector.add(tempTransferQueueLocal, (#principal(user), amount0 - tFees0, poolKey.0, genTxId()));
+                      dbgV2LpCount += 1;
+                      if (poolKey.0 == added) { dbgV2LpRefund += (amount0 - tFees0) };
                       logWithRunId("Queued liquidity return for user: " # debug_show (user) # ", amount: " # Nat.toText(amount0 - tFees0) # " of " # poolKey.0);
                     } else {
                       addFees(poolKey.0, amount0, false, "", nowVar);
@@ -5916,6 +7004,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     let tFees1 = returnTfees(poolKey.1);
                     if (amount1 > tFees1) {
                       Vector.add(tempTransferQueueLocal, (#principal(user), amount1 - tFees1, poolKey.1, genTxId()));
+                      dbgV2LpCount += 1;
+                      if (poolKey.1 == added) { dbgV2LpRefund += (amount1 - tFees1) };
                       logWithRunId("Queued liquidity return for user: " # debug_show (user) # ", amount: " # Nat.toText(amount1 - tFees1) # " of " # poolKey.1);
                     } else {
                       addFees(poolKey.1, amount1, false, "", nowVar);
@@ -5954,23 +7044,48 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               var cumulativeFee1Claimed : Nat = 0;
               var totalRefunded0 : Nat = 0;
               var totalRefunded1 : Nat = 0;
+              var positionsIterated : Nat = 0;
+              var sumPosLiquidity : Nat = 0;
+              var dbgCTransferSum0 : Nat = 0;
+              var dbgCDustToFees0 : Nat = 0;
+              var dbgCTransferSum1 : Nat = 0;
+              var dbgCDustToFees1 : Nat = 0;
+              var dbgCTransferCount : Nat = 0;
+              var dbgCDustCount : Nat = 0;
               let nowVar = Time.now();
+              // pre-pass to compute ACTUAL sum of position liquidities
+              // for this pool. Using pool.totalLiquidity as denominator is unsafe — if stale
+              // tick-tree state inflated v3.activeLiquidity (which syncPoolFromV3 wrote to
+              // pool.totalLiquidity), each position gets under-paid and the shortfall orphans
+              // to feescollectedDAO. sumPosLiquidityPreCalc reflects reality: refunds sum to
+              // exactly pool.reserve (modulo rounding).
+              var sumPosLiquidityPreCalc : Nat = 0;
+              for ((_, cPositions) in Map.entries(concentratedPositions)) {
+                for (pos in cPositions.vals()) {
+                  if ((pos.token0 == poolKey.0 and pos.token1 == poolKey.1) or (pos.token0 == poolKey.1 and pos.token1 == poolKey.0)) {
+                    sumPosLiquidityPreCalc += pos.liquidity;
+                  };
+                };
+              };
+              if (test) {
+                Debug.print("POOL_DELETE_START " # debug_show(poolKey)
+                  # " pool.reserve0=" # Nat.toText(pool.reserve0)
+                  # " pool.reserve1=" # Nat.toText(pool.reserve1)
+                  # " pool.totalLiquidity=" # Nat.toText(pool.totalLiquidity)
+                  # " sumPosLiquidityPreCalc=" # Nat.toText(sumPosLiquidityPreCalc));
+              };
               for ((user, cPositions) in Map.entries(concentratedPositions)) {
                 let remaining = Vector.new<ConcentratedPosition>();
                 for (pos in cPositions.vals()) {
                   if ((pos.token0 == poolKey.0 and pos.token1 == poolKey.1) or (pos.token0 == poolKey.1 and pos.token1 == poolKey.0)) {
-                    // Drift-safe unified refund math: always proportional to pool reserves.
-                    // Rationale: on pool deletion, the pool has a single shared reserve pool.
-                    // Mixing V3 virtual-liquidity math (amountsFromLiquidity) for concentrated
-                    // positions with proportional math for full-range causes Σbase != pool.reserve,
-                    // which either orphans tokens (positive drift) or over-refunds (negative drift).
-                    // Proportional to pool.totalLiquidity (= v3.activeLiquidity) guarantees
-                    // Σ base ≤ pool.reserve. Out-of-range concentrated positions effectively
-                    // get refunded their pro-rata share of reserves — fair during deletion.
-                    // Cap at remaining reserves to be safe against any rounding overshoot.
-                    let (rawBase0, rawBase1) = if (pool.totalLiquidity > 0) {
-                      (mulDiv(pos.liquidity, pool.reserve0, pool.totalLiquidity),
-                       mulDiv(pos.liquidity, pool.reserve1, pool.totalLiquidity))
+                    // Drift-safe unified refund math: proportional to sumPosLiquidityPreCalc
+                    // (NOT pool.totalLiquidity, which can be inflated by tick-tree staleness).
+                    // When healthy, sumPosLiquidityPreCalc == pool.totalLiquidity and behavior
+                    // is identical to before. When stale, this redirects would-be DAO orphans
+                    // back to their rightful LP owners.
+                    let (rawBase0, rawBase1) = if (sumPosLiquidityPreCalc > 0) {
+                      (mulDiv(pos.liquidity, pool.reserve0, sumPosLiquidityPreCalc),
+                       mulDiv(pos.liquidity, pool.reserve1, sumPosLiquidityPreCalc))
                     } else { (0, 0) };
                     let remainingReserve0 = safeSub(pool.reserve0, totalRefunded0);
                     let remainingReserve1 = safeSub(pool.reserve1, totalRefunded1);
@@ -5994,6 +7109,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     let total1 = base1 + fee1;
                     totalRefunded0 += total0;
                     totalRefunded1 += total1;
+                    positionsIterated += 1;
+                    sumPosLiquidity += pos.liquidity;
                     let tf0 = returnTfees(poolKey.0);
                     let tf1 = returnTfees(poolKey.1);
                     // Dust handling: route small amounts to feescollectedDAO via direct Map
@@ -6001,15 +7118,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     // cause negative drift accumulation across hundreds of dust events).
                     if (total0 > tf0) {
                       Vector.add(tempTransferQueueLocal, (#principal(user), total0 - tf0, poolKey.0, genTxId()));
+                      dbgCTransferCount += 1;
+                      dbgCTransferSum0 += total0;
                     } else if (total0 > 0) {
                       let cur0 = switch (Map.get(feescollectedDAO, thash, poolKey.0)) { case (?v) v; case null 0 };
                       Map.set(feescollectedDAO, thash, poolKey.0, cur0 + total0);
+                      dbgCDustCount += 1;
+                      dbgCDustToFees0 += total0;
                     };
                     if (total1 > tf1) {
                       Vector.add(tempTransferQueueLocal, (#principal(user), total1 - tf1, poolKey.1, genTxId()));
+                      dbgCTransferCount += 1;
+                      dbgCTransferSum1 += total1;
                     } else if (total1 > 0) {
                       let cur1 = switch (Map.get(feescollectedDAO, thash, poolKey.1)) { case (?v) v; case null 0 };
                       Map.set(feescollectedDAO, thash, poolKey.1, cur1 + total1);
+                      dbgCDustCount += 1;
+                      dbgCDustToFees1 += total1;
                     };
                     logWithRunId("Refunded V3 position for user: " # debug_show (user) # " liq=" # Nat.toText(pos.liquidity));
                   } else {
@@ -6043,6 +7168,26 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 Map.set(feescollectedDAO, thash, poolKey.1, cur1 + poolRemainder1);
               };
               logWithRunId("Pool deletion remainder (protocol fees + dust) → feescollectedDAO: token0=" # Nat.toText(poolRemainder0) # " token1=" # Nat.toText(poolRemainder1));
+              if (test) {
+                Debug.print("POOL_DELETE_SUMMARY " # debug_show(poolKey)
+                  # " positionsIterated=" # Nat.toText(positionsIterated)
+                  # " sumPosLiquidity=" # Nat.toText(sumPosLiquidity)
+                  # " pool.totalLiquidity=" # Nat.toText(pool.totalLiquidity)
+                  # " pool.reserve0=" # Nat.toText(pool.reserve0)
+                  # " pool.reserve1=" # Nat.toText(pool.reserve1)
+                  # " totalRefunded0=" # Nat.toText(totalRefunded0)
+                  # " totalRefunded1=" # Nat.toText(totalRefunded1)
+                  # " cTransferCount=" # Nat.toText(dbgCTransferCount)
+                  # " cTransferSum0=" # Nat.toText(dbgCTransferSum0)
+                  # " cTransferSum1=" # Nat.toText(dbgCTransferSum1)
+                  # " cDustCount=" # Nat.toText(dbgCDustCount)
+                  # " cDustToFees0=" # Nat.toText(dbgCDustToFees0)
+                  # " cDustToFees1=" # Nat.toText(dbgCDustToFees1)
+                  # " v3Resid0=" # Nat.toText(switch (v3Opt) { case (?v3) safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0); case null 0 })
+                  # " v3Resid1=" # Nat.toText(switch (v3Opt) { case (?v3) safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1); case null 0 })
+                  # " poolRemainder0=" # Nat.toText(poolRemainder0)
+                  # " poolRemainder1=" # Nat.toText(poolRemainder1));
+              };
 
               Map.delete(poolV3Data, hashtt, poolKey);
 
@@ -6108,6 +7253,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       removeToken(added);
       logWithRunId("Removed token: " # added);
 
+      if (test) {
+        Debug.print("REMOVE_BREAKDOWN token=" # added
+          # " orderbookCount=" # Nat.toText(dbgObCount)
+          # " orderbookRefund(added-token)=" # Nat.toText(dbgObRefund0)
+          # " foreignCount=" # Nat.toText(dbgForeignCount)
+          # " foreignRefund(added-token)=" # Nat.toText(dbgForeignRefund)
+          # " privateCount=" # Nat.toText(dbgPrivateCount)
+          # " privateRefund(added-token)=" # Nat.toText(dbgPrivateRefund)
+          # " v2LpCount=" # Nat.toText(dbgV2LpCount)
+          # " v2LpRefund(added-token)=" # Nat.toText(dbgV2LpRefund)
+          # " totalLocalTransfers=" # Nat.toText(Vector.size(tempTransferQueueLocal)));
+      };
     } else if ((action == #Add and containsToken(added) == false) or (containsToken(added) == false and action == #Opposite)) {
       logWithRunId("Adding new token: " # added);
       let acceptedTokensVec = Vector.fromArray<Text>(acceptedTokens);
@@ -6270,6 +7427,27 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let loggingText = Text.join("\n", Vector.toArray(logEntries).vals());
     Map.set(loggingMapaddAcceptedToken, nhash, runId, loggingText);
     return #Ok("addAcceptedToken completed");
+  };
+
+  public shared ({ caller }) func updateTokenType(
+    token : Text,
+    newType : { #ICP; #ICRC12; #ICRC3 },
+  ) : async ExTypes.ActionResult {
+    if (not isAdmin(caller)) { return #Err(#NotAuthorized) };
+    let index = Array.indexOf<Text>(token, acceptedTokens, Text.equal);
+    switch (index) {
+      case (?k) {
+        let mutable = Array.thaw<{ #ICP; #ICRC12; #ICRC3 }>(tokenType);
+        mutable[k] := newType;
+        tokenType := Array.freeze(mutable);
+        // Refresh the cached acceptedTokensInfo so queries reflect the change immediately
+        let updated = Array.thaw<TokenInfo>(acceptedTokensInfo);
+        updated[k] := { acceptedTokensInfo[k] with asset_type = newType };
+        acceptedTokensInfo := Array.freeze(updated);
+        #Ok("Token type updated to " # debug_show (newType));
+      };
+      case null { #Err(#InvalidInput("Token not found")) };
+    };
   };
 
   private func removeToken(tokenToRemove : Text) {
@@ -6786,6 +7964,27 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
 
+    // Same-token reject: makes no economic sense and can drain pools via cyclic
+    // AMM routes. Burn canister exempt (adminFlashArb routes back to start token).
+    if (token_sell_identifier == token_init_identifier and caller != BUYBACK_CANISTER_ID) {
+      if (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block))) {
+        return #Err(#InvalidInput("Block already processed"));
+      };
+      Map.set(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block), nowVar);
+      let nowVar2 = nowVar;
+      let tType = returnType(token_init_identifier);
+      try {
+        let blockData = await* getBlockData(token_init_identifier, Block, tType);
+        Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token_init_identifier, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar2)).1.vals());
+      } catch (err) {
+        Map.delete(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block));
+      };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InvalidInput("Sell and buy token must be different"));
+    };
+
     // Check if tokens are accepted. If not, refund the deposit (the user may have
     // sent tokens before the token was removed — don't leave them untracked).
     let tokenNotAccepted = (token_sell_identifier != "ryjl3-tyaaa-aaaaa-aaaba-cai" and containsToken(token_sell_identifier) == false)
@@ -6924,9 +8123,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             // If no referrer provided, set to null
             Map.set(userReferrerLink, thash, user, null);
           } else {
-            // Check if the referrer is a valid principal
+            // Check if the referrer is a valid principal AND not the caller
+            // themselves (self-referral would let the user siphon ReferralFees%
+            // of their OWN fees back via claimFeesReferrer, stealing from DAO).
             let a = PrincipalExt.fromText(referrer);
-            if (a == null) {
+            if (a == null or referrer == user) {
               Map.set(userReferrerLink, thash, user, null);
             } else {
               Map.set(userReferrerLink, thash, user, ?referrer);
@@ -7320,7 +8521,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Validate route structure (cheap checks before any block processing)
     var validationError : Text = "";
-    if (route.size() < 1 or route.size() > 3) { validationError := "Invalid route: 1-3 hops required" }
+    if (tokenIn == tokenOut and caller != BUYBACK_CANISTER_ID) {
+      validationError := "Same token (cyclic route not allowed)";
+    };
+    if (validationError != "") { /* same-token already rejected */ }
+    else if (route.size() < 1 or route.size() > 3) { validationError := "Invalid route: 1-3 hops required" }
     else if (route[0].tokenIn != tokenIn) { validationError := "Route mismatch: first hop tokenIn != tokenIn" }
     else if (route[route.size() - 1].tokenOut != tokenOut) { validationError := "Route mismatch: last hop tokenOut != tokenOut" }
     else {
@@ -7525,12 +8730,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let prevCurrentAmount = currentAmount; // Save before overwrite for error path
       currentAmount := hopOutput;
       if (currentAmount == 0) {
-        // No output from this hop — collect first-hop fees that would otherwise be skipped.
-        // For hop 0 failure: amountIn is refunded (line above), so only track the non-revoke
-        // trading fee (NOT inputTfees — the refund transfer costs Tfees which covers it).
-        // For hop 1+ failure: same fee tracking needed.
-        let tradingFee = calculateFee(amountIn, ICPfee, RevokeFeeNow);
+        // No output — collect hop 0 fees. User deposited amount * (1 + Fee%) upfront;
+        // the non-revoke portion (calculateFee) is user's fee to DAO. Additionally, any
+        // AMM protocol fee deducted during partial hop-0 execution (firstHopProtocolFee)
+        // also goes to DAO. The 70% LP portion stays in v3 residual (claimable by LPs).
+        // Sync v3 claim by protocolFee only, so residual retains exactly the LP portion.
+        let tradingFee = calculateFee(amountIn, ICPfee, RevokeFeeNow) + firstHopProtocolFee;
         if (tradingFee > 0) { addFees(tokenIn, tradingFee, false, user, nowVar) };
+        if (firstHopProtocolFee > 0) {
+          claimProtocolFeeInV3(tokenIn, route[0].tokenOut, firstHopProtocolFee);
+        };
 
         // For hop 1+ failures: the intermediate tokens from previous hops are in the
         // wallet (AMM reserves decreased but tokens weren't transferred out).
@@ -7586,10 +8795,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // NOTE: This only collects hop 0 fees. Hops 1+ fees are collected inside the loop above.
     let firstHopMatched : Nat = amountIn;
     if (firstHopMatched > 0) {
-      let tradingFee = calculateFee(firstHopMatched, ICPfee, RevokeFeeNow);
+      // tradingFee = user's upfront non-revoke (calculateFee) + AMM protocol 30% (firstHopProtocolFee).
+      // LP 70% stays in v3 residual (claimable). Sync v3 claim by protocolFee only.
+      let tradingFee = calculateFee(firstHopMatched, ICPfee, RevokeFeeNow) + firstHopProtocolFee;
       let inputTfees = if (firstHopHadOrderbookMatch) { 0 } else { returnTfees(tokenIn) };
       let feeToAdd = tradingFee + inputTfees;
       addFees(tokenIn, feeToAdd, false, user, nowVar);
+      if (firstHopProtocolFee > 0) {
+        claimProtocolFeeInV3(tokenIn, route[0].tokenOut, firstHopProtocolFee);
+      };
     };
 
     // 6. Slippage check on actual result
@@ -7698,26 +8912,31 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     var totalAmountIn : Nat = 0;
     var validationError : Text = "";
-    if (splits.size() < 1 or splits.size() > 3) { validationError := "1-3 splits required" };
+    if (tokenIn == tokenOut and caller != BUYBACK_CANISTER_ID) {
+      validationError := "Same token (cyclic route not allowed)";
+    };
+    if (validationError == "" and (splits.size() < 1 or splits.size() > 3)) { validationError := "1-3 splits required" };
 
     for (leg in splits.vals()) {
-      if (leg.amountIn == 0) { validationError := "Leg amount must be > 0" };
-      if (leg.route.size() < 1 or leg.route.size() > 3) { validationError := "Each leg: 1-3 hops required" };
       if (validationError == "") {
-        if (leg.route[0].tokenIn != tokenIn) { validationError := "Leg route must start with tokenIn" };
-        if (leg.route[leg.route.size() - 1].tokenOut != tokenOut) { validationError := "Leg route must end with tokenOut" };
-        var i = 0;
-        while (i + 1 < leg.route.size()) {
-          if (leg.route[i].tokenOut != leg.route[i + 1].tokenIn) { validationError := "Route broken at hop " # Nat.toText(i) };
-          i += 1;
-        };
-        for (hop in leg.route.vals()) {
-          if (not containsToken(hop.tokenIn) or not containsToken(hop.tokenOut)) { validationError := "Token not accepted" };
-          if ((switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenIn })) { case null { false }; case (?_) { true } }) or
-              (switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenOut })) { case null { false }; case (?_) { true } })) {
-            validationError := "A token in the route is paused";
+        if (leg.amountIn == 0) { validationError := "Leg amount must be > 0" };
+        if (leg.route.size() < 1 or leg.route.size() > 3) { validationError := "Each leg: 1-3 hops required" };
+        if (validationError == "") {
+          if (leg.route[0].tokenIn != tokenIn) { validationError := "Leg route must start with tokenIn" };
+          if (leg.route[leg.route.size() - 1].tokenOut != tokenOut) { validationError := "Leg route must end with tokenOut" };
+          var i = 0;
+          while (i + 1 < leg.route.size()) {
+            if (leg.route[i].tokenOut != leg.route[i + 1].tokenIn) { validationError := "Route broken at hop " # Nat.toText(i) };
+            i += 1;
           };
-          if (not isKnownPool(hop.tokenIn, hop.tokenOut)) { validationError := "No pool for hop " # hop.tokenIn # " -> " # hop.tokenOut };
+          for (hop in leg.route.vals()) {
+            if (not containsToken(hop.tokenIn) or not containsToken(hop.tokenOut)) { validationError := "Token not accepted" };
+            if ((switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenIn })) { case null { false }; case (?_) { true } }) or
+                (switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenOut })) { case null { false }; case (?_) { true } })) {
+              validationError := "A token in the route is paused";
+            };
+            if (not isKnownPool(hop.tokenIn, hop.tokenOut)) { validationError := "No pool for hop " # hop.tokenIn # " -> " # hop.tokenOut };
+          };
         };
       };
       totalAmountIn += leg.amountIn;
@@ -7791,75 +9010,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       return #Err(#InsufficientFunds("Funds not received"));
     };
 
-    // ── 3. V3-aware sequential simulation with cross-leg pool impact ──
-    // NO state modification. NO await. Pool state is frozen.
-    let simPools = Map.new<(Text, Text), AMMPool>();
-    let simV3 = Map.new<(Text, Text), PoolV3Data>();
-
-    var totalSimulated : Nat = 0;
-    var simError : Text = "";
-
-    label simLoop for (legIdx in Iter.range(0, splits.size() - 1)) {
-      let leg = splits[legIdx];
-      var simAmount = leg.amountIn;
-
-      label hopSim for (hop in leg.route.vals()) {
-        let pk = getPool(hop.tokenIn, hop.tokenOut);
-        // Use simulation copy if available (cross-leg accuracy), else real pool
-        let poolOpt = switch (Map.get(simPools, hashtt, pk)) {
-          case (?p) { ?p };
-          case null { Map.get(AMMpools, hashtt, pk) };
-        };
-        let v3Opt = switch (Map.get(simV3, hashtt, pk)) {
-          case (?v) { ?v };
-          case null { Map.get(poolV3Data, hashtt, pk) };
-        };
-        switch (poolOpt) {
-          case (?pool) {
-            let (out, updatedPool, updatedV3) = simulateSwap(pool, v3Opt, hop.tokenIn, simAmount, ICPfee);
-            if (out == 0) { simError := "Leg " # Nat.toText(legIdx) # ": zero output at simulation"; break simLoop };
-            // Store updated copies for cross-leg accuracy
-            Map.set(simPools, hashtt, pk, updatedPool);
-            switch (updatedV3) {
-              case (?v) { Map.set(simV3, hashtt, pk, v) };
-              case null {};
-            };
-            simAmount := out;
-          };
-          case null { simError := "Leg " # Nat.toText(legIdx) # ": pool not found"; break simLoop };
-        };
-      };
-
-      // Per-leg minimum check
-      if (simError == "" and leg.minLegOut > 0 and simAmount < leg.minLegOut) {
-        simError := "Leg " # Nat.toText(legIdx) # ": simulated " # Nat.toText(simAmount) # " < min " # Nat.toText(leg.minLegOut);
-        break simLoop;
-      };
-      if (simError == "") { totalSimulated += simAmount };
-    };
-
-    // Also check global simulated output vs minAmountOut
-    if (simError == "" and totalSimulated < minAmountOut) {
-      simError := "Total simulated " # Nat.toText(totalSimulated) # " < min " # Nat.toText(minAmountOut);
-    };
-
-    // If simulation found errors (per-leg minimum violated or global slippage), reject BEFORE
-    // state modification. Refund the full deposit.
-    if (simError != "") {
-      let tradingFeePortion = (totalAmountIn * ICPfee) / 10000;
-      let revokeFeePortion = (totalAmountIn * ICPfee) / (10000 * RevokeFeeNow);
-      let untrackedFees = tradingFeePortion - revokeFeePortion;
-      if (untrackedFees > 0) {
-        addFees(tokenIn, untrackedFees, false, user, nowVar);
-      };
-      Vector.add(tempTransferQueueLocal, (#principal(caller), totalAmountIn, tokenIn, genTxId()));
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
-        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
-      };
-      return #Err(#SlippageExceeded({ expected = minAmountOut; got = totalSimulated }));
-    };
-
-    // ── 4. Execute all legs sequentially (state IS modified — NO await until transfers) ──
+    // ── 3. Execute all legs sequentially (state IS modified — NO await until transfers) ──
     // Between simulation check above and execution below: ZERO awaits.
     // Motoko actor model guarantees no other message interleaves.
     // Pool state is identical to simulation → execution output ≥ simulated.
@@ -7945,6 +9096,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           // DRIFT FIX: this refund transfer consumes the user's inputTfees buffer
           // (ledger fee deducted on outflow). Flag so we don't double-book it later.
           legFirstHopHadOrderbookMatch := true;
+          recordOpDrift("splitRoutes_firstHopRefund", hop.tokenIn, -remaining);
         };
 
         let prevCurrentAmount = currentAmount;
@@ -7958,19 +9110,27 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             let itf = returnTfees(intermediateToken);
             if (prevCurrentAmount > itf) {
               Vector.add(tempTransferQueueLocal, (#principal(caller), prevCurrentAmount - itf, intermediateToken, genTxId()));
+              recordOpDrift("splitRoutes_intermediateRefund", intermediateToken, -prevCurrentAmount);
             } else {
               // Dust too small to transfer — track in feescollectedDAO so nothing is lost
               let cur = switch (Map.get(feescollectedDAO, thash, intermediateToken)) { case (?v) v; case null 0 };
               Map.set(feescollectedDAO, thash, intermediateToken, cur + prevCurrentAmount);
+              recordOpDrift("splitRoutes_intermediateDust", intermediateToken, 0);
             };
           };
           // DRIFT FIX: book the leg's trading fee on failure (mirrors swapMultiHop:7530-7531).
           // Without this, the user's deposited fee for the partial route is unaccounted → positive drift.
           // Use direct Map update to avoid addFees' -1 sat loss (would cause negative drift).
-          let failedLegTradingFee = calculateFee(leg.amountIn, ICPfee, RevokeFeeNow);
+          // Additive: calculateFee (user upfront) + legFirstHopProtocolFee (AMM protocol).
+          // Sync v3 claim by protocolFee only. LP 70% stays in v3 residual.
+          let failedLegTradingFee = calculateFee(leg.amountIn, ICPfee, RevokeFeeNow) + legFirstHopProtocolFee;
           if (failedLegTradingFee > 0) {
             let curFee = switch (Map.get(feescollectedDAO, thash, tokenIn)) { case (?v) v; case null 0 };
             Map.set(feescollectedDAO, thash, tokenIn, curFee + failedLegTradingFee);
+            if (legFirstHopProtocolFee > 0) {
+              claimProtocolFeeInV3(tokenIn, leg.route[0].tokenOut, legFirstHopProtocolFee);
+            };
+            recordOpDrift("splitRoutes_failedLegFee", tokenIn, 0);
           };
           break hopExec;
         };
@@ -7980,24 +9140,31 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         // hops don't actually transfer — add it back for AMM-only)
         if (not isLastHop and wasAMMOnly) {
           currentAmount += returnTfees(hop.tokenOut);
+          recordOpDrift("splitRoutes_ammOnlyRefund", hop.tokenOut, 0);
         };
         if (not isLastHop and not wasAMMOnly) {
           // DRIFT FIX: use direct Map update instead of addFees to avoid -1 sat loss.
           let hopTfees = returnTfees(hop.tokenOut);
           let curFee = switch (Map.get(feescollectedDAO, thash, hop.tokenOut)) { case (?v) v; case null 0 };
           Map.set(feescollectedDAO, thash, hop.tokenOut, curFee + hopTfees);
+          recordOpDrift("splitRoutes_hopTfees", hop.tokenOut, 0);
         };
       };
 
       // Per-leg fee tracking — only charge if the leg produced output.
       // Don't charge fees for failed legs (user got nothing from them).
       if (currentAmount > 0) {
-        let legTradingFee = calculateFee(leg.amountIn, ICPfee, RevokeFeeNow);
+        // Additive: calculateFee (user upfront) + legFirstHopProtocolFee (AMM protocol).
+        // Sync v3 claim by protocolFee only. LP 70% stays in v3 residual.
+        let legTradingFee = calculateFee(leg.amountIn, ICPfee, RevokeFeeNow) + legFirstHopProtocolFee;
         if (legTradingFee > 0) {
-          // DRIFT FIX: direct Map update to avoid addFees' -1 sat loss per call.
-          // 80 split ops × 3 legs × -1 sat was causing negative drift.
+          // Direct Map update to avoid addFees' -1 sat loss.
           let curFee = switch (Map.get(feescollectedDAO, thash, tokenIn)) { case (?v) v; case null 0 };
           Map.set(feescollectedDAO, thash, tokenIn, curFee + legTradingFee);
+          if (legFirstHopProtocolFee > 0) {
+            claimProtocolFeeInV3(tokenIn, leg.route[0].tokenOut, legFirstHopProtocolFee);
+          };
+          recordOpDrift("splitRoutes_legTradingFee", tokenIn, 0);
         };
       };
 
@@ -8017,7 +9184,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (inputTfees > 0) {
         let curFee = switch (Map.get(feescollectedDAO, thash, tokenIn)) { case (?v) v; case null 0 };
         Map.set(feescollectedDAO, thash, tokenIn, curFee + inputTfees);
+        recordOpDrift("splitRoutes_inputTfees", tokenIn, 0);
       };
+    } else {
+      recordOpDrift("splitRoutes_inputTfees_SKIPPED", tokenIn, 0);
     };
 
     // ── 5. Record swap history (single entry for all legs) ──
@@ -8045,13 +9215,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // ── 6. Update exchange info ──
     doInfoBeforeStep2();
 
-    // ── 7. Post-execution global slippage check ──
+    // ── Post-execution global slippage check (ATOMIC ROLLBACK on failure) ──
+    // We removed the pre-check (it duplicated quote-time work and this final check
+    // catches the same failures anyway). On failure, Debug.trap
+    // reverts ALL state mutations from this update message (Motoko/IC actor model
+    // guarantees this) — including BlocksDone, AMM/V3 pool state, orderbook entries,
+    // fee accumulators. Crucially the queued transfers in tempTransferQueueLocal are
+    // ALSO reverted because they haven't been awaited yet. Net effect: nothing happened.
+    // The user's deposit on the ledger remains in the exchange treasury and the
+    // BlocksDone marker is reverted, so the same Block can be retried (or recovered
+    // via checkDiffs later if treasury moves on).
     if (totalOutput < minAmountOut) {
-      // State already modified — can't rollback. Send whatever was received.
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
-        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
-      };
-      return #Err(#SlippageExceeded({ expected = minAmountOut; got = totalOutput }));
+      Debug.trap("SlippageExceeded: expected at least " # Nat.toText(minAmountOut) # " got " # Nat.toText(totalOutput));
     };
 
     // ── 8. Consolidate transfers (combine same recipient+token to save transfer fees) ──
@@ -8079,8 +9254,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Track saved ledger fees from consolidation for OUTPUT token only.
     // Consolidating taker output transfers (tokenOut) saves ledger fees that create
-    // untracked surplus. Consolidating counterparty transfers (tokenIn) was needed
-    // to fix the input token drift and should NOT add extra tracking.
+    // untracked surplus.
     for ((key, count) in Map.entries(preCountMap)) {
       if (count > 1) {
         let token = switch (Map.get(consolidatedMap, thash, key)) {
@@ -8113,35 +9287,96 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     });
   };
 
+  // Estimate how much `token_init` can be input to push the AMM exactly to `orderRatio`.
+  // V3 path (pool has poolV3Data): simulates the real V3 tick-walk via swapWithAMMV3 with
+  //   a sqrtPriceLimit at the user's target. This is the only honest answer when V3
+  //   concentrated liquidity is in use — V2-style reserveOut/reserveIn diverges from V3
+  //   spot whenever ranges concentrate liquidity, and that divergence is signed (it's
+  //   under V3 spot in price units, over V3 spot in inverse units), which is why the old
+  //   V2-only estimator silently zeroed-out only the SELL direction on every V3 pool.
+  // V2 fallback: pools without poolV3Data are degenerate (swapWithAMM also returns 0 for
+  //   them), so we keep the original constant-product solve unchanged for compatibility.
   func getAMMLiquidity(pool : AMMPool, orderRatio : Ratio, token_init_identifier : Text) : (Nat, Ratio) {
     let reserveIn = if (pool.token0 == token_init_identifier) pool.reserve0 else pool.reserve1;
     let reserveOut = if (pool.token0 == token_init_identifier) pool.reserve1 else pool.reserve0;
-    let currentRatio = if (reserveIn == 0) #Max else if (reserveOut == 0) #Zero else #Value((reserveOut * tenToPower60) / reserveIn);
     if ((returnMinimum(token_init_identifier, reserveIn, true) and returnMinimum(if (pool.token0 == token_init_identifier) pool.token1 else pool.token0, reserveOut, true)) == false) {
       return (0, #Value(0));
     };
-    switch (orderRatio, currentRatio) {
-      case (#Value(targetRatio), #Value(poolRatio)) {
-        if (targetRatio == poolRatio) {
-          return (0, currentRatio); // No swap needed
-        };
+    let poolKey = (pool.token0, pool.token1);
+    let tokenInIsToken0 = (pool.token0 == token_init_identifier);
 
-        let k = reserveIn * reserveOut;
-        let newReserveIn = sqrt((k * tenToPower60) / targetRatio);
-        let amountIn = if (newReserveIn >= reserveIn) {
-          newReserveIn - reserveIn;
-        } else {
-          0;
-        };
+    switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case (?v3Live) {
+        // V3 path — recalc-pure first so a one-sided / freshly-drained pool gets a
+        // synced sqrtRatio without writing to Maps (recalcV3Pure returns new structs).
+        let (poolPure, v3) = recalcV3Pure(pool, v3Live);
+        let v3Spot : Ratio = if (v3.currentSqrtRatio > 0) {
+          let raw = (v3.currentSqrtRatio * v3.currentSqrtRatio) / tenToPower60;
+          if (tokenInIsToken0) {
+            #Value(raw);
+          } else if (raw > 0) {
+            #Value(tenToPower120 / raw);
+          } else { #Max };
+        } else { #Zero };
 
-        (amountIn, #Value(targetRatio));
+        switch (orderRatio, v3Spot) {
+          case (#Zero, _) {
+            // accept-any-price: hand back a budget that reserveIn-cap will dominate later
+            (reserveIn * 1000, v3Spot);
+          };
+          case (#Value(t), #Value(s)) {
+            if (t == s) return (0, v3Spot);
+            // V3 spot is on the unfavourable side of the user's limit → no liquidity
+            // (caller's outer gate at orderPairing line 9150 already checks this, but
+            // belt+braces — keeps the simulation off the hot path when nothing is to do).
+            if (tokenInIsToken0) {
+              // SELL token0 (e.g. SELL TACO with TACO=token0): user wants AMM spot
+              // expressed as out/in (= ICP/TACO) ≥ their limit. Favourable iff s > t.
+              if (s <= t) return (0, v3Spot);
+            } else {
+              // BUY token0 (token_init is token1): user wants AMM spot expressed as
+              // out/in (= TACO/ICP, which is 1e120/v3PoolRatio) ≥ their limit.
+              // Same s > t after the inversion above.
+              if (s <= t) return (0, v3Spot);
+            };
+            // Translate user's target ratio to a sqrtPriceLimit in V3's native
+            // (token1/token0 price) sqrt space.
+            let targetSqrtPrice = if (tokenInIsToken0) {
+              ratioToSqrtRatio(t);
+            } else {
+              if (t > 0) ratioToSqrtRatio(tenToPower120 / t) else 0;
+            };
+            // Generous upper-bound budget; the sqrtPriceLimit governs termination.
+            let bigBudget = if (reserveIn > 0) reserveIn * 1000 else 0;
+            if (bigBudget == 0) return (0, v3Spot);
+            let (totalIn, _, _, _, _, _) = swapWithAMMV3(
+              poolPure, v3, tokenInIsToken0, bigBudget, ICPfee, "sim", ?targetSqrtPrice
+            );
+            (totalIn, #Value(t));
+          };
+          case _ { (0, v3Spot) };
+        };
       };
-      case (#Zero, #Value(_)) {
-        // #Zero orderRatio = "accept any price" — return full reserve as available liquidity
-        (reserveIn * 1000, currentRatio);
-      };
-      case (_, _) {
-        (0, currentRatio) // Handle edge cases (Max ratios etc)
+      case null {
+        // V2 fallback (pre-existing logic, untouched).
+        let currentRatio = if (reserveIn == 0) #Max else if (reserveOut == 0) #Zero else #Value((reserveOut * tenToPower60) / reserveIn);
+        switch (orderRatio, currentRatio) {
+          case (#Value(targetRatio), #Value(poolRatio)) {
+            if (targetRatio == poolRatio) {
+              return (0, currentRatio);
+            };
+            let k = reserveIn * reserveOut;
+            let newReserveIn = sqrt((k * tenToPower60) / targetRatio);
+            let amountIn = if (newReserveIn >= reserveIn) {
+              newReserveIn - reserveIn;
+            } else { 0 };
+            (amountIn, #Value(targetRatio));
+          };
+          case (#Zero, #Value(_)) {
+            (reserveIn * 1000, currentRatio);
+          };
+          case (_, _) { (0, currentRatio) };
+        };
       };
     };
   };
@@ -8158,9 +9393,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // V3 path: use concentrated liquidity engine
     let poolKey = (pool.token0, pool.token1);
+    // DRIFT FIX: re-sync V3 currentSqrtRatio from LIVE reserves before the swap.
+    // Upstream operations (orderbook fills, LP ops) can change reserves without updating
+    // currentSqrtRatio, making V3 math think the pool has MORE tokens than it does →
+    // output exceeds reserves → clamp fires → insolvency risk.
+    // sqrtRatioFromReserves handles one-sided pools (reserve0=0 or reserve1=0) correctly.
+    recalculateActiveLiquidity(poolKey);
+    // Re-read pool and v3 after sync (pool passed as param is pre-sync; use fresh copy)
+    let syncedPool = switch (Map.get(AMMpools, hashtt, poolKey)) { case (?p) { p }; case null { pool } };
     switch (Map.get(poolV3Data, hashtt, poolKey)) {
       case (?v3) {
-        let (totalIn, totalOut, protocolFee, poolFee, updatedPool, updatedV3) = swapWithAMMV3(pool, v3, tokenInIsToken0, amountIn, fee);
+        let (totalIn, totalOut, protocolFee, poolFee, updatedPool, updatedV3) = swapWithAMMV3(syncedPool, v3, tokenInIsToken0, amountIn, fee, "real", null);
         Map.set(poolV3Data, hashtt, poolKey, updatedV3);
         syncPoolFromV3(poolKey);
         let reserveIn = if (tokenInIsToken0) updatedPool.reserve0 else updatedPool.reserve1;
@@ -8199,8 +9442,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let tokenInIsToken0 = (tokenIn == pool.token0);
     switch (v3) {
       case (?v3Data) {
-        // V3 path: use real V3 engine (pure — returns new state without Map.set)
-        let (_totalIn, totalOut, _protocolFee, _poolFee, updatedPool, updatedV3) = swapWithAMMV3(pool, v3Data, tokenInIsToken0, amountIn, fee);
+        // V3 path: use real V3 engine (pure — returns new state without Map.set).
+        // Pre-sync the input pool/v3 so that simulation chains with drained reserves
+        // don't trigger the swapV3 clamp via stale currentSqrtRatio.
+        let (syncedPool, syncedV3) = recalcV3Pure(pool, v3Data);
+        let (_totalIn, totalOut, _protocolFee, _poolFee, updatedPool, updatedV3) = swapWithAMMV3(syncedPool, syncedV3, tokenInIsToken0, amountIn, fee, "sim", null);
         (totalOut, updatedPool, ?updatedV3);
       };
       case null {
@@ -8243,7 +9489,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     for (hop in hops.vals()) {
       let hopAmountIn = currentAmount;
 
-      // Snapshot pre-swap reserves BEFORE orderPairing mutates the pool
+      // Snapshot pre-swap reserves AND V3 sqrtRatio BEFORE orderPairing mutates the pool
       let hopPoolKey = getPool(hop.tokenIn, hop.tokenOut);
       let preHopReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, hopPoolKey)) {
         case (?hopPool) {
@@ -8252,6 +9498,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         case null { null };
       };
+      let preHopV3Ratio : Nat = getPoolRatioV3(hopPoolKey);
 
       let syntheticTrade : TradePrivate = {
         Fee = ICPfee;
@@ -8285,26 +9532,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
 
-      // Per-hop blended price impact: only AMM portion contributes
+      // Per-hop V3-aware overall price impact against full hop input (partial fills surface as impact)
       let hopPriceImpact : Float = if (hopOutput > 0 and hopAmountIn > 0) {
-        if (hopAmmAmountIn == 0) {
-          // Pure orderbook fill for this hop
-          0.0;
-        } else {
-          switch (preHopReserves) {
-            case (?(rIn, rOut)) {
-              if (rIn > 0 and rOut > 0) {
-                let mathOut = Float.fromInt(rOut) * Float.fromInt(hopAmmAmountIn) / Float.fromInt(rIn + hopAmmAmountIn);
-                let spotOut = Float.fromInt(rOut) / Float.fromInt(rIn) * Float.fromInt(hopAmmAmountIn);
-                if (spotOut > 0.0) {
-                  let ammImpact = Float.abs(1.0 - mathOut / spotOut);
-                  ammImpact * Float.fromInt(hopAmmAmountIn) / Float.fromInt(hopAmountIn);
-                } else { 0.0 };
-              } else { 0.0 };
-            };
-            case null { 0.0 };
-          };
-        };
+        computeBlendedAmmImpact(hopPoolKey, hop.tokenIn, hopOutput, hopAmountIn, preHopV3Ratio, preHopReserves);
       } else { 0.0 };
 
       totalFees += protocolFee + poolFee;
@@ -8328,12 +9558,138 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     { amountOut = currentAmount; totalFees; hopDetails = Vector.toArray(hopDetailsVec) };
   };
 
+  // Snapshot of all global state that orderPairing (and its sub-callees swapWithAMM,
+  // swapWithAMMV3, syncPoolFromV3) mutate. Used by batch quote endpoints to isolate
+  // each request from the prior one's mutations — without this, request N in a batch
+  // sees the cumulative effects of requests 0..N-1 as if their swaps had executed,
+  // because IC only reverts state at the END of a query call, not between iterations.
+  type QuoteStateSnapshot = {
+    amm : [((Text, Text), AMMPool)];
+    v3 : [((Text, Text), PoolV3Data)];
+    hist : [((Text, Text), RBTree.Tree<Time, [{ amount_init : Nat; amount_sell : Nat; init_principal : Text; sell_principal : Text; accesscode : Text; token_init_identifier : Text; filledInit : Nat; filledSell : Nat; strictlyOTC : Bool; allOrNothing : Bool }]>)];
+    tempQueueSize : Nat;
+    // Extended state captured so the swapSplitRoutes pre-check can run real
+    // orderPairing via simulateMultiHop and fully revert its mutations before
+    // real execution proceeds. Also fixes batch quote isolation: prior to this,
+    // request N in a batch quote saw orderbook/fee/kline mutations from request N-1.
+    liqPub : [((Text, Text), liqmapsort)];
+    liqFor : [((Text, Text), liqmapsort)];
+    tspub : [(Text, TradePrivate)];
+    tspriv : [(Text, TradePrivate)];
+    fees : [(Text, Nat)];
+    ltp : [Float];
+    klines : [(KlineKey, RBTree.Tree<Int, KlineData>)];
+    vol24h : [Nat];
+  };
+
+  private func snapshotQuoteState() : QuoteStateSnapshot {
+    {
+      amm = Iter.toArray(Map.entries(AMMpools));
+      v3 = Iter.toArray(Map.entries(poolV3Data));
+      hist = Iter.toArray(Map.entries(pool_history));
+      tempQueueSize = Vector.size(tempTransferQueue);
+      liqPub = Iter.toArray(Map.entries(liqMapSort));
+      liqFor = Iter.toArray(Map.entries(liqMapSortForeign));
+      tspub = Iter.toArray(Map.entries(tradeStorePublic));
+      tspriv = Iter.toArray(Map.entries(tradeStorePrivate));
+      fees = Iter.toArray(Map.entries(feescollectedDAO));
+      ltp = Iter.toArray(Vector.vals(last_traded_price));
+      klines = Iter.toArray(Map.entries(klineDataStorage));
+      vol24h = volume_24hArray;
+    };
+  };
+
+  private func restoreQuoteState(snap : QuoteStateSnapshot) {
+    // AMMpools: clear entries that aren't in snapshot, then overwrite remaining with snapshot values
+    let ammKeys = Iter.toArray(Map.keys(AMMpools));
+    for (k in ammKeys.vals()) { ignore Map.remove(AMMpools, hashtt, k) };
+    for ((k, v) in snap.amm.vals()) { Map.set(AMMpools, hashtt, k, v) };
+
+    let v3Keys = Iter.toArray(Map.keys(poolV3Data));
+    for (k in v3Keys.vals()) { ignore Map.remove(poolV3Data, hashtt, k) };
+    for ((k, v) in snap.v3.vals()) { Map.set(poolV3Data, hashtt, k, v) };
+
+    let histKeys = Iter.toArray(Map.keys(pool_history));
+    for (k in histKeys.vals()) { ignore Map.remove(pool_history, hashtt, k) };
+    for ((k, v) in snap.hist.vals()) { Map.set(pool_history, hashtt, k, v) };
+
+    // tempTransferQueue: trim back to snapshot size (orderPairing only Vector.add's on error paths)
+    while (Vector.size(tempTransferQueue) > snap.tempQueueSize) {
+      ignore Vector.removeLast(tempTransferQueue);
+    };
+
+    // Public orderbook (limit orders, sorted by ratio)
+    let liqPubKeys = Iter.toArray(Map.keys(liqMapSort));
+    for (k in liqPubKeys.vals()) { ignore Map.remove(liqMapSort, hashtt, k) };
+    for ((k, v) in snap.liqPub.vals()) { Map.set(liqMapSort, hashtt, k, v) };
+
+    // Foreign orderbook
+    let liqForKeys = Iter.toArray(Map.keys(liqMapSortForeign));
+    for (k in liqForKeys.vals()) { ignore Map.remove(liqMapSortForeign, hashtt, k) };
+    for ((k, v) in snap.liqFor.vals()) { Map.set(liqMapSortForeign, hashtt, k, v) };
+
+    // Trade store (public): per-accesscode TradePrivate records
+    let tspubKeys = Iter.toArray(Map.keys(tradeStorePublic));
+    for (k in tspubKeys.vals()) { ignore Map.remove(tradeStorePublic, thash, k) };
+    for ((k, v) in snap.tspub.vals()) { Map.set(tradeStorePublic, thash, k, v) };
+
+    // Trade store (private/OTC)
+    let tsprivKeys = Iter.toArray(Map.keys(tradeStorePrivate));
+    for (k in tsprivKeys.vals()) { ignore Map.remove(tradeStorePrivate, thash, k) };
+    for ((k, v) in snap.tspriv.vals()) { Map.set(tradeStorePrivate, thash, k, v) };
+
+    // Fee accumulators (DAO + per-token)
+    let feeKeys = Iter.toArray(Map.keys(feescollectedDAO));
+    for (k in feeKeys.vals()) { ignore Map.remove(feescollectedDAO, thash, k) };
+    for ((k, v) in snap.fees.vals()) { Map.set(feescollectedDAO, thash, k, v) };
+
+    // last_traded_price Vector — clear and reload (Vector.put writes by index, so values map 1:1)
+    Vector.clear(last_traded_price);
+    for (f in snap.ltp.vals()) { Vector.add(last_traded_price, f) };
+
+    // Kline (OHLCV) per (token0, token1, timeframe)
+    let klineKeys = Iter.toArray(Map.keys(klineDataStorage));
+    for (k in klineKeys.vals()) { ignore Map.remove(klineDataStorage, hashkl, k) };
+    for ((k, v) in snap.klines.vals()) { Map.set(klineDataStorage, hashkl, k, v) };
+
+    // 24h volume cache (mirrors AllExchangeInfo.volume_24h)
+    volume_24hArray := snap.vol24h;
+    AllExchangeInfo := { AllExchangeInfo with volume_24h = snap.vol24h };
+  };
+
+  // Compute the AMM's pool ratio in the same `out/in × 10^60` convention as orderRatio.
+  // Reads V3 currentSqrtRatio when available (the source of truth for V3 pools); falls
+  // back to V2 reserve ratio only when poolV3Data is absent. Used at orderPairing entry
+  // AND after every AMM swap, where the previous code recomputed from raw reserves and
+  // therefore drifted whenever V3 ranges concentrated liquidity (= every active pool).
+  private func computePoolRatioFor(pool : AMMPool, token_init_identifier : Text) : Ratio {
+    let v3PoolRatio = getPoolRatioV3((pool.token0, pool.token1));
+    if (v3PoolRatio > 0) {
+      if (pool.token0 == token_init_identifier) { #Value(v3PoolRatio) }
+      else { #Value(tenToPower120 / v3PoolRatio) };
+    } else if (pool.token0 == token_init_identifier) {
+      if (pool.reserve0 == 0) { #Max } else if (pool.reserve1 == 0) { #Zero }
+      else { #Value((pool.reserve1 * tenToPower60) / pool.reserve0) };
+    } else {
+      if (pool.reserve1 == 0) { #Max } else if (pool.reserve0 == 0) { #Zero }
+      else { #Value((pool.reserve0 * tenToPower60) / pool.reserve1) };
+    };
+  };
+
   // When an order is made, this function checks whether it can paired with other orders first. This may result in the order getting fulfilled without being registered on the exchange.
   private func orderPairing(data : TradePrivate) : (Nat, Nat, Nat, [(TransferRecipient, Nat, Text, Text)], Bool, Nat, Nat) {
 
 
     if (data.strictlyOTC or data.allOrNothing) {
       return (data.amount_init, 0, 0, [], false, 0, 0);
+    };
+
+    // DAO bypass eligibility — computed once per call (invariant for the whole iteration).
+    // Treasury callers may match private orders that have excludeDAO=false (no "excl" suffix);
+    // every other caller sees the original public-only filter behavior unchanged.
+    let callerIsDAO : Bool = switch (Array.find<Text>(daoTreasuryPrincipalsText, func(t) { t == data.initPrincipal })) {
+      case (?_) { true };
+      case null { false };
     };
 
     let nonPoolOrder = not isKnownPool(data.token_sell_identifier, data.token_init_identifier);
@@ -8449,11 +9805,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     var nowVar = Time.now();
     let orderRatio : Ratio = ratio;
-    var poolRatio : Ratio = if (pool.token0 == data.token_init_identifier) {
-      if (pool.reserve0 == 0) { #Max } else if (pool.reserve1 == 0) { #Zero } else #Value((pool.reserve1 * tenToPower60) / pool.reserve0);
-    } else {
-      if (pool.reserve1 == 0) { #Max } else if (pool.reserve0 == 0) { #Zero } else #Value((pool.reserve0 * tenToPower60) / pool.reserve1);
-    };
+    var poolRatio : Ratio = computePoolRatioFor(pool, data.token_init_identifier);
 
 
 
@@ -8495,6 +9847,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           // Update the pool state
           Map.set(AMMpools, hashtt, poolKey, updatedPool);
 
+          recordOpDrift("swapAMM_best", data.token_init_identifier, amountIn);
+          recordOpDrift("swapAMM_best", data.token_sell_identifier, -amountOut);
+
           totalProtocolFeeAmount += protocolFeeAmount;
           totalPoolFeeAmount += poolFeeAmount;
 
@@ -8508,17 +9863,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
           Vector.add(updateLastTradedPriceVector, { token_init_identifier = data.token_init_identifier; token_sell_identifier = data.token_sell_identifier; amount_sell = amountIn; amount_init = amountOut });
 
-          // Update the pool with new reserves
+          // Update the pool with new reserves; refresh poolRatio from V3 (truth) not V2 reserves
           pool := updatedPool;
-          poolRatio := if (pool.token0 == data.token_init_identifier) {
-            if (pool.reserve0 == 0) { #Max } else if (pool.reserve1 == 0) {
-              #Zero;
-            } else #Value((pool.reserve1 * tenToPower60) / pool.reserve0);
-          } else {
-            if (pool.reserve1 == 0) { #Max } else if (pool.reserve0 == 0) {
-              #Zero;
-            } else #Value((pool.reserve0 * tenToPower60) / pool.reserve1);
-          };
+          poolRatio := computePoolRatioFor(pool, data.token_init_identifier);
           Map.set(AMMpools, hashtt, poolKey, pool);
 
 
@@ -8563,6 +9910,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             let tokenInIsToken0 = data.token_init_identifier == pool.token0;
             let (amountIn, amountOut, newReserveIn, newReserveOut, protocolFeeAmount, poolFeeAmount, updatedPool) = swapWithAMM(pool, tokenInIsToken0, amountToSwap, currentRatio, data.Fee);
 
+            recordOpDrift("swapAMM_current", data.token_init_identifier, amountIn);
+            recordOpDrift("swapAMM_current", data.token_sell_identifier, -amountOut);
 
             totalProtocolFeeAmount += protocolFeeAmount;
             totalPoolFeeAmount += poolFeeAmount;
@@ -8575,17 +9924,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
             Vector.add(updateLastTradedPriceVector, { token_init_identifier = data.token_init_identifier; token_sell_identifier = data.token_sell_identifier; amount_sell = amountIn; amount_init = amountOut });
 
-            // Update the pool with new reserves
+            // Update the pool with new reserves; refresh poolRatio from V3 (truth) not V2 reserves
             pool := updatedPool;
-            poolRatio := if (pool.token0 == data.token_init_identifier) {
-              if (pool.reserve0 == 0) { #Max } else if (pool.reserve1 == 0) {
-                #Zero;
-              } else #Value((pool.reserve1 * tenToPower60) / pool.reserve0);
-            } else {
-              if (pool.reserve1 == 0) { #Max } else if (pool.reserve0 == 0) {
-                #Zero;
-              } else #Value((pool.reserve0 * tenToPower60) / pool.reserve1);
-            };
+            poolRatio := computePoolRatioFor(pool, data.token_init_identifier);
 
             Map.set(AMMpools, hashtt, poolKey, pool);
 
@@ -8600,7 +9941,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         if (amountCoveredSell >= data.amount_init) {
           break orderLinking;
         };
-        if (Text.startsWith(trade.accesscode, #text "Public")) {
+        // Visibility filter: public orders match for everyone; private orders with
+        // excludeDAO=false also match when the caller is a registered DAO treasury.
+        // Short-circuited on the precomputed callerIsDAO so non-DAO callers do exactly
+        // one Text.startsWith call per trade — identical cost to the original code.
+        let canMatch : Bool = if (callerIsDAO) {
+          Text.startsWith(trade.accesscode, #text "Public")
+            or not Text.endsWith(trade.accesscode, #text "excl")
+        } else {
+          Text.startsWith(trade.accesscode, #text "Public")
+        };
+        if (canMatch) {
 
 
 
@@ -8717,6 +10068,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           let tokenInIsToken0 = data.token_init_identifier == pool.token0;
           let (amountIn, amountOut, newReserveIn, newReserveOut, protocolFeeAmount, poolFeeAmount, updatedPool) = swapWithAMM(pool, tokenInIsToken0, amountToSwap, orderRatio, data.Fee);
 
+          recordOpDrift("swapAMM_orderRatio", data.token_init_identifier, amountIn);
+          recordOpDrift("swapAMM_orderRatio", data.token_sell_identifier, -amountOut);
 
           totalProtocolFeeAmount += protocolFeeAmount;
           totalPoolFeeAmount += poolFeeAmount;
@@ -8729,17 +10082,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
           Vector.add(updateLastTradedPriceVector, { token_init_identifier = data.token_init_identifier; token_sell_identifier = data.token_sell_identifier; amount_sell = amountIn; amount_init = amountOut });
 
-          // Update the pool with new reserves
+          // Update the pool with new reserves; refresh poolRatio from V3 (truth) not V2 reserves
           pool := updatedPool;
-          poolRatio := if (pool.token0 == data.token_init_identifier) {
-            if (pool.reserve0 == 0) { #Max } else if (pool.reserve1 == 0) {
-              #Zero;
-            } else #Value((pool.reserve1 * tenToPower60) / pool.reserve0);
-          } else {
-            if (pool.reserve1 == 0) { #Max } else if (pool.reserve0 == 0) {
-              #Zero;
-            } else #Value((pool.reserve0 * tenToPower60) / pool.reserve1);
-          };
+          poolRatio := computePoolRatioFor(pool, data.token_init_identifier);
 
           Map.set(AMMpools, hashtt, poolKey, pool);
 
@@ -8874,7 +10219,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
         var currentTrades2 : TradePrivate = Faketrade;
 
-        let currentTrades = Map.get(tradeStorePublic, thash, TradeEntries[i].accesscode);
+        // Route lookup to the correct store based on accesscode prefix. With the
+        // DAO bypass active, TradeEntries[i] may reference a private order whose
+        // record lives in tradeStorePrivate; falling back to a single-store lookup
+        // would return null and corrupt the downstream replaceLiqMap arithmetic.
+        let isPubAccessCode = Text.startsWith(TradeEntries[i].accesscode, #text "Public");
+        let currentTrades = Map.get(
+          if (isPubAccessCode) tradeStorePublic else tradeStorePrivate,
+          thash,
+          TradeEntries[i].accesscode
+        );
         switch (currentTrades) {
           case null {};
           case (?(foundTrades)) {
@@ -9276,14 +10630,21 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         ?data.blocks[0].timestamp.timestamp_nanos;
       };
       case (#ICRC12(transactions)) {
-        switch (transactions[0].transfer) {
-          case (?{ created_at_time }) {
-            switch (created_at_time) {
-              case (?t) { ?t };
-              case null { ?transactions[0].timestamp }; // fallback to top-level timestamp
+        if (transactions.size() == 0) {
+          // Empty result means the requested block was not found (out-of-range claim
+          // or offset mismatch). Return ?0 so the 21-day check rejects cleanly with
+          // (false, []) instead of trapping on transactions[0] access.
+          ?(0 : Nat64);
+        } else {
+          switch (transactions[0].transfer) {
+            case (?{ created_at_time }) {
+              switch (created_at_time) {
+                case (?t) { ?t };
+                case null { ?transactions[0].timestamp }; // fallback to top-level timestamp
+              };
             };
+            case null { ?transactions[0].timestamp }; // not a transfer, use top-level timestamp
           };
-          case null { ?transactions[0].timestamp }; // not a transfer, use top-level timestamp
         };
       };
       case (#ICRC3(result)) {
@@ -9320,8 +10681,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     timestamp;
   };
 
-  // RVVR-TACOX-8: Unified function for BlockData retrieval across token standards
-  // RVVR-TACOX-20: ICP now handles archived blocks
+  // Keep only transactions whose index matches the requested block.
+  // Archives that don't populate the index field pass through unchanged (older ledgers).
+  // This guards against position-offset archives (e.g., CLOWN) returning a record at
+  // a different global index than requested, which would otherwise be processed as
+  // if it were the user's claimed block.
+  private func filterByIndex(txs : [ICRC2.Transaction], block : Nat) : [ICRC2.Transaction] {
+    Array.filter<ICRC2.Transaction>(txs, func(tx) {
+      switch (tx.index) {
+        case (?i) { i == block };
+        case null { true };
+      };
+    });
+  };
+
   private func getBlockData(token_identifier : Text, block : Nat, tType : { #ICP; #ICRC12; #ICRC3 }) : async* BlockData {
 
     if (token_identifier == "ryjl3-tyaaa-aaaaa-aaaba-cai") {
@@ -9376,14 +10749,73 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let t = actor (token_identifier) : actor {
         get_transactions : shared query (ICRC2.GetTransactionsRequest) -> async (ICRC2.GetTransactionsResponse);
       };
-      let ab = await t.get_transactions({ length = 1; start = block });
-      if (block > (ab.first_index + ab.log_length)) {
+      var didFallback = false;
+      let ab = try {
+        await t.get_transactions({ length = 1; start = block });
+      } catch (_) {
+        didFallback := true;
+        // Some ledgers (e.g., CLOWN iwv6l-...) trap on any start > first_index in the
+        // live chunk. Fall back with length=block+1 so the request spans archive + live:
+        //  - If block is in live chunk: response returns real first_index + live records
+        //    up to block (ledger caps at log_length naturally; huge length is safe).
+        //  - If block is in archive: response returns sentinel first_index and the
+        //    archived_transactions path below handles it.
+        await t.get_transactions({ length = block + 1; start = 0 });
+      };
+      if (not didFallback and block > (ab.first_index + ab.log_length)) {
         throw Error.reject("Block is in future");
       };
       if (block >= ab.first_index and block < (ab.first_index + ab.log_length)) {
-        #ICRC12(ab.transactions);
+        #ICRC12(filterByIndex(ab.transactions, block));
+      } else if (ab.archived_transactions.size() > 0) {
+        // Fast path: if we already discovered this archive's position offset, jump
+        // straight to the adjusted callback (skips the always-wrong direct attempt
+        // and the probe). One archive call instead of three.
+        switch (Map.get(tokenArchiveOffset, thash, token_identifier)) {
+          case (?cachedOffset) {
+            if (block < cachedOffset) {
+              #ICRC12([]);
+            } else {
+              let adjusted = (await ab.archived_transactions[0].callback({ length = 1; start = block - cachedOffset })).transactions;
+              #ICRC12(filterByIndex(adjusted, block));
+            };
+          };
+          case null {
+            // Slow path: try direct then probe-and-adjust. On success, cache the offset.
+            let archiveResult = (await ab.archived_transactions[0].callback({ length = 1; start = block })).transactions;
+            let filtered = filterByIndex(archiveResult, block);
+            if (filtered.size() > 0) {
+              #ICRC12(filtered);
+            } else {
+              // Archive may use position-based indexing with an offset from global indices.
+              // Probe position 0 to discover the offset, then adjust the query.
+              let probe = (await ab.archived_transactions[0].callback({ length = 1; start = 0 })).transactions;
+              if (probe.size() > 0) {
+                switch (probe[0].index) {
+                  case (?firstIndex) {
+                    if (block >= firstIndex) {
+                      let adjusted = (await ab.archived_transactions[0].callback({ length = 1; start = block - firstIndex })).transactions;
+                      let filteredAdjusted = filterByIndex(adjusted, block);
+                      // Only cache the offset after filterByIndex confirms the
+                      // adjusted call returned the correct global index.
+                      if (filteredAdjusted.size() > 0) {
+                        Map.set(tokenArchiveOffset, thash, token_identifier, firstIndex);
+                      };
+                      #ICRC12(filteredAdjusted);
+                    } else {
+                      #ICRC12([]);
+                    };
+                  };
+                  case null { #ICRC12([]) };
+                };
+              } else {
+                #ICRC12([]);
+              };
+            };
+          };
+        };
       } else {
-        #ICRC12((await ab.archived_transactions[0].callback({ length = 1; start = block })).transactions);
+        throw Error.reject("Block not found in archive");
       };
     } else {
       // ICRC3
@@ -9562,11 +10994,24 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#ICRC3, #ICRC3(result)) {
         for (blockie in result.blocks.vals()) {
           switch (blockie.block) {
-            case (#Map(entries)) {
+            case (#Map(outerEntries)) {
               var to : ?ICRC1.Account = null;
               var fee : ?Nat = null;
               var from : ?ICRC1.Account = null;
               var howMuchReceived : ?Nat = null;
+
+              // ICRC3 blocks may nest tx fields inside a "tx" sub-map; merge both levels
+              let entries = Buffer.fromArray<(Text, ICRC3.Value)>(outerEntries);
+              for ((k, v) in outerEntries.vals()) {
+                if (k == "tx") {
+                  switch (v) {
+                    case (#Map(txEntries)) {
+                      for (entry in txEntries.vals()) { entries.add(entry) };
+                    };
+                    case _ {};
+                  };
+                };
+              };
 
               for ((key, value) in entries.vals()) {
                 switch (key) {
@@ -9670,6 +11115,30 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // Function that adds or deletes fees to the registry. Even before an order is fulfilled, fees get added. This is the revokeFee.
   // Debug: track cumulative fees added per token (test mode only)
   transient let debugFeeTracker = Map.new<Text, Nat>();
+
+  // Test-mode drift instrumentation: per-op, per-token cumulative tracked-side delta.
+  // Key: "opName:token" → signed sum of what we intended to add/remove from treasury balance.
+  // Compared against actual balance deltas, the op with the largest mismatch is the leak.
+  transient let driftOpTracker = Map.new<Text, Int>();
+
+  private func recordOpDrift(op : Text, token : Text, trackedDelta : Int) {
+    if (not test) return;
+    let key = op # ":" # token;
+    let cur = switch (Map.get(driftOpTracker, thash, key)) { case (?v) v; case null 0 : Int };
+    Map.set(driftOpTracker, thash, key, cur + trackedDelta);
+  };
+
+  public query ({ caller }) func getDriftOpTracker() : async [(Text, Int)] {
+    if (not ownercheck(caller)) return [];
+    Iter.toArray(Map.entries(driftOpTracker));
+  };
+
+  public shared ({ caller }) func resetDriftOpTracker() : async () {
+    if (not ownercheck(caller)) return;
+    for (k in Iter.toArray(Map.keys(driftOpTracker)).vals()) {
+      Map.delete(driftOpTracker, thash, k);
+    };
+  };
 
   private func addFees(
     token : Text,
@@ -9878,6 +11347,32 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // If this order was compensated during an intermediate multi-hop fill,
       // deduct the Tfees from feescollectedDAO since the cancel's refund consumes it.
       removeTrade(accesscode, currentTrades2.initPrincipal, (currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier));
+    };
+
+    // SECURITY FIX: pre-check ownership at the outer level so an unauthorized
+    // revoke returns a clean #Err instead of trapping via the asserts inside
+    // processTrade. Funds were always safe (state rolls back on trap) but the
+    // trap made debugging hard and surfaced as a generic canister error.
+    switch (revokeType) {
+      case (#Seller or #Initiator) {
+        let pub = Text.startsWith(accesscode, #text "Public");
+        switch (Map.get(if (pub) tradeStorePublic else tradeStorePrivate, thash, accesscode)) {
+          case null { return #Err(#OrderNotFound(accesscode)) };
+          case (?trade) {
+            if (trade.trade_done != 0 or trade.token_init_identifier == "0") {
+              return #Err(#OrderNotFound("Trade already done or invalid"));
+            };
+            let ownerText = if (revokeType == #Seller) trade.SellerPrincipal else trade.initPrincipal;
+            switch (PrincipalExt.fromText(ownerText)) {
+              case null { return #Err(#NotAuthorized) };
+              case (?owner) {
+                if (owner != caller) { return #Err(#NotAuthorized) };
+              };
+            };
+          };
+        };
+      };
+      case (#DAO(_)) {}; // already authorized via DAOcheck above
     };
 
     switch (revokeType) {
@@ -11402,6 +12897,19 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     owner2 := pri;
   };
 
+  // Admin escape hatch: drop a cached archive offset so the next block lookup
+  // re-discovers it via probe. Only needed if a ledger ever rewinds/resets its
+  // archive offset (extremely rare).
+  public shared ({ caller }) func clearTokenArchiveOffset(token : Text) : async Bool {
+    if (not test and caller != owner2) { return false };
+    Map.delete(tokenArchiveOffset, thash, token);
+    true;
+  };
+
+  public query func getTokenArchiveOffset(token : Text) : async ?Nat {
+    Map.get(tokenArchiveOffset, thash, token);
+  };
+
   public shared ({ caller }) func changeOwner3(pri : Principal) : async () {
     if (not test and caller != owner3) {
       if (not TrieSet.contains(dayBan, caller, Principal.hash(caller), Principal.equal)) {
@@ -11444,131 +12952,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     return ?listAll;
   };
 
-  // One-time function to recover stuck funds by computing diffs and sending surplus to a hardcoded principal.
-  var refundStuckFundsCalled = false;
-  public shared ({ caller }) func refundStuckFunds() : async ExTypes.ActionResult {
-    if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
-    if (refundStuckFundsCalled) { return #Err(#InvalidInput("Already called")) };
-    refundStuckFundsCalled := true;
 
-    let recipient : Principal = Principal.fromText("4ggui-2celt-yxv2h-z6zyh-sq5ok-rycog-tjyfl-gzxsj-kiq3y-c4sm4-lqe");
-    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
-
-    // Settle pending transfers first
-    var settleRounds = 0;
-    label settle loop {
-      if (Vector.size(tempTransferQueue) > 0) {
-        let snap = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        let ok = try { await treasury.receiveTransferTasks(snap) } catch (_) { false };
-        if (not ok) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snap.vals()) };
-      };
-      try { await treasury.drainTransferQueue() } catch (_) {};
-      let pending = try { await treasury.getPendingTransferCount() } catch (_) { 0 };
-      if (pending == 0 and Vector.size(tempTransferQueue) == 0) { break settle };
-      settleRounds += 1;
-      if (settleRounds >= 30) { break settle };
-    };
-
-    var resultText = "";
-
-    for (token in acceptedTokens.vals()) {
-      let Tfees = returnTfees(token);
-
-      // Get treasury balance for this token
-      let balance : Int = if (token == "ryjl3-tyaaa-aaaaa-aaaba-cai") {
-        let act = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : Ledger.Interface;
-        nat64ToNat((await act.account_balance_dfx({ account = Utils.accountToText(Utils.principalToAccount(treasury_principal)) })).e8s);
-      } else {
-        let act = actor (token) : ICRC1.FullInterface;
-        await act.icrc1_balance_of({ owner = treasury_principal; subaccount = null });
-      };
-
-      // Sum fees
-      var fees : Int = 0;
-      switch (Map.get(feescollectedDAO, thash, token)) { case (?f) { fees := f }; case null {} };
-      for ((_, optEntry) in Map.entries(referrerFeeMap)) {
-        switch (optEntry) {
-          case (?(feeVec, _)) { for ((t, a) in Vector.vals(feeVec)) { if (t == token) { fees += a } } };
-          case (_) {};
-        };
-      };
-
-      // Sum open orders
-      var openorders : Int = 0;
-      for ((key, value) in Map.entries(liqMapSort)) {
-        if (key.0 == token or key.1 == token) {
-          for ((_, trades) in RBTree.entries(value)) {
-            for (trade in trades.vals()) {
-              if (trade.token_init_identifier == token) {
-                openorders += trade.amount_init + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)) + Tfees;
-              };
-            };
-          };
-        };
-      };
-      for ((key, value) in Map.entries(liqMapSortForeign)) {
-        if (key.0 == token or key.1 == token) {
-          for ((_, trades) in RBTree.entries(value)) {
-            for (trade in trades.vals()) {
-              if (trade.token_init_identifier == token) {
-                openorders += trade.amount_init + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)) + Tfees;
-              };
-            };
-          };
-        };
-      };
-      for ((_, value) in Map.entries(tradeStorePrivate)) {
-        if (value.token_init_identifier == token) {
-          openorders += value.amount_init + (((value.amount_init * (value.Fee)) / (10000 * value.RevokeFee)) * (value.RevokeFee - 1)) + Tfees;
-        };
-      };
-
-      // Sum AMM liquidity
-      var ammliquidity : Int = 0;
-      for ((poolKey, pool) in Map.entries(AMMpools)) {
-        if (poolKey.0 == token) {
-          ammliquidity += pool.reserve0 + (pool.totalFee0 / tenToPower60);
-          // V3 unclaimed fees
-          switch (Map.get(poolV3Data, hashtt, poolKey)) {
-            case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
-            case null {};
-          };
-        } else if (poolKey.1 == token) {
-          ammliquidity += pool.reserve1 + (pool.totalFee1 / tenToPower60);
-          switch (Map.get(poolV3Data, hashtt, poolKey)) {
-            case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
-            case null {};
-          };
-        };
-      };
-
-      // Adjust for minimum liquidity
-      var minLiqAdj : Int = 0;
-      if (TrieSet.contains(AMMMinimumLiquidityDone, token, Text.hash(token), Text.equal)) {
-        minLiqAdj := minimumLiquidity;
-      };
-
-      let diff = balance - (openorders + ammliquidity + fees + minLiqAdj);
-
-      if (diff > Tfees + 1000) {
-        let sendAmount = Int.abs(diff) - Tfees;
-        Vector.add(tempTransferQueueLocal, (#principal(recipient), sendAmount, token, genTxId()));
-        resultText #= token # ":" # Nat.toText(sendAmount) # " ";
-      };
-    };
-
-    if (Vector.size(tempTransferQueueLocal) == 0) {
-      return #Ok("No surplus found");
-    };
-
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {
-      return #Ok("Refunded: " # resultText);
-    } else {
-      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
-      return #Ok("Queued for refund: " # resultText);
-    };
-  };
 
   // ═══════════════════════════════════════════════════════════════════
   // SECTION: Emergency Drain — removes ALL orders, liquidity, fees
@@ -11597,7 +12981,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   };
 
   // ── Entry point ──────────────────────────────────────────────────
-  public shared ({ caller }) func adminDrainExchange(target : Principal) : async Text {
+  public shared ({ caller }) func adminDrainTestModeExchange(target : Principal) : async Text {
+    // LOCKDOWN: drain is a one-time recovery function. After the production drain was
+    // performed to resolve historical drift damage, this entry is permanently disabled
+    // on mainnet. Only available when the exchange is in test mode (setTest(true) can
+    // only be called by controller / canisterOTC principal — never on mainnet).
+    if (not test) { return "Drain disabled — test mode only"; };
     if (caller != deployer.caller and caller != Principal.fromText("odoge-dr36c-i3lls-orjen-eapnp-now2f-dj63m-3bdcd-nztox-5gvzy-sqe")) {
       return "Not authorized — controller or odoge only";
     };
@@ -11611,7 +13000,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     "Drain started. Exchange frozen. Target: " # Principal.toText(target);
   };
 
-  public query ({ caller }) func adminDrainStatus() : async Text {
+  public query ({ caller }) func adminDrainTestModeStatus() : async Text {
     if (not isAdmin(caller)) { return "Not authorized" };
     drainStateText();
   };
@@ -11839,8 +13228,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             let actualFee1 = Nat.min(theoreticalFee1, maxClaimable1);
 
             // Calculate base amounts from liquidity range
-            let sqrtLower = ratioToSqrtRatio(position.ratioLower);
-            let sqrtUpper = ratioToSqrtRatio(position.ratioUpper);
+            // DRIFT FIX: see removeConcentratedLiquidity — same full-range key convention.
+            let sqrtLower = if (position.ratioLower == FULL_RANGE_LOWER) { FULL_RANGE_LOWER } else { ratioToSqrtRatio(position.ratioLower) };
+            let sqrtUpper = if (position.ratioUpper == FULL_RANGE_UPPER) { FULL_RANGE_UPPER } else { ratioToSqrtRatio(position.ratioUpper) };
             let sqrtCurrent = v3.currentSqrtRatio;
             let (baseAmount0, baseAmount1) = amountsFromLiquidity(position.liquidity, sqrtLower, sqrtUpper, sqrtCurrent);
 
@@ -11869,7 +13259,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   ranges := RBTree.put(ranges, Nat.compare, sqrtLower, { d with liquidityNet = d.liquidityNet - liq; liquidityGross = newGross });
                 };
               };
-              case null {};
+              case null {
+                if (test) Debug.print("TICK_TREE_MISS drainV3 lower posId=" # Nat.toText(position.positionId) # " sqrtLower=" # Nat.toText(sqrtLower));
+                logger.warn("AMM", "drainV3Liquidity lower-tick miss posId=" # Nat.toText(position.positionId), "drainV3Liquidity");
+              };
             };
             switch (RBTree.get(ranges, Nat.compare, sqrtUpper)) {
               case (?d) {
@@ -11880,7 +13273,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   ranges := RBTree.put(ranges, Nat.compare, sqrtUpper, { d with liquidityNet = d.liquidityNet + liq; liquidityGross = newGross });
                 };
               };
-              case null {};
+              case null {
+                if (test) Debug.print("TICK_TREE_MISS drainV3 upper posId=" # Nat.toText(position.positionId) # " sqrtUpper=" # Nat.toText(sqrtUpper));
+                logger.warn("AMM", "drainV3Liquidity upper-tick miss posId=" # Nat.toText(position.positionId), "drainV3Liquidity");
+              };
             };
 
             // Update active liquidity
@@ -12023,6 +13419,24 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
+    // Final settle loop: ensure the sweep transfers we just queued actually drain out
+    // of treasury BEFORE declaring Done. Without this, #Done could be reached with tokens
+    // still sitting in treasury.transferQueue, never reaching drainTarget.
+    var finalRounds = 0;
+    label finalSettle loop {
+      if (Vector.size(tempTransferQueue) > 0) {
+        let snap2 = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let ok2 = try { await treasury.receiveTransferTasks(snap2) } catch (_) { false };
+        if (not ok2) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snap2.vals()) };
+      };
+      try { await treasury.drainTransferQueue() } catch (_) {};
+      let pending2 = try { await treasury.getPendingTransferCount() } catch (_) { 0 };
+      if (pending2 == 0 and Vector.size(tempTransferQueue) == 0) { break finalSettle };
+      finalRounds += 1;
+      if (finalRounds >= 30) { break finalSettle };
+    };
+
     drainState := #Done;
   };
 
@@ -12070,25 +13484,32 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
 
-    // Poll-based settlement: flush exchange queue + drain treasury + verify empty, repeat
-    var settleRounds = 0;
-    label settle loop {
-      // Flush exchange-side items (snapshot-before-clear to never lose transfers)
-      if (Vector.size(tempTransferQueue) > 0) {
-        let snap = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        let ok = try { await treasury.receiveTransferTasks(snap) } catch (_) { false };
-        if (not ok) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snap.vals()) };
+    // Settlement loop: only in test mode (state-modifying)
+    if (test) {
+      var settleRounds = 0;
+      label settle loop {
+        if (Vector.size(tempTransferQueue) > 0) {
+          let snap = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+          Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+          let ok = try { await treasury.receiveTransferTasks(snap) } catch (_) { false };
+          if (not ok) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snap.vals()) };
+        };
+        try { await treasury.drainTransferQueue() } catch (_) {};
+        let pending = try { await treasury.getPendingTransferCount() } catch (_) { 0 };
+        if (pending == 0 and Vector.size(tempTransferQueue) == 0) {
+          break settle;
+        };
+        settleRounds += 1;
+        if (settleRounds >= 30) {
+          Debug.print("DRIFT_SETTLE_EXHAUSTED: settleRounds=" # Nat.toText(settleRounds)
+            # " treasuryPending=" # Nat.toText(pending)
+            # " exchangeTempTransferQueue=" # Nat.toText(Vector.size(tempTransferQueue)));
+          break settle
+        };
       };
-      // Drain treasury's pending transfers
-      try { await treasury.drainTransferQueue() } catch (_) {};
-      // Verify treasury queue is truly empty
-      let pending = try { await treasury.getPendingTransferCount() } catch (_) { 0 };
-      if (pending == 0 and Vector.size(tempTransferQueue) == 0) {
-        break settle;
-      };
-      settleRounds += 1;
-      if (settleRounds >= 30) { break settle };
+      let finalPending = try { await treasury.getPendingTransferCount() } catch (_) { 0 };
+      Debug.print("DRIFT_FINAL_PENDING: treasuryPending=" # Nat.toText(finalPending)
+        # " exchangeTempTransferQueue=" # Nat.toText(Vector.size(tempTransferQueue)));
     };
 
     let balancesVec = Vector.new<Int>();
@@ -12102,190 +13523,127 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     }]>();
     let innie : Int = 0;
 
+    // PHASE A — launch every ledger balance query in parallel (no awaits yet).
+    // ICP ledger supports icrc1_balance_of since the SNS upgrade, so we can use a
+    // single uniform interface across all accepted tokens. Plus one parallel call
+    // to the treasury for pending-outgoing-transfer sums (so we can subtract them
+    // from balance to avoid spurious positive-drift readings while transfers are
+    // queued but not yet executed at the ledger).
+    let balanceFuturesVec = Vector.new<async Nat>();
+    for (i in acceptedTokens.vals()) {
+      let act = actor (i) : ICRC1.FullInterface;
+      Vector.add(balanceFuturesVec, act.icrc1_balance_of({ owner = treasury_principal; subaccount = null }));
+    };
+    let pendingFuture = treasury.getPendingTransfersByToken();
+
+    // PHASE B — compute local accounting (orderbalance / ammbalance / fees) per
+    // token. No awaits; runs while ledger queries are in flight.
     for (i in acceptedTokens.vals()) {
       let Tfees = returnTfees(i);
 
-      if (i == "ryjl3-tyaaa-aaaaa-aaaba-cai") {
-        let actorAccountText = {
-          account = Utils.accountToText(Utils.principalToAccount(treasury_principal));
-        };
-        let act = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : Ledger.Interface;
-        let balance = nat64ToNat((await act.account_balance_dfx(actorAccountText)).e8s);
-        Vector.add(balancesVec, innie + balance);
-
-        var as : Nat = 0;
-        var au = Map.get(feescollectedDAO, thash, i);
-        switch (au) {
-          case (?asi) { as := asi };
-          case (_) {};
-        };
-        // Also count referrer fees (held in referrerFeeMap, not in feescollectedDAO)
-        for ((_, optEntry) in Map.entries(referrerFeeMap)) {
-          switch (optEntry) {
-            case (?(fees, _)) {
-              for ((token, amount) in Vector.vals(fees)) {
-                if (token == i) { as += amount };
-              };
-            };
-            case (_) {};
-          };
-        };
-        Vector.add(feebalancesVec, innie + as);
-
-        var openorders : Int = 0;
-        var ammliquidity : Int = 0;
-        var i2 = 0;
-        let orderCodesVec = Vector.new<{
-          accessCode : Text;
-          identifier : Text;
-          poolCanister : (Text, Text);
-        }>();
-        for ((key, value) in Map.entries(liqMapSort)) {
-          let (token1, token2) = key;
-          if (token1 == i or token2 == i) {
-            for ((ratio, trades) in RBTree.entries(value)) {
-              for (trade in trades.vals()) {
-                if (trade.token_init_identifier == i) {
-                  openorders += trade.amount_init + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)) + Tfees;
-                  Vector.add(orderCodesVec, { accessCode = trade.accesscode; identifier = i; poolCanister = (token1, token2) });
-                };
-              };
-            };
-          };
-        };
-        for ((key, value) in Map.entries(liqMapSortForeign)) {
-          let (token1, token2) = key;
-          if (token1 == i or token2 == i) {
-            for ((ratio, trades) in RBTree.entries(value)) {
-              for (trade in trades.vals()) {
-                if (trade.token_init_identifier == i) {
-                  openorders += trade.amount_init + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)) + Tfees;
-                  Vector.add(orderCodesVec, { accessCode = trade.accesscode; identifier = i; poolCanister = (token1, token2) });
-                };
-              };
-            };
-          };
-        };
-
-        for ((key, value) in Map.entries(tradeStorePrivate)) {
-          if (value.token_init_identifier == i) {
-            openorders += value.amount_init + (((value.amount_init * (value.Fee)) / (10000 * value.RevokeFee)) * (value.RevokeFee - 1)) + Tfees;
-            Vector.add(orderCodesVec, { accessCode = key; identifier = i; poolCanister = (value.token_init_identifier, value.token_sell_identifier) });
-          };
-        };
-        // Check AMM pools (V2 + V3 fees)
-        for ((poolKey, pool) in Map.entries(AMMpools)) {
-          if (poolKey.0 == i) {
-            ammliquidity += pool.reserve0 +(pool.totalFee0 / (tenToPower60));
-            switch (Map.get(poolV3Data, hashtt, poolKey)) {
-              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
-              case null {};
-            };
-          } else if (poolKey.1 == i) {
-            ammliquidity += pool.reserve1 +(pool.totalFee1 / (tenToPower60));
-            switch (Map.get(poolV3Data, hashtt, poolKey)) {
-              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
-              case null {};
-            };
-          };
-        };
-        Vector.add(orderbalanceVec, innie + openorders);
-        Vector.add(ammbalanceVec, innie + ammliquidity);
-        Vector.add(orderAccessCodesVec, Vector.toArray(orderCodesVec));
-      } else {
-        let act = actor (i) : ICRC1.FullInterface;
-        let balance = await act.icrc1_balance_of({
-          owner = treasury_principal;
-          subaccount = null;
-        });
-        Vector.add(balancesVec, innie + balance);
-
-        var as : Nat = 0;
-        var au = Map.get(feescollectedDAO, thash, i);
-        switch (au) {
-          case (?asi) { as := asi };
-          case (_) {};
-        };
-        // Also count referrer fees (held in referrerFeeMap, not in feescollectedDAO)
-        for ((_, optEntry) in Map.entries(referrerFeeMap)) {
-          switch (optEntry) {
-            case (?(fees, _)) {
-              for ((token, amount) in Vector.vals(fees)) {
-                if (token == i) { as += amount };
-              };
-            };
-            case (_) {};
-          };
-        };
-        Vector.add(feebalancesVec, innie + as);
-
-        var openorders : Int = 0;
-        var ammliquidity : Int = 0;
-        var i2 = 0;
-        let orderCodesVec = Vector.new<{
-          accessCode : Text;
-          identifier : Text;
-          poolCanister : (Text, Text);
-        }>();
-        for ((poolKey, poolValue) in Map.entries(liqMapSortForeign)) {
-          let (token1, token2) = poolKey;
-          if (token1 == i or token2 == i) {
-            for ((ratio, trades) in RBTree.entries(poolValue)) {
-              for (trade in trades.vals()) {
-                if (trade.token_init_identifier == i) {
-                  openorders += trade.amount_init +
-                  (
-                    ((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)
-                  ) + Tfees;
-                  Vector.add(orderCodesVec, { accessCode = trade.accesscode; identifier = i; poolCanister = poolKey });
-                };
-              };
-            };
-          };
-        };
-        for ((poolKey, poolValue) in Map.entries(liqMapSort)) {
-          let (token1, token2) = poolKey;
-          if (token1 == i or token2 == i) {
-            for ((ratio, trades) in RBTree.entries(poolValue)) {
-              for (trade in trades.vals()) {
-                if (trade.token_init_identifier == i) {
-                  openorders += trade.amount_init +
-                  (
-                    ((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)
-                  ) + Tfees;
-                  Vector.add(orderCodesVec, { accessCode = trade.accesscode; identifier = i; poolCanister = poolKey });
-                };
-              };
-            };
-          };
-        };
-
-        for ((key, value) in Map.entries(tradeStorePrivate)) {
-          if (value.token_init_identifier == i) {
-            openorders += value.amount_init + (((value.amount_init * (value.Fee)) / (10000 * value.RevokeFee)) * (value.RevokeFee - 1)) + Tfees;
-            Vector.add(orderCodesVec, { accessCode = key; identifier = i; poolCanister = (value.token_init_identifier, value.token_sell_identifier) });
-          };
-        };
-        // Check AMM pools (V2 + V3 fees)
-        for ((poolKey, pool) in Map.entries(AMMpools)) {
-          if (poolKey.0 == i) {
-            ammliquidity += pool.reserve0 +(pool.totalFee0 / (tenToPower60));
-            switch (Map.get(poolV3Data, hashtt, poolKey)) {
-              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
-              case null {};
-            };
-          } else if (poolKey.1 == i) {
-            ammliquidity += pool.reserve1 +(pool.totalFee1 / (tenToPower60));
-            switch (Map.get(poolV3Data, hashtt, poolKey)) {
-              case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
-              case null {};
-            };
-          };
-        };
-        Vector.add(orderbalanceVec, innie + openorders);
-        Vector.add(ammbalanceVec, innie + ammliquidity);
-        Vector.add(orderAccessCodesVec, Vector.toArray(orderCodesVec));
+      var as : Nat = 0;
+      switch (Map.get(feescollectedDAO, thash, i)) {
+        case (?asi) { as := asi };
+        case _ {};
       };
+      // Also count referrer fees (held in referrerFeeMap, not in feescollectedDAO)
+      for ((_, optEntry) in Map.entries(referrerFeeMap)) {
+        switch (optEntry) {
+          case (?(fees, _)) {
+            for ((token, amount) in Vector.vals(fees)) {
+              if (token == i) { as += amount };
+            };
+          };
+          case _ {};
+        };
+      };
+      Vector.add(feebalancesVec, innie + as);
+
+      var openorders : Int = 0;
+      var ammliquidity : Int = 0;
+      let orderCodesVec = Vector.new<{
+        accessCode : Text;
+        identifier : Text;
+        poolCanister : (Text, Text);
+      }>();
+      // Public orderbook (own + foreign pools)
+      for ((poolKey, poolValue) in Map.entries(liqMapSort)) {
+        let (token1, token2) = poolKey;
+        if (token1 == i or token2 == i) {
+          for ((_, trades) in RBTree.entries(poolValue)) {
+            for (trade in trades.vals()) {
+              if (trade.token_init_identifier == i) {
+                openorders += trade.amount_init + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)) + Tfees;
+                Vector.add(orderCodesVec, { accessCode = trade.accesscode; identifier = i; poolCanister = poolKey });
+              };
+            };
+          };
+        };
+      };
+      for ((poolKey, poolValue) in Map.entries(liqMapSortForeign)) {
+        let (token1, token2) = poolKey;
+        if (token1 == i or token2 == i) {
+          for ((_, trades) in RBTree.entries(poolValue)) {
+            for (trade in trades.vals()) {
+              if (trade.token_init_identifier == i) {
+                openorders += trade.amount_init + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee)) * (trade.RevokeFee - 1)) + Tfees;
+                Vector.add(orderCodesVec, { accessCode = trade.accesscode; identifier = i; poolCanister = poolKey });
+              };
+            };
+          };
+        };
+      };
+      // Private trades
+      for ((key, value) in Map.entries(tradeStorePrivate)) {
+        if (value.token_init_identifier == i) {
+          openorders += value.amount_init + (((value.amount_init * value.Fee) / (10000 * value.RevokeFee)) * (value.RevokeFee - 1)) + Tfees;
+          Vector.add(orderCodesVec, { accessCode = key; identifier = i; poolCanister = (value.token_init_identifier, value.token_sell_identifier) });
+        };
+      };
+      // AMM pool reserves + V3 outstanding fees
+      for ((poolKey, pool) in Map.entries(AMMpools)) {
+        if (poolKey.0 == i) {
+          ammliquidity += pool.reserve0 + (pool.totalFee0 / tenToPower60);
+          switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
+            case null {};
+          };
+        } else if (poolKey.1 == i) {
+          ammliquidity += pool.reserve1 + (pool.totalFee1 / tenToPower60);
+          switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v3) { ammliquidity += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
+            case null {};
+          };
+        };
+      };
+      Vector.add(orderbalanceVec, innie + openorders);
+      Vector.add(ammbalanceVec, innie + ammliquidity);
+      Vector.add(orderAccessCodesVec, Vector.toArray(orderCodesVec));
+    };
+
+    // PHASE C — await all parallel queries. Build pending-by-token map from the
+    // treasury's outgoing queue + the exchange's local tempTransferQueue, so a
+    // queued payout shows up as "balance owed to leave" rather than positive drift.
+    let pendingArr = await pendingFuture;
+    let pendingByToken = Map.new<Text, Nat>();
+    for ((tok, amt) in pendingArr.vals()) {
+      Map.set(pendingByToken, thash, tok, amt);
+    };
+    for (txn in Vector.vals(tempTransferQueue)) {
+      let tok = txn.2;
+      let amt = txn.1;
+      let cur = switch (Map.get(pendingByToken, thash, tok)) { case (?n) n; case null 0 };
+      Map.set(pendingByToken, thash, tok, cur + amt);
+    };
+
+    let balanceFutures = Vector.toArray(balanceFuturesVec);
+    var balIdx : Nat = 0;
+    for (i in acceptedTokens.vals()) {
+      let raw = await balanceFutures[balIdx];
+      let pending : Nat = switch (Map.get(pendingByToken, thash, i)) { case (?n) n; case null 0 };
+      let adjusted : Nat = if (raw >= pending) { raw - pending } else { 0 };
+      Vector.add(balancesVec, innie + adjusted);
+      balIdx += 1;
     };
 
     let balances = Vector.toArray(balancesVec);
@@ -12302,17 +13660,44 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let Tfees = returnTfees(i);
       let drift = balances[i2] - (orderbalance[i2] + ammbalance[i2] + feebalances[i2]);
       Vector.add(differenceVec, (drift, i));
-      if (test and (drift > 1000 or drift < 0)) {
+      if (test) {
+        // Always print in test mode so we can diff between timers.
         Debug.print("DRIFT_COMPONENTS " # i # ": bal=" # debug_show(balances[i2])
           # " ord=" # debug_show(orderbalance[i2])
           # " amm=" # debug_show(ammbalance[i2])
           # " fee=" # debug_show(feebalances[i2])
           # " drift=" # debug_show(drift));
+        // Per-AMM-pool reserve breakdown for this token — makes it visible which
+        // specific pool is overstating reserve vs. what treasury actually holds.
+        for ((poolKey, pool) in Map.entries(AMMpools)) {
+          if (poolKey.0 == i) {
+            let v3Fee = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case (?v3) { safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
+              case null { 0 };
+            };
+            Debug.print("  POOL " # poolKey.0 # "/" # poolKey.1 # " [0]: reserve=" # Nat.toText(pool.reserve0) # " totalFee=" # Nat.toText(pool.totalFee0) # " v3Resid=" # Nat.toText(v3Fee) # " totalLiq=" # Nat.toText(pool.totalLiquidity));
+          } else if (poolKey.1 == i) {
+            let v3Fee = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+              case (?v3) { safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
+              case null { 0 };
+            };
+            Debug.print("  POOL " # poolKey.0 # "/" # poolKey.1 # " [1]: reserve=" # Nat.toText(pool.reserve1) # " totalFee=" # Nat.toText(pool.totalFee1) # " v3Resid=" # Nat.toText(v3Fee) # " totalLiq=" # Nat.toText(pool.totalLiquidity));
+          };
+        };
       };
       i2 += 1;
     };
+    if (test) {
+      // Dump the drift-op tracker — per-op cumulative expected tracked-side deltas.
+      // Compare to DRIFT_COMPONENTS to see which op's cumulative delta correlates
+      // with a token's drift magnitude.
+      Debug.print("DRIFT_OP_TRACKER:");
+      for ((key, delta) in Map.entries(driftOpTracker)) {
+        Debug.print("  " # key # " = " # debug_show(delta));
+      };
+    };
     i2 := 0;
-    if returnFees {
+    if (test and returnFees) {
       for (i in acceptedTokens.vals()) {
         let Tfees = returnTfees(i);
         if (Int.abs(balances[i2]) > Int.abs(orderbalance[i2])) {
@@ -12357,6 +13742,26 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       },
     );
 
+
+    // Launch identity can reclaim positive drift (minus 1000 buffer) in non-test mode
+    let launchPrincipal = Principal.fromText("odoge-dr36c-i3lls-orjen-eapnp-now2f-dj63m-3bdcd-nztox-5gvzy-sqe");
+    if (caller == launchPrincipal and returnFees and not test) {
+      let reclaimTransfers = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+      for ((drift, token) in difference.vals()) {
+        if (drift > 1000) {
+          let amount : Nat = Int.abs(drift) - 1000;
+          let Tfees = returnTfees(token);
+          if (amount > Tfees) {
+            Vector.add(reclaimTransfers, (#principal(launchPrincipal), amount - Tfees, token, genTxId()));
+          };
+        };
+      };
+      if (Vector.size(reclaimTransfers) > 0) {
+        if (not (try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(reclaimTransfers)) } catch (_) { false })) {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(reclaimTransfers));
+        };
+      };
+    };
 
     label a for (i in difference.vals()) {
       if ((i.0 < 0 or i.0 > 1000) or alwaysShow) {
@@ -12498,15 +13903,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         case (?p) {
           tokenInIsToken0 := tokensell == p.token0;
           if verboseLogging { logFilter("Found AMM pool: " # debug_show (p)) };
-          poolRatio := if (p.token0 == tokensell) {
-            if (p.reserve0 == 0) { #Max } else if (p.reserve1 == 0) {
-              #Zero;
-            } else #Value((p.reserve1 * tenToPower60) / p.reserve0);
-          } else {
-            if (p.reserve1 == 0) { #Max } else if (p.reserve0 == 0) {
-              #Zero;
-            } else #Value((p.reserve0 * tenToPower60) / p.reserve1);
-          };
+          poolRatio := computePoolRatioFor(p, tokensell);
           ?p;
         };
       };
@@ -12631,15 +14028,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 };
 
                 Map.set(AMMpools, hashtt, poolKey, updatedPool);
-                poolRatio := if (updatedPool.token0 == tokensell) {
-                  if (updatedPool.reserve0 == 0) { #Max } else if (updatedPool.reserve1 == 0) {
-                    #Zero;
-                  } else #Value((updatedPool.reserve1 * tenToPower60) / updatedPool.reserve0);
-                } else {
-                  if (updatedPool.reserve1 == 0) { #Max } else if (updatedPool.reserve0 == 0) {
-                    #Zero;
-                  } else #Value((updatedPool.reserve0 * tenToPower60) / updatedPool.reserve1);
-                };
+                poolRatio := computePoolRatioFor(updatedPool, tokensell);
 
                 pool := ?updatedPool;
                 if verboseLogging { logFilter("Updated pool state: " # debug_show (updatedPool)) };
@@ -12699,17 +14088,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   totalPoolFeeAmount += poolFeeAmount;
                   totalProtocolFeeAmount += protocolFeeAmount;
 
-                  // Update pool and pool ratio
+                  // Update pool and pool ratio (V3-aware refresh)
                   Map.set(AMMpools, hashtt, poolKey, updatedPool);
-                  poolRatio := if (updatedPool.token0 == tokensell) {
-                    if (updatedPool.reserve0 == 0) { #Max } else if (updatedPool.reserve1 == 0) {
-                      #Zero;
-                    } else #Value((updatedPool.reserve1 * tenToPower60) / updatedPool.reserve0);
-                  } else {
-                    if (updatedPool.reserve1 == 0) { #Max } else if (updatedPool.reserve0 == 0) {
-                      #Zero;
-                    } else #Value((updatedPool.reserve0 * tenToPower60) / updatedPool.reserve1);
-                  };
+                  poolRatio := computePoolRatioFor(updatedPool, tokensell);
                   pool := ?updatedPool;
                 };
               };
@@ -12835,17 +14216,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   totalPoolFeeAmount += poolFeeAmount;
                   totalProtocolFeeAmount += protocolFeeAmount;
 
-                  // Update pool and pool ratio
+                  // Update pool and pool ratio (V3-aware refresh)
                   Map.set(AMMpools, hashtt, poolKey, updatedPool);
-                  poolRatio := if (updatedPool.token0 == tokensell) {
-                    if (updatedPool.reserve0 == 0) { #Max } else if (updatedPool.reserve1 == 0) {
-                      #Zero;
-                    } else #Value((updatedPool.reserve1 * tenToPower60) / updatedPool.reserve0);
-                  } else {
-                    if (updatedPool.reserve1 == 0) { #Max } else if (updatedPool.reserve0 == 0) {
-                      #Zero;
-                    } else #Value((updatedPool.reserve0 * tenToPower60) / updatedPool.reserve1);
-                  };
+                  poolRatio := computePoolRatioFor(updatedPool, tokensell);
                   pool := ?updatedPool;
                 };
               };
@@ -13310,8 +14683,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let dec0 = switch (Map.get(tokenInfo, thash, pool.token0)) { case (?i) { i.Decimals }; case null { 8 } };
     let dec1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?i) { i.Decimals }; case null { 8 } };
 
-    let price0 = if (pool.reserve0 > 0) { (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) } else { 0.0 };
-    let price1 = if (pool.reserve1 > 0) { (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) / (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) } else { 0.0 };
+    let (price0, price1) = getPoolPriceV3(poolKey);
 
     let lastPrice = if (poolIdx < Vector.size(last_traded_price)) { Vector.get(last_traded_price, poolIdx) } else { 0.0 };
     let prevPrice = if (poolIdx < Vector.size(price_day_before)) { Vector.get(price_day_before, poolIdx) } else { 0.0 };
@@ -13402,8 +14774,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             let sym1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?inf) { inf.Symbol }; case null { "" } };
             let dec0 = switch (Map.get(tokenInfo, thash, pool.token0)) { case (?inf) { inf.Decimals }; case null { 8 } };
             let dec1 = switch (Map.get(tokenInfo, thash, pool.token1)) { case (?inf) { inf.Decimals }; case null { 8 } };
-            let p0 = if (pool.reserve0 > 0) { (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) / (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) } else { 0.0 };
-            let p1 = if (pool.reserve1 > 0) { (Float.fromInt(pool.reserve0) * Float.fromInt(10 ** dec1)) / (Float.fromInt(pool.reserve1) * Float.fromInt(10 ** dec0)) } else { 0.0 };
+            let (p0, p1) = getPoolPriceV3(poolKey);
             let lastP = if (i < Vector.size(last_traded_price)) { Vector.get(last_traded_price, i) } else { 0.0 };
             let prevP = if (i < Vector.size(price_day_before)) { Vector.get(price_day_before, i) } else { 0.0 };
             let pChange = if (prevP > 0.0) { ((lastP - prevP) / prevP) * 100.0 } else { 0.0 };
@@ -13998,7 +15369,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   //after upgrade make sure all KLines are filled
   system func postupgrade() {
-    // Fix stale activeLiquidity: recalculate from tick tree for all pools
+    // recalculate from tick tree for all pools
     recalculateAllActiveLiquidity();
     rebuildPoolIndex();
     checkAndAggregateAllPools();
@@ -14028,238 +15399,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   };
   startTempTransferQueueTimer<system>();
 
-  // ═══ V2 → V3 Migration (runs once) ═══
-  if (not v3Migrated) {
-    for ((poolKey, pool) in Map.entries(AMMpools)) {
-      if (pool.reserve0 > 0 and pool.reserve1 > 0 and pool.totalLiquidity > 0) {
-        let sqrtRatio = ratioToSqrtRatio((pool.reserve1 * tenToPower60) / pool.reserve0);
 
-        // Create range tree with full-range boundaries
-        var rangeTree = RBTree.init<Nat, RangeData>();
-        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_LOWER, {
-          liquidityNet = pool.totalLiquidity; // positive = liquidity enters
-          liquidityGross = pool.totalLiquidity;
-          feeGrowthOutside0 = 0;
-          feeGrowthOutside1 = 0;
-        });
-        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_UPPER, {
-          liquidityNet = -pool.totalLiquidity; // negative = liquidity exits
-          liquidityGross = pool.totalLiquidity;
-          feeGrowthOutside0 = 0;
-          feeGrowthOutside1 = 0;
-        });
-
-        Map.set(poolV3Data, hashtt, poolKey, {
-          activeLiquidity = pool.totalLiquidity;
-          currentSqrtRatio = sqrtRatio;
-          feeGrowthGlobal0 = 0;
-          feeGrowthGlobal1 = 0;
-          totalFeesCollected0 = 0;
-          totalFeesCollected1 = 0;
-          totalFeesClaimed0 = 0;
-          totalFeesClaimed1 = 0;
-          ranges = rangeTree;
-        });
-      };
-    };
-
-    // Convert user positions to concentrated (full-range)
-    for ((user, positions) in Map.entries(userLiquidityPositions)) {
-      let converted = Array.map<LiquidityPosition, ConcentratedPosition>(positions, func(p) {
-        nextPositionId += 1;
-        {
-          positionId = nextPositionId;
-          token0 = p.token0; token1 = p.token1;
-          liquidity = p.liquidity;
-          ratioLower = FULL_RANGE_LOWER;
-          ratioUpper = FULL_RANGE_UPPER;
-          lastFeeGrowth0 = 0;
-          lastFeeGrowth1 = 0;
-          lastUpdateTime = p.lastUpdateTime;
-        };
-      });
-      Map.set(concentratedPositions, phash, user, converted);
-    };
-
-    v3Migrated := true;
-  };
-
-  // V3 migration pass 2: re-key range trees with sqrtRatio values
-  if (not v3MigratedV2) {
-    for ((poolKey, pool) in Map.entries(AMMpools)) {
-      if (pool.reserve0 > 0 and pool.reserve1 > 0 and pool.totalLiquidity > 0) {
-        let sqrtRatio = ratioToSqrtRatio((pool.reserve1 * tenToPower60) / pool.reserve0);
-        // Rebuild range tree from scratch with sqrtRatio keys
-        var rangeTree = RBTree.init<Nat, RangeData>();
-        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_LOWER, {
-          liquidityNet = pool.totalLiquidity;
-          liquidityGross = pool.totalLiquidity;
-          feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
-        });
-        rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_UPPER, {
-          liquidityNet = -pool.totalLiquidity;
-          liquidityGross = pool.totalLiquidity;
-          feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
-        });
-        // Preserve fee growth data from previous migration
-        let existingV3 = Map.get(poolV3Data, hashtt, poolKey);
-        let feeG0 = switch (existingV3) { case (?v) { v.feeGrowthGlobal0 }; case null { 0 } };
-        let feeG1 = switch (existingV3) { case (?v) { v.feeGrowthGlobal1 }; case null { 0 } };
-        Map.set(poolV3Data, hashtt, poolKey, {
-          activeLiquidity = pool.totalLiquidity;
-          currentSqrtRatio = sqrtRatio;
-          feeGrowthGlobal0 = feeG0;
-          feeGrowthGlobal1 = feeG1;
-          totalFeesCollected0 = 0; totalFeesCollected1 = 0;
-          totalFeesClaimed0 = 0; totalFeesClaimed1 = 0;
-          ranges = rangeTree;
-        });
-      };
-    };
-    v3MigratedV2 := true;
-  };
-
-  // V3 pass 3: Ensure all V2 users have V3 full-range positions, zero V2 fees
-  if (not v3MigratedV3) {
-    for ((user, positions) in Map.entries(userLiquidityPositions)) {
-      let existingConc = switch (Map.get(concentratedPositions, phash, user)) {
-        case null { [] }; case (?a) { a };
-      };
-      let concVec = Vector.fromArray<ConcentratedPosition>(existingConc);
-      var changed = false;
-
-      for (pos in positions.vals()) {
-        if (pos.liquidity > 0) {
-          let poolKey = (pos.token0, pos.token1);
-          // Check if V3 full-range position already exists for this pool
-          let hasV3 = switch (Array.find<ConcentratedPosition>(existingConc, func(cp) {
-            cp.token0 == pos.token0 and cp.token1 == pos.token1 and cp.ratioLower == FULL_RANGE_LOWER and cp.ratioUpper == FULL_RANGE_UPPER
-          })) { case (?_) { true }; case null { false } };
-
-          if (not hasV3) {
-            // Create V3 full-range position from V2
-            nextPositionId += 1;
-            let feeSnapshot = switch (Map.get(poolV3Data, hashtt, poolKey)) {
-              case (?v) { (v.feeGrowthGlobal0, v.feeGrowthGlobal1) };
-              case null { (0, 0) };
-            };
-            Vector.add(concVec, {
-              positionId = nextPositionId;
-              token0 = pos.token0; token1 = pos.token1;
-              liquidity = pos.liquidity;
-              ratioLower = FULL_RANGE_LOWER;
-              ratioUpper = FULL_RANGE_UPPER;
-              lastFeeGrowth0 = feeSnapshot.0;
-              lastFeeGrowth1 = feeSnapshot.1;
-              lastUpdateTime = Time.now();
-            });
-            changed := true;
-          };
-        };
-      };
-
-      if (changed) {
-        Map.set(concentratedPositions, phash, user, Vector.toArray(concVec));
-      };
-
-      // Zero all V2 fee fields to prevent stale double-claims
-      let cleaned = Array.map<LiquidityPosition, LiquidityPosition>(positions, func(p) {
-        { p with fee0 = 0; fee1 = 0 };
-      });
-      Map.set(userLiquidityPositions, phash, user, cleaned);
-    };
-    v3MigratedV3 := true;
-  };
-
-  // ═══ feeGrowthInside hard-reset migration (runs once) ═══
-  //
-  // Purpose: fix the out-of-range concentrated-LP over-claim bug by switching from
-  // (feeGrowthGlobal - lastFeeGrowth) math to (feeGrowthInside - lastFeeGrowthInside).
-  //
-  // Strategy (user-approved hard reset):
-  //   1. Sweep residual (totalFeesCollected - totalFeesClaimed) per pool into feescollectedDAO.
-  //      Maintains the invariant: canister_physical_balance(token) unchanged.
-  //   2. Re-initialize feeGrowthOutside on every existing tick per Uniswap V3 convention.
-  //      Consequence: feeGrowthInside evaluates to 0 for every existing position immediately.
-  //   3. Reset per-pool totalFeesCollected/Claimed to 0 (keeps feeGrowthGlobal unchanged).
-  //   4. For each position: lastFeeGrowth0/1 (which now semantically means
-  //      lastFeeGrowthInside0/1) set to 0. Position's pre-migration unclaimed fees go to 0;
-  //      future growth accrues correctly via feeGrowthInside.
-  //
-  // Drift safety: step 1 is critical. Without it, the residual tokens would stay
-  // physically in the canister but be "orphaned" from all accounting → positive drift.
-  // With step 1, those tokens become feescollectedDAO (DAO-claimable via collectFees),
-  // preserving the invariant bit-for-bit.
-  if (not feeGrowthInsideMigrated) {
-    for ((poolKey, v3) in Map.entries(poolV3Data)) {
-      // Step 1: residual sweep to feescollectedDAO (preserves canister balance invariant)
-      let residual0 = safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0);
-      let residual1 = safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1);
-      if (residual0 > 0) {
-        let cur0 = switch (Map.get(feescollectedDAO, thash, poolKey.0)) { case (?v) { v }; case null { 0 } };
-        Map.set(feescollectedDAO, thash, poolKey.0, cur0 + residual0);
-      };
-      if (residual1 > 0) {
-        let cur1 = switch (Map.get(feescollectedDAO, thash, poolKey.1)) { case (?v) { v }; case null { 0 } };
-        Map.set(feescollectedDAO, thash, poolKey.1, cur1 + residual1);
-      };
-
-      // Step 2: re-initialize feeGrowthOutside on every tick per Uniswap convention
-      var newRanges = RBTree.init<Nat, RangeData>();
-      for ((tickKey, rangeData) in RBTree.entries(v3.ranges)) {
-        let (fgo0, fgo1) = initialFeeGrowthOutside(tickKey, v3.currentSqrtRatio, v3.feeGrowthGlobal0, v3.feeGrowthGlobal1);
-        newRanges := RBTree.put(newRanges, Nat.compare, tickKey, {
-          liquidityNet = rangeData.liquidityNet;
-          liquidityGross = rangeData.liquidityGross;
-          feeGrowthOutside0 = fgo0;
-          feeGrowthOutside1 = fgo1;
-        });
-      };
-
-      // Step 3: reset per-pool fee counters (keep feeGrowthGlobal + activeLiquidity + currentSqrtRatio)
-      Map.set(poolV3Data, hashtt, poolKey, {
-        activeLiquidity = v3.activeLiquidity;
-        currentSqrtRatio = v3.currentSqrtRatio;
-        feeGrowthGlobal0 = v3.feeGrowthGlobal0;
-        feeGrowthGlobal1 = v3.feeGrowthGlobal1;
-        totalFeesCollected0 = 0;
-        totalFeesCollected1 = 0;
-        totalFeesClaimed0 = 0;
-        totalFeesClaimed1 = 0;
-        ranges = newRanges;
-      });
-    };
-
-    // Step 4: snapshot each position's lastFeeGrowth* to positionFeeGrowthInside(pos, v3_now).
-    //
-    // This is critical for correct post-migration math:
-    //   - Full-range positions: positionFeeGrowthInside short-circuits to feeGrowthGlobal
-    //     → lastFeeGrowth = feeGrowthGlobal. Next claim with no new swap: theoretical = 0. ✓
-    //     After new swap ΔG: theoretical = liquidity × ΔG / 10^60 = proper LP share. ✓
-    //   - Concentrated positions: positionFeeGrowthInside computes Uniswap formula which
-    //     evaluates to 0 post step-2 tick re-init (mathematical identity).
-    //     → lastFeeGrowth = 0. Next claim with no new swap: theoretical = 0. ✓
-    //     After new in-range swap: feeGrowthInside grows by Δ → theoretical = liquidity × Δ / 10^60. ✓
-    //     Out-of-range swaps don't grow feeGrowthInside for this position → stays 0. ✓
-    //
-    // Simply zeroing lastFeeGrowth* would over-credit full-range LPs on the first claim
-    // (clamped by totalFeesCollected-totalFeesClaimed, but would still eat the entire
-    // post-migration pool fee budget, leaving no protocol-share residual accruing).
-    for ((user, positions) in Map.entries(concentratedPositions)) {
-      let updated = Array.map<ConcentratedPosition, ConcentratedPosition>(positions, func(p) {
-        switch (Map.get(poolV3Data, hashtt, (p.token0, p.token1))) {
-          case (?v3) {
-            let (insideNow0, insideNow1) = positionFeeGrowthInside(p, v3);
-            { p with lastFeeGrowth0 = insideNow0; lastFeeGrowth1 = insideNow1 };
-          };
-          case null { { p with lastFeeGrowth0 = 0; lastFeeGrowth1 = 0 } };
-        };
-      });
-      Map.set(concentratedPositions, phash, user, updated);
-    };
-
-    feeGrowthInsideMigrated := true;
-  };
 
   if (first_time_running_after_upgrade == 1) {
     let timersize = Vector.size(timerIDs);
@@ -14365,7 +15505,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (depth < 2 or depth > 6 or sampleSize == 0) { return [] };
 
     var routesExplored : Nat = 0;
-    let MAX_ROUTES : Nat = 2000;
+    let MAX_ROUTES : Nat = 5000;
 
     let results = Vector.new<{
       route : [SwapHop];
@@ -14469,6 +15609,211 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     } { sorted[i] });
   };
 
+  // Single-call optimal arb finder. Runs ternary search across a capital range
+  // and returns the (amount, route) with highest absolute profit (in token units).
+  // Replaces N separate adminAnalyzeRouteEfficiency calls + external ternary —
+  // saves inter-canister round trips, gives consistent snapshot semantics
+  // (all probes hit the same pool state), and bounds work to one query budget.
+  //
+  // Tracks running-best across all probes — robust against bumpy AMM curves
+  // (OTC orders create discrete profit jumps that violate strict unimodality).
+  //
+  // Returns null if:
+  //   - caller is not admin (also day-bans them on the way out, see ownercheck)
+  //   - validation fails
+  //   - no positive-profit route found in the searched range
+  public query ({ caller }) func adminFindOptimalArb(
+    token : Text,
+    minSample : Nat,
+    maxSample : Nat,
+    depth : Nat,
+    probes : Nat,
+    tolerancePct : Nat,
+  ) : async ?{
+    amount : Nat;
+    route : [SwapHop];
+    outputAmount : Nat;
+    efficiency : Int;
+    efficiencyBps : Int;
+    hopDetails : [HopDetail];
+    probesRun : Nat;
+  } {
+    if (not test and not isAdmin(caller)) { return null };
+    if (depth < 2 or depth > 6) { return null };
+    if (probes < 1 or probes > 20) { return null };
+    if (maxSample == 0 or minSample >= maxSample) { return null };
+
+    let MAX_ROUTES : Nat = 5000;
+    let mids = Array.filter<Text>(acceptedTokens, func(t) { t != token });
+
+    // Helper: enumerate all routes at given sampleSize, return single best
+    // positive-profit candidate (or null if none).
+    // Identical simulation logic to adminAnalyzeRouteEfficiency's buildAndSimulate
+    // but tracks just the best instead of accumulating all routes — saves allocation.
+    let findBestAt = func(sampleSize : Nat) : ?{
+      route : [SwapHop];
+      outputAmount : Nat;
+      efficiency : Int;
+      efficiencyBps : Int;
+      hopDetails : [HopDetail];
+    } {
+      if (sampleSize == 0) { return null };
+      var routesExplored : Nat = 0;
+      var best : ?{
+        route : [SwapHop];
+        outputAmount : Nat;
+        efficiency : Int;
+        efficiencyBps : Int;
+        hopDetails : [HopDetail];
+      } = null;
+
+      func buildAndSimulate(current : Text, hopsLeft : Nat, visited : [Text], routeSoFar : [SwapHop]) {
+        if (routesExplored >= MAX_ROUTES) { return };
+        routesExplored += 1;
+        if (hopsLeft == 0) {
+          if (isKnownPool(current, token)) {
+            let fullRoute = Array.append(routeSoFar, [{ tokenIn = current; tokenOut = token }]);
+            let simPools = Map.new<(Text, Text), AMMPool>();
+            let simV3 = Map.new<(Text, Text), PoolV3Data>();
+            var amount = sampleSize;
+            let hopDetailsVec = Vector.new<HopDetail>();
+            var failed = false;
+            for (hop in fullRoute.vals()) {
+              let pk = getPool(hop.tokenIn, hop.tokenOut);
+              let poolOpt = switch (Map.get(simPools, hashtt, pk)) { case (?p) { ?p }; case null { Map.get(AMMpools, hashtt, pk) } };
+              let v3Opt = switch (Map.get(simV3, hashtt, pk)) { case (?v) { ?v }; case null { Map.get(poolV3Data, hashtt, pk) } };
+              switch (poolOpt) {
+                case (?pool) {
+                  let (out, updatedPool, updatedV3) = simulateSwap(pool, v3Opt, hop.tokenIn, amount, ICPfee);
+                  if (out == 0) { failed := true };
+                  Map.set(simPools, hashtt, pk, updatedPool);
+                  switch (updatedV3) { case (?uv3) { Map.set(simV3, hashtt, pk, uv3) }; case null {} };
+                  let hopAmountIn = amount;
+                  Vector.add(hopDetailsVec, {
+                    tokenIn = hop.tokenIn; tokenOut = hop.tokenOut;
+                    amountIn = hopAmountIn; amountOut = out;
+                    fee = (hopAmountIn * ICPfee) / 10000;
+                    priceImpact = 0.0;
+                  });
+                  amount := out;
+                };
+                case null { failed := true };
+              };
+              if (failed) { return };
+            };
+            if (not failed and amount > sampleSize) {
+              let eff : Int = amount - sampleSize;
+              let effBps : Int = if (sampleSize > 0) { (eff * 10000) / sampleSize } else { 0 };
+              let candidate = {
+                route = fullRoute;
+                outputAmount = amount;
+                efficiency = eff;
+                efficiencyBps = effBps;
+                hopDetails = Vector.toArray(hopDetailsVec);
+              };
+              switch (best) {
+                case null { best := ?candidate };
+                case (?b) { if (eff > b.efficiency) { best := ?candidate } };
+              };
+            };
+          };
+          return;
+        };
+        for (mid in mids.vals()) {
+          let alreadyVisited = switch (Array.find<Text>(visited, func(v) { v == mid })) {
+            case (?_) { true }; case null { false };
+          };
+          if (not alreadyVisited and isKnownPool(current, mid)) {
+            let newRoute = Array.append(routeSoFar, [{ tokenIn = current; tokenOut = mid }]);
+            let newVisited = Array.append(visited, [mid]);
+            buildAndSimulate(mid, hopsLeft - 1, newVisited, newRoute);
+          };
+        };
+      };
+
+      for (d in Iter.range(1, depth - 1)) {
+        buildAndSimulate(token, d, [token], []);
+      };
+      best;
+    };
+
+    // Ternary search over [minSample, maxSample]. Tracks running best across
+    // probes so a bumpy curve doesn't lose a good candidate to a subsequent
+    // worse probe.
+    var low : Nat = minSample;
+    var high : Nat = maxSample;
+    var bestSeen : ?{
+      amount : Nat;
+      route : [SwapHop];
+      outputAmount : Nat;
+      efficiency : Int;
+      efficiencyBps : Int;
+      hopDetails : [HopDetail];
+    } = null;
+    var probesRun : Nat = 0;
+
+    label probesLoop while (probesRun < probes) {
+      if (high <= low) { break probesLoop };
+
+      let m1 : Nat = low + (high - low) / 3;
+      let m2 : Nat = if (high > (high - low) / 3) { high - (high - low) / 3 } else { high };
+
+      let r1 = findBestAt(m1);
+      let r2 = findBestAt(m2);
+
+      let p1 : Int = switch (r1) { case (?b) { b.efficiency }; case null { 0 } };
+      let p2 : Int = switch (r2) { case (?b) { b.efficiency }; case null { 0 } };
+
+      // Track running best
+      switch (r1) {
+        case null {};
+        case (?b) {
+          let cand = { amount = m1; route = b.route; outputAmount = b.outputAmount; efficiency = b.efficiency; efficiencyBps = b.efficiencyBps; hopDetails = b.hopDetails };
+          switch (bestSeen) {
+            case null { bestSeen := ?cand };
+            case (?s) { if (cand.efficiency > s.efficiency) { bestSeen := ?cand } };
+          };
+        };
+      };
+      switch (r2) {
+        case null {};
+        case (?b) {
+          let cand = { amount = m2; route = b.route; outputAmount = b.outputAmount; efficiency = b.efficiency; efficiencyBps = b.efficiencyBps; hopDetails = b.hopDetails };
+          switch (bestSeen) {
+            case null { bestSeen := ?cand };
+            case (?s) { if (cand.efficiency > s.efficiency) { bestSeen := ?cand } };
+          };
+        };
+      };
+
+      // Narrow the range
+      if (p1 < p2) { low := m1 } else { high := m2 };
+
+      // Early termination
+      if (maxSample > 0 and tolerancePct > 0) {
+        let rangePct = ((high - low) * 100) / maxSample;
+        if (rangePct < tolerancePct) { probesRun += 1; break probesLoop };
+      };
+
+      probesRun += 1;
+    };
+
+    switch (bestSeen) {
+      case null { null };
+      case (?b) {
+        ?{
+          amount = b.amount;
+          route = b.route;
+          outputAmount = b.outputAmount;
+          efficiency = b.efficiency;
+          efficiencyBps = b.efficiencyBps;
+          hopDetails = b.hopDetails;
+          probesRun;
+        };
+      };
+    };
+  };
+
   public shared ({ caller }) func adminExecuteRouteStrategy(
     amount : Nat,
     route : [SwapHop],
@@ -14543,6 +15888,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Execute hops
     var currentAmount = amount;
     var firstHopPoolFee : Nat = 0;
+    // capture 30% DAO portion from hop 0 to avoid adding
+    // 99.5% non-revoke (which includes the 70% already in feeGrowthGlobal).
+    var firstHopProtocolFee : Nat = 0;
     var firstHopHadOrderbookMatch = false;
     var lastHopWasAMMOnly = false;
 
@@ -14568,6 +15916,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       lastHopWasAMMOnly := wasAMMOnly;
       if (hopIndex == 0) {
         firstHopPoolFee := poolFee;
+        firstHopProtocolFee := protocolFee;
         firstHopHadOrderbookMatch := not wasAMMOnly;
       };
 
@@ -14612,10 +15961,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     // Fee collection for hop 0
-    let tradingFee = calculateFee(amount, ICPfee, RevokeFeeNow);
+    // Additive: calculateFee (user upfront) + firstHopProtocolFee (AMM protocol).
+    // Sync v3 claim by protocolFee only.
+    let tradingFee = calculateFee(amount, ICPfee, RevokeFeeNow) + firstHopProtocolFee;
     let inputTfees = if (firstHopHadOrderbookMatch) { 0 } else { returnTfees(tokenIn) };
     let feeToAdd = tradingFee + inputTfees;
     addFees(tokenIn, feeToAdd, false, user, nowVar);
+    if (firstHopProtocolFee > 0) {
+      claimProtocolFeeInV3(tokenIn, route[0].tokenOut, firstHopProtocolFee);
+    };
 
     // Slippage check
     if (currentAmount < minOutput) {
@@ -14702,6 +16056,264 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     });
   };
 
+  // ── Flash arbitrage (zero-capital, buyback-canister-only) ──
+  // Buyback canister principal hoisted to top of actor (see BUYBACK_CANISTER_ID
+  // declaration after DAOTreasury) so it's also visible to the same-token guard
+  // in addPosition / swapMultiHop / swapSplitRoutes.
+
+  // adminFlashArb — execute a circular arbitrage route using exchange-internal
+  // capital (lent from feescollectedDAO[startToken] when available, phantom otherwise).
+  // The buyback canister provides NO ICP/ckUSDC capital; profit (or zero) is paid
+  // out via a single ICRC-1 transfer of `netProfit` of startToken to the caller.
+  //
+  // Atomicity & safety: the entire synchronous segment (route execution + fee
+  // booking + lend repay) commits atomically. If realized < notional + minProfit
+  // + costs, the function traps and ALL state mutations roll back — no funds move,
+  // no record is created, and the buyback's profit guarantee is preserved
+  // (netProfit is always >= 0 on success, message reverts otherwise).
+  //
+  // Drift profile mirrors adminExecuteRouteStrategy (same fee booking, same
+  // ±10K satoshi envelope per call). No new drift sources introduced.
+  public shared ({ caller }) func adminFlashArb(
+    notional : Nat,
+    route : [SwapHop],
+    minProfit : Nat,
+  ) : async {
+    #Ok : {
+      notional : Nat;
+      realized : Nat;
+      grossProfit : Nat;     // realized − notional (before fees)
+      netProfit : Nat;       // grossProfit − tradingFee − inputTfees − transferFee
+      tradingFee : Nat;      // calculateFee(notional, ICPfee, RevokeFeeNow) + firstHopProtocolFee
+      inputTfees : Nat;
+      transferFee : Nat;
+      hops : Nat;
+      swapId : Nat;
+      capitalSource : { #lent; #phantom };
+    };
+    #Err : Text;
+  } {
+    // ── Auth: ONLY the buyback canister may call ──
+    if (caller != BUYBACK_CANISTER_ID) {
+      return #Err("Not authorized: caller is not the buyback canister");
+    };
+
+    // ── Input validation ──
+    if (notional == 0) return #Err("notional must be > 0");
+    if (route.size() < 2 or route.size() > 6) return #Err("2-6 hops required");
+    let startToken = route[0].tokenIn;
+    if (route[route.size() - 1].tokenOut != startToken) {
+      return #Err("Route must be circular: last.tokenOut != first.tokenIn");
+    };
+
+    // Validate route continuity
+    var rci = 0;
+    while (rci < route.size() - 1) {
+      if (route[rci].tokenOut != route[rci + 1].tokenIn) {
+        return #Err("Route broken at hop " # Nat.toText(rci));
+      };
+      rci += 1;
+    };
+
+    // Validate all pools exist
+    for (hop in route.vals()) {
+      if (not isKnownPool(hop.tokenIn, hop.tokenOut)) {
+        return #Err("Pool not found: " # hop.tokenIn # " / " # hop.tokenOut);
+      };
+    };
+
+    // ── Capital decision: lend mode (preferred) vs phantom mode (fallback) ──
+    let lendable = switch (Map.get(feescollectedDAO, thash, startToken)) {
+      case (?v) v;
+      case null 0;
+    };
+    let useLend : Bool = lendable >= notional;
+
+    var nowVar = Time.now();
+    // tempTransferQueueLocal is message-scoped; trap below this line reverts it cleanly
+    // along with all other state mutations from this point onward.
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    let user = Principal.toText(caller);
+
+    // ── LEND (accounting only — no physical token movement) ──
+    if (useLend) {
+      Map.set(feescollectedDAO, thash, startToken, (lendable - notional : Nat));
+    };
+
+    // ── EXECUTE HOPS (synchronous, no awaits) ──
+    var currentAmount : Nat = notional;
+    var firstHopProtocolFee : Nat = 0;
+    var firstHopHadOrderbookMatch : Bool = false;
+
+    for (hopIndex in Iter.range(0, route.size() - 1)) {
+      let hop = route[hopIndex];
+      let isLastHop : Bool = hopIndex + 1 == route.size();
+
+      let syntheticTrade : TradePrivate = {
+        Fee = ICPfee;
+        amount_sell = 1;
+        amount_init = currentAmount;
+        token_sell_identifier = hop.tokenOut;
+        token_init_identifier = hop.tokenIn;
+        trade_done = 0; seller_paid = 0; init_paid = 1;
+        seller_paid2 = 0; init_paid2 = 0; trade_number = 0;
+        SellerPrincipal = "0"; initPrincipal = user;
+        RevokeFee = RevokeFeeNow; OCname = "";
+        time = nowVar; filledInit = 0; filledSell = 0;
+        allOrNothing = false; strictlyOTC = false;
+      };
+
+      let (remaining, protocolFee, _poolFee, transfers, wasAMMOnly, _, _) = orderPairing(syntheticTrade);
+      if (hopIndex == 0) {
+        firstHopProtocolFee := protocolFee;
+        firstHopHadOrderbookMatch := not wasAMMOnly;
+      };
+
+      var hopOutput : Nat = 0;
+      for (tx in transfers.vals()) {
+        if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
+          hopOutput += tx.1;
+          // Flash arb: do NOT queue the last hop output here — we split it into
+          // (repay notional via accounting) + (netProfit via outgoing transfer)
+          // after the loop. Intermediate hop outputs are consumed by the next hop.
+        } else {
+          // OTC seller payouts, AMM rebates, refunds — queue normally.
+          Vector.add(tempTransferQueueLocal, tx);
+          if (hopIndex == 0 and tx.2 == startToken) {
+            firstHopHadOrderbookMatch := true;
+          };
+        };
+      };
+
+      // Trap on hop 0 partial fill (route diverged from snapshot — abort cleanly).
+      if (hopIndex == 0 and remaining > returnTfees(hop.tokenIn) * 3) {
+        Debug.trap("Flash arb hop 0 partial fill: remaining=" # Nat.toText(remaining));
+      };
+
+      currentAmount := hopOutput;
+      if (currentAmount == 0) {
+        Debug.trap("Flash arb hop " # Nat.toText(hopIndex) # " produced no output");
+      };
+
+      // Mirror adminExecuteRouteStrategy intermediate-hop handling
+      if (not isLastHop and wasAMMOnly) {
+        currentAmount += returnTfees(hop.tokenOut);
+      };
+      if (not isLastHop and not wasAMMOnly) {
+        addFees(hop.tokenOut, returnTfees(hop.tokenOut), false, "", nowVar);
+      };
+    };
+
+    let realized = currentAmount;
+    let grossProfit : Nat = if (realized >= notional) { realized - notional } else { 0 };
+
+    // ── FEE COLLECTION (EXACT mirror of adminExecuteRouteStrategy:15870-15879) ──
+    let tradingFee = calculateFee(notional, ICPfee, RevokeFeeNow) + firstHopProtocolFee;
+    let inputTfees = if (firstHopHadOrderbookMatch) { 0 } else { returnTfees(startToken) };
+    let feeToAdd = tradingFee + inputTfees;
+    let transferFee = returnTfees(startToken);
+
+    // ── PROFIT GUARANTEE: trap if profit insufficient (reverts ALL state) ──
+    // Costs to the buyback: feeToAdd (booked to feescollectedDAO) + transferFee
+    // (paid by exchange_treasury on the outgoing netProfit transfer).
+    if (grossProfit < feeToAdd + transferFee + minProfit) {
+      Debug.trap(
+        "Flash arb profit guard: realized=" # Nat.toText(realized) #
+        " notional=" # Nat.toText(notional) #
+        " grossProfit=" # Nat.toText(grossProfit) #
+        " feeToAdd=" # Nat.toText(feeToAdd) #
+        " transferFee=" # Nat.toText(transferFee) #
+        " minProfit=" # Nat.toText(minProfit)
+      );
+    };
+    let netProfit : Nat = grossProfit - feeToAdd - transferFee;
+
+    // Book all fees to feescollectedDAO + sync V3 internal accounting.
+    addFees(startToken, feeToAdd, false, user, nowVar);
+    if (firstHopProtocolFee > 0) {
+      claimProtocolFeeInV3(startToken, route[0].tokenOut, firstHopProtocolFee);
+    };
+
+    // ── REPAY LEND (accounting only) ──
+    if (useLend) {
+      let postLend = (lendable - notional : Nat);
+      Map.set(feescollectedDAO, thash, startToken, postLend + notional);
+    };
+
+    // ── QUEUE PROFIT TRANSFER ──
+    Vector.add(tempTransferQueueLocal, (#principal(caller), netProfit, startToken, genTxId()));
+
+    // ── RECORD SWAP (swapType=#multihop, tokenIn==tokenOut indicates flash arb) ──
+    nextSwapId += 1;
+    let routeVec = Vector.new<Text>();
+    Vector.add(routeVec, startToken);
+    for (hop in route.vals()) { Vector.add(routeVec, hop.tokenOut) };
+    recordSwap(caller, {
+      swapId = nextSwapId;
+      tokenIn = startToken;
+      tokenOut = startToken;
+      amountIn = notional;
+      amountOut = realized;
+      route = Vector.toArray(routeVec);
+      fee = tradingFee;
+      swapType = #multihop;
+      timestamp = Time.now();
+    });
+
+    doInfoBeforeStep2();
+
+    // ── CONSOLIDATE TRANSFERS (mirror adminExecuteRouteStrategy:15915-15945) ──
+    let preCountMap = Map.new<Text, Nat>();
+    for (tx in Vector.vals(tempTransferQueueLocal)) {
+      let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+      let key = rcpt # ":" # tx.2;
+      switch (Map.get(preCountMap, thash, key)) {
+        case (?n) { Map.set(preCountMap, thash, key, n + 1) };
+        case null { Map.set(preCountMap, thash, key, 1) };
+      };
+    };
+    let consolidatedMap = Map.new<Text, (TransferRecipient, Nat, Text, Text)>();
+    for (tx in Vector.vals(tempTransferQueueLocal)) {
+      let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+      let key = rcpt # ":" # tx.2;
+      switch (Map.get(consolidatedMap, thash, key)) {
+        case (?existing) { Map.set(consolidatedMap, thash, key, (tx.0, existing.1 + tx.1, tx.2, tx.3)) };
+        case null { Map.set(consolidatedMap, thash, key, tx) };
+      };
+    };
+    let consolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    for ((_, tx) in Map.entries(consolidatedMap)) { Vector.add(consolidatedVec, tx) };
+
+    // Track consolidation savings — drift-critical (line 15938-15945 logic).
+    for ((key, count) in Map.entries(preCountMap)) {
+      if (count > 1) {
+        let tkn = switch (Map.get(consolidatedMap, thash, key)) { case (?tx) { tx.2 }; case null { "" } };
+        if (tkn == startToken) {
+          let savedFees = (count - 1) * returnTfees(tkn);
+          addFees(tkn, savedFees, false, "", nowVar);
+        };
+      };
+    };
+
+    // ── FLUSH (single await — commits all synchronous state above) ──
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec)) } catch (_) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
+    };
+
+    #Ok({
+      notional;
+      realized;
+      grossProfit;
+      netProfit;
+      tradingFee;
+      inputTfees;
+      transferFee;
+      hops = route.size();
+      swapId = nextSwapId;
+      capitalSource = if (useLend) { #lent } else { #phantom };
+    });
+  };
+
   // certain rules that get applied before cyclespent so spamming is mitigated. Here also certain ruling is available considering who can access certain functions.
   system func inspect({
     caller : Principal;
@@ -14747,11 +16359,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #addTimer : () -> ();
         #changeOwner2 : () -> (pri : Principal);
         #changeOwner3 : () -> (pri : Principal);
+        #clearTokenArchiveOffset : () -> (token : Text);
+        #getTokenArchiveOffset : () -> (token : Text);
         #checkDiffs : () -> (returnFees : Bool, alwaysShow : Bool);
+        #getDriftOpTracker : () -> ();
+        #resetDriftOpTracker : () -> ();
         #clearAllBans : () -> ();
         #clearStuckLocks : () -> (accesscode : ?Text, blocksDoneKey : ?Text);
         #setMinimumAmount : () -> (token : Text, newMinimum : Nat);
         #adminRepairLastTradedPriceAndKlines : () -> (affectedPoolIndexes : [Nat], alsoRepairVolume24h : Bool);
+        #adminDeleteKlinesBefore : () -> (cutoffNs : Int, maxDeletesPerBucket : Nat);
         #cleanTokenIds : () -> ();
         #isExchangeFrozen : () -> ();
         #resetAllState : () -> ();
@@ -14784,6 +16401,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           () -> (tokenSell : Text, tokenBuy : Text, amountSell : Nat);
         #getExpectedReceiveAmountBatch :
           () -> (requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }]);
+        #getExpectedReceiveAmountBatchMulti :
+          () -> (requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }],
+                 maxRoutesPerRequest : Nat);
         #getKlineData :
           () ->
             (token1 : Text, token2 : Text, timeFrame : TimeFrame,
@@ -14792,6 +16412,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           () ->
             (token1 : Text, token2 : Text, timeFrame : TimeFrame,
              before : ?Int, limit : Nat);
+        #get_token_trends_7d : () -> (tokens : [Principal]);
         #getLogs : () -> (count : Nat);
         #getLogging :
           () ->
@@ -14831,6 +16452,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                             addToAllTimeBan : ?[Text];
                             changeAllowedCalls : ?Nat;
                             changeallowedSilentWarnings : ?Nat;
+                            daoTreasuryPrincipalsText : ?[Text];
                             deleteAllowedCanisters : ?[Text];
                             deleteFromAllTimeBan : ?[Text];
                             deleteFromDayBan : ?[Text];
@@ -14843,6 +16465,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             (identifier : Text, Block : Nat, tType : {#ICP; #ICRC12; #ICRC3});
         #claimLPFees :
           () -> (token0i : Text, token1i : Text);
+        #claimConcentratedFees :
+          () -> (positionId : Nat);
+        #claimAllLPFees : () -> ();
         #removeLiquidity :
           () -> (token0i : Text, token1i : Text, liquidityAmount : Nat);
         #retrieveFundsDao : () -> (trades : [(Text, Nat64)]);
@@ -14853,6 +16478,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
              revokeType : {#DAO : [Text]; #Initiator; #Seller});
         #sendDAOInfo : () -> ();
         #setTest : () -> (a : Bool);
+        #simulateSplitRoutes :
+          () -> (splits : [{ amountIn : Nat; route : [SwapHop] }]);
         #swapMultiHop :
           () ->
             (tokenIn : Text, tokenOut : Text, amountIn : Nat,
@@ -14872,14 +16499,22 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #adminAnalyzeRouteEfficiency :
           () ->
             (token : Text, sampleSize : Nat, depth : Nat);
-        #adminDrainExchange : () -> (target : Principal);
-        #adminDrainStatus : () -> ();
+        #adminFindOptimalArb :
+          () ->
+            (token : Text, minSample : Nat, maxSample : Nat, depth : Nat,
+             probes : Nat, tolerancePct : Nat);
+        #adminFlashArb :
+          () -> (notional : Nat, route : [SwapHop], minProfit : Nat);
+        #adminDrainTestModeExchange : () -> (target : Principal);
+        #adminDrainTestModeStatus : () -> ();
         #batchClaimAllFees : () -> ();
         #batchAdjustLiquidity : () -> (adjustments : [{ token0 : Text; token1 : Text; action : { #Remove : { liquidityAmount : Nat } } }]);
         #addLiquidityDAO : () -> (token0 : Text, token1 : Text, amount0 : Nat, amount1 : Nat, block0 : Nat, block1 : Nat, isInitial : ?Bool);
         #getDAOLiquiditySnapshot : () -> ();
         #getDAOLPPerformance : () -> ();
         #debugV3Ticks : () -> (token0 : Text, token1 : Text);
+        #updateTokenType : () -> (token : Text, newType : {#ICP; #ICRC12; #ICRC3});
+        #canTradeTokens : () -> (tokenIn : Text, tokenOut : Text);
     };
   }) : Bool {
 
@@ -14897,8 +16532,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         switch (msg) {
           case (#revokeTrade _) true;
           case (#pauseToken _) true;
-          case (#adminDrainExchange _) true;
-          case (#adminDrainStatus _) true;
+          case (#adminDrainTestModeExchange _) true;
+          case (#adminDrainTestModeStatus _) true;
           case (#Freeze _) true;
           case (#clearAllBans _) true;
           case (#isExchangeFrozen _) true;
@@ -14919,15 +16554,22 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#clearStuckLocks _) callerIsAdmin;
       case (#setMinimumAmount _) callerIsAdmin;
       case (#adminRepairLastTradedPriceAndKlines _) callerIsAdmin;
+      case (#adminDeleteKlinesBefore _) callerIsAdmin;
       case (#resetAllState _) callerIsAdmin;
       case (#FinishSellBatchDAO _) false;
       case (#Freeze _) callerIsAdmin;
       case (#adminExecuteRouteStrategy _) callerIsAdmin;
       case (#adminAnalyzeRouteEfficiency _) callerIsAdmin;
+      case (#adminFindOptimalArb _) callerIsAdmin;
+      case (#adminFlashArb _) caller == BUYBACK_CANISTER_ID;
       case (#addAcceptedToken _) callerIsAdmin;
+      case (#updateTokenType _) callerIsAdmin;
+      case (#canTradeTokens _) true;
       case (#addTimer _) callerIsAdmin;
       case (#changeOwner2 _) caller == owner2 or callerIsAdmin;
       case (#changeOwner3 _) caller == owner3 or callerIsAdmin;
+      case (#clearTokenArchiveOffset _) caller == owner2 or callerIsAdmin;
+      case (#getTokenArchiveOffset _) true;
       case (#collectFees _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
       case (#addFeeCollector _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
       case (#removeFeeCollector _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
@@ -14950,10 +16592,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#treasurySwap _) callerIsAdmin;
       case (#setTest _) callerIsAdmin or test;
       case (#checkDiffs _) callerIsAdmin or test;
+      case (#getDriftOpTracker _) callerIsAdmin or test;
+      case (#resetDriftOpTracker _) callerIsAdmin or test;
       case (#cleanTokenIds _) callerIsAdmin;
       case (#refundStuckFunds _) callerIsAdmin;
-      case (#adminDrainExchange _) caller == deployer.caller or caller == Principal.fromText("odoge-dr36c-i3lls-orjen-eapnp-now2f-dj63m-3bdcd-nztox-5gvzy-sqe");
-      case (#adminDrainStatus _) callerIsAdmin;
+      case (#adminDrainTestModeExchange _) caller == deployer.caller or caller == Principal.fromText("odoge-dr36c-i3lls-orjen-eapnp-now2f-dj63m-3bdcd-nztox-5gvzy-sqe");
+      case (#adminDrainTestModeStatus _) callerIsAdmin;
       case (#batchClaimAllFees _) callerIsAdmin;
       case (#batchAdjustLiquidity _) callerIsAdmin;
       case (#addLiquidityDAO _) callerIsAdmin;
@@ -14993,6 +16637,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
 
       case (#claimLPFees _) true;
+      case (#claimAllLPFees _) true;
+
+      case (#claimConcentratedFees _) true;
 
       case (#getPrivateTrade d) {
         var tid : Text = d();

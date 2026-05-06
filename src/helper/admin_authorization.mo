@@ -18,7 +18,11 @@ module {
     "as6jn-gaoo7-k4kji-tdkxg-jlsrk-avxkc-zu76j-vz7hj-di3su-2f74z-qqe",
     "odoge-dr36c-i3lls-orjen-eapnp-now2f-dj63m-3bdcd-nztox-5gvzy-sqe",
     "nfzo4-i26mj-e2tuj-bt3ba-cuco4-vcqxx-ybjw7-gzyzh-kvyp7-wjeyp-hqe",
-    "4ggui-2celt-yxv2h-z6zyh-sq5ok-rycog-tjyfl-gzxsj-kiq3y-c4sm4-lqe"
+    "4ggui-2celt-yxv2h-z6zyh-sq5ok-rycog-tjyfl-gzxsj-kiq3y-c4sm4-lqe",
+    // ── Buyback canister (production) ────────────────────────────────────
+    // Required so vault.claimAllFees and exchange admin functions accept
+    // calls from the buyback canister. Production-only deployment.
+    "cfl3o-5qaaa-aaaan-q6fga-cai"
   ];
 
   // Check if caller is a master admin (human admin or known canister)

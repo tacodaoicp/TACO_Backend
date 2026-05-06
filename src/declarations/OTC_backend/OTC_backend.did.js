@@ -106,6 +106,31 @@ export const idlFactory = ({ IDL }) => {
     'lastHopAMMOnly' : IDL.Bool,
   });
   const SwapResult = IDL.Variant({ 'Ok' : SwapOk, 'Err' : ExchangeError });
+  const LPFeeClaimEntry = IDL.Record({
+    'ratioUpper' : IDL.Nat,
+    'source' : IDL.Variant({ 'v2' : IDL.Null, 'v3' : IDL.Null }),
+    'transferred0' : IDL.Nat,
+    'transferred1' : IDL.Nat,
+    'dust1ToDAO' : IDL.Nat,
+    'positionId' : IDL.Nat,
+    'token0' : IDL.Text,
+    'token1' : IDL.Text,
+    'dust0ToDAO' : IDL.Nat,
+    'ratioLower' : IDL.Nat,
+    'fees0' : IDL.Nat,
+    'fees1' : IDL.Nat,
+  });
+  const ClaimAllLPFeesOk = IDL.Record({
+    'totalsTransferredByToken' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat)),
+    'positionsClaimed' : IDL.Nat,
+    'positionsScanned' : IDL.Nat,
+    'entries' : IDL.Vec(LPFeeClaimEntry),
+    'consolidationSavings' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat)),
+  });
+  const ClaimAllLPFeesResult = IDL.Variant({
+    'Ok' : ClaimAllLPFeesOk,
+    'Err' : ExchangeError,
+  });
   const ClaimFeesOk = IDL.Record({
     'transferred0' : IDL.Nat,
     'transferred1' : IDL.Nat,
@@ -528,11 +553,58 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
-    'adminDrainExchange' : IDL.Func([IDL.Principal], [IDL.Text], []),
-    'adminDrainStatus' : IDL.Func([], [IDL.Text], ['query']),
+    'adminDeleteKlinesBefore' : IDL.Func([IDL.Int, IDL.Nat], [IDL.Text], []),
+    'adminDrainTestModeExchange' : IDL.Func([IDL.Principal], [IDL.Text], []),
+    'adminDrainTestModeStatus' : IDL.Func([], [IDL.Text], ['query']),
     'adminExecuteRouteStrategy' : IDL.Func(
         [IDL.Nat, IDL.Vec(SwapHop), IDL.Nat, IDL.Nat],
         [SwapResult],
+        [],
+      ),
+    'adminFindOptimalArb' : IDL.Func(
+        [IDL.Text, IDL.Nat, IDL.Nat, IDL.Nat, IDL.Nat, IDL.Nat],
+        [
+          IDL.Opt(
+            IDL.Record({
+              'efficiency' : IDL.Int,
+              'hopDetails' : IDL.Vec(HopDetail),
+              'probesRun' : IDL.Nat,
+              'efficiencyBps' : IDL.Int,
+              'amount' : IDL.Nat,
+              'outputAmount' : IDL.Nat,
+              'route' : IDL.Vec(SwapHop),
+            })
+          ),
+        ],
+        ['query'],
+      ),
+    'adminFlashArb' : IDL.Func(
+        [IDL.Nat, IDL.Vec(SwapHop), IDL.Nat],
+        [
+          IDL.Variant({
+            'Ok' : IDL.Record({
+              'realized' : IDL.Nat,
+              'grossProfit' : IDL.Nat,
+              'hops' : IDL.Nat,
+              'capitalSource' : IDL.Variant({
+                'lent' : IDL.Null,
+                'phantom' : IDL.Null,
+              }),
+              'transferFee' : IDL.Nat,
+              'inputTfees' : IDL.Nat,
+              'tradingFee' : IDL.Nat,
+              'notional' : IDL.Nat,
+              'swapId' : IDL.Nat,
+              'netProfit' : IDL.Nat,
+            }),
+            'Err' : IDL.Text,
+          }),
+        ],
+        [],
+      ),
+    'adminRepairLastTradedPriceAndKlines' : IDL.Func(
+        [IDL.Vec(IDL.Nat), IDL.Bool],
+        [IDL.Text],
         [],
       ),
     'batchAdjustLiquidity' : IDL.Func(
@@ -575,6 +647,7 @@ export const idlFactory = ({ IDL }) => {
         ],
         [],
       ),
+    'canTradeTokens' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], ['query']),
     'changeOwner2' : IDL.Func([IDL.Principal], [], []),
     'changeOwner3' : IDL.Func([IDL.Principal], [], []),
     'checkDiffs' : IDL.Func(
@@ -603,6 +676,8 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat))],
         ['query'],
       ),
+    'claimAllLPFees' : IDL.Func([], [ClaimAllLPFeesResult], []),
+    'claimConcentratedFees' : IDL.Func([IDL.Nat], [ClaimFeesResult], []),
     'claimFeesReferrer' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat))],
@@ -616,6 +691,7 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Bool],
         [],
       ),
+    'clearTokenArchiveOffset' : IDL.Func([IDL.Text], [IDL.Bool], []),
     'collectFees' : IDL.Func([], [ActionResult], []),
     'debugV3Ticks' : IDL.Func(
         [IDL.Text, IDL.Text],
@@ -802,6 +878,11 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getDriftOpTracker' : IDL.Func(
+        [],
+        [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Int))],
+        ['query'],
+      ),
     'getExpectedMultiHopAmount' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat],
         [
@@ -856,6 +937,59 @@ export const idlFactory = ({ IDL }) => {
                 IDL.Record({ 'amount_init' : IDL.Nat, 'amount_sell' : IDL.Nat })
               ),
               'expectedBuyAmount' : IDL.Nat,
+            })
+          ),
+        ],
+        ['query'],
+      ),
+    'getExpectedReceiveAmountBatchMulti' : IDL.Func(
+        [
+          IDL.Vec(
+            IDL.Record({
+              'tokenBuy' : IDL.Text,
+              'amountSell' : IDL.Nat,
+              'tokenSell' : IDL.Text,
+            })
+          ),
+          IDL.Nat,
+        ],
+        [
+          IDL.Vec(
+            IDL.Record({
+              'routes' : IDL.Vec(
+                IDL.Record({
+                  'fee' : IDL.Nat,
+                  'hopDetails' : IDL.Vec(HopDetail),
+                  'routeDescription' : IDL.Text,
+                  'canFulfillFully' : IDL.Bool,
+                  'routeTokens' : IDL.Vec(IDL.Text),
+                  'priceImpact' : IDL.Float64,
+                  'potentialOrderDetails' : IDL.Opt(
+                    IDL.Record({
+                      'amount_init' : IDL.Nat,
+                      'amount_sell' : IDL.Nat,
+                    })
+                  ),
+                  'expectedBuyAmount' : IDL.Nat,
+                })
+              ),
+              'splitSim' : IDL.Opt(
+                IDL.Record({
+                  'legs' : IDL.Vec(
+                    IDL.Record({
+                      'amountIn' : IDL.Nat,
+                      'expectedOut' : IDL.Nat,
+                      'route' : IDL.Vec(
+                        IDL.Record({
+                          'tokenIn' : IDL.Text,
+                          'tokenOut' : IDL.Text,
+                        })
+                      ),
+                    })
+                  ),
+                  'totalOut' : IDL.Nat,
+                })
+              ),
             })
           ),
         ],
@@ -986,6 +1120,11 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Opt(TradePosition)],
         ['query'],
       ),
+    'getTokenArchiveOffset' : IDL.Func(
+        [IDL.Text],
+        [IDL.Opt(IDL.Nat)],
+        ['query'],
+      ),
     'getTokenUSDPrices' : IDL.Func(
         [IDL.Float64, IDL.Float64],
         [
@@ -1072,6 +1211,24 @@ export const idlFactory = ({ IDL }) => {
       ),
     'getUserTrades' : IDL.Func([], [IDL.Vec(TradePrivate2)], ['query']),
     'get_cycles' : IDL.Func([], [IDL.Nat], ['query']),
+    'get_token_trends_7d' : IDL.Func(
+        [IDL.Vec(IDL.Principal)],
+        [
+          IDL.Variant({
+            'ok' : IDL.Vec(
+              IDL.Record({
+                'token' : IDL.Principal,
+                'change_pct_7d' : IDL.Float64,
+                'change_pct_24h' : IDL.Float64,
+                'price_now' : IDL.Float64,
+                'points' : IDL.Vec(IDL.Float64),
+              })
+            ),
+            'err' : IDL.Text,
+          }),
+        ],
+        ['query'],
+      ),
     'hmFee' : IDL.Func([], [IDL.Nat], ['query']),
     'hmRefFee' : IDL.Func([], [IDL.Nat], ['query']),
     'hmRevokeFee' : IDL.Func([], [IDL.Nat], ['query']),
@@ -1090,6 +1247,7 @@ export const idlFactory = ({ IDL }) => {
             'addToAllTimeBan' : IDL.Opt(IDL.Vec(IDL.Text)),
             'addAllowedCanisters' : IDL.Opt(IDL.Vec(IDL.Text)),
             'changeallowedSilentWarnings' : IDL.Opt(IDL.Nat),
+            'daoTreasuryPrincipalsText' : IDL.Opt(IDL.Vec(IDL.Text)),
           }),
         ],
         [],
@@ -1119,7 +1277,7 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Bool],
         [],
       ),
-    'refundStuckFunds' : IDL.Func([], [ActionResult], []),
+    'refundStuckFunds' : IDL.Func([], [IDL.Text], []),
     'removeConcentratedLiquidity' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat],
         [RemoveConcentratedResult],
@@ -1132,6 +1290,7 @@ export const idlFactory = ({ IDL }) => {
         [],
       ),
     'resetAllState' : IDL.Func([], [IDL.Text], []),
+    'resetDriftOpTracker' : IDL.Func([], [], []),
     'retrieveFundsDao' : IDL.Func(
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat64))],
         [],
@@ -1167,7 +1326,23 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'setMinimumAmount' : IDL.Func([IDL.Text, IDL.Nat], [ActionResult], []),
     'setTest' : IDL.Func([IDL.Bool], [], []),
+    'simulateSplitRoutes' : IDL.Func(
+        [
+          IDL.Vec(
+            IDL.Record({ 'amountIn' : IDL.Nat, 'route' : IDL.Vec(SwapHop) })
+          ),
+        ],
+        [
+          IDL.Record({
+            'perLegOut' : IDL.Vec(IDL.Nat),
+            'error' : IDL.Text,
+            'totalOut' : IDL.Nat,
+          }),
+        ],
+        ['query'],
+      ),
     'swapMultiHop' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Vec(SwapHop), IDL.Nat, IDL.Nat],
         [SwapResult],
@@ -1181,6 +1356,18 @@ export const idlFactory = ({ IDL }) => {
     'treasurySwap' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat, IDL.Nat],
         [SwapResult],
+        [],
+      ),
+    'updateTokenType' : IDL.Func(
+        [
+          IDL.Text,
+          IDL.Variant({
+            'ICP' : IDL.Null,
+            'ICRC3' : IDL.Null,
+            'ICRC12' : IDL.Null,
+          }),
+        ],
+        [ActionResult],
         [],
       ),
   });

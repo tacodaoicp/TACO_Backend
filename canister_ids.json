@@ -6,6 +6,9 @@
   "OTC_backend": {
     "ic": "qioex-5iaaa-aaaan-q52ba-cai"
   },
+  "buyback_canister": {
+    "ic": "cfl3o-5qaaa-aaaan-q6fga-cai"
+  },
   "dao_admin_archive": {
     "ic": "cspwf-4aaaa-aaaan-qz5ia-cai",
     "staging": "b6ygs-xaaaa-aaaan-qz5ca-cai"
@@ -25,10 +28,15 @@
   "exchange_treasury": {
     "ic": "qbnpl-laaaa-aaaan-q52aq-cai"
   },
+  "nachos_index": {
+    "ic": "ozme7-gaaaa-aaaan-q6duq-cai"
+  },
   "nachos_ledger": {
+    "ic": "o6ncl-lyaaa-aaaan-q6dua-cai",
     "staging": "pabnq-2qaaa-aaaam-qhryq-cai"
   },
   "nachos_vault": {
+    "ic": "ptdgf-eqaaa-aaaan-q6dtq-cai",
     "staging": "p4nog-baaaa-aaaad-qkwpa-cai"
   },
   "neuronSnapshot": {

@@ -49,6 +49,7 @@ module {
     kind : Text;
     mint : ?Mint;
     timestamp : Nat64;
+    index : ?Nat;
     transfer : ?Transfer;
   };
   public type Transfer = {

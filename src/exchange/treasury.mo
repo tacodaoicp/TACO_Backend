@@ -353,6 +353,26 @@ shared (deployer) persistent actor class treasury() = this {
     Vector.size(transferQueue);
   };
 
+  // Sum of pending outgoing-transfer amounts grouped by token. Used by checkDiffs
+  // on the exchange to discount tokens that are queued to leave the treasury but
+  // haven't been transmitted to the ledger yet, so positive-drift detection isn't
+  // confused by transient queue depth (e.g. a removeConcentratedLiquidity payout
+  // sitting between debit-from-internal-state and ledger-side execution).
+  public query ({ caller }) func getPendingTransfersByToken() : async [(Text, Nat)] {
+    let sums = Map.new<Text, Nat>();
+    for (transfer in Vector.vals(transferQueue)) {
+      let token = transfer.2;
+      let amount = transfer.1;
+      let cur = switch (Map.get(sums, thash, token)) { case (?n) { n }; case null { 0 } };
+      Map.set(sums, thash, token, cur + amount);
+    };
+    let out = Vector.new<(Text, Nat)>();
+    for ((token, amount) in Map.entries(sums)) {
+      Vector.add(out, (token, amount));
+    };
+    Vector.toArray(out);
+  };
+
   //This function is set to update each tokens decimals, transferfee and name. This is also important as the exchange calls the function named getTokenInfo to get the same data.
   private func updateTokenInfoTimer() : async () {
     let timersize = Vector.size(tokenInfoTimerIDs);
@@ -569,6 +589,7 @@ shared (deployer) persistent actor class treasury() = this {
       #drainTransferQueue : () -> ();
       #getAcceptedtokens : () -> (a : [Text]);
       #getPendingTransferCount : () -> ();
+      #getPendingTransfersByToken : () -> ();
       #getTokenInfo : () -> ();
       #receiveTransferTasks :
         () -> (tempTransferQueue : [(TransferRecipient, Nat, Text, Text)]);

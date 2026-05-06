@@ -543,6 +543,10 @@ module {
   };
 
   // TACO quote with route info (for multi-route detection)
+  // routeTokens is the canonical [tokenSell, …intermediates, tokenBuy] form — used by
+  // the treasury scenario builder to identify the same route across different fractions
+  // and to compute pool-key sets for the disjointness filter on TACO×TACO splits.
+  // Empty for legacy single-route quotes; populated by the multi-route batch wrapper.
   public type TACOQuoteReply = {
     receive_amount : Nat;
     price : Float;
@@ -551,6 +555,7 @@ module {
     route : [{ tokenIn : Text; tokenOut : Text }];
     routeDescription : Text;
     canFulfillFully : Bool;
+    routeTokens : [Text];
   };
 
   // TACO split leg for swapSplitRoutes execution

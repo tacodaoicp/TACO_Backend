@@ -7,6 +7,7 @@ import Treasury_types "../treasury/treasury_types";
 import DAO_types "../DAO_backend/dao_types";
 import NachosTypes "../nachos_vault/nachos_vault_types";
 import TacoSwapTypes "../taco_swap/taco_swap_types";
+import BuybackTypes "../buyback_canister/buyback_canister_types";
 import Nat "mo:base/Nat";
 
 persistent actor validation {
@@ -379,6 +380,42 @@ persistent actor validation {
     };
 
 // ==============================
+// NACHO ledger GNSF — treasury transfer
+// ==============================
+// Equivalent of TransferSnsTreasuryFunds for the NACHO token. The built-in
+// SNS treasury action only handles ICP (treasury=1) and TACO (treasury=2);
+// NACHO sits in the SNS Governance canister's main account from genesis but
+// has no native transfer path. This validator pairs with target
+// (canister=o6ncl-lyaaa-aaaan-q6dua-cai, method=icrc1_transfer) so that an
+// ExecuteGenericNervousSystemFunction proposal calls NACHO ledger directly —
+// SNS Governance is the caller, NACHO is debited from its own account.
+
+    public query func validate_transfer_nacho_treasury(arg : {
+      to : { owner : Principal; subaccount : ?Subaccount };
+      amount : Nat;
+      fee : ?Nat;
+      memo : ?Blob;
+      from_subaccount : ?Subaccount;
+      created_at_time : ?Nat64;
+    }) : async ValidationResult {
+      if (arg.amount == 0) return #Err("amount must be > 0");
+      let toAcct = "owner=" # Principal.toText(arg.to.owner) #
+                   " subaccount=" # debug_show(arg.to.subaccount);
+      let fromSub = switch (arg.from_subaccount) {
+        case (?b) { "subaccount=" # debug_show(b) };
+        case null { "main account" };
+      };
+      #Ok(
+        "Transfer NACHO from SNS treasury (" # fromSub # ")" #
+        " → " # toAcct #
+        "; amount=" # debug_show(arg.amount) # " e8s" #
+        "; fee=" # debug_show(arg.fee) #
+        "; memo=" # debug_show(arg.memo) #
+        "; created_at_time=" # debug_show(arg.created_at_time)
+      );
+    };
+
+// ==============================
 // nachos_vault.mo GNSF Admin functions
 // ==============================
 
@@ -537,6 +574,131 @@ persistent actor validation {
 
     public query func validate_recoverTacoSwapPoolBalances() : async ValidationResult {
       #Ok("recoverTacoSwapPoolBalances: Recover stuck tokens from ICPSwap pools");
+    };
+
+    // ──────────────────────────────────────────────────────────────
+    // Vault claim validator (vault function used by buyback canister)
+    // ──────────────────────────────────────────────────────────────
+
+    public query func validate_claimAllFees(recipient : Principal, recipientSubaccount : ?Subaccount) : async ValidationResult {
+      #Ok("claimAllFees recipient=" # Principal.toText(recipient) # " subaccount=" # debug_show(recipientSubaccount));
+    };
+
+    // ──────────────────────────────────────────────────────────────
+    // Buyback canister validators
+    // ──────────────────────────────────────────────────────────────
+
+    public query func validate_updateBuybackConfig(patch : BuybackTypes.BuybackConfigUpdate) : async ValidationResult {
+      switch (patch.intervalNS) {
+        case (?v) {
+          if (v < 3_600_000_000_000 or v > 30 * 86_400_000_000_000) {
+            return #Err("intervalNS out of range [1 hour, 30 days]");
+          };
+        };
+        case null {};
+      };
+      switch (patch.minTokenValueICP) {
+        case (?v) { if (v == 0) { return #Err("minTokenValueICP must be > 0") } };
+        case null {};
+      };
+      switch (patch.arbDepth) {
+        case (?v) { if (v < 2 or v > 6) { return #Err("arbDepth out of range [2, 6]") } };
+        case null {};
+      };
+      switch (patch.arbTernaryProbes) {
+        case (?v) { if (v < 3 or v > 20) { return #Err("arbTernaryProbes out of range [3, 20]") } };
+        case null {};
+      };
+      switch (patch.arbMaxIterations) {
+        case (?v) { if (v < 1 or v > 50) { return #Err("arbMaxIterations out of range [1, 50]") } };
+        case null {};
+      };
+      switch (patch.arbMaxRoutesPerAnalysis) {
+        case (?v) { if (v < 1 or v > 20) { return #Err("arbMaxRoutesPerAnalysis out of range [1, 20]") } };
+        case null {};
+      };
+      switch (patch.arbSettlementTimeoutMs) {
+        case (?v) { if (v < 5_000 or v > 120_000) { return #Err("arbSettlementTimeoutMs out of range [5000, 120000]") } };
+        case null {};
+      };
+      switch (patch.arbProfitSlippageBps) {
+        case (?v) { if (v > 10000) { return #Err("arbProfitSlippageBps out of range [0, 10000]") } };
+        case null {};
+      };
+      // enabled=true outside production is enforced at runtime in the buyback canister
+      #Ok("updateBuybackConfig patch: " # debug_show(patch));
+    };
+
+    public query func validate_triggerBuybackNow() : async ValidationResult {
+      #Ok("triggerBuybackNow: run one buyback cycle synchronously on the buyback canister");
+    };
+
+    public query func validate_syncTokenDetailsFromTreasury() : async ValidationResult {
+      #Ok("syncTokenDetailsFromTreasury: pull fresh price/decimals/fee from treasury into buyback cache");
+    };
+
+    public query func validate_adminWithdraw(token : Principal, to : Principal, amount : Nat) : async ValidationResult {
+      #Ok("adminWithdraw token=" # Principal.toText(token) # " to=" # Principal.toText(to) # " amount=" # debug_show(amount) # " (controllers only — emergency recovery)");
+    };
+
+    public query func validate_adminBurnNow() : async ValidationResult {
+      #Ok("adminBurnNow: trigger TACO burn outside the daily cycle");
+    };
+
+    public query func validate_emergencyStop(reason : Text) : async ValidationResult {
+      #Ok("emergencyStop: cancel timer, clear cycleInProgress, set enabled=false. Reason: " # reason);
+    };
+
+    // ── Exchange (OTC_backend) batch LP fee claim ──
+    // User-callable: claims every unclaimed LP fee across the caller's V3
+    // (concentratedPositions) and V2 (userLiquidityPositions) entries in a
+    // single message. Per-position math identical to the existing single-position
+    // functions (claimLPFees / claimConcentratedFees / batchClaimAllFees).
+    // Transfers consolidated by token; saved ledger fees recovered to feescollectedDAO.
+    public query func validate_claimAllLPFees() : async ValidationResult {
+      #Ok(
+        "claimAllLPFees: harvest all LP fees across the caller's V3 unified positions" #
+        " (full-range + concentrated) and V2 legacy positions in one call." #
+        " Per-position math mirrors claimLPFees/claimConcentratedFees/batchClaimAllFees." #
+        " Transfers consolidate by (recipient, token); saved ledger fees recovered to" #
+        " feescollectedDAO. Single inter-canister flush. User-callable; identical drift" #
+        " profile to N single-position calls."
+      );
+    };
+
+    // ── Exchange (OTC_backend) flash arbitrage ──
+    // Buyback-canister-only; the exchange's inspect block rejects all other callers
+    // at ingress. Validator documents the call shape for SNS proposal previews.
+    public query func validate_adminFlashArb(
+      notional : Nat,
+      route : [{ tokenIn : Text; tokenOut : Text }],
+      minProfit : Nat,
+    ) : async ValidationResult {
+      let hopCount = route.size();
+      if (notional == 0) return #Err("notional must be > 0");
+      if (hopCount < 2 or hopCount > 6) return #Err("route must have 2-6 hops");
+      if (route[0].tokenIn != route[hopCount - 1].tokenOut) {
+        return #Err("route must be circular: route[0].tokenIn must equal route[last].tokenOut");
+      };
+      var i = 0;
+      var routeStr = route[0].tokenIn;
+      while (i < hopCount) {
+        if (i > 0 and route[i].tokenIn != route[i - 1].tokenOut) {
+          return #Err("route broken at hop " # debug_show(i));
+        };
+        routeStr := routeStr # " → " # route[i].tokenOut;
+        i += 1;
+      };
+      #Ok(
+        "adminFlashArb (BUYBACK-CANISTER-ONLY): notional=" # debug_show(notional) #
+        " minProfit=" # debug_show(minProfit) #
+        " hops=" # debug_show(hopCount) #
+        " route=" # routeStr #
+        ". Exchange lends notional from feescollectedDAO[" # route[0].tokenIn #
+        "] (or runs phantom mode), executes circular route, traps if grossProfit" #
+        " < minProfit + tradingFee + inputTfees + transferFee." #
+        " Profit guard guarantees recipient gets netProfit > 0 or message reverts."
+      );
     };
 
 }

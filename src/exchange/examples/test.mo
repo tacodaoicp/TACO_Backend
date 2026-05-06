@@ -4780,6 +4780,8 @@ shared (deployer) persistent actor class test() = this {
   stable var timer9TotalOperations = 0;
   stable var timer10OperationsComplete = 0;
   stable var timer10TotalOperations = 0;
+  stable var timer11OperationsComplete = 0;
+  stable var timer11TotalOperations = 0;
 
   stable var currentTimerRunning = 0;
 
@@ -4830,6 +4832,9 @@ shared (deployer) persistent actor class test() = this {
       currentTimerRunning := 10;
       startTimer10(skipCancelAllPositions);
     } else if (currentTimerRunning == 10 and timer10OperationsComplete + 3 > timer10TotalOperations and timer10OperationsComplete < timer10TotalOperations + 3) {
+      currentTimerRunning := 11;
+      startTimer11(skipCancelAllPositions);
+    } else if (currentTimerRunning == 11 and timer11OperationsComplete == timer11TotalOperations) {
       await printFinalResults();
       Debug.print("All stress tests completed.");
     } else {
@@ -5965,6 +5970,340 @@ shared (deployer) persistent actor class test() = this {
     );
   };
 
+  // Timer11: LP Roundtrip Accounting — regression guard for the AMM fee
+  // double-booking bug (where the 70% LP portion was tracked in both
+  // feeGrowthGlobal AND feescollectedDAO, letting LPs extract tokens from pool
+  // reserves that were also earmarked for DAO sweep). Runs three phases:
+  //   A. Bare add+remove (no swap)  → user must break even (± transfer-fee dust)
+  //   B. 3× add + cross-swap + remove → user earns legitimate LP fees only
+  //   C. Concentrated (V3) add + cross-swap + claimLPFees + remove → exercises
+  //      the V3 feeGrowthInside path that was the bug's primary mechanism
+  // An attack is flagged when the user gains tokens without corresponding
+  // swap-fee income (Phase A) or gains tokens on BOTH sides simultaneously
+  // (Phases B/C — impossible without minting).
+  func startTimer11<system>(skipCancelAllPositions : Bool) {
+    currentTimerRunning := 11;
+    timer11TotalOperations := 1;
+    timer11OperationsComplete := 0;
+
+    ignore setTimer(
+      #nanoseconds(1),
+      func() : async () {
+        try {
+          await logDiffTable("Before Timer 11 (LP Roundtrip Accounting)");
+
+          let tokenICP = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+          let tokenICRCA = "mxzaz-hqaaa-aaaar-qaada-cai";
+
+          // ===== Phase A: bare add + immediate remove (no swap) =====
+          Debug.print("\n=== Timer 11 Phase A: bare add+remove (no swap) — ICP/ICRCA ===");
+          let preA_icp = await actorA.getICPbalance();
+          let preA_icrca = await actorA.getICRCAbalance();
+          Debug.print("Phase A pre: ICP=" # Nat.toText(preA_icp) # " ICRCA=" # Nat.toText(preA_icrca));
+
+          let addAmt : Nat = 200_000_000;
+          let blkAicp = await actorA.TransferICPtoExchange(addAmt, fee, 1);
+          let blkAicrca = await actorA.TransferICRCAtoExchange(addAmt, fee, 1);
+          let addResA = await actorA.addLiquidity(tokenICP, tokenICRCA, addAmt, addAmt, blkAicp, blkAicrca);
+          Debug.print("Phase A addLiquidity: " # addResA);
+
+          let posA1 = await actorA.getUserLiquidityDetailed();
+          for (p in posA1.vals()) {
+            if ((p.token0 == tokenICP and p.token1 == tokenICRCA) or (p.token0 == tokenICRCA and p.token1 == tokenICP)) {
+              let r = await actorA.removeLiquidity(p.token0, p.token1, p.liquidity);
+              Debug.print("Phase A removeLiquidity: " # r);
+            };
+          };
+
+          for (_ in Iter.range(0, 9)) { await async {} };
+          ignore await actorA.claimFees();
+
+          let postA_icp = await actorA.getICPbalance();
+          let postA_icrca = await actorA.getICRCAbalance();
+          let diffA_icp : Int = postA_icp - preA_icp;
+          let diffA_icrca : Int = postA_icrca - preA_icrca;
+          Debug.print("Phase A post: ICP=" # Nat.toText(postA_icp) # " ICRCA=" # Nat.toText(postA_icrca));
+          Debug.print("Phase A diff: ICP=" # debug_show (diffA_icp) # " ICRCA=" # debug_show (diffA_icrca));
+
+          // With no swap activity there is nothing for the LP to earn. The user
+          // must not leave the roundtrip with MORE tokens than they started.
+          if (diffA_icp > 100_000 or diffA_icrca > 100_000) {
+            let msg = "Timer 11 Phase A ATTACK: user gained tokens without swap activity; ICP=" # debug_show (diffA_icp) # " ICRCA=" # debug_show (diffA_icrca);
+            Vector.add(errMess, msg);
+            Debug.print(msg);
+          };
+          // Also shouldn't lose more than transfer-fee overhead (~10k sat per transfer × ~6 transfers).
+          if (diffA_icp < -1_000_000 or diffA_icrca < -1_000_000) {
+            let msg = "Timer 11 Phase A SUSPICIOUS: user lost more than transfer overhead in bare roundtrip; ICP=" # debug_show (diffA_icp) # " ICRCA=" # debug_show (diffA_icrca);
+            Vector.add(errMess, msg);
+            Debug.print(msg);
+          };
+
+          await logDiffTable("After Timer 11 Phase A (bare add/remove)");
+
+          // ===== Phase B: 3× add + cross-swap + remove =====
+          Debug.print("\n=== Timer 11 Phase B: 3x add/swap/remove — ICP/ICRCA ===");
+          let preB_icp = await actorA.getICPbalance();
+          let preB_icrca = await actorA.getICRCAbalance();
+          Debug.print("Phase B pre: ICP=" # Nat.toText(preB_icp) # " ICRCA=" # Nat.toText(preB_icrca));
+
+          var roundB : Nat = 0;
+          while (roundB < 3) {
+            roundB += 1;
+            Debug.print("Phase B round " # Nat.toText(roundB));
+
+            let blkIcp = await actorA.TransferICPtoExchange(addAmt, fee, 1);
+            let blkIcrca = await actorA.TransferICRCAtoExchange(addAmt, fee, 1);
+            let addR = await actorA.addLiquidity(tokenICP, tokenICRCA, addAmt, addAmt, blkIcp, blkIcrca);
+            Debug.print("Phase B r" # Nat.toText(roundB) # " add: " # addR);
+
+            let swapAmt : Nat = 50_000_000;
+            let blkB = await actorB.TransferICRCAtoExchange(swapAmt, fee, 1);
+            let rB = await actorB.swapMultiHop(tokenICRCA, tokenICP, swapAmt, [{ tokenIn = tokenICRCA; tokenOut = tokenICP }], 0, blkB);
+            Debug.print("Phase B r" # Nat.toText(roundB) # " swapB: " # rB);
+
+            let blkC = await actorC.TransferICPtoExchange(swapAmt, fee, 1);
+            let rC = await actorC.swapMultiHop(tokenICP, tokenICRCA, swapAmt, [{ tokenIn = tokenICP; tokenOut = tokenICRCA }], 0, blkC);
+            Debug.print("Phase B r" # Nat.toText(roundB) # " swapC: " # rC);
+
+            let posB = await actorA.getUserLiquidityDetailed();
+            for (p in posB.vals()) {
+              if ((p.token0 == tokenICP and p.token1 == tokenICRCA) or (p.token0 == tokenICRCA and p.token1 == tokenICP)) {
+                let r = await actorA.removeLiquidity(p.token0, p.token1, p.liquidity);
+                Debug.print("Phase B r" # Nat.toText(roundB) # " remove: " # r);
+              };
+            };
+          };
+
+          for (_ in Iter.range(0, 9)) { await async {} };
+          ignore await actorA.claimFees();
+
+          let postB_icp = await actorA.getICPbalance();
+          let postB_icrca = await actorA.getICRCAbalance();
+          let diffB_icp : Int = postB_icp - preB_icp;
+          let diffB_icrca : Int = postB_icrca - preB_icrca;
+          Debug.print("Phase B post: ICP=" # Nat.toText(postB_icp) # " ICRCA=" # Nat.toText(postB_icrca));
+          Debug.print("Phase B diff: ICP=" # debug_show (diffB_icp) # " ICRCA=" # debug_show (diffB_icrca));
+          Debug.print("Phase B note: single-sided gain + other-side loss is normal (impermanent loss + fees). Gain on BOTH sides is an attack.");
+
+          if (diffB_icp > 500_000 and diffB_icrca > 500_000) {
+            let msg = "Timer 11 Phase B ATTACK: user gained tokens on BOTH sides from LP/swap cycle; ICP=" # debug_show (diffB_icp) # " ICRCA=" # debug_show (diffB_icrca);
+            Vector.add(errMess, msg);
+            Debug.print(msg);
+          };
+
+          await logDiffTable("After Timer 11 Phase B (3x add/swap/remove)");
+
+          // V3 price-range conventions: priceRatio is reserve1/reserve0 scaled
+          // by tenToPower60. Full-range positions MUST be created via addLiquidity
+          // (main.mo:3379 rejects FULL_RANGE sentinels in addConcentratedLiquidity).
+          let tenToPower60 : Nat = 1_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000;
+
+          let cAddAmt : Nat = 300_000_000;
+          let cSwapAmt : Nat = 80_000_000;
+
+          // Phase C: FULL-RANGE via addLiquidity (V2 API that auto-creates a V3
+          // full-range concentrated position at FULL_RANGE_LOWER/UPPER).
+          Debug.print("\n=== Timer 11 Phase C (full-range via addLiquidity) ===");
+          let preC_icp = await actorA.getICPbalance();
+          let preC_icrca = await actorA.getICRCAbalance();
+          Debug.print("Phase C pre: ICP=" # Nat.toText(preC_icp) # " ICRCA=" # Nat.toText(preC_icrca));
+
+          let bCicp = await actorA.TransferICPtoExchange(cAddAmt, fee, 1);
+          let bCicrca = await actorA.TransferICRCAtoExchange(cAddAmt, fee, 1);
+          let addC = await actorA.addLiquidity(tokenICP, tokenICRCA, cAddAmt, cAddAmt, bCicp, bCicrca);
+          Debug.print("Phase C addLiquidity (full-range): " # addC);
+
+          let bCswapB = await actorB.TransferICRCAtoExchange(cSwapAmt, fee, 1);
+          let rCswapB = await actorB.swapMultiHop(tokenICRCA, tokenICP, cSwapAmt, [{ tokenIn = tokenICRCA; tokenOut = tokenICP }], 0, bCswapB);
+          Debug.print("Phase C swapB: " # rCswapB);
+
+          let bCswapC = await actorC.TransferICPtoExchange(cSwapAmt, fee, 1);
+          let rCswapC = await actorC.swapMultiHop(tokenICP, tokenICRCA, cSwapAmt, [{ tokenIn = tokenICP; tokenOut = tokenICRCA }], 0, bCswapC);
+          Debug.print("Phase C swapC: " # rCswapC);
+
+          let claimC = await actorA.claimLPFees(tokenICP, tokenICRCA);
+          Debug.print("Phase C claimLPFees: " # claimC);
+
+          let posC = await actorA.getUserLiquidityDetailed();
+          for (p in posC.vals()) {
+            if ((p.token0 == tokenICP and p.token1 == tokenICRCA) or (p.token0 == tokenICRCA and p.token1 == tokenICP)) {
+              let r = await actorA.removeLiquidity(p.token0, p.token1, p.liquidity);
+              Debug.print("Phase C removeLiquidity: " # r);
+            };
+          };
+
+          for (_ in Iter.range(0, 9)) { await async {} };
+          ignore await actorA.claimFees();
+
+          let postC_icp = await actorA.getICPbalance();
+          let postC_icrca = await actorA.getICRCAbalance();
+          let diffC_icp : Int = postC_icp - preC_icp;
+          let diffC_icrca : Int = postC_icrca - preC_icrca;
+          Debug.print("Phase C post: ICP=" # Nat.toText(postC_icp) # " ICRCA=" # Nat.toText(postC_icrca));
+          Debug.print("Phase C diff: ICP=" # debug_show (diffC_icp) # " ICRCA=" # debug_show (diffC_icrca));
+          if (diffC_icp > 500_000 and diffC_icrca > 500_000) {
+            let msg = "Timer 11 Phase C ATTACK: full-range LP gained on BOTH sides; ICP=" # debug_show (diffC_icp) # " ICRCA=" # debug_show (diffC_icrca);
+            Vector.add(errMess, msg);
+            Debug.print(msg);
+          };
+
+          await logDiffTable("After Timer 11 Phase C (full-range V2 LP)");
+
+          // Phase D: NARROW concentrated V3 (±25% around midRatio).
+          Debug.print("\n=== Timer 11 Phase D (narrow ±25% V3) ===");
+          let preD_icp = await actorA.getICPbalance();
+          let preD_icrca = await actorA.getICRCAbalance();
+          Debug.print("Phase D pre: ICP=" # Nat.toText(preD_icp) # " ICRCA=" # Nat.toText(preD_icrca));
+
+          let midForD = switch (await exchange.getAMMPoolInfo(tokenICP, tokenICRCA)) {
+            case (?pool) {
+              if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+                (pool.reserve1 * tenToPower60) / pool.reserve0;
+              } else { tenToPower60 };
+            };
+            case null { tenToPower60 };
+          };
+          let narrowLower = midForD * 75 / 100;
+          let narrowUpper = midForD * 125 / 100;
+
+          let bDicp = await actorA.TransferICPtoExchange(cAddAmt, fee, 1);
+          let bDicrca = await actorA.TransferICRCAtoExchange(cAddAmt, fee, 1);
+          let addD = await actorA.addConcentratedLiquidity(tokenICP, tokenICRCA, cAddAmt, cAddAmt, narrowLower, narrowUpper, bDicp, bDicrca);
+          Debug.print("Phase D addConcentrated: " # addD);
+
+          let bDswapB = await actorB.TransferICRCAtoExchange(cSwapAmt, fee, 1);
+          let rDswapB = await actorB.swapMultiHop(tokenICRCA, tokenICP, cSwapAmt, [{ tokenIn = tokenICRCA; tokenOut = tokenICP }], 0, bDswapB);
+          Debug.print("Phase D swapB: " # rDswapB);
+
+          let bDswapC = await actorC.TransferICPtoExchange(cSwapAmt, fee, 1);
+          let rDswapC = await actorC.swapMultiHop(tokenICP, tokenICRCA, cSwapAmt, [{ tokenIn = tokenICP; tokenOut = tokenICRCA }], 0, bDswapC);
+          Debug.print("Phase D swapC: " # rDswapC);
+
+          let claimD = await actorA.claimLPFees(tokenICP, tokenICRCA);
+          Debug.print("Phase D claimLPFees: " # claimD);
+
+          let posD = await actorA.getUserConcentratedPositions();
+          for (pos in posD.vals()) {
+            if ((pos.token0 == tokenICP and pos.token1 == tokenICRCA) or (pos.token0 == tokenICRCA and pos.token1 == tokenICP)) {
+              let r = await actorA.removeConcentratedLiquidity(pos.token0, pos.token1, pos.positionId, pos.liquidity);
+              Debug.print("Phase D removeConc posId=" # Nat.toText(pos.positionId) # ": " # r);
+            };
+          };
+
+          for (_ in Iter.range(0, 9)) { await async {} };
+          ignore await actorA.claimFees();
+
+          let postD_icp = await actorA.getICPbalance();
+          let postD_icrca = await actorA.getICRCAbalance();
+          let diffD_icp : Int = postD_icp - preD_icp;
+          let diffD_icrca : Int = postD_icrca - preD_icrca;
+          Debug.print("Phase D post: ICP=" # Nat.toText(postD_icp) # " ICRCA=" # Nat.toText(postD_icrca));
+          Debug.print("Phase D diff: ICP=" # debug_show (diffD_icp) # " ICRCA=" # debug_show (diffD_icrca));
+          if (diffD_icp > 500_000 and diffD_icrca > 500_000) {
+            let msg = "Timer 11 Phase D ATTACK: narrow V3 LP gained on BOTH sides; ICP=" # debug_show (diffD_icp) # " ICRCA=" # debug_show (diffD_icrca);
+            Vector.add(errMess, msg);
+            Debug.print(msg);
+          };
+
+          await logDiffTable("After Timer 11 Phase D (narrow V3 LP)");
+
+          // Phase E: MIX — one full-range + one narrow position open
+          // simultaneously. Cross-swap moves price; both positions share
+          // fees proportionally via feeGrowthInside. On removal, each must
+          // return only what it's entitled to (no double-count across
+          // positions).
+          Debug.print("\n=== Timer 11 Phase E: MIX full-range + narrow concentrated ===");
+          let preE_icp = await actorA.getICPbalance();
+          let preE_icrca = await actorA.getICRCAbalance();
+          Debug.print("Phase E pre: ICP=" # Nat.toText(preE_icp) # " ICRCA=" # Nat.toText(preE_icrca));
+
+          // Full-range via addLiquidity (V2 API creates a V3 full-range position).
+          let bE1_icp = await actorA.TransferICPtoExchange(cAddAmt, fee, 1);
+          let bE1_icrca = await actorA.TransferICRCAtoExchange(cAddAmt, fee, 1);
+          let addE_full = await actorA.addLiquidity(tokenICP, tokenICRCA, cAddAmt, cAddAmt, bE1_icp, bE1_icrca);
+          Debug.print("Phase E add full-range (addLiquidity): " # addE_full);
+
+          let midForE = switch (await exchange.getAMMPoolInfo(tokenICP, tokenICRCA)) {
+            case (?pool) {
+              if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+                (pool.reserve1 * tenToPower60) / pool.reserve0;
+              } else { tenToPower60 };
+            };
+            case null { tenToPower60 };
+          };
+          let eNarrowLower = midForE * 90 / 100;
+          let eNarrowUpper = midForE * 110 / 100;
+
+          let bE2_icp = await actorA.TransferICPtoExchange(cAddAmt, fee, 1);
+          let bE2_icrca = await actorA.TransferICRCAtoExchange(cAddAmt, fee, 1);
+          let addE_narrow = await actorA.addConcentratedLiquidity(tokenICP, tokenICRCA, cAddAmt, cAddAmt, eNarrowLower, eNarrowUpper, bE2_icp, bE2_icrca);
+          Debug.print("Phase E add narrow ±10%: " # addE_narrow);
+
+          // Cross-swap to push price out of the narrow band (tests boundary accounting).
+          let bEswapB = await actorB.TransferICRCAtoExchange(cSwapAmt * 2, fee, 1);
+          let rEswapB = await actorB.swapMultiHop(tokenICRCA, tokenICP, cSwapAmt * 2, [{ tokenIn = tokenICRCA; tokenOut = tokenICP }], 0, bEswapB);
+          Debug.print("Phase E swapB (push narrow out): " # rEswapB);
+
+          let bEswapC = await actorC.TransferICPtoExchange(cSwapAmt, fee, 1);
+          let rEswapC = await actorC.swapMultiHop(tokenICP, tokenICRCA, cSwapAmt, [{ tokenIn = tokenICP; tokenOut = tokenICRCA }], 0, bEswapC);
+          Debug.print("Phase E swapC (small): " # rEswapC);
+
+          let claimE = await actorA.claimLPFees(tokenICP, tokenICRCA);
+          Debug.print("Phase E claimLPFees: " # claimE);
+
+          // Remove narrow V3 position first via removeConcentratedLiquidity,
+          // then the full-range position via removeLiquidity (V2 API).
+          let positionsE = await actorA.getUserConcentratedPositions();
+          for (pos in positionsE.vals()) {
+            if ((pos.token0 == tokenICP and pos.token1 == tokenICRCA) or (pos.token0 == tokenICRCA and pos.token1 == tokenICP)) {
+              // FULL_RANGE_LOWER sentinel = 10^20 (main.mo:609). Full-range
+              // positions created by addLiquidity carry ratioLower == 10^20;
+              // narrow concentrated positions carry much larger snapped ticks
+              // (on the order of 10^60 for ~1:1 prices). Use the exact sentinel
+              // check to route the removal through the correct API.
+              if (pos.ratioLower == 100_000_000_000_000_000_000) {
+                let r = await actorA.removeLiquidity(pos.token0, pos.token1, pos.liquidity);
+                Debug.print("Phase E removeLiquidity (full-range) posId=" # Nat.toText(pos.positionId) # ": " # r);
+              } else {
+                let r = await actorA.removeConcentratedLiquidity(pos.token0, pos.token1, pos.positionId, pos.liquidity);
+                Debug.print("Phase E removeConc (narrow) posId=" # Nat.toText(pos.positionId) # ": " # r);
+              };
+            };
+          };
+
+          for (_ in Iter.range(0, 9)) { await async {} };
+          ignore await actorA.claimFees();
+
+          let postE_icp = await actorA.getICPbalance();
+          let postE_icrca = await actorA.getICRCAbalance();
+          let diffE_icp : Int = postE_icp - preE_icp;
+          let diffE_icrca : Int = postE_icrca - preE_icrca;
+          Debug.print("Phase E post: ICP=" # Nat.toText(postE_icp) # " ICRCA=" # Nat.toText(postE_icrca));
+          Debug.print("Phase E diff: ICP=" # debug_show (diffE_icp) # " ICRCA=" # debug_show (diffE_icrca));
+
+          if (diffE_icp > 1_000_000 and diffE_icrca > 1_000_000) {
+            let msg = "Timer 11 Phase E ATTACK: mixed V3 positions gained tokens on BOTH sides; ICP=" # debug_show (diffE_icp) # " ICRCA=" # debug_show (diffE_icrca);
+            Vector.add(errMess, msg);
+            Debug.print(msg);
+          };
+
+          await logDiffTable("After Timer 11 Phase E (mixed full-range + narrow)");
+
+          await logDiffTable("After Timer 11 (LP Roundtrip Accounting)");
+          timer11OperationsComplete += 1;
+          await checkAndStartNextTimer(skipCancelAllPositions);
+        } catch (ERR) {
+          Vector.add(errMess, "Timer 11: " # Error.message(ERR));
+          Debug.print("Timer 11 error: " # Error.message(ERR));
+          error += 1;
+          timer11OperationsComplete += 1;
+          await checkAndStartNextTimer(skipCancelAllPositions);
+        };
+      },
+    );
+  };
+
   public func runStressTests(skipCancelAllPositions : Bool) : async () {
     // Reset all counters and flags
     timer1OperationsComplete := 0;
@@ -5977,6 +6316,7 @@ shared (deployer) persistent actor class test() = this {
     timer8OperationsComplete := 0;
     timer9OperationsComplete := 0;
     timer10OperationsComplete := 0;
+    timer11OperationsComplete := 0;
 
     currentTimerRunning := 0;
 
@@ -6028,7 +6368,7 @@ shared (deployer) persistent actor class test() = this {
   };
 
   public func printFinalResults() : async () {
-    if (currentTimerRunning == 10 and timer10OperationsComplete == timer10TotalOperations) {
+    if (currentTimerRunning == 11 and timer11OperationsComplete == timer11TotalOperations) {
       Debug.print("\n\nAll Difference Tables:\n");
       for (log in diffLogs.vals()) {
         Debug.print(log);
@@ -6062,6 +6402,7 @@ shared (deployer) persistent actor class test() = this {
       Debug.print("Timer 8 (Multi-Hop) operations completed: " # debug_show (timer8OperationsComplete) # " / " # debug_show (timer8TotalOperations));
       Debug.print("Timer 9 (New Features) operations completed: " # debug_show (timer9OperationsComplete) # " / " # debug_show (timer9TotalOperations));
       Debug.print("Timer 10 (Split Routes) operations completed: " # debug_show (timer10OperationsComplete) # " / " # debug_show (timer10TotalOperations));
+      Debug.print("Timer 11 (LP Roundtrip Accounting) operations completed: " # debug_show (timer11OperationsComplete) # " / " # debug_show (timer11TotalOperations));
       timer1OperationsComplete := 0;
       timer2OperationsComplete := 0;
       timer3OperationsComplete := 0;
@@ -6072,6 +6413,7 @@ shared (deployer) persistent actor class test() = this {
       timer8OperationsComplete := 0;
       timer9OperationsComplete := 0;
       timer10OperationsComplete := 0;
+      timer11OperationsComplete := 0;
 
       timer1TotalOperations := 0;
       timer2TotalOperations := 0;
@@ -6083,6 +6425,7 @@ shared (deployer) persistent actor class test() = this {
       timer8TotalOperations := 0;
       timer9TotalOperations := 0;
       timer10TotalOperations := 0;
+      timer11TotalOperations := 0;
 
       Debug.print("\nStress test took " # debug_show (((now() - stressTestStarted) / 1000000000) - 8) # " seconds");
       Debug.print("To run the stress test again without deleting all orders at the end, use: dfx canister call test runTests '(true, false)'");
@@ -6122,6 +6465,7 @@ shared (deployer) persistent actor class test() = this {
       Debug.print("Timer 8 (Multi-Hop) operations completed: " # debug_show (timer8OperationsComplete) # " / " # debug_show (timer8TotalOperations));
       Debug.print("Timer 9 (New Features) operations completed: " # debug_show (timer9OperationsComplete) # " / " # debug_show (timer9TotalOperations));
       Debug.print("Timer 10 (Split Routes) operations completed: " # debug_show (timer10OperationsComplete) # " / " # debug_show (timer10TotalOperations));
+      Debug.print("Timer 11 (LP Roundtrip Accounting) operations completed: " # debug_show (timer11OperationsComplete) # " / " # debug_show (timer11TotalOperations));
       timer1OperationsComplete := 0;
       timer2OperationsComplete := 0;
       timer3OperationsComplete := 0;
@@ -6132,6 +6476,7 @@ shared (deployer) persistent actor class test() = this {
       timer8OperationsComplete := 0;
       timer9OperationsComplete := 0;
       timer10OperationsComplete := 0;
+      timer11OperationsComplete := 0;
 
       timer1TotalOperations := 0;
       timer2TotalOperations := 0;
@@ -6143,6 +6488,7 @@ shared (deployer) persistent actor class test() = this {
       timer8TotalOperations := 0;
       timer9TotalOperations := 0;
       timer10TotalOperations := 0;
+      timer11TotalOperations := 0;
 
     };
   };
