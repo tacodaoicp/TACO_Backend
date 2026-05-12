@@ -1396,6 +1396,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // Map that saves all the blocks that have been used for exchange transactions. So no-one can  make 2 orders with 1 transfer.
   stable let BlocksDone : Map.Map<Text, Time> = Map.new<Text, Time>();
 
+  // One-shot marker: set when adminRecoverWronglysent has dispatched a refund
+  // for a trap-orphaned deposit. Prevents repeated admin calls from double-paying
+  // the same block. Independent of BlocksDone (which gates regular recoverWronglysent).
+  stable let BlocksAdminRecovered : Map.Map<Text, Time> = Map.new<Text, Time>();
+
   // liqidity map that has all the order ratios (asset a amount/ asset b) in order
   stable let liqMapSort : BigLiqMapSort = Map.new<(Text, Text), liqmapsort>();
 
@@ -1483,11 +1488,26 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   stable var DAOTreasury = Principal.fromText("odoge-dr36c-i3lls-orjen-eapnp-now2f-dj63m-3bdcd-nztox-5gvzy-sqe"); //change in production
   stable var DAOTreasuryText = Principal.toText(DAOTreasury); //change in production
 
-  // Burn / buyback canister principal — used by adminFlashArb (line ~16239) AND
-  // by the same-token reject in addPosition / swapMultiHop / swapSplitRoutes.
-  // Cyclic flash-arb routes are legitimate from this caller; everyone else gets
-  // their deposit refunded with the standard rejection fee.
+  // Retained for stable-storage compatibility with previous deployments
+  // (persistent actor `let` bindings are part of the stable signature; dropping
+  // one requires an explicit migration function). Superseded by FLASH_ARB_CALLERS.
   let BUYBACK_CANISTER_ID : Principal = Principal.fromText("cfl3o-5qaaa-aaaan-q6fga-cai");
+
+  // Flash-arb-trusted callers — used by adminFlashArb AND by the same-token
+  // reject in addPosition / swapMultiHop / swapSplitRoutes. Cyclic flash-arb
+  // routes are legitimate from these callers; everyone else gets their deposit
+  // refunded with the standard rejection fee.
+  // Add/remove requires a code edit + redeploy — no runtime mutator.
+  let FLASH_ARB_CALLERS : [Principal] = [
+    BUYBACK_CANISTER_ID, // buyback canister (kept above for stable-compat)
+    Principal.fromText("r7wkx-fqqi2-nwydg-gcytg-75vgc-7d33n-d4hxs-wsfqe-6inmj-6oiic-pae"),
+  ];
+  private func isFlashArbCaller(p : Principal) : Bool {
+    for (allowed in FLASH_ARB_CALLERS.vals()) {
+      if (allowed == p) return true;
+    };
+    false;
+  };
 
   // variable that stores all the transfer made within 1 exchangeblock. It gets cleared when its sent to the treasury canister.
   // This way, if the intercanister call to the treasury errors out, no funds are lost.
@@ -2549,7 +2569,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       doInfoBeforeStep2();
 
       // Transferring the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), false) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
     };
@@ -2605,7 +2625,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         if ((
           try {
 
-            await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal));
+            await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller));
           } catch (err) {
 
             false;
@@ -3034,6 +3054,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
       hopDetails : [HopDetail];
       routeTokens : [Text]; // [tokenSell, …intermediates, tokenBuy] for cross-fraction matching
+      tradingFeeBps : Nat;  // snapshot of ICPfee for the simulation that produced this route
     }];
   }] {
     if (isAllowedQuery(caller) != 1 or requests.size() > 20) { return [] };
@@ -3052,6 +3073,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
       hopDetails : [HopDetail];
       routeTokens : [Text];
+      tradingFeeBps : Nat;
     };
     let allResults = Vector.new<{ routes : [QuoteRoute] }>();
 
@@ -3126,6 +3148,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             potentialOrderDetails = directPotential;
             hopDetails = [];
             routeTokens = [tokenSell, tokenBuy];
+            tradingFeeBps = ICPfee;
           });
         };
 
@@ -3155,6 +3178,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 potentialOrderDetails = null;
                 hopDetails = sim.hopDetails;
                 routeTokens = Vector.toArray(tokenList);
+                tradingFeeBps = ICPfee;
               });
             };
           };
@@ -3351,7 +3375,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar2)).1.vals());
       };
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -3385,7 +3409,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, Time.now())).1.vals());
       };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool (pre-check)"));
@@ -3439,7 +3463,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - returnTfees(token1), token1, genTxId()));
       };
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -3472,7 +3496,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           if (amount1 > Tfees1) {
             Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - Tfees1, token1, genTxId()));
           };
-          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
             Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
           };
           return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool"));
@@ -3537,7 +3561,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             if (amount1 > Tfees1) {
               Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - Tfees1, token1, genTxId()));
             };
-            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
               Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
             };
             return #Err(#InsufficientFunds("Amounts below minimum liquidity for pool recreation"));
@@ -3690,7 +3714,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
     // Transferring the transactions that have to be made to the treasury,
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
     } else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -3763,7 +3787,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, Time.now())).1.vals());
       };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       #Err(errMsg);
@@ -3831,7 +3855,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, Time.now())).1.vals());
       };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#TokenPaused("Validation failed"));
@@ -3854,7 +3878,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     Vector.addFromIter(tempTransferQueueLocal, Vector.vals(receiveTransfersVec));
     if (not receiveBool) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InsufficientFunds("Deposit not received"));
@@ -3908,7 +3932,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     if (liquidity == 0) {
       // Refund
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InvalidInput("Zero liquidity for range"));
@@ -4049,7 +4073,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     doInfoBeforeStep2();
 
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
     };
 
@@ -4273,7 +4297,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     doInfoBeforeStep2();
 
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
     };
 
@@ -4420,7 +4444,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 };
 
                 if (Vector.size(tempTransferQueueLocal) > 0) {
-                  if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+                  if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
                     Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
                   };
                 };
@@ -4513,7 +4537,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             };
 
             if (Vector.size(tempTransferQueueLocal) > 0) {
-              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
                 Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
               };
             };
@@ -4773,7 +4797,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // ── Phase 4 — single flush ──
     if (Vector.size(consolidatedVec) > 0) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
       };
     };
@@ -4927,7 +4951,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             };
 
             doInfoBeforeStep2();
-            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
               Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
             };
 
@@ -5181,7 +5205,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Execute all transfers in one batch
     if (Vector.size(transferBatch) > 0) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray(transferBatch)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray(transferBatch), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(transferBatch));
       };
     };
@@ -5974,6 +5998,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     return true;
   };
+  // Strict membership check — true ONLY if caller is in the trusted
+  // allowedCanisters list. Distinct from `isAllowed`, which also returns 1
+  // for clean (non-banned, non-frozen) regular users. Used to gate sync-
+  // transfer mode at every receiveTransferTasks call site: only trusted
+  // callers (treasury, DAO entries, owners, registered bot principals) get
+  // immediate transfers; regular users continue with the async setTimer
+  // queue.
+  private func isInAllowedCanisters(caller : Principal) : Bool {
+    Array.find<Principal>(allowedCanisters, func(t) { t == caller }) != null;
+  };
+
   private func isAllowed(caller : Principal) : Nat {
     let callerText = Principal.toText(caller);
     let allowed = Array.find<Principal>(allowedCanisters, func(t) { t == caller });
@@ -6050,6 +6085,19 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     logger.info("ADMIN", "clearAllBans called by " # Principal.toText(caller), "clearAllBans");
   };
 
+  // Admin diagnostic: returns the ban code for `p` per isAllowedQuery semantics.
+  //   0 = anonymous / frozen (rejected)
+  //   1 = allowed
+  //   2 = warning (rate exceeded once, count halved)
+  //   3 = day-banned
+  //   4 = all-time-banned
+  //   999 = caller is not admin (sentinel; never overlaps real codes)
+  // Owner-only: ban-list contents are sensitive.
+  public shared query ({ caller }) func adminCheckBan(p : Principal) : async Nat {
+    if (not ownercheck(caller)) { return 999 };
+    isAllowedQuery(p);
+  };
+
   // Diagnostic: expose allowedCanisters so operators can verify DAO treasury /
   // DAO backend are allowlisted without guessing.
   public query func getAllowedCanisters() : async [Text] {
@@ -6088,6 +6136,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case null {};
     };
     return true;
+  };
+
+  // Admin escape hatch: resets adminRecoveryRunning if a sync-region trap inside
+  // adminRecoverWronglysent left it stuck at true. Only touches the serialization
+  // flag — no funds move, no BlocksDone or BlocksAdminRecovered changes.
+  public shared ({ caller }) func adminForceUnlockRecovery() : async Bool {
+    if (not ownercheck(caller)) { return false };
+    adminRecoveryRunning := false;
+    logger.warn(
+      "ADMIN",
+      "adminForceUnlockRecovery: flag reset by " # Principal.toText(caller),
+      "adminForceUnlockRecovery"
+    );
+    true;
   };
 
   // Admin: update the per-token minimum amount in place. Preserves all pools,
@@ -7412,7 +7474,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Transferring the transactions that have to be made to the treasury,
     Debug.print("addAcceptedToken: queuing " # debug_show(Vector.size(tempTransferQueueLocal)) # " transfers");
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { Debug.print("addAcceptedToken transfer ERROR: " # Error.message(err)); false })) {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print("addAcceptedToken transfer ERROR: " # Error.message(err)); false })) {
       Debug.print("addAcceptedToken: transfers sent to treasury OK");
     } else {
       Debug.print("addAcceptedToken: transfer FAILED, queuing to tempTransferQueue");
@@ -7574,7 +7636,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
     // Transfering the transactions that have to be made to the treasury,
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
     } else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -7710,6 +7772,319 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     Vector.toArray(results);
   };
 
+  // Walks blockData; returns the gross transfer amount iff the block contains
+  // a Transfer FROM `recipient` TO treasury_principal. Mirrors the case
+  // branches in recoverWronglysent (#ICP, #ICRC12, #ICRC3) but only EXTRACTS —
+  // does not queue any transfers. Returns null if no matching transfer.
+  private func extractRecipientToTreasuryAmount(
+    blockData : BlockData,
+    recipient : Principal,
+  ) : ?Nat {
+    switch (blockData) {
+      case (#ICP(response)) {
+        for ({ transaction = { operation } } in response.blocks.vals()) {
+          switch (operation) {
+            case (? #Transfer({ amount; from; to })) {
+              let check_from = Utils.accountToText({ hash = from });
+              let check_to = Utils.accountToText({ hash = to });
+              let from2 = Utils.accountToText(Utils.principalToAccount(recipient));
+              let to2 = Utils.accountToText(Utils.principalToAccount(treasury_principal));
+              if (Text.endsWith(check_from, #text from2)
+                  and Text.endsWith(check_to, #text to2)) {
+                return ?(nat64ToNat(amount.e8s));
+              };
+            };
+            case _ {};
+          };
+        };
+        null
+      };
+      case (#ICRC12(transactions)) {
+        for ({ transfer } in transactions.vals()) {
+          switch (transfer) {
+            case (?{ to; from; amount = received }) {
+              if (to.owner == treasury_principal and from.owner == recipient) {
+                return ?received;
+              };
+            };
+            case null {};
+          };
+        };
+        null
+      };
+      case (#ICRC3(result)) {
+        for (block in result.blocks.vals()) {
+          switch (block.block) {
+            case (#Map(entries)) {
+              var to : ?ICRC1.Account = null;
+              var from : ?ICRC1.Account = null;
+              var amount : ?Nat = null;
+              for ((key, value) in entries.vals()) {
+                switch (key) {
+                  case "to" {
+                    switch (value) {
+                      case (#Array(arr)) {
+                        if (arr.size() >= 1) {
+                          switch (arr[0]) {
+                            case (#Blob(owner)) {
+                              to := ?{
+                                owner = Principal.fromBlob(owner);
+                                subaccount = if (arr.size() > 1) {
+                                  switch (arr[1]) {
+                                    case (#Blob(s)) ?s;
+                                    case _ null;
+                                  };
+                                } else null;
+                              };
+                            };
+                            case _ {};
+                          };
+                        };
+                      };
+                      case (#Blob(owner)) {
+                        to := ?{ owner = Principal.fromBlob(owner); subaccount = null };
+                      };
+                      case _ {};
+                    };
+                  };
+                  case "from" {
+                    switch (value) {
+                      case (#Array(arr)) {
+                        if (arr.size() == 1) {
+                          switch (arr[0]) {
+                            case (#Blob(owner)) {
+                              from := ?{ owner = Principal.fromBlob(owner); subaccount = null };
+                            };
+                            case _ {};
+                          };
+                        };
+                      };
+                      case _ {};
+                    };
+                  };
+                  case "amt" {
+                    switch (value) {
+                      case (#Nat(a)) { amount := ?a };
+                      case (#Int(a)) { amount := ?Int.abs(a) };
+                      case _ {};
+                    };
+                  };
+                  case _ {};
+                };
+              };
+              switch (to, from, amount) {
+                case (?toAcc, ?fromAcc, ?howMuchReceived) {
+                  if (toAcc.owner == treasury_principal and fromAcc.owner == recipient) {
+                    return ?howMuchReceived;
+                  };
+                };
+                case _ {};
+              };
+            };
+            case _ {};
+          };
+        };
+        null
+      };
+    };
+  };
+
+  // Replicates checkDiffs (Phase B+C math) for ONE token only. Returns
+  //   balance(treasury) − pending − orderbalance − ammbalance − feebalances
+  // Sync work for buckets + one icrc1_balance_of(treasury) + one
+  // treasury.getPendingTransfersByToken(). Used as a sanity gate inside
+  // adminRecoverWronglysent to verify funds are actually orphaned before
+  // dispatching a refund.
+  private func computeDriftForToken(token : Text) : async Int {
+    let Tfees = returnTfees(token);
+
+    var feebalance : Nat = 0;
+    switch (Map.get(feescollectedDAO, thash, token)) {
+      case (?asi) { feebalance := asi };
+      case _ {};
+    };
+    for ((_, optEntry) in Map.entries(referrerFeeMap)) {
+      switch (optEntry) {
+        case (?(fees, _)) {
+          for ((tok, amt) in Vector.vals(fees)) {
+            if (tok == token) { feebalance += amt };
+          };
+        };
+        case _ {};
+      };
+    };
+
+    var orderbalance : Nat = 0;
+    for ((poolKey, poolValue) in Map.entries(liqMapSort)) {
+      let (t1, t2) = poolKey;
+      if (t1 == token or t2 == token) {
+        for ((_, trades) in RBTree.entries(poolValue)) {
+          for (trade in trades.vals()) {
+            if (trade.token_init_identifier == token) {
+              orderbalance += trade.amount_init
+                + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee))
+                   * (trade.RevokeFee - 1))
+                + Tfees;
+            };
+          };
+        };
+      };
+    };
+    for ((poolKey, poolValue) in Map.entries(liqMapSortForeign)) {
+      let (t1, t2) = poolKey;
+      if (t1 == token or t2 == token) {
+        for ((_, trades) in RBTree.entries(poolValue)) {
+          for (trade in trades.vals()) {
+            if (trade.token_init_identifier == token) {
+              orderbalance += trade.amount_init
+                + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee))
+                   * (trade.RevokeFee - 1))
+                + Tfees;
+            };
+          };
+        };
+      };
+    };
+    for ((_, trade) in Map.entries(tradeStorePrivate)) {
+      if (trade.token_init_identifier == token) {
+        orderbalance += trade.amount_init
+          + (((trade.amount_init * trade.Fee) / (10000 * trade.RevokeFee))
+             * (trade.RevokeFee - 1))
+          + Tfees;
+      };
+    };
+
+    var ammbalance : Nat = 0;
+    for ((poolKey, pool) in Map.entries(AMMpools)) {
+      if (poolKey.0 == token) {
+        ammbalance += pool.reserve0 + (pool.totalFee0 / tenToPower60);
+        switch (Map.get(poolV3Data, hashtt, poolKey)) {
+          case (?v3) { ammbalance += safeSub(v3.totalFeesCollected0, v3.totalFeesClaimed0) };
+          case null {};
+        };
+      } else if (poolKey.1 == token) {
+        ammbalance += pool.reserve1 + (pool.totalFee1 / tenToPower60);
+        switch (Map.get(poolV3Data, hashtt, poolKey)) {
+          case (?v3) { ammbalance += safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1) };
+          case null {};
+        };
+      };
+    };
+
+    let act = actor (token) : ICRC1.FullInterface;
+    let rawFut = act.icrc1_balance_of({ owner = treasury_principal; subaccount = null });
+    let pendingFut = treasury.getPendingTransfersByToken();
+
+    let raw = await rawFut;
+    let pendingArr = await pendingFut;
+
+    var pending : Nat = 0;
+    for ((tok, amt) in pendingArr.vals()) { if (tok == token) { pending := amt } };
+    for (txn in Vector.vals(tempTransferQueue)) {
+      if (txn.2 == token) { pending += txn.1 };
+    };
+
+    let adjustedBalance : Nat = if (raw >= pending) { raw - pending } else { 0 };
+    let drift : Int = adjustedBalance - (orderbalance + ammbalance + feebalance);
+    drift;
+  };
+
+  // Admin one-shot recovery for a stuck (trap-orphaned) deposit. Bypasses but
+  // does NOT delete the BlocksDone gate so a trapped swap's stuck deposit can
+  // be returned. Marks BlocksAdminRecovered to prevent any future admin call
+  // from re-paying. Concurrent admin calls serialize via adminRecoveryRunning.
+  // Refuses if drift in `identifier` < deposit amount (Bug 5 — drain guard).
+  //
+  // Safe operating procedure:
+  //   1. checkDiffs to confirm positive drift in `identifier` ≥ deposit amount.
+  //   2. Run this function with the depositor's principal.
+  //   3. checkDiffs again to confirm drift dropped by the refund amount.
+  public shared ({ caller }) func adminRecoverWronglysent(
+    recipient : Principal,
+    identifier : Text,
+    Block : Nat,
+    tType : { #ICP; #ICRC12; #ICRC3 }
+  ) : async Bool {
+    if (not ownercheck(caller)) { return false };
+    if (adminRecoveryRunning) { return false };
+    adminRecoveryRunning := true;
+
+    let blockKey = identifier # ":" # Nat.toText(Block);
+
+    if (Map.has(BlocksAdminRecovered, thash, blockKey)) {
+      adminRecoveryRunning := false;
+      return false;
+    };
+
+    let nowVar = Time.now();
+
+    let blockData = try { await* getBlockData(identifier, Block, tType) }
+                    catch (_) { adminRecoveryRunning := false; return false };
+    let timestamp = getTimestamp(blockData);
+    if (timestamp == 0) { adminRecoveryRunning := false; return false };
+    let timeDiff : Int = Int.abs(Time.now()) - timestamp;
+    if (timeDiff > 1814400000000000) { adminRecoveryRunning := false; return false };
+
+    let depositAmount : Nat = switch (extractRecipientToTreasuryAmount(blockData, recipient)) {
+      case (?n) n;
+      case null { adminRecoveryRunning := false; return false };
+    };
+    if (depositAmount == 0) { adminRecoveryRunning := false; return false };
+
+    let drift : Int = await computeDriftForToken(identifier);
+    if (drift < (depositAmount : Int)) {
+      adminRecoveryRunning := false;
+      logger.warn(
+        "ADMIN",
+        "adminRecoverWronglysent: refund refused — drift "
+          # debug_show(drift) # " < depositAmount " # Nat.toText(depositAmount)
+          # " for " # identifier # " block " # Nat.toText(Block)
+          # " (recipient " # Principal.toText(recipient) # ")",
+        "adminRecoverWronglysent"
+      );
+      return false;
+    };
+
+    let Tfees = returnTfees(identifier);
+    if (depositAmount <= Tfees) { adminRecoveryRunning := false; return false };
+    let refundAmount = depositAmount - Tfees;
+
+    Map.set(BlocksAdminRecovered, thash, blockKey, nowVar);
+
+    let q = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    Vector.add(q, (#principal(recipient), refundAmount, identifier, genTxId()));
+    let delivered = try {
+      await treasury.receiveTransferTasks(
+        Vector.toArray<(TransferRecipient, Nat, Text, Text)>(q),
+        isInAllowedCanisters(recipient)
+      )
+    } catch (_) { false };
+
+    adminRecoveryRunning := false;
+
+    if (delivered) {
+      logger.info(
+        "ADMIN",
+        "adminRecoverWronglysent: refunded " # Nat.toText(refundAmount) # " "
+          # identifier # " to " # Principal.toText(recipient)
+          # " for block " # Nat.toText(Block)
+          # " by admin " # Principal.toText(caller),
+        "adminRecoverWronglysent"
+      );
+      return true;
+    };
+
+    Vector.addFromIter(tempTransferQueue, Vector.vals(q));
+    logger.warn(
+      "ADMIN",
+      "adminRecoverWronglysent: treasury rejected dispatch, queued refund of "
+        # Nat.toText(refundAmount) # " " # identifier # " for "
+        # Principal.toText(recipient) # " block " # Nat.toText(Block),
+      "adminRecoverWronglysent"
+    );
+    return false;
+  };
+
   public shared ({ caller }) func recoverWronglysent(identifier : Text, Block : Nat, tType : { #ICP; #ICRC12; #ICRC3 }) : async Bool {
     if (isAllowed(caller) != 1) {
       return false;
@@ -7760,7 +8135,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     Map.delete(BlocksDone, thash, identifier # ":" #Nat.toText(Block));
                     return false;
                   };
-                  if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+                  if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
                     Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
                   };
                   return true;
@@ -7786,7 +8161,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               } else {
                 addFees(identifier, howMuchReceived, false, "", nowVar);
               };
-              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
                 Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
               };
               return true;
@@ -7883,7 +8258,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                       } else {
                         addFees(identifier, howMuchReceived, false, "", nowVar);
                       };
-                      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+                      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
                         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
                       };
                       return true;
@@ -7966,7 +8341,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Same-token reject: makes no economic sense and can drain pools via cyclic
     // AMM routes. Burn canister exempt (adminFlashArb routes back to start token).
-    if (token_sell_identifier == token_init_identifier and caller != BUYBACK_CANISTER_ID) {
+    if (token_sell_identifier == token_init_identifier and not isFlashArbCaller(caller)) {
       if (Map.has(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block))) {
         return #Err(#InvalidInput("Block already processed"));
       };
@@ -7979,7 +8354,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       } catch (err) {
         Map.delete(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block));
       };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InvalidInput("Sell and buy token must be different"));
@@ -8000,7 +8375,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       } catch (err) {
         Map.delete(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block));
       };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#TokenNotAccepted(token_init_identifier));
@@ -8024,7 +8399,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
       };
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -8053,7 +8428,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Map.delete(BlocksDone, thash, token_init_identifier # ":" #Nat.toText(Block));
       };
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -8095,7 +8470,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue)) } catch (err) { Debug.print(Error.message(err)); false })) {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
           Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
         };
         FixStuckTXRunning := false;
@@ -8146,7 +8521,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         let tType = returnType(token_init_identifier);
         Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token_init_identifier, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar2)).1.vals());
         // Transfering the transactions that have to be made to the treasury,
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
         };
         return #Err(#TokenPaused("Asset paused during execution"));
@@ -8160,7 +8535,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { Debug.print(Error.message(err)); false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -8435,7 +8810,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let poolKey = getPool(token_init_identifier, token_sell_identifier);
       ignore updatePriceDayBefore(poolKey, nowVar);
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { Debug.print("Check"); Debug.print(Error.message(err)); false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print("Check"); Debug.print(Error.message(err)); false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -8484,7 +8859,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let poolKey = getPool(token_init_identifier, token_sell_identifier);
       ignore updatePriceDayBefore(poolKey, nowVar);
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { Debug.print("Check"); Debug.print(Error.message(err)); false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print("Check"); Debug.print(Error.message(err)); false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -8521,7 +8896,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Validate route structure (cheap checks before any block processing)
     var validationError : Text = "";
-    if (tokenIn == tokenOut and caller != BUYBACK_CANISTER_ID) {
+    if (tokenIn == tokenOut and not isFlashArbCaller(caller)) {
       validationError := "Same token (cyclic route not allowed)";
     };
     if (validationError != "") { /* same-token already rejected */ }
@@ -8568,7 +8943,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Map.delete(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block));
       };
       if (Vector.size(tempRefund) > 0) {
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempRefund)) } catch (_) { false })) {} else {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempRefund), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempRefund));
         };
       };
@@ -8589,7 +8964,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue)) } catch (err) { Debug.print(Error.message(err)); false })) {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
           Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
         };
         FixStuckTXRunning := false;
@@ -8613,7 +8988,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let (receiveBool, receiveTransfers) = checkReceive(Block, caller, amountIn, tokenIn, ICPfee, RevokeFeeNow, false, true, blockData, tType, nowVar2);
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InsufficientFunds("Funds not received"));
@@ -8645,7 +9020,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         addFees(tokenIn, untrackedFees, false, user, nowVar);
       };
       Vector.add(tempTransferQueueLocal, (#principal(caller), amountIn, tokenIn, genTxId()));
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#SlippageExceeded({ expected = minAmountOut; got = estimatedOut }));
@@ -8759,7 +9134,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
 
         // No output from this hop, stop
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
         };
         return #Err(#RouteFailed({ hop = hopIndex; reason = "No output" }));
@@ -8837,7 +9212,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       let slipConsolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
       for ((_, tx) in Map.entries(slipConsolidatedMap)) { Vector.add(slipConsolidatedVec, tx) };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(slipConsolidatedVec)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(slipConsolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(slipConsolidatedVec));
       };
       return #Err(#SlippageExceeded({ expected = minAmountOut; got = currentAmount }));
@@ -8873,7 +9248,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let consolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
     for ((_, tx) in Map.entries(consolidatedMap)) { Vector.add(consolidatedVec, tx) };
 
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec)) } catch (err) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
     };
 
@@ -8912,7 +9287,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     var totalAmountIn : Nat = 0;
     var validationError : Text = "";
-    if (tokenIn == tokenOut and caller != BUYBACK_CANISTER_ID) {
+    if (tokenIn == tokenOut and not isFlashArbCaller(caller)) {
       validationError := "Same token (cyclic route not allowed)";
     };
     if (validationError == "" and (splits.size() < 1 or splits.size() > 3)) { validationError := "1-3 splits required" };
@@ -8958,7 +9333,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Map.delete(BlocksDone, thash, tokenIn # ":" # Nat.toText(Block));
       };
       if (Vector.size(tempRefund) > 0) {
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempRefund)) } catch (_) { false })) {} else {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempRefund), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempRefund));
         };
       };
@@ -8979,7 +9354,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue)) } catch (err) { Debug.print(Error.message(err)); false })) {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
           Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
         };
         FixStuckTXRunning := false;
@@ -9004,7 +9379,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let (receiveBool, receiveTransfers) = checkReceive(Block, caller, totalAmountIn, tokenIn, ICPfee, RevokeFeeNow, false, true, blockData, tType, nowVar2);
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InsufficientFunds("Funds not received"));
@@ -9269,7 +9644,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     // Send consolidated transfers to treasury
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec)) } catch (err) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
     };
 
@@ -11385,7 +11760,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     doInfoBeforeStep2();
 
 
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
       // tempTransferQueue := Vector.new<(TransferRecipient , Nat, Text)>();
     } else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -11636,7 +12011,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let (receiveBool, receiveTransfers) = checkReceive(block, caller, amountIn, tokenIn, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar);
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InsufficientFunds("Funds not received"));
@@ -11717,7 +12092,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Send all transfers
     doInfoBeforeStep2();
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (_) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
     };
 
@@ -11844,7 +12219,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
 
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {
         logWithRunId("Successfully transferred funds back to treasury");
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -11868,7 +12243,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
 
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {
         logWithRunId("Successfully transferred funds back to treasury");
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -12305,7 +12680,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     // Treasury transfer of remaining amounts
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {
       if verboseLogging { logWithRunId("Successfully transferred remaining funds to treasury: " #debug_show (Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal))) };
     } else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -12455,7 +12830,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (blockData != #ICRC12([])) {
         Vector.addFromIter(tempTransferQueueLocal, (checkReceive(nat64ToNat(Block), msg.caller, 0, token_init_identifier, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar2)).1.vals());
       };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       for (accesscode in accesscode.vals()) {
@@ -12529,7 +12904,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
       if (Vector.size(tempTransferQueueLocal) > 0) {
-        if (try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false }) {} else {
+        if (try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false }) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
         };
       };
@@ -12594,7 +12969,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       } else {
         Vector.add(tempTransferQueueLocal, (#principal(msg.caller), (amountInit / 10000), token_init_identifier, genTxId()));
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
         };
         for (accesscode in accesscode.vals()) {
@@ -12608,7 +12983,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     if (TradeEntries.size() == 0) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       for (accesscode in accesscode.vals()) {
@@ -12695,7 +13070,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     doInfoBeforeStep2();
     let poolKey = getPool(token_init_identifier, token_sell_identifier);
     ignore updatePriceDayBefore(poolKey, nowVar2);
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
     };
     for (accesscode in accesscode.vals()) {
@@ -12756,7 +13131,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         Map.delete(BlocksDone, thash, currentTrades2.token_sell_identifier # ":" #Nat64.toText(Block));
 
       };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
@@ -12777,7 +13152,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
@@ -12797,7 +13172,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if sendBack {
 
       Vector.addFromIter(tempTransferQueueLocal, (checkReceive(nat64ToNat(Block), msg.caller, 0, currentTrades2.token_sell_identifier, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar2)).1.vals());
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
@@ -12879,7 +13254,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     doInfoBeforeStep2();
     let poolKey = getPool(currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier);
     ignore updatePriceDayBefore(poolKey, nowVar);
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
     };
 
@@ -13095,7 +13470,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Consolidate & send transfers (merge same user+token into single transfer)
     if (Vector.size(tempTransferQueueLocal) > 0) {
       let consolidated = consolidateTransfers(tempTransferQueueLocal);
-      if ((try { await treasury.receiveTransferTasks(consolidated) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(consolidated, false) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, consolidated.vals());
       };
     };
@@ -13180,7 +13555,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Consolidate & send transfers
     if (Vector.size(tempTransferQueueLocal) > 0) {
       let consolidated = consolidateTransfers(tempTransferQueueLocal);
-      if ((try { await treasury.receiveTransferTasks(consolidated) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(consolidated, false) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, consolidated.vals());
       };
     };
@@ -13316,7 +13691,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Consolidate & send transfers
     if (Vector.size(tempTransferQueueLocal) > 0) {
       let consolidated = consolidateTransfers(tempTransferQueueLocal);
-      if ((try { await treasury.receiveTransferTasks(consolidated) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(consolidated, false) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, consolidated.vals());
       };
     };
@@ -13365,7 +13740,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Consolidate & send transfers
     if (Vector.size(tempTransferQueueLocal) > 0) {
       let consolidated = consolidateTransfers(tempTransferQueueLocal);
-      if ((try { await treasury.receiveTransferTasks(consolidated) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(consolidated, false) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, consolidated.vals());
       };
     };
@@ -13383,7 +13758,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (Vector.size(tempTransferQueue) > 0) {
         let snap = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
         Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        let ok = try { await treasury.receiveTransferTasks(snap) } catch (_) { false };
+        let ok = try { await treasury.receiveTransferTasks(snap, false) } catch (_) { false };
         if (not ok) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snap.vals()) };
       };
       try { await treasury.drainTransferQueue() } catch (_) {};
@@ -13414,7 +13789,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     if (Vector.size(tempTransferQueueLocal) > 0) {
       let consolidated = consolidateTransfers(tempTransferQueueLocal);
-      if ((try { await treasury.receiveTransferTasks(consolidated) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(consolidated, false) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, consolidated.vals());
       };
     };
@@ -13427,7 +13802,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (Vector.size(tempTransferQueue) > 0) {
         let snap2 = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
         Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        let ok2 = try { await treasury.receiveTransferTasks(snap2) } catch (_) { false };
+        let ok2 = try { await treasury.receiveTransferTasks(snap2, false) } catch (_) { false };
         if (not ok2) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snap2.vals()) };
       };
       try { await treasury.drainTransferQueue() } catch (_) {};
@@ -13491,7 +13866,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         if (Vector.size(tempTransferQueue) > 0) {
           let snap = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
           Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-          let ok = try { await treasury.receiveTransferTasks(snap) } catch (_) { false };
+          let ok = try { await treasury.receiveTransferTasks(snap, isInAllowedCanisters(caller)) } catch (_) { false };
           if (not ok) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snap.vals()) };
         };
         try { await treasury.drainTransferQueue() } catch (_) {};
@@ -13710,7 +14085,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
       };
       // Transfering the transactions that have to be made to the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -13757,7 +14132,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
       if (Vector.size(reclaimTransfers) > 0) {
-        if (not (try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(reclaimTransfers)) } catch (_) { false })) {
+        if (not (try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(reclaimTransfers), isInAllowedCanisters(caller)) } catch (_) { false })) {
           Vector.addFromIter(tempTransferQueue, Vector.vals(reclaimTransfers));
         };
       };
@@ -13801,7 +14176,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     };
     // Transfering the transactions that have to be made to the treasury,
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
 
     } else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
@@ -14977,6 +15352,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   var FixStuckTXRunning = false;
 
+  // Serializes adminRecoverWronglysent so two parallel admin calls cannot both
+  // pass the BlocksAdminRecovered guard and double-dispatch a refund.
+  var adminRecoveryRunning : Bool = false;
+
   // Retrieve funds that are stuck. If partials is used as text, it will go through the tempTransferQueue vector. If an accesscode is given, it will see what went wrong and send stuck assets back to the one its for within a position.
   public shared ({ caller }) func FixStuckTX(accesscode : Text) : async ExTypes.ActionResult {
     if (accesscode == "partial") {
@@ -14997,7 +15376,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     if (accesscode == "partial") {
       // Transfering the transactions that have to be made by the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue)) } catch (err) { return #Err(#SystemError(Error.message(err))); FixStuckTXRunning := false; false })) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { return #Err(#SystemError(Error.message(err))); FixStuckTXRunning := false; false })) {
         Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
       };
       FixStuckTXRunning := false;
@@ -15006,7 +15385,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let tempTransferQueueLocal = syncFixStuckTX(accesscode, Principal.toText(caller));
 
     // Transfering the transactions that have to be made to the treasury,
-    if ((try { await treasury.receiveTransferTasks(tempTransferQueueLocal) } catch (err) { false })) {
+    if ((try { await treasury.receiveTransferTasks(tempTransferQueueLocal, isInAllowedCanisters(caller)) } catch (err) { false })) {
 
     } else {
       Vector.addFromIter(tempTransferQueue, tempTransferQueueLocal.vals());
@@ -15388,7 +15767,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       func() : async () {
         if (Vector.size(tempTransferQueue) > 0 and not FixStuckTXRunning) {
           FixStuckTXRunning := true;
-          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue)) } catch (_) { false })) {
+          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), false) } catch (_) { false })) {
             Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
           };
           FixStuckTXRunning := false;
@@ -15490,7 +15869,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // ADMIN ROUTE ANALYSIS — discover and execute multi-hop circular routes
   // ═══════════════════════════════════════════════════════════════
 
-  public query ({ caller }) func adminAnalyzeRouteEfficiency(
+  public query func adminAnalyzeRouteEfficiency(
     token : Text,
     sampleSize : Nat,
     depth : Nat,
@@ -15501,7 +15880,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     efficiencyBps : Int;
     hopDetails : [HopDetail];
   }] {
-    if (not test and not isAdmin(caller)) { return [] };
     if (depth < 2 or depth > 6 or sampleSize == 0) { return [] };
 
     var routesExplored : Nat = 0;
@@ -15619,10 +15997,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // (OTC orders create discrete profit jumps that violate strict unimodality).
   //
   // Returns null if:
-  //   - caller is not admin (also day-bans them on the way out, see ownercheck)
   //   - validation fails
   //   - no positive-profit route found in the searched range
-  public query ({ caller }) func adminFindOptimalArb(
+  public query func adminFindOptimalArb(
     token : Text,
     minSample : Nat,
     maxSample : Nat,
@@ -15638,7 +16015,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     hopDetails : [HopDetail];
     probesRun : Nat;
   } {
-    if (not test and not isAdmin(caller)) { return null };
     if (depth < 2 or depth > 6) { return null };
     if (probes < 1 or probes > 20) { return null };
     if (maxSample == 0 or minSample >= maxSample) { return null };
@@ -15856,7 +16232,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue)) } catch (err) { Debug.print(Error.message(err)); false })) {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
           Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
         };
         FixStuckTXRunning := false;
@@ -15879,7 +16255,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let (receiveBool, receiveTransfers) = checkReceive(Block, caller, amount, tokenIn, ICPfee, RevokeFeeNow, false, true, blockData, tType, nowVar2);
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
       return #Err(#InsufficientFunds("Funds not received"));
@@ -15944,7 +16320,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
       currentAmount := hopOutput;
       if (currentAmount == 0) {
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal)) } catch (err) { false })) {} else {
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
         };
         return #Err(#RouteFailed({ hop = hopIndex; reason = "No output" }));
@@ -15984,7 +16360,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       let slipVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
       for ((_, tx) in Map.entries(slipConsolidatedMap)) { Vector.add(slipVec, tx) };
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(slipVec)) } catch (_) { false })) {} else {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(slipVec), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(slipVec));
       };
       return #Err(#SlippageExceeded({ expected = minOutput; got = currentAmount }));
@@ -16038,7 +16414,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
     };
 
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec)) } catch (err) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
     };
 
@@ -16056,10 +16432,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     });
   };
 
-  // ── Flash arbitrage (zero-capital, buyback-canister-only) ──
-  // Buyback canister principal hoisted to top of actor (see BUYBACK_CANISTER_ID
-  // declaration after DAOTreasury) so it's also visible to the same-token guard
-  // in addPosition / swapMultiHop / swapSplitRoutes.
+  // ── Flash arbitrage (zero-capital, allowlist-gated) ──
+  // Trusted callers hoisted to top of actor (see FLASH_ARB_CALLERS declaration
+  // after DAOTreasury) so the membership check is also visible to the same-token
+  // guard in addPosition / swapMultiHop / swapSplitRoutes.
 
   // adminFlashArb — execute a circular arbitrage route using exchange-internal
   // capital (lent from feescollectedDAO[startToken] when available, phantom otherwise).
@@ -16094,8 +16470,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     #Err : Text;
   } {
     // ── Auth: ONLY the buyback canister may call ──
-    if (caller != BUYBACK_CANISTER_ID) {
-      return #Err("Not authorized: caller is not the buyback canister");
+    if (not isFlashArbCaller(caller)) {
+      return #Err("Not authorized: caller is not on the flash-arb allowlist");
     };
 
     // ── Input validation ──
@@ -16296,7 +16672,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     // ── FLUSH (single await — commits all synchronous state above) ──
-    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec)) } catch (_) { false })) {} else {
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
       Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
     };
 
@@ -16369,6 +16745,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #setMinimumAmount : () -> (token : Text, newMinimum : Nat);
         #adminRepairLastTradedPriceAndKlines : () -> (affectedPoolIndexes : [Nat], alsoRepairVolume24h : Bool);
         #adminDeleteKlinesBefore : () -> (cutoffNs : Int, maxDeletesPerBucket : Nat);
+        #adminCheckBan : () -> (p : Principal);
+        #adminForceUnlockRecovery : () -> ();
+        #adminRecoverWronglysent :
+          () ->
+            (recipient : Principal, identifier : Text, Block : Nat,
+             tType : {#ICP; #ICRC12; #ICRC3});
         #cleanTokenIds : () -> ();
         #isExchangeFrozen : () -> ();
         #resetAllState : () -> ();
@@ -16552,6 +16934,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#parameterManagement _) callerIsAdmin;
       case (#clearAllBans _) callerIsAdmin;
       case (#clearStuckLocks _) callerIsAdmin;
+      case (#adminCheckBan _) callerIsAdmin;
+      case (#adminForceUnlockRecovery _) callerIsAdmin;
+      case (#adminRecoverWronglysent _) callerIsAdmin;
       case (#setMinimumAmount _) callerIsAdmin;
       case (#adminRepairLastTradedPriceAndKlines _) callerIsAdmin;
       case (#adminDeleteKlinesBefore _) callerIsAdmin;
@@ -16559,9 +16944,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#FinishSellBatchDAO _) false;
       case (#Freeze _) callerIsAdmin;
       case (#adminExecuteRouteStrategy _) callerIsAdmin;
-      case (#adminAnalyzeRouteEfficiency _) callerIsAdmin;
-      case (#adminFindOptimalArb _) callerIsAdmin;
-      case (#adminFlashArb _) caller == BUYBACK_CANISTER_ID;
+      case (#adminAnalyzeRouteEfficiency _) true;
+      case (#adminFindOptimalArb _) true;
+      case (#adminFlashArb _) isFlashArbCaller(caller);
       case (#addAcceptedToken _) callerIsAdmin;
       case (#updateTokenType _) callerIsAdmin;
       case (#canTradeTokens _) true;

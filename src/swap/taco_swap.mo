@@ -270,6 +270,7 @@ module {
           potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
           hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
           routeTokens : [Text];
+          tradingFeeBps : Nat;
         }];
       }];
     };
@@ -292,6 +293,7 @@ module {
           potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
           hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
           routeTokens : [Text];
+          tradingFeeBps : Nat;
         }, Types.TACOQuoteReply>(bundle.routes, func(q) {
           if (q.expectedBuyAmount == 0) {
             { receive_amount = 0; price = 0.0; mid_price = 0.0; slippage = 0.0;

@@ -407,6 +407,44 @@ shared (deployer) persistent actor class treasury() = this {
     };
   };
 
+  // Phase 5 Fix 2: returns the combined (liquid + LP + transit + flight) token-units balance
+  // for a token, applying the same arrival-detection that getLPBackingPerToken uses (so callers
+  // see consistent numbers). Use this anywhere you want the total economic holdings of a token;
+  // use `details.balance` directly when you specifically want LIQUID-only (e.g., trade sizing,
+  // LP deployment cap, "what can we actually spend right now").
+  //
+  // After Fix 2, treasury's `tokenDetailsMap.balance` is the canonical liquid-wallet balance
+  // (no longer overwritten with combined value in updateBalances). Consumers that need the
+  // combined view call this helper.
+  private func tokenTotalBalanceUnits(token : Principal, details : TokenDetails) : Nat {
+    let liquid = details.balance;
+    let backing = switch (Map.get(lpBackingPerToken, phash, token)) { case (?v) v; case null 0 };
+    let rawTransit = switch (Map.get(lpTokensInTransit, phash, token)) { case (?(amt, _)) amt; case null 0 };
+    let flight = switch (Map.get(lpDepositsInFlight, phash, token)) { case (?v) v; case null 0 };
+
+    // Arrival detection (same as getLPBackingPerToken's Phase 4 fix): if liquid balance has
+    // already absorbed the in-transit amount, treat transit as 0 to avoid double-count.
+    let effectiveTransit = if (rawTransit > 0) {
+      let curLiquid = switch (Map.get(liquidBalancePerToken, phash, token)) { case (?v) v; case null 0 };
+      let prevLiquid = switch (Map.get(previousLiquidBalance, phash, token)) { case (?v) v; case null 0 };
+      if (curLiquid >= prevLiquid + rawTransit) { 0 } else { rawTransit };
+    } else { 0 };
+
+    liquid + backing + effectiveTransit + flight;
+  };
+
+  // Build a snapshot of tokenDetailsMap suitable for outbound sync to other canisters
+  // (DAO, minting_vault). Replaces each entry's `balance` with the COMBINED view
+  // (liquid + LP) so consumers see the full portfolio holding. Treasury's internal
+  // tokenDetailsMap stays liquid-only (Fix 2 invariant).
+  private func tokenDetailsSnapshotForSync() : [(Principal, TokenDetails)] {
+    let buf = Buffer.Buffer<(Principal, TokenDetails)>(Map.size(tokenDetailsMap));
+    for ((p, d) in Map.entries(tokenDetailsMap)) {
+      buf.add((p, { d with balance = tokenTotalBalanceUnits(p, d) }));
+    };
+    Buffer.toArray(buf);
+  };
+
   // Randomization
   // NOTE: Fuzz.fromSeed internally uses Nat64.fromNat, so seed must be < 2^64
   transient let fuzz = Fuzz.fromSeed((Fuzz.fromSeed(Int.abs(now()) % (2 ** 63)).nat.randomRange(45978345345987, 2 ** 63)) % (2 ** 63));
@@ -606,6 +644,16 @@ shared (deployer) persistent actor class treasury() = this {
   // Tokens removed from LP but not yet arrived at treasury wallet
   // Value: (amount, timestamp of removal) — timestamp prevents false-positive arrival detection
   stable var lpTokensInTransit = Map.new<Principal, (Nat, Int)>();
+  // Per-token in-flight LP unwinds requested by NACHOS vault (visibility/debug + concurrency tracking)
+  // Cleared when lpTokensInTransit reconciliation completes for the same token.
+  stable var burnUnwindRequests = Map.new<Principal, [{
+    requestId : Nat;
+    amount : Nat;
+    liquidityRemoved : Nat;
+    poolKey : Text;
+    requestedAt : Int;
+  }]>();
+  stable var nextBurnUnwindRequestId : Nat = 0;
   // Tokens transferred to exchange but not yet confirmed as LP position
   stable var lpDepositsInFlight = Map.new<Principal, Nat>();
   // ICP value of each token's LP across all pools (budget tracking)
@@ -763,11 +811,13 @@ shared (deployer) persistent actor class treasury() = this {
         case null {};
       };
     };
+    // Phase 5 Fix 2: combined view for portfolio (was details.balance, which is now liquid-only).
+    // The "high volume" heuristic compares pending burn ICP to TOTAL portfolio (incl. LP).
     var totalPortfolioICP : Nat = 0;
-    for ((_, d) in Map.entries(tokenDetailsMap)) {
+    for ((token, d) in Map.entries(tokenDetailsMap)) {
       if (d.Active) {
         let decimals : Nat = d.tokenDecimals;
-        totalPortfolioICP += (d.balance * d.priceInICP) / (10 ** decimals);
+        totalPortfolioICP += (tokenTotalBalanceUnits(token, d) * d.priceInICP) / (10 ** decimals);
       };
     };
     if (totalPortfolioICP == 0) return true;
@@ -1672,17 +1722,19 @@ shared (deployer) persistent actor class treasury() = this {
     var totalValueUSD : Float = 0;
     let currentAllocs = Vector.new<(Principal, Nat)>();
 
-    // First pass - calculate totals
+    // Phase 5 Fix 2: combined view via helper (was details.balance, which is now liquid-only)
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        let totalUnits = tokenTotalBalanceUnits(principal, details);
+        let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
         totalValueICP += valueInICP;
-        totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
+        totalValueUSD += details.priceInUSD * Float.fromInt(totalUnits) / (10.0 ** Float.fromInt(details.tokenDecimals));
     };
 
     // Second pass - calculate allocations (only if totalValueICP > 0 to avoid division by zero)
     if (totalValueICP > 0) {
       for ((principal, details) in Map.entries(tokenDetailsMap)) {
-          let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+          let totalUnits = tokenTotalBalanceUnits(principal, details);
+          let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
           if (valueInICP > 0) {
               let basisPoints = (valueInICP * 10000) / totalValueICP;
               Vector.add(currentAllocs, (principal, basisPoints));
@@ -1752,15 +1804,19 @@ shared (deployer) persistent actor class treasury() = this {
     var totalValueUSD : Float = 0;
     let currentAllocs = Vector.new<(Principal, Nat)>();
 
+    // Phase 5 Fix 2: combined view via helper (was details.balance, which after Fix 2
+    // is liquid-only; need explicit total to include LP positions).
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-      let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+      let totalUnits = tokenTotalBalanceUnits(principal, details);
+      let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
       totalValueICP += valueInICP;
-      totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
+      totalValueUSD += details.priceInUSD * Float.fromInt(totalUnits) / (10.0 ** Float.fromInt(details.tokenDecimals));
     };
 
     if (totalValueICP > 0) {
       for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        let totalUnits = tokenTotalBalanceUnits(principal, details);
+        let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
         if (valueInICP > 0) {
           Vector.add(currentAllocs, (principal, (valueInICP * 10000) / totalValueICP));
         };
@@ -1896,7 +1952,15 @@ shared (deployer) persistent actor class treasury() = this {
    * Get all token details including balances and prices
    */
   public query func getTokenDetails() : async [(Principal, TokenDetails)] {
-    Iter.toArray(Map.entries(tokenDetailsMap));
+    // Phase 5 follow-up: external consumers see COMBINED balance (liquid + LP backing
+    // + transit + flight). Internal `tokenDetailsMap[t].balance` remains liquid-only
+    // (Fix 2 invariant); we synthesize the combined view at query time. This restores
+    // pre-Fix-2 external semantics without re-introducing the dual-purpose pollution.
+    let buf = Buffer.Buffer<(Principal, TokenDetails)>(Map.size(tokenDetailsMap));
+    for ((p, d) in Map.entries(tokenDetailsMap)) {
+      buf.add((p, { d with balance = tokenTotalBalanceUnits(p, d) }));
+    };
+    Buffer.toArray(buf);
   };
 
   //=========================================================================
@@ -1922,17 +1986,19 @@ shared (deployer) persistent actor class treasury() = this {
     var totalValueUSD : Float = 0;
     let currentAllocs = Vector.new<(Principal, Nat)>();
 
-    // First pass - calculate totals
+    // Phase 5 Fix 2: combined view via helper (was details.balance, which is now liquid-only)
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        let totalUnits = tokenTotalBalanceUnits(principal, details);
+        let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
         totalValueICP += valueInICP;
-        totalValueUSD += details.priceInUSD * Float.fromInt(details.balance) / (10.0 ** Float.fromInt(details.tokenDecimals));
+        totalValueUSD += details.priceInUSD * Float.fromInt(totalUnits) / (10.0 ** Float.fromInt(details.tokenDecimals));
     };
 
     // Second pass - calculate allocations (only if totalValueICP > 0 to avoid division by zero)
     if (totalValueICP > 0) {
       for ((principal, details) in Map.entries(tokenDetailsMap)) {
-          let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+          let totalUnits = tokenTotalBalanceUnits(principal, details);
+          let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
           if (valueInICP > 0) {
               let basisPoints = (valueInICP * 10000) / totalValueICP;
               Vector.add(currentAllocs, (principal, basisPoints));
@@ -2047,7 +2113,8 @@ shared (deployer) persistent actor class treasury() = this {
         tokenSymbol = details.tokenSymbol;
         tokenDecimals = details.tokenDecimals;
         tokenTransferFee = details.tokenTransferFee;
-        balance = details.balance;
+        // Combined balance (liquid + LP) — matches getTokenDetails semantics
+        balance = tokenTotalBalanceUnits(principal, details);
         priceInICP = details.priceInICP;
         priceInUSD = details.priceInUSD;
         tokenType = details.tokenType;
@@ -2858,27 +2925,31 @@ shared (deployer) persistent actor class treasury() = this {
       var totalValueICP : Nat = 0;
       var totalValueUSD : Float = 0.0;
 
-      // Collect data for each active token
+      // Phase 5 Fix 2: snapshot records TOTAL holdings (liquid + LP) per token, not just liquid.
+      // Both `balance` and `valueIn*` use the combined view via the helper.
       for ((token, details) in Map.entries(tokenDetailsMap)) {
-        if (details.Active and details.balance > 0) {
-          let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-          let valueInUSD = (Float.fromInt(details.balance) * details.priceInUSD) / Float.fromInt(10 ** details.tokenDecimals);
-          
-          totalValueICP += valueInICP;
-          totalValueUSD += valueInUSD;
+        if (details.Active) {
+          let totalUnits = tokenTotalBalanceUnits(token, details);
+          if (totalUnits > 0) {
+            let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
+            let valueInUSD = (Float.fromInt(totalUnits) * details.priceInUSD) / Float.fromInt(10 ** details.tokenDecimals);
 
-          let tokenSnapshot : TokenSnapshot = {
-            token = token;
-            symbol = details.tokenSymbol;
-            balance = details.balance;
-            decimals = details.tokenDecimals;
-            priceInICP = details.priceInICP;
-            priceInUSD = details.priceInUSD;
-            valueInICP = valueInICP;
-            valueInUSD = valueInUSD;
+            totalValueICP += valueInICP;
+            totalValueUSD += valueInUSD;
+
+            let tokenSnapshot : TokenSnapshot = {
+              token = token;
+              symbol = details.tokenSymbol;
+              balance = totalUnits;
+              decimals = details.tokenDecimals;
+              priceInICP = details.priceInICP;
+              priceInUSD = details.priceInUSD;
+              valueInICP = valueInICP;
+              valueInUSD = valueInUSD;
+            };
+
+            Vector.add(tokenSnapshots, tokenSnapshot);
           };
-          
-          Vector.add(tokenSnapshots, tokenSnapshot);
         };
       };
 
@@ -3729,13 +3800,17 @@ shared (deployer) persistent actor class treasury() = this {
     var totalValueICP : Nat = 0;
     var totalValueUSD : Float = 0.0;
 
+    // Phase 5 Fix 2: combined view for portfolio value (was details.balance, now liquid-only).
     for ((token, details) in Map.entries(tokenDetailsMap)) {
-      if (details.Active and details.balance > 0) {
-        let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-        let valueInUSD = (Float.fromInt(details.balance) * details.priceInUSD) / Float.fromInt(10 ** details.tokenDecimals);
-        
-        totalValueICP += valueInICP;
-        totalValueUSD += valueInUSD;
+      if (details.Active) {
+        let totalUnits = tokenTotalBalanceUnits(token, details);
+        if (totalUnits > 0) {
+          let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
+          let valueInUSD = (Float.fromInt(totalUnits) * details.priceInUSD) / Float.fromInt(10 ** details.tokenDecimals);
+
+          totalValueICP += valueInICP;
+          totalValueUSD += valueInUSD;
+        };
       };
     };
 
@@ -4913,9 +4988,10 @@ shared (deployer) persistent actor class treasury() = this {
         let lpTargets = computeLPTargets();
         // Compute portfolio value for 0.5% per-operation cap.
         // This bounds the between-await race window so NAV drift ≤ 0.5% (= burn fee).
+        // Phase 5 Fix 2: combined view (was details.balance) — cap is based on TOTAL portfolio.
         var lpCapPortfolioICP : Nat = 0;
-        for ((_, details) in Map.entries(tokenDetailsMap)) {
-          if (details.Active) { lpCapPortfolioICP += (details.balance * details.priceInICP) / (10 ** details.tokenDecimals) };
+        for ((tk, details) in Map.entries(tokenDetailsMap)) {
+          if (details.Active) { lpCapPortfolioICP += (tokenTotalBalanceUnits(tk, details) * details.priceInICP) / (10 ** details.tokenDecimals) };
         };
         let maxLPChangePerOp = lpCapPortfolioICP / 200; // 0.5% of portfolio
         let removals = Vector.new<(Text, Principal, Principal, Nat, Nat, Nat)>();
@@ -5017,10 +5093,12 @@ shared (deployer) persistent actor class treasury() = this {
         switch (selectTradingPair(tradeDiffs)) {
           case (?(sellToken, buyToken)) {
             // Calculate total portfolio value for exact targeting decisions
+            // Phase 5 Fix 2: combined view (was details.balance, now liquid-only) — preserves
+            // pre-Fix-2 behavior where trade-sizing math saw the combined value.
             var totalValueICP = 0;
             for ((principal, details) in Map.entries(tokenDetailsMap)) {
               if (details.Active and not isTokenPausedFromTrading(principal)) {
-                let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+                let valueInICP = (tokenTotalBalanceUnits(principal, details) * details.priceInICP) / (10 ** details.tokenDecimals);
                 totalValueICP += valueInICP;
               };
             };
@@ -8934,9 +9012,10 @@ shared (deployer) persistent actor class treasury() = this {
     if (lpConfig.enabled and not isNachosHighVolume() and lastLPQueryTimestamp > 0) {
       let lpTargets = computeLPTargets(); // Recompute with post-trade state
       // Compute portfolio value for 0.5% per-operation cap (same as Step A).
+      // Phase 5 Fix 2: combined view (was details.balance, now liquid-only).
       var lpCapPortfolioICP_C : Nat = 0;
-      for ((_, details) in Map.entries(tokenDetailsMap)) {
-        if (details.Active) { lpCapPortfolioICP_C += (details.balance * details.priceInICP) / (10 ** details.tokenDecimals) };
+      for ((tk, details) in Map.entries(tokenDetailsMap)) {
+        if (details.Active) { lpCapPortfolioICP_C += (tokenTotalBalanceUnits(tk, details) * details.priceInICP) / (10 ** details.tokenDecimals) };
       };
       let maxLPChangePerOp_C = lpCapPortfolioICP_C / 200; // 0.5% of portfolio
       let additions = Vector.new<(Text, Principal, Principal, Nat)>();
@@ -8986,11 +9065,13 @@ shared (deployer) persistent actor class treasury() = this {
 
     let targets = Vector.new<(Text, Principal, Principal, Nat, Nat, Nat)>();
 
-    // Total portfolio value for percentage calculations
+    // Total portfolio value for percentage calculations.
+    // Phase 5 Fix 2: combined view (was details.balance, now liquid-only) — LP target % is
+    // calculated against the FULL portfolio including existing LP positions.
     var totalPortfolioICP : Nat = 0;
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
       if (details.Active and not isTokenPausedFromTrading(principal)) {
-        totalPortfolioICP += (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
+        totalPortfolioICP += (tokenTotalBalanceUnits(principal, details) * details.priceInICP) / (10 ** details.tokenDecimals);
       };
     };
     if (totalPortfolioICP == 0) return [];
@@ -9140,20 +9221,31 @@ shared (deployer) persistent actor class treasury() = this {
 
   // Remove LP from a pool (Step A in trading cycle)
   // LP removal is NOT gated by token pause (protective action)
-  private func removeLiquidityFromPool(
+  type LPRemoveResult = {
+    liquidityBurned : Nat;
+    amount0 : Nat;
+    amount1 : Nat;
+    fees0 : Nat;
+    fees1 : Nat;
+  };
+
+  // Inner: returns the actual exchange result so callers (rebalancer, requestLPUnwind) can
+  // make decisions based on what was actually removed. All bookkeeping (lpTokensInTransit,
+  // lpBackingPerToken, treasuryLPPositions, audit log) happens here.
+  private func removeLiquidityFromPoolInner(
     poolKey : Text, t0 : Principal, t1 : Principal,
     excessValueICP : Nat, currentLPValueICP : Nat, currentLiquidity : Nat,
-  ) : async () {
-    if (currentLPValueICP == 0 or currentLiquidity == 0) return;
+  ) : async Result.Result<LPRemoveResult, Text> {
+    if (currentLPValueICP == 0 or currentLiquidity == 0) return #err("Empty position");
 
     // Compute liquidity units to remove proportionally
     let liquidityToRemove = (excessValueICP * currentLiquidity) / currentLPValueICP;
-    if (liquidityToRemove == 0) return;
+    if (liquidityToRemove == 0) return #err("liquidityToRemove rounded to zero");
 
     let t0Text = Principal.toText(t0);
     let t1Text = Principal.toText(t1);
 
-    logger.info("LP_REMOVE", "Removing LP from " # poolKey # " liq=" # Nat.toText(liquidityToRemove) # " excess=" # Nat.toText(excessValueICP) # "e8s", "removeLiquidityFromPool");
+    logger.info("LP_REMOVE", "Removing LP from " # poolKey # " liq=" # Nat.toText(liquidityToRemove) # " excess=" # Nat.toText(excessValueICP) # "e8s", "removeLiquidityFromPoolInner");
 
     try {
       let result = await (with timeout = 65) TACOSwap.doRemoveLiquidity(t0Text, t1Text, liquidityToRemove);
@@ -9196,15 +9288,175 @@ shared (deployer) persistent actor class treasury() = this {
           };
 
           logTreasuryAdminAction(Principal.fromActor(this), #LPRemoveLiquidity({ pool = poolKey; details = "burned=" # Nat.toText(ok.liquidityBurned) # " returned=" # Nat.toText(ok.amount0) # "/" # Nat.toText(ok.amount1) }), "LP removal from " # poolKey, true, null);
-          logger.info("LP_REMOVE", "Success: a0=" # Nat.toText(ok.amount0) # " a1=" # Nat.toText(ok.amount1) # " f0=" # Nat.toText(ok.fees0) # " f1=" # Nat.toText(ok.fees1), "removeLiquidityFromPool");
+          logger.info("LP_REMOVE", "Success: a0=" # Nat.toText(ok.amount0) # " a1=" # Nat.toText(ok.amount1) # " f0=" # Nat.toText(ok.fees0) # " f1=" # Nat.toText(ok.fees1), "removeLiquidityFromPoolInner");
+
+          #ok({
+            liquidityBurned = ok.liquidityBurned;
+            amount0 = ok.amount0;
+            amount1 = ok.amount1;
+            fees0 = ok.fees0;
+            fees1 = ok.fees1;
+          });
         };
         case (#Err(e)) {
-          logger.error("LP_REMOVE", "Failed: " # debug_show(e), "removeLiquidityFromPool");
+          logger.error("LP_REMOVE", "Failed: " # debug_show(e), "removeLiquidityFromPoolInner");
+          #err("Exchange returned error: " # debug_show(e));
         };
       };
     } catch (e) {
-      logger.error("LP_REMOVE", "Exception: " # Error.message(e), "removeLiquidityFromPool");
+      logger.error("LP_REMOVE", "Exception: " # Error.message(e), "removeLiquidityFromPoolInner");
+      #err("Exception: " # Error.message(e));
     };
+  };
+
+  // Wrapper preserving the original signature for the rebalancer (which doesn't care about the result).
+  private func removeLiquidityFromPool(
+    poolKey : Text, t0 : Principal, t1 : Principal,
+    excessValueICP : Nat, currentLPValueICP : Nat, currentLiquidity : Nat,
+  ) : async () {
+    ignore await removeLiquidityFromPoolInner(poolKey, t0, t1, excessValueICP, currentLPValueICP, currentLiquidity);
+  };
+
+  // Public: NACHOS vault calls this to extract a specific token amount by unwinding LP positions
+  // that contain the token. Walks #fullRange positions largest-first, stops when the cumulative
+  // amount removed for `token` reaches `neededAmount`. Returns synchronously (the exchange→treasury
+  // ICRC-1 transfers are async — see lpTokensInTransit reconciliation in updateBalances).
+  public shared ({ caller }) func requestLPUnwind(
+    token : Principal,
+    neededAmount : Nat,
+  ) : async Result.Result<{
+    requestId : Nat;
+    liquidityRemoved : Nat;
+    expectedAmount : Nat;
+    poolsUsed : [Text];
+  }, Text> {
+    assert (caller == NachosVaultPrincipal);
+    if (neededAmount == 0) return #err("neededAmount is zero");
+
+    type Cand = {
+      poolKey : Text;
+      t0 : Principal;
+      t1 : Principal;
+      tokenSide : { #zero; #one };
+      tokenAmount : Nat;
+      liquidity : Nat;
+      lpValueICP : Nat;
+    };
+
+    let candidates = Vector.new<Cand>();
+    for (pos in cachedLPPositions.vals()) {
+      switch (pos.positionType) {
+        case (#fullRange) {
+          if (pos.liquidity > 0) {
+            let t0 = Principal.fromText(pos.token0);
+            let t1 = Principal.fromText(pos.token1);
+            let poolKey = normalizePoolKeyText(pos.token0, pos.token1);
+            if (t0 == token) {
+              Vector.add(candidates, {
+                poolKey; t0; t1; tokenSide = #zero;
+                tokenAmount = pos.token0Amount + pos.fee0;
+                liquidity = pos.liquidity;
+                lpValueICP = getCurrentLPValueICP(poolKey);
+              });
+            } else if (t1 == token) {
+              Vector.add(candidates, {
+                poolKey; t0; t1; tokenSide = #one;
+                tokenAmount = pos.token1Amount + pos.fee1;
+                liquidity = pos.liquidity;
+                lpValueICP = getCurrentLPValueICP(poolKey);
+              });
+            };
+          };
+        };
+        case (_) {}; // skip #concentrated
+      };
+    };
+
+    if (Vector.size(candidates) == 0) {
+      return #err("No #fullRange positions contain token " # Principal.toText(token));
+    };
+
+    let sorted = Array.sort<Cand>(
+      Vector.toArray(candidates),
+      func(a, b) { Nat.compare(b.tokenAmount, a.tokenAmount) },
+    );
+
+    let priceICP = switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?d) d.priceInICP; case null 0;
+    };
+    let decimals = switch (Map.get(tokenDetailsMap, phash, token)) {
+      case (?d) d.tokenDecimals; case null 8;
+    };
+    if (priceICP == 0) return #err("No price for " # Principal.toText(token));
+
+    let requestId = nextBurnUnwindRequestId;
+    nextBurnUnwindRequestId += 1;
+
+    var remaining : Nat = neededAmount;
+    let poolsUsed = Vector.new<Text>();
+    var totalLiquidityRemoved : Nat = 0;
+    var totalExpectedAmount : Nat = 0;
+
+    label walk for (cand in sorted.vals()) {
+      if (remaining == 0) break walk;
+      let takeAmount = Nat.min(remaining, cand.tokenAmount);
+      let takeValueICP = (takeAmount * priceICP) / (10 ** decimals);
+      if (takeValueICP == 0) continue walk;
+
+      let result = await removeLiquidityFromPoolInner(
+        cand.poolKey, cand.t0, cand.t1,
+        takeValueICP, cand.lpValueICP, cand.liquidity,
+      );
+      switch (result) {
+        case (#ok(r)) {
+          Vector.add(poolsUsed, cand.poolKey);
+          totalLiquidityRemoved += r.liquidityBurned;
+          let amountForToken = switch (cand.tokenSide) {
+            case (#zero) r.amount0 + r.fees0;
+            case (#one) r.amount1 + r.fees1;
+          };
+          totalExpectedAmount += amountForToken;
+          if (amountForToken >= remaining) { remaining := 0 }
+          else { remaining -= amountForToken };
+        };
+        case (#err(_)) {}; // skip this pool, keep walking
+      };
+    };
+
+    if (totalLiquidityRemoved == 0) {
+      return #err("No liquidity could be removed for " # Principal.toText(token));
+    };
+
+    let existing = switch (Map.get(burnUnwindRequests, phash, token)) {
+      case (?arr) arr; case null [];
+    };
+    let entry = {
+      requestId;
+      amount = neededAmount;
+      liquidityRemoved = totalLiquidityRemoved;
+      poolKey = if (Vector.size(poolsUsed) > 0) Vector.get(poolsUsed, 0) else "";
+      requestedAt = now();
+    };
+    Map.set(burnUnwindRequests, phash, token, Array.append(existing, [entry]));
+
+    logger.info("LP_UNWIND", "Burn unwind req#" # Nat.toText(requestId) # " token=" # Principal.toText(token) # " requested=" # Nat.toText(neededAmount) # " expected=" # Nat.toText(totalExpectedAmount) # " pools=" # Nat.toText(Vector.size(poolsUsed)), "requestLPUnwind");
+
+    #ok({
+      requestId;
+      liquidityRemoved = totalLiquidityRemoved;
+      expectedAmount = totalExpectedAmount;
+      poolsUsed = Vector.toArray(poolsUsed);
+    });
+  };
+
+  // Visibility for vault and admins.
+  public shared query ({ caller }) func getBurnUnwindRequests() : async [(Principal, [{
+    requestId : Nat; amount : Nat; liquidityRemoved : Nat; poolKey : Text; requestedAt : Int;
+  }])] {
+    if (caller != NachosVaultPrincipal and not isMasterAdmin(caller) and not Principal.isController(caller)) {
+      return [];
+    };
+    Iter.toArray(Map.entries(burnUnwindRequests));
   };
 
   // Add LP to a pool (Step C in trading cycle)
@@ -9631,8 +9883,11 @@ shared (deployer) persistent actor class treasury() = this {
     );
 
     // First pass - identify active tokens and calculate total target basis points
+    // LP-held tokens count as part of the portfolio: a token we hold ONLY via LP is
+    // still a holding the rebalancer must reason about (target diff, sell/buy direction).
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        if ((details.Active or details.balance > 0) and not isTokenPausedFromTrading(principal)) {
+        let totalUnits = tokenTotalBalanceUnits(principal, details);
+        if ((details.Active or totalUnits > 0) and not isTokenPausedFromTrading(principal)) {
             Vector.add(activeTokens, principal);
             switch (Map.get(currentAllocations, phash, principal)) {
                 case (?target) { totalTargetBasisPoints += target };
@@ -9667,19 +9922,24 @@ shared (deployer) persistent actor class treasury() = this {
       );
     };
 
-    // Second pass - calculate total value and store allocations
+    // Second pass - calculate total value and store allocations.
+    // LP holdings count as part of the portfolio for both inclusion (`> 0` check) and
+    // for the force-sell trigger on inactive tokens. The trade-size logic still trades
+    // liquid-only (LP can't be sold without unwinding first), but the rebalancer must
+    // see LP-held tokens as positions that need targets/diffs.
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-        if (details.Active or details.balance > 0) {
-            let valueInICP = (details.balance * details.priceInICP) / (10 ** details.tokenDecimals);
-            
+        let totalUnits = tokenTotalBalanceUnits(principal, details);
+        if (details.Active or totalUnits > 0) {
+            let valueInICP = (totalUnits * details.priceInICP) / (10 ** details.tokenDecimals);
+
             // Only include value of unpaused tokens in total
             if (not isTokenPausedFromTrading(principal)) {
                 totalValueICP += valueInICP;
             };
 
             // Calculate adjusted target basis points
-            let targetBasisPoints = if (not details.Active and details.balance > 0) {
-                0 // Force sell inactive tokens with balance
+            let targetBasisPoints = if (not details.Active and totalUnits > 0) {
+                0 // Force sell inactive tokens with any holding (liquid or LP-locked)
             } else if (isTokenPausedFromTrading(principal)) {
                 0 // No target allocation for paused tokens
             } else {
@@ -10141,9 +10401,10 @@ shared (deployer) persistent actor class treasury() = this {
     
     let tokenStates = Vector.new<Text>();
     
-    // Calculate totals and collect per-token data
+    // Calculate totals and collect per-token data.
+    // Combined view: LP holdings are part of the portfolio for valuation purposes.
     for ((principal, details) in Map.entries(tokenDetailsMap)) {
-      let rawBalance = details.balance;
+      let rawBalance = tokenTotalBalanceUnits(principal, details);
       let decimals = details.tokenDecimals;
       let priceICP = details.priceInICP;
       let priceUSD = details.priceInUSD;
@@ -12236,7 +12497,7 @@ shared (deployer) persistent actor class treasury() = this {
             );
           };
           try {
-            ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+            ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(tokenDetailsSnapshotForSync());
           } catch (e_sync) {
             logger.error(
               "SHORT_SYNC",
@@ -12282,7 +12543,7 @@ shared (deployer) persistent actor class treasury() = this {
       } catch (_) {};
       try {
         Debug.print("Sync token details to DAO");
-        ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+        ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(tokenDetailsSnapshotForSync());
       } catch (_) {};
       for ((token, details) in Iter.toArray(Map.entries(tokenDetailsMap)).vals()) {
         Debug.print("Check token details sync failure for " # Principal.toText(token));
@@ -12314,7 +12575,7 @@ shared (deployer) persistent actor class treasury() = this {
       } catch (_) {};
       try {
         Debug.print("Sync token details to DAO");
-        ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+        ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(tokenDetailsSnapshotForSync());
       } catch (_) {};
       for ((token, details) in Iter.toArray(Map.entries(tokenDetailsMap)).vals()) {
         Debug.print("Check token details sync failure for " # Principal.toText(token));
@@ -12336,7 +12597,7 @@ shared (deployer) persistent actor class treasury() = this {
     };
 
     try {
-      ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(Iter.toArray(Map.entries(tokenDetailsMap)));
+      ignore await (with timeout = 65) dao.syncTokenDetailsFromTreasury(tokenDetailsSnapshotForSync());
       return #ok("Synced with DAO");
     } catch (e) {
       return #err("Error syncing with DAO: " # Error.message(e));
@@ -13304,7 +13565,8 @@ shared (deployer) persistent actor class treasury() = this {
       icpPriceUSD = icpPrice;
       tokenDetails = Array.map<(Principal, TokenDetails), (Principal, TokenDetails)>(
         Iter.toArray(Map.entries(tokenDetailsMap)),
-        func((p, d)) { (p, { d with pastPrices = [] }) },
+        // Phase 5 follow-up: return COMBINED balance to external consumers (liquid + LP).
+        func((p, d)) { (p, { d with pastPrices = []; balance = tokenTotalBalanceUnits(p, d) }) },
       );
       tradingPauses = Iter.toArray(Map.vals(tradingPauses));
       lpBackingPerToken = Buffer.toArray(lpBuf);
@@ -13362,9 +13624,22 @@ shared (deployer) persistent actor class treasury() = this {
     let result = Buffer.Buffer<(Principal, Nat)>(Map.size(tokenDetailsMap));
     for ((token, _) in Map.entries(tokenDetailsMap)) {
       let backing = switch (Map.get(lpBackingPerToken, phash, token)) { case (?v) v; case null 0 };
-      let transit = switch (Map.get(lpTokensInTransit, phash, token)) { case (?(amt, _)) amt; case null 0 };
+      let rawTransit = switch (Map.get(lpTokensInTransit, phash, token)) { case (?(amt, _)) amt; case null 0 };
       let flight = switch (Map.get(lpDepositsInFlight, phash, token)) { case (?v) v; case null 0 };
-      let total = backing + transit + flight;
+
+      // Phase 4 race-fix: if liquid balance has already absorbed the in-transit amount
+      // (i.e. tokens arrived but periodic reconciliation hasn't cleared lpTokensInTransit yet),
+      // treat transit as 0 here. Otherwise consumers double-count: once via the refreshed
+      // liquid balance (already includes the arrived tokens) and once via this LP-backing
+      // total (still claims the tokens are in transit). Same condition the reconciliation
+      // block uses; applied as a query filter rather than a state mutation.
+      let effectiveTransit = if (rawTransit > 0) {
+        let curLiquid = switch (Map.get(liquidBalancePerToken, phash, token)) { case (?v) v; case null 0 };
+        let prevLiquid = switch (Map.get(previousLiquidBalance, phash, token)) { case (?v) v; case null 0 };
+        if (curLiquid >= prevLiquid + rawTransit) { 0 } else { rawTransit };
+      } else { 0 };
+
+      let total = backing + effectiveTransit + flight;
       if (total > 0) { result.add((token, total)) };
     };
     Buffer.toArray(result);
@@ -13581,6 +13856,7 @@ shared (deployer) persistent actor class treasury() = this {
               if (newLiquid >= oldLiquid + inTransitAmount and elapsed > 30_000_000_000) {
                 // Balance increased sufficiently and enough time passed — tokens likely arrived
                 Map.delete(lpTokensInTransit, phash, token);
+                Map.delete(burnUnwindRequests, phash, token); // clear vault-side unwind tracking
               } else if (elapsed > 600_000_000_000) {
                 // 10 min timeout — tokens may not have arrived. Add back to liquid balance
                 // so effective balance stays correct. Next updateBalances() will get actual
@@ -13588,6 +13864,7 @@ shared (deployer) persistent actor class treasury() = this {
                 let curLiquid = switch (Map.get(liquidBalancePerToken, phash, token)) { case (?v) v; case null 0 };
                 Map.set(liquidBalancePerToken, phash, token, curLiquid + inTransitAmount);
                 Map.delete(lpTokensInTransit, phash, token);
+                Map.delete(burnUnwindRequests, phash, token); // clear vault-side unwind tracking on timeout too
                 logger.warn("LP_BALANCE", "In-transit timeout for " # Principal.toText(token) # " amount=" # Nat.toText(inTransitAmount) # " — added back to liquid", "updateBalances");
               };
             };
@@ -13615,44 +13892,31 @@ shared (deployer) persistent actor class treasury() = this {
             };
             lpBudgetUsedPerToken := newBudget;
 
-            // Set effectiveBalance = liquid + lpBacking + inTransit + inFlight
-            for ((token, details) in Map.entries(tokenDetailsMap)) {
-              let liquid = details.balance;
-              let backing = switch (Map.get(lpBackingPerToken, phash, token)) { case (?v) v; case null 0 };
-              let transit = switch (Map.get(lpTokensInTransit, phash, token)) { case (?(amt, _)) amt; case null 0 };
-              let flight = switch (Map.get(lpDepositsInFlight, phash, token)) { case (?v) v; case null 0 };
-              Map.set(tokenDetailsMap, phash, token, { details with balance = liquid + backing + transit + flight });
-            };
+            // Phase 5 Fix 2: REMOVED the per-token balance overwrite that combined
+            // liquid + LP + transit + flight into details.balance. That dual-purpose use
+            // of `balance` was the root cause of the "ICRC-1 timeout pollution" bug —
+            // failed ICRC-1 queries leave balance stale, and re-running this overwrite
+            // would double-count LP. tokenDetailsMap.balance is now ALWAYS pure liquid
+            // wallet (whatever ICRC-1 query returned). Combined view is computed on
+            // demand by callers via `tokenTotalBalanceUnits(token, details)`.
 
             logger.info("LP_BALANCE", "LP state updated: " # Nat.toText(positions.size()) # " positions, " # Nat.toText(pools.size()) # " pools", "updateBalances");
           };
           case _ {
-            // Exchange query failed — use cache or degrade gracefully
+            // Exchange query failed — log and continue. Phase 5 Fix 2 removed the
+            // cache-fallback balance overwrite (was source of pollution on repeated failures).
+            // tokenDetailsMap.balance remains pure liquid; LP-aware consumers use
+            // tokenTotalBalanceUnits which reads lpBackingPerToken/lpTokensInTransit/lpDepositsInFlight directly.
             if (now() - lastLPQueryTimestamp < 3_600_000_000_000) {
-              // Cache < 1hr — add cached backing to balances
-              logger.warn("LP_QUERY", "Using cached LP backing (age: " # Int.toText((now() - lastLPQueryTimestamp) / 1_000_000_000) # "s)", "updateBalances");
-              for ((token, details) in Map.entries(tokenDetailsMap)) {
-                let backing = switch (Map.get(lpBackingPerToken, phash, token)) { case (?v) v; case null 0 };
-                let transit = switch (Map.get(lpTokensInTransit, phash, token)) { case (?(amt, _)) amt; case null 0 };
-                let flight = switch (Map.get(lpDepositsInFlight, phash, token)) { case (?v) v; case null 0 };
-                Map.set(tokenDetailsMap, phash, token, { details with balance = details.balance + backing + transit + flight });
-              };
+              logger.warn("LP_QUERY", "Exchange query failed; LP data is from cache (age: " # Int.toText((now() - lastLPQueryTimestamp) / 1_000_000_000) # "s)", "updateBalances");
             } else {
               logger.error("LP_QUERY", "Exchange unreachable, cache expired — LP data stale", "updateBalances");
             };
           };
         };
       } catch (e) {
-        logger.error("LP_QUERY", "LP query exception: " # Error.message(e), "updateBalances");
-        // Same cache fallback
-        if (now() - lastLPQueryTimestamp < 3_600_000_000_000) {
-          for ((token, details) in Map.entries(tokenDetailsMap)) {
-            let backing = switch (Map.get(lpBackingPerToken, phash, token)) { case (?v) v; case null 0 };
-            let transit = switch (Map.get(lpTokensInTransit, phash, token)) { case (?(amt, _)) amt; case null 0 };
-            let flight = switch (Map.get(lpDepositsInFlight, phash, token)) { case (?v) v; case null 0 };
-            Map.set(tokenDetailsMap, phash, token, { details with balance = details.balance + backing + transit + flight });
-          };
-        };
+        // Same as failure case — no balance overwrite, LP data falls back to cache
+        logger.error("LP_QUERY", "LP query exception: " # Error.message(e) # "; using cached LP data", "updateBalances");
       };
     } else {
       // No LP state — still populate liquidBalancePerToken for consistency
@@ -13972,9 +14236,10 @@ shared (deployer) persistent actor class treasury() = this {
     for ((token, used) in Map.entries(lpBudgetUsedPerToken)) {
       let sym = switch (Map.get(tokenDetailsMap, phash, token)) { case (?d) { d.tokenSymbol }; case null { Principal.toText(token) } };
       let alloc = switch (Map.get(currentAllocations, phash, token)) { case (?v) v; case null 0 };
+      // Phase 5 Fix 2: combined view for LP budget calculation.
       var totalPortfolio : Nat = 0;
-      for ((_, d) in Map.entries(tokenDetailsMap)) {
-        if (d.Active) { totalPortfolio += (d.balance * d.priceInICP) / (10 ** d.tokenDecimals) };
+      for ((tk, d) in Map.entries(tokenDetailsMap)) {
+        if (d.Active) { totalPortfolio += (tokenTotalBalanceUnits(tk, d) * d.priceInICP) / (10 ** d.tokenDecimals) };
       };
       let budget = (alloc * totalPortfolio * lpConfig.lpRatioBP) / (10_000 * 10_000);
       Vector.add(budgetVec, { tokenSymbol = sym; usedICP = used; budgetICP = budget });

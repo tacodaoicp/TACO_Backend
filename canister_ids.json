@@ -6,6 +6,9 @@
   "OTC_backend": {
     "ic": "qioex-5iaaa-aaaan-q52ba-cai"
   },
+  "batch_quoter_fid": {
+    "ic": "7wapi-xiaaa-aaaar-qb6yq-cai"
+  },
   "buyback_canister": {
     "ic": "cfl3o-5qaaa-aaaan-q6fga-cai"
   },

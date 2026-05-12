@@ -129,6 +129,14 @@
       "main": "src/exchange/examples/testActorC.mo",
       "type": "motoko",
       "args": "--enhanced-orthogonal-persistence"
+    },
+    "batch_quoter_app1": {
+      "main": "arb-bot/canister/batch_quoter.mo",
+      "type": "motoko"
+    },
+    "batch_quoter_fid": {
+      "main": "arb-bot/canister/batch_quoter.mo",
+      "type": "motoko"
     }
   },
   "networks":  {

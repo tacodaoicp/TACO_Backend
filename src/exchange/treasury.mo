@@ -90,6 +90,28 @@ shared (deployer) persistent actor class treasury() = this {
   // Per-transaction idempotency: stores txId → timestamp of successful transfer
   stable let processedTxIds = Map.new<Text, Int>();
 
+  // 24h rolling inter-canister call telemetry. Key = "<method>:<token>".
+  // Each entry is a 24-slot ring buffer indexed by absolute hour; a slot whose
+  // `hour` no longer matches the current absolute hour is reset on next write.
+  type StatSlot = { var ok : Nat; var err : Nat; var hour : Int };
+  stable let callStats24h = Map.new<Text, [var StatSlot]>();
+
+  private func recordCall(method : Text, token : Text, success : Bool) {
+    let hour = now() / 3_600_000_000_000;
+    let key = method # ":" # token;
+    let entry = switch (Map.get(callStats24h, thash, key)) {
+      case (?e) { e };
+      case null {
+        let e = Array.tabulateVar<StatSlot>(24, func(_) = { var ok = 0; var err = 0; var hour : Int = -1 });
+        Map.set(callStats24h, thash, key, e);
+        e;
+      };
+    };
+    let slot = entry[Int.abs(hour) % 24];
+    if (slot.hour != hour) { slot.ok := 0; slot.err := 0; slot.hour := hour };
+    if (success) { slot.ok += 1 } else { slot.err += 1 };
+  };
+
   private func cleanupTxIds<system>() {
     let cutoff = now() - 30 * 86_400_000_000_000;
     let toDelete = Vector.new<Text>();
@@ -109,37 +131,56 @@ shared (deployer) persistent actor class treasury() = this {
     transfer_fee : Nat;
   };
 
-  //This function is called by the exchange each time it has new transfers that have to be done. When not testing, it does not fulfill these transfers directly but instead creates a timer.
-  public shared ({ caller }) func receiveTransferTasks(tempTransferQueue : [(TransferRecipient, Nat, Text, Text)]) : async Bool {
+  //This function is called by the exchange each time it has new transfers that have to be done.
+  // `immediate=true` (passed by the exchange when the original caller is in
+  // allowedCanisters) drains the transfer queue synchronously — `swapMultiHop`
+  // returns AFTER the icrc1_transfer to user main commits, eliminating the
+  // queue-vs-consensus race that was causing arb bots' next leg to see
+  // InsufficientFunds. `immediate=false` (default for regular users / system
+  // tasks) preserves the original setTimer-queued behavior.
+  public shared ({ caller }) func receiveTransferTasks(tempTransferQueue : [(TransferRecipient, Nat, Text, Text)], immediate : Bool) : async Bool {
     assert (caller == canisterOTCPrincipal);
 
     if (tempTransferQueue.size() != 0) {
       try {
         Vector.addFromIter(transferQueue, tempTransferQueue.vals());
-        if test {
-          if (not transferTimerRunning) {
-            transferTimerRunning := true;
-            // Loop until queue empty — picks up items added by concurrent callers
-            var rounds = 0;
-            while (not Vector.isEmpty(transferQueue) and rounds < 10) {
-              try { await transferTimer(true) } catch (_) {};
-              rounds += 1;
-            };
-            transferTimerRunning := false;
+        if (test or immediate) {
+          // CORRECTNESS: every immediate caller MUST await until the queue is
+          // empty. The previous `if (not transferTimerRunning)` guard was a
+          // BUG — when two swap_multi_hop calls overlapped, the second
+          // returned `true` without waiting for its own items to drain
+          // (relying on the running loop). The caller (swap_multi_hop) then
+          // returned to the bot, which fired the next leg before its TACO
+          // payout had committed → ICPSwap pool saw `balance=10_001` and
+          // rejected. Instead, every immediate caller now runs its own drain
+          // loop. transferTimer pops items atomically between awaits, so
+          // concurrent loops cooperate (each grabs distinct items via
+          // Vector.removeLast). transferTimerRunning is kept as a hint but
+          // not enforced for correctness in immediate mode.
+          var rounds = 0;
+          while (not Vector.isEmpty(transferQueue) and rounds < 10) {
+            try { await transferTimer(true) } catch (_) {};
+            rounds += 1;
           };
-          // If lock was held: items are in transferQueue, the running loop will pick them up
         } else {
-          Vector.add(
-            transferTimerIDs,
-            setTimer<system>(
-              #nanoseconds(100000000),
-              func() : async () {
-                try { await transferTimer(false) } catch (_) {
-                  retryFunc<system>(20, 5, 1);
-                };
-              },
-            ),
-          );
+          // De-duplicate: if a transfer timer is already pending (or one is
+          // mid-flight with its ID still in the vector), skip scheduling.
+          // The new items are already in transferQueue and will be drained
+          // when that timer fires (transferTimer's end-block reschedules at
+          // 5 s if the queue is still non-empty after each batch).
+          if (Vector.size(transferTimerIDs) == 0) {
+            Vector.add(
+              transferTimerIDs,
+              setTimer<system>(
+                #seconds(5),
+                func() : async () {
+                  try { await transferTimer(false) } catch (_) {
+                    retryFunc<system>(20, 5, 1);
+                  };
+                },
+              ),
+            );
+          };
         };
         true;
       } catch (_) { false };
@@ -184,60 +225,73 @@ shared (deployer) persistent actor class treasury() = this {
         transferNonce += 1;
         nsAdd += 1;
         if (data.2 != ICPprincipalText) {
-          // Transfer ICRC1 token
-          let token = actor (data.2) : ICRC1.FullInterface;
-          let Tfees2 = Map.get(tokenInfo, thash, data.2);
-          var Tfees = 0;
-          switch (Tfees2) {
-            case null {};
-            case (?(foundTrades)) {
-              Tfees := foundTrades.TransferFee;
+          // Transfer ICRC1 token. Dispatch wrapped in try/catch so that a
+          // synchronous throw (e.g. outbound message queue full) re-enqueues
+          // the un-dispatched item rather than aborting the whole batch and
+          // losing already-popped items.
+          try {
+            let token = actor (data.2) : ICRC1.FullInterface;
+            let Tfees2 = Map.get(tokenInfo, thash, data.2);
+            var Tfees = 0;
+            switch (Tfees2) {
+              case null {};
+              case (?(foundTrades)) {
+                Tfees := foundTrades.TransferFee;
+              };
             };
-          };
-          let recipient = switch (data.0) {
-            case (#principal(p)) { p };
-            case (#accountId({ owner })) { owner };
-          };
+            let recipient = switch (data.0) {
+              case (#principal(p)) { p };
+              case (#accountId({ owner })) { owner };
+            };
 
-          let subaccount = switch (data.0) {
-            case (#principal(_)) { null };
-            case (#accountId({ subaccount })) { subaccount };
-          };
+            let subaccount = switch (data.0) {
+              case (#principal(_)) { null };
+              case (#accountId({ subaccount })) { subaccount };
+            };
 
-          let transferTask = token.icrc1_transfer({
-            from_subaccount = null;
-            to = { owner = recipient; subaccount = subaccount };
-            amount = (data.1);
-            fee = ?Tfees;
-            memo = ?Blob.fromArray([1]);
-            created_at_time = ?(natToNat64(Int.abs(now())) - transferNonce);
-          });
-          Vector.add(transferTasksICRC1, (transferTask, data));
+            let transferTask = token.icrc1_transfer({
+              from_subaccount = null;
+              to = { owner = recipient; subaccount = subaccount };
+              amount = (data.1);
+              fee = ?Tfees;
+              memo = ?Blob.fromArray([1]);
+              created_at_time = ?(natToNat64(Int.abs(now())) - transferNonce);
+            });
+            Vector.add(transferTasksICRC1, (transferTask, data));
+          } catch (_) {
+            recordCall("icrc1_transfer", data.2, false);
+            Vector.add(transferQueue, data);
+          };
         } else {
-          // Transfer ICP
-          let ledger = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : Ledger.Interface;
-          let Tfees2 = Map.get(tokenInfo, thash, "ryjl3-tyaaa-aaaaa-aaaba-cai");
-          var Tfees = 0;
-          switch (Tfees2) {
-            case null {};
-            case (?(foundTrades)) {
-              Tfees := foundTrades.TransferFee;
+          // Transfer ICP. Same dispatch-throw protection as ICRC1 path.
+          try {
+            let ledger = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : Ledger.Interface;
+            let Tfees2 = Map.get(tokenInfo, thash, "ryjl3-tyaaa-aaaaa-aaaba-cai");
+            var Tfees = 0;
+            switch (Tfees2) {
+              case null {};
+              case (?(foundTrades)) {
+                Tfees := foundTrades.TransferFee;
+              };
             };
+            let transferTask = ledger.transfer({
+              memo : Nat64 = 0;
+              from_subaccount = null;
+              to = switch (data.0) {
+                case (#principal(p)) Principal.toLedgerAccount(p, null);
+                case (#accountId({ owner; subaccount })) Principal.toLedgerAccount(owner, subaccount);
+              };
+              amount = { e8s = natToNat64(data.1) };
+              fee = { e8s = natToNat64(Tfees) };
+              created_at_time = ?{
+                timestamp_nanos = natToNat64(Int.abs(now())) - transferNonce;
+              };
+            });
+            Vector.add(transferTasksICP, (transferTask, data));
+          } catch (_) {
+            recordCall("icp_transfer", ICPprincipalText, false);
+            Vector.add(transferQueue, data);
           };
-          let transferTask = ledger.transfer({
-            memo : Nat64 = 0;
-            from_subaccount = null;
-            to = switch (data.0) {
-              case (#principal(p)) Principal.toLedgerAccount(p, null);
-              case (#accountId({ owner; subaccount })) Principal.toLedgerAccount(owner, subaccount);
-            };
-            amount = { e8s = natToNat64(data.1) };
-            fee = { e8s = natToNat64(Tfees) };
-            created_at_time = ?{
-              timestamp_nanos = natToNat64(Int.abs(now())) - transferNonce;
-            };
-          });
-          Vector.add(transferTasksICP, (transferTask, data));
         };
         }; // end idempotency else
       };
@@ -250,12 +304,15 @@ shared (deployer) persistent actor class treasury() = this {
             case (#Ok(_)) {
               let tid = transferTask.1.3;
               if (tid != "") { Map.set(processedTxIds, thash, tid, now()) };
+              recordCall("icrc1_transfer", transferTask.1.2, true);
             };
             case (#Err(transferError)) {
+              recordCall("icrc1_transfer", transferTask.1.2, false);
               Vector.add(transferQueue, transferTask.1);
             };
           };
         } catch (err) {
+          recordCall("icrc1_transfer", transferTask.1.2, false);
           Vector.add(transferQueue, transferTask.1);
         };
       };
@@ -268,12 +325,15 @@ shared (deployer) persistent actor class treasury() = this {
             case (#Ok(_)) {
               let tid = transferTask.1.3;
               if (tid != "") { Map.set(processedTxIds, thash, tid, now()) };
+              recordCall("icp_transfer", ICPprincipalText, true);
             };
             case (#Err(transferError)) {
+              recordCall("icp_transfer", ICPprincipalText, false);
               Vector.add(transferQueue, transferTask.1);
             };
           };
         } catch (err) {
+          recordCall("icp_transfer", ICPprincipalText, false);
           Vector.add(transferQueue, transferTask.1);
         };
       };
@@ -292,7 +352,7 @@ shared (deployer) persistent actor class treasury() = this {
           Vector.add(
             transferTimerIDs,
             setTimer<system>(
-              #nanoseconds(100000000),
+              #seconds(5),
               func() : async () {
                 try {
                   await transferTimer(false);
@@ -315,11 +375,7 @@ shared (deployer) persistent actor class treasury() = this {
           setTimer<system>(
             #seconds(1),
             func() : async () {
-              try {
-                await updateTokenInfoTimer();
-              } catch (_) {
-                retryFunc<system>(20, 5, 2);
-              };
+              try { await updateTokenInfoTimer() } catch (_) {};
             },
           ),
         );
@@ -351,6 +407,25 @@ shared (deployer) persistent actor class treasury() = this {
 
   public query ({ caller }) func getPendingTransferCount() : async Nat {
     Vector.size(transferQueue);
+  };
+
+  // Aggregated inter-canister call counts over the rolling last 24 hours.
+  // Returned as (key, ok, err) where key = "<method>:<token>".
+  public query func getCallStats24h() : async [(Text, Nat, Nat)] {
+    let now_hour = now() / 3_600_000_000_000;
+    let out = Vector.new<(Text, Nat, Nat)>();
+    for ((key, entry) in Map.entries(callStats24h)) {
+      var ok = 0;
+      var err = 0;
+      for (slot in entry.vals()) {
+        if (slot.hour > now_hour - 24) {
+          ok += slot.ok;
+          err += slot.err;
+        };
+      };
+      if (ok > 0 or err > 0) { Vector.add(out, (key, ok, err)) };
+    };
+    Vector.toArray(out);
   };
 
   // Sum of pending outgoing-transfer amounts grouped by token. Used by checkDiffs
@@ -396,13 +471,9 @@ shared (deployer) persistent actor class treasury() = this {
     Vector.add(
       tokenInfoTimerIDs,
       setTimer<system>(
-        #seconds(500),
+        #seconds(3000),
         func() : async () {
-          try {
-            await updateTokenInfoTimer();
-          } catch (_) {
-            retryFunc<system>(20, 5, 2);
-          };
+          try { await updateTokenInfoTimer() } catch (_) {};
         },
       ),
     );
@@ -417,11 +488,7 @@ shared (deployer) persistent actor class treasury() = this {
   public shared ({ caller }) func getAcceptedtokens(a : [Text]) : async () {
     assert (caller == canisterOTCPrincipal);
     acceptedTokens := a;
-    try {
-      await updateTokenInfo();
-    } catch (_) {
-      retryFunc<system>(20, 5, 2);
-    };
+    try { await updateTokenInfo() } catch (_) {};
   };
   public query ({ caller }) func getTokenInfo() : async [(Text, { TransferFee : Nat; Decimals : Nat; Name : Text; Symbol : Text })] {
     assert (caller == canisterOTCPrincipal);
@@ -494,7 +561,11 @@ shared (deployer) persistent actor class treasury() = this {
 
   };
 
-  //Getting the metadata of each token
+  //Getting the metadata of each token. Refresh runs in serial batches of
+  //BATCH_SIZE so we never have more than BATCH_SIZE outbound metadata calls
+  //outstanding at once — that prevents the canister's outbound message queue
+  //from filling, which is what previously caused synchronous dispatch throws
+  //("Error initializing future") and a 5s retry storm.
   private func updateTokenInfo() : async () {
     let timersize = Vector.size(tokenInfoTimerIDs);
     if (timersize > 0) {
@@ -504,65 +575,69 @@ shared (deployer) persistent actor class treasury() = this {
     };
     Vector.clear(tokenInfoTimerIDs);
 
-    // Create a map to store the futures
-    let metadataFutures = Map.new<Text, async [(Text, { #Nat : Nat; #Int : Int; #Blob : Blob; #Text : Text })]>();
+    let BATCH_SIZE = 3;
+    let total = acceptedTokens.size();
+    var idx = 0;
+    while (idx < total) {
+      let endIdx = if (idx + BATCH_SIZE > total) total else idx + BATCH_SIZE;
 
-    // Initialize all async calls and store futures
-    for (token in acceptedTokens.vals()) {
-      try {
-        let ledger = actor (token) : ICRC1.FullInterface;
-        let future = ledger.icrc1_metadata();
-        Map.set(metadataFutures, thash, token, future);
-      } catch (_) {
-        Debug.print("Error initializing future for token: " # token);
-      };
-    };
-
-    // Process all futures
-    for (token in acceptedTokens.vals()) {
-      try {
-        let futureMaybe = Map.get(metadataFutures, thash, token);
-        switch (futureMaybe) {
-          case (?future) {
-            let get = await future;
-            var fee2 = 0;
-            var decimals2 = 0;
-            var name2 = "";
-            var symbol2 = "";
-
-            for (i in Array.vals(get)) {
-              switch (i.0) {
-                case "icrc1:fee" {
-                  switch (i.1) { case (#Nat(ok)) { fee2 := ok }; case (#Int(ok)) { fee2 := Int.abs(ok) }; case _ {} };
-                };
-                case "icrc1:name" {
-                  switch (i.1) { case (#Text(ok)) { name2 := ok }; case _ {} };
-                };
-                case "icrc1:symbol" {
-                  switch (i.1) { case (#Text(ok)) { symbol2 := ok }; case _ {} };
-                };
-                case "icrc1:decimals" {
-                  switch (i.1) { case (#Nat(ok)) { decimals2 := ok }; case (#Int(ok)) { decimals2 := Int.abs(ok) }; case _ {} };
-                };
-                case _ {};
-              };
-            };
-
-            let data2 = {
-              TransferFee = fee2;
-              Decimals = decimals2;
-              Name = name2;
-              Symbol = symbol2;
-            };
-            Map.set(tokenInfo, thash, token, data2);
-          };
-          case (null) {
-            Debug.print("No future found for token: " # token);
-          };
+      // Synchronously dispatch up to BATCH_SIZE futures, each guarded so a
+      // dispatch-time throw on one token doesn't abort the batch.
+      let futures = Vector.new<(Text, async [(Text, { #Nat : Nat; #Int : Int; #Blob : Blob; #Text : Text })])>();
+      var i = idx;
+      while (i < endIdx) {
+        let token = acceptedTokens[i];
+        try {
+          let ledger = actor (token) : ICRC1.FullInterface;
+          Vector.add(futures, (token, ledger.icrc1_metadata()));
+        } catch (_) {
+          recordCall("icrc1_metadata", token, false);
+          Debug.print("Error initializing future for token: " # token);
         };
-      } catch (_) {
-        Debug.print("Error processing metadata for token: " # token);
+        i += 1;
       };
+
+      // Await this batch before starting the next one.
+      for ((token, future) in Vector.vals(futures)) {
+        try {
+          let get = await future;
+          var fee2 = 0;
+          var decimals2 = 0;
+          var name2 = "";
+          var symbol2 = "";
+
+          for (entry in Array.vals(get)) {
+            switch (entry.0) {
+              case "icrc1:fee" {
+                switch (entry.1) { case (#Nat(ok)) { fee2 := ok }; case (#Int(ok)) { fee2 := Int.abs(ok) }; case _ {} };
+              };
+              case "icrc1:name" {
+                switch (entry.1) { case (#Text(ok)) { name2 := ok }; case _ {} };
+              };
+              case "icrc1:symbol" {
+                switch (entry.1) { case (#Text(ok)) { symbol2 := ok }; case _ {} };
+              };
+              case "icrc1:decimals" {
+                switch (entry.1) { case (#Nat(ok)) { decimals2 := ok }; case (#Int(ok)) { decimals2 := Int.abs(ok) }; case _ {} };
+              };
+              case _ {};
+            };
+          };
+
+          Map.set(tokenInfo, thash, token, {
+            TransferFee = fee2;
+            Decimals = decimals2;
+            Name = name2;
+            Symbol = symbol2;
+          });
+          recordCall("icrc1_metadata", token, true);
+        } catch (_) {
+          recordCall("icrc1_metadata", token, false);
+          Debug.print("Error processing metadata for token: " # token);
+        };
+      };
+
+      idx := endIdx;
     };
   };
 
@@ -572,10 +647,15 @@ shared (deployer) persistent actor class treasury() = this {
       setTimer<system>(
         #seconds(1),
         func() : async () {
-          try {
-            await updateTokenInfoTimer();
-          } catch (_) {
-            retryFunc<system>(20, 5, 2);
+          try { await updateTokenInfoTimer() } catch (_) {
+            // Bootstrap path: if the very first invocation fails, schedule a
+            // 3000 s recovery so the timer chain is guaranteed to keep going.
+            ignore setTimer<system>(
+              #seconds(3000),
+              func() : async () {
+                try { await updateTokenInfoTimer() } catch (_) {};
+              },
+            );
           };
         },
       ),
@@ -588,11 +668,12 @@ shared (deployer) persistent actor class treasury() = this {
     msg : {
       #drainTransferQueue : () -> ();
       #getAcceptedtokens : () -> (a : [Text]);
+      #getCallStats24h : () -> ();
       #getPendingTransferCount : () -> ();
       #getPendingTransfersByToken : () -> ();
       #getTokenInfo : () -> ();
       #receiveTransferTasks :
-        () -> (tempTransferQueue : [(TransferRecipient, Nat, Text, Text)]);
+        () -> (tempTransferQueue : [(TransferRecipient, Nat, Text, Text)], immediate : Bool);
       #setOTCCanister : () -> (id : Text);
       #setTest : () -> (a : Bool);
     };

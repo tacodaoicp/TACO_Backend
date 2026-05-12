@@ -7,7 +7,7 @@ module {
   public type Treasury = actor {
     getAcceptedtokens : shared ([Text]) -> async ();
     getTokenInfo : shared query () -> async [(Text, { TransferFee : Nat; Decimals : Nat; Name : Text; Symbol : Text })];
-    receiveTransferTasks : shared ([(TransferRecipient, Nat, Text, Text)]) -> async Bool;
+    receiveTransferTasks : shared ([(TransferRecipient, Nat, Text, Text)], Bool) -> async Bool;
     drainTransferQueue : shared () -> async ();
     getPendingTransferCount : shared query () -> async Nat;
     getPendingTransfersByToken : shared query () -> async [(Text, Nat)];

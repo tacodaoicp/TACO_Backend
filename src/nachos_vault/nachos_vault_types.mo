@@ -226,6 +226,7 @@ module {
     portfolioValueICP : Nat;
     nachosSupply : Nat;
     reason : NavSnapshotReason;
+    icpPriceUSD : ?Float; // null on legacy snapshots; ?value going forward
   };
 
   // ═══════════════════════════════════════════════════════

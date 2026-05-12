@@ -479,6 +479,7 @@ export interface create_trading_canister {
       }
     >
   >,
+  'adminCheckBan' : ActorMethod<[Principal], bigint>,
   'adminDeleteKlinesBefore' : ActorMethod<[bigint, bigint], string>,
   'adminDrainTestModeExchange' : ActorMethod<[Principal], string>,
   'adminDrainTestModeStatus' : ActorMethod<[], string>,
@@ -518,6 +519,18 @@ export interface create_trading_canister {
         }
       } |
       { 'Err' : string }
+  >,
+  'adminForceUnlockRecovery' : ActorMethod<[], boolean>,
+  'adminRecoverWronglysent' : ActorMethod<
+    [
+      Principal,
+      string,
+      bigint,
+      { 'ICP' : null } |
+        { 'ICRC3' : null } |
+        { 'ICRC12' : null },
+    ],
+    boolean
   >,
   'adminRepairLastTradedPriceAndKlines' : ActorMethod<
     [Array<bigint>, boolean],
@@ -799,6 +812,7 @@ export interface create_trading_canister {
         'routes' : Array<
           {
             'fee' : bigint,
+            'tradingFeeBps' : bigint,
             'hopDetails' : Array<HopDetail>,
             'routeDescription' : string,
             'canFulfillFully' : boolean,
@@ -810,18 +824,6 @@ export interface create_trading_canister {
             'expectedBuyAmount' : bigint,
           }
         >,
-        'splitSim' : [] | [
-          {
-            'legs' : Array<
-              {
-                'amountIn' : bigint,
-                'expectedOut' : bigint,
-                'route' : Array<{ 'tokenIn' : string, 'tokenOut' : string }>,
-              }
-            >,
-            'totalOut' : bigint,
-          }
-        ],
       }
     >
   >,

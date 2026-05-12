@@ -22,9 +22,8 @@ module {
   };
 
   // ═══════════════════════════════════════════════════════
-  // STATE TYPES (field names match stable variable names)
-  // Previous migration (fromSubaccount + recipient) already applied.
-  // This is now an identity migration.
+  // STATE TYPES — previous USD-NAV migration is now applied;
+  // this is now an identity migration for forward-compat.
   // ═══════════════════════════════════════════════════════
 
   public type OldState = {

@@ -553,6 +553,7 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'adminCheckBan' : IDL.Func([IDL.Principal], [IDL.Nat], ['query']),
     'adminDeleteKlinesBefore' : IDL.Func([IDL.Int, IDL.Nat], [IDL.Text], []),
     'adminDrainTestModeExchange' : IDL.Func([IDL.Principal], [IDL.Text], []),
     'adminDrainTestModeStatus' : IDL.Func([], [IDL.Text], ['query']),
@@ -600,6 +601,21 @@ export const idlFactory = ({ IDL }) => {
             'Err' : IDL.Text,
           }),
         ],
+        [],
+      ),
+    'adminForceUnlockRecovery' : IDL.Func([], [IDL.Bool], []),
+    'adminRecoverWronglysent' : IDL.Func(
+        [
+          IDL.Principal,
+          IDL.Text,
+          IDL.Nat,
+          IDL.Variant({
+            'ICP' : IDL.Null,
+            'ICRC3' : IDL.Null,
+            'ICRC12' : IDL.Null,
+          }),
+        ],
+        [IDL.Bool],
         [],
       ),
     'adminRepairLastTradedPriceAndKlines' : IDL.Func(
@@ -959,6 +975,7 @@ export const idlFactory = ({ IDL }) => {
               'routes' : IDL.Vec(
                 IDL.Record({
                   'fee' : IDL.Nat,
+                  'tradingFeeBps' : IDL.Nat,
                   'hopDetails' : IDL.Vec(HopDetail),
                   'routeDescription' : IDL.Text,
                   'canFulfillFully' : IDL.Bool,
@@ -971,23 +988,6 @@ export const idlFactory = ({ IDL }) => {
                     })
                   ),
                   'expectedBuyAmount' : IDL.Nat,
-                })
-              ),
-              'splitSim' : IDL.Opt(
-                IDL.Record({
-                  'legs' : IDL.Vec(
-                    IDL.Record({
-                      'amountIn' : IDL.Nat,
-                      'expectedOut' : IDL.Nat,
-                      'route' : IDL.Vec(
-                        IDL.Record({
-                          'tokenIn' : IDL.Text,
-                          'tokenOut' : IDL.Text,
-                        })
-                      ),
-                    })
-                  ),
-                  'totalOut' : IDL.Nat,
                 })
               ),
             })

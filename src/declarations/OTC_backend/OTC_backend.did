@@ -79,6 +79,7 @@ type create_trading_canister =
         outputAmount: nat;
         route: vec SwapHop;
       }) query;
+   adminCheckBan: (p: principal) -> (nat) query;
    adminDeleteKlinesBefore: (cutoffNs: int, maxDeletesPerBucket: nat) ->
     (text);
    adminDrainTestModeExchange: (target: principal) -> (text);
@@ -117,6 +118,13 @@ type create_trading_canister =
           transferFee: nat;
         };
      });
+   adminForceUnlockRecovery: () -> (bool);
+   adminRecoverWronglysent: (recipient: principal, identifier: text, Block:
+    nat, tType: variant {
+                  ICP;
+                  ICRC12;
+                  ICRC3;
+                }) -> (bool);
    adminRepairLastTradedPriceAndKlines: (affectedPoolIndexes: vec nat,
     alsoRepairVolume24h: bool) -> (text);
    batchAdjustLiquidity: (adjustments:
@@ -386,23 +394,8 @@ type create_trading_canister =
             priceImpact: float64;
             routeDescription: text;
             routeTokens: vec text;
-          };
-        splitSim:
-         opt
-          record {
-            legs:
-             vec
-              record {
-                amountIn: nat;
-                expectedOut: nat;
-                route: vec record {
-                             tokenIn: text;
-                             tokenOut: text;
-                           };
-              };
-            totalOut: nat;
-          };
-      }) query;
+            tradingFeeBps: nat;
+          };}) query;
    getFeeCollectors: () -> (vec principal) query;
    getKlineData: (token1: text, token2: text, timeFrame: TimeFrame,
     initialGet: bool) -> (vec KlineData) query;
