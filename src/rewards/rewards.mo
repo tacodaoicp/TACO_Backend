@@ -25,9 +25,14 @@ import NeuronSnapshot "../neuron_snapshot/ns_types";
 import Cycles "mo:base/ExperimentalCycles";
 import Char "mo:base/Char";
 import Service "mo:icrc3-mo/service";
-import Migration "migration";
 
-(with migration = Migration.migrate)
+// NOTE: the leaderboard migration (src/rewards/migration.mo) was a one-time old->new
+// transition that already ran in a prior deploy — the deployed canister's stable state
+// already carries LeaderboardEntry.totalRewardsEarned (verified via its candid metadata).
+// Re-wiring `(with migration = Migration.migrate)` would force current state back through
+// an OldState that lacks the field, which the IC rejects as an illegal data-drop and which
+// blocks ALL further upgrades. It is therefore intentionally not wired. migration.mo is
+// retained for historical reference only.
 shared (deployer) persistent actor class Rewards() = this {
 
   private func this_canister_id() : Principal {
@@ -165,6 +170,29 @@ shared (deployer) persistent actor class Rewards() = this {
     endTime: Int;
     totalRewardPot: Nat;
     neuronRewards: [NeuronRewardSummary];
+  };
+
+  // Per-distribution DAO-wide performance stats. Values are PERFORMANCE MULTIPLIERS
+  // (1.0 = break-even), matching NeuronReward.performanceScore, so the frontend can
+  // reuse its existing formatter ((score - 1) * 100 => percent).
+  // Histogram axis is ADAPTIVE per metric: edges are this metric's min/max perf
+  // rounded outward to a 5pp grid; every bin is exactly 5pp wide, so histBinCount
+  // (and the histogram length) VARY per metric/distribution. All edges are on the grid.
+  public type PerfStats = {
+    vpWeightedAvg: Float;   // Σ(perf*vp)/Σ(vp); falls back to neuronCountAvg if Σvp == 0
+    neuronCountAvg: Float;  // arithmetic mean of perf (one neuron = one vote)
+    median: Float;          // median perf (mean of two middles when count is even)
+    histogram: [Nat];       // length == histBinCount; counts per 5pp bin
+    histMinPercent: Float;  // window low edge (percent, multiple of 5, e.g. -30.0) — adaptive
+    histMaxPercent: Float;  // window high edge (percent, multiple of 5, e.g. 45.0) — adaptive
+    histBinCount: Nat;      // (histMaxPercent - histMinPercent) / 5 — varies
+  };
+
+  public type DistributionStats = {
+    distributionId: Nat;
+    participantCount: Nat;  // neurons counted for USD (votingPower>0 & finite perf)
+    usd: PerfStats;         // from performanceScore
+    icp: ?PerfStats;        // from performanceScoreICP; null if NO counted neuron has one
   };
 
   public type NeuronDistributionEntry = {
@@ -350,6 +378,11 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var performanceScorePower : Float = 1.0; // Power to raise performance scores to (0 = no effect, 1 = linear, 2 = quadratic, etc.)
   stable var votingPowerPower : Float = 1.0; // Power to raise voting power to (0 = no effect, 1 = linear, 2 = quadratic, etc.)
 
+  // getDistributionStats histogram config (single source of truth for the adaptive window)
+  transient let HIST_BIN_WIDTH : Float = 5.0;  // each histogram bin spans 5 percentage points
+  transient let HIST_MIN_SPAN : Float = 20.0;  // expand window so there are >= 4 bins
+  transient let HIST_MAX_BINS : Nat = 240;     // safety cap; pathological outliers clamp into top bin
+
   // Distribution state
   stable var distributionCounter : Nat = 0;
   stable var currentDistributionId : ?Nat = null;
@@ -391,7 +424,13 @@ shared (deployer) persistent actor class Rewards() = this {
   
   // Distribution history (circular buffer using Vector)
   private stable let distributionHistory = Vector.new<DistributionRecord>();
-  
+
+  // Cache of per-distribution DAO-wide stats, keyed by distributionId. Populated at
+  // distribution-finalize time and by admin_generateDistributionStats (backfill).
+  // getDistributionStats serves from here with a live-compute fallback, so correctness
+  // never depends on the cache being warm. Invalidated when a record's scores change.
+  private stable var distributionStatsCache = Map.new<Nat, DistributionStats>();
+
   // Withdrawal history (circular buffer using Vector)
   private stable let withdrawalHistory = Vector.new<WithdrawalRecord>();
 
@@ -2029,6 +2068,9 @@ shared (deployer) persistent actor class Rewards() = this {
         };
         Vector.put(distributionHistory, historyIndex, finalRecord);
 
+        // Materialize DAO-wide stats for this finalized distribution (O(1) reads later)
+        Map.set(distributionStatsCache, nhash, finalRecord.id, computeDistributionStats(finalRecord));
+
         // Update per-neuron distribution index
         updateNeuronDistributionIndex(finalRecord, neuronRewards);
       };
@@ -3001,6 +3043,166 @@ shared (deployer) persistent actor class Rewards() = this {
       hasMore = offset + take < totalMatches;
       records = result;
     };
+  };
+
+  // performanceScore is a product of price ratios, so guard against NaN / ±inf.
+  private func isFinitePerf(x : Float) : Bool {
+    x == x and x < 1.0e308 and x > -1.0e308   // x==x rejects NaN; bounds reject ±inf
+  };
+
+  // Compute DAO-wide PerfStats from already-filtered scores + weights (all finite;
+  // weights summed for the VP-weighted mean). Histogram window is adaptive per metric.
+  private func computePerfStats(scores : [Float], weights : [Nat]) : PerfStats {
+    let n = scores.size();
+    if (n == 0) {
+      // neutral, labelable default axis when nothing is counted
+      return {
+        vpWeightedAvg = 1.0; neuronCountAvg = 1.0; median = 1.0;
+        histogram = Array.freeze(Array.init<Nat>(4, 0));
+        histMinPercent = -10.0; histMaxPercent = 10.0; histBinCount = 4;
+      };
+    };
+    // means + min/max pct in one pass
+    var sumPerf = 0.0; var sumW = 0.0; var sumWP = 0.0;
+    var minPct = (scores[0] - 1.0) * 100.0;
+    var maxPct = minPct;
+    for (i in scores.keys()) {
+      let p = scores[i];
+      let pct = (p - 1.0) * 100.0;
+      sumPerf += p;
+      let w = Float.fromInt(weights[i]);
+      sumW += w; sumWP += p * w;
+      if (pct < minPct) minPct := pct;
+      if (pct > maxPct) maxPct := pct;
+    };
+    let neuronCountAvg = sumPerf / Float.fromInt(n);
+    let vpWeightedAvg = if (sumW > 0.0) sumWP / sumW else neuronCountAvg;
+
+    // median (sort ascending)
+    let sorted = Array.sort<Float>(scores, Float.compare);
+    let median =
+      if (n % 2 == 1) sorted[n / 2]
+      else (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+
+    // adaptive window: 5pp-aligned edges, fixed 5pp bins, variable bin count
+    var lo = Float.floor(minPct / HIST_BIN_WIDTH) * HIST_BIN_WIDTH;
+    var hi = Float.ceil(maxPct / HIST_BIN_WIDTH) * HIST_BIN_WIDTH;
+    while (hi - lo < HIST_MIN_SPAN) { lo -= HIST_BIN_WIDTH; hi += HIST_BIN_WIDTH; }; // >= 4 bins
+    var binCount = Int.abs(Float.toInt((hi - lo) / HIST_BIN_WIDTH));
+    if (binCount > HIST_MAX_BINS) {                 // safety cap; top bin absorbs outliers
+      binCount := HIST_MAX_BINS;
+      hi := lo + Float.fromInt(binCount) * HIST_BIN_WIDTH;
+    };
+
+    let hist = Array.init<Nat>(binCount, 0);
+    for (i in scores.keys()) {
+      let pct = (scores[i] - 1.0) * 100.0;
+      var idx = Int.abs(Float.toInt(Float.floor((pct - lo) / HIST_BIN_WIDTH)));
+      if (idx >= binCount) idx := binCount - 1; // top edge & float slop / capped outliers
+      hist[idx] += 1;
+    };
+
+    {
+      vpWeightedAvg; neuronCountAvg; median;
+      histogram = Array.freeze(hist);
+      histMinPercent = lo; histMaxPercent = hi; histBinCount = binCount;
+    };
+  };
+
+  // Pure per-record computation of DAO-wide stats from a DistributionRecord.
+  // Reads only performanceScore / performanceScoreICP / votingPower — never checkpoints.
+  // Excludes zero-VP neurons; icp is null when no counted neuron has a finite ICP score.
+  private func computeDistributionStats(rec : DistributionRecord) : DistributionStats {
+    // USD: VP>0 and finite performanceScore
+    let usdScores = Buffer.Buffer<Float>(rec.neuronRewards.size());
+    let usdWeights = Buffer.Buffer<Nat>(rec.neuronRewards.size());
+    // ICP: subset that also has a finite performanceScoreICP
+    let icpScores = Buffer.Buffer<Float>(rec.neuronRewards.size());
+    let icpWeights = Buffer.Buffer<Nat>(rec.neuronRewards.size());
+    for (nr in rec.neuronRewards.vals()) {
+      if (nr.votingPower > 0 and isFinitePerf(nr.performanceScore)) {
+        usdScores.add(nr.performanceScore);
+        usdWeights.add(nr.votingPower);
+        switch (nr.performanceScoreICP) {
+          case (?s) { if (isFinitePerf(s)) { icpScores.add(s); icpWeights.add(nr.votingPower); }; };
+          case null {};
+        };
+      };
+    };
+    let usd = computePerfStats(Buffer.toArray(usdScores), Buffer.toArray(usdWeights));
+    let icp =
+      if (icpScores.size() == 0) null
+      else ?computePerfStats(Buffer.toArray(icpScores), Buffer.toArray(icpWeights));
+    {
+      distributionId = rec.id;
+      participantCount = usdScores.size();
+      usd; icp;
+    };
+  };
+
+  // DAO-wide per-distribution performance benchmarks for the given distribution IDs.
+  // Serves from distributionStatsCache when warm, else computes live (cache stays an
+  // optimization, never a correctness dependency). Unknown IDs are omitted; the frontend
+  // maps the result by distributionId.
+  public query func getDistributionStats(distributionIds : [Nat]) : async [DistributionStats] {
+    let totalSize = Vector.size(distributionHistory);
+
+    // id -> index, built once (only needed for cache misses)
+    let idIndex = Map.new<Nat, Nat>();
+    var k = 0;
+    while (k < totalSize) {
+      switch (Vector.getOpt(distributionHistory, k)) {
+        case (?rec) { Map.set(idIndex, nhash, rec.id, k); };
+        case null {};
+      };
+      k += 1;
+    };
+
+    let out = Buffer.Buffer<DistributionStats>(distributionIds.size());
+    for (wantedId in distributionIds.vals()) {
+      switch (Map.get(distributionStatsCache, nhash, wantedId)) {
+        case (?cached) { out.add(cached); };          // cache hit
+        case null {                                    // miss -> compute live
+          switch (Map.get(idIndex, nhash, wantedId)) {
+            case null {};                              // unknown id -> skip
+            case (?idx) {
+              switch (Vector.getOpt(distributionHistory, idx)) {
+                case (?rec) { out.add(computeDistributionStats(rec)); };
+                case null {};
+              };
+            };
+          };
+        };
+      };
+    };
+    Buffer.toArray(out);
+  };
+
+  // Admin backfill: (re)compute and cache DAO-wide stats for the newest `newestX`
+  // distributions (capped by available history). Update call — populates the stable
+  // cache that getDistributionStats serves from. Yields periodically to stay within
+  // the instruction limit on large histories.
+  public shared ({ caller }) func admin_generateDistributionStats(newestX : Nat) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) { return #err(#NotAuthorized) };
+
+    let totalSize = Vector.size(distributionHistory);
+    let take = Nat.min(newestX, totalSize);
+    var generated : Nat = 0;
+    var i = 0;
+    while (i < take) {
+      let index = totalSize - 1 - i;                  // newest first
+      switch (Vector.getOpt(distributionHistory, index)) {
+        case (?rec) {
+          Map.set(distributionStatsCache, nhash, rec.id, computeDistributionStats(rec));
+          generated += 1;
+          if (generated % 10 == 0) { await (with timeout = 65) async {} }; // yield
+        };
+        case null {};
+      };
+      i += 1;
+    };
+
+    #ok("Generated distribution stats cache for " # Nat.toText(generated) # " of newest " # Nat.toText(take) # " distributions");
   };
 
   // Get current distribution status
@@ -4858,6 +5060,7 @@ shared (deployer) persistent actor class Rewards() = this {
       };
 
       Vector.put(distributionHistory, i, updatedRecord);
+      Map.set(distributionStatsCache, nhash, updatedRecord.id, computeDistributionStats(updatedRecord)); // refresh stale stats
       updatedCount += 1;
 
       // Also yield after each distribution
@@ -4929,6 +5132,7 @@ shared (deployer) persistent actor class Rewards() = this {
         };
 
         Vector.put(distributionHistory, index, updatedRecord);
+        Map.set(distributionStatsCache, nhash, updatedRecord.id, computeDistributionStats(updatedRecord)); // refresh stale stats
         #ok("Recalculated ICP performance for distribution #" # Nat.toText(distributionId) # " (" # Nat.toText(neuronsProcessed) # " neurons)")
       };
       case null {
@@ -5183,6 +5387,7 @@ shared (deployer) persistent actor class Rewards() = this {
         status = existingRecord.status;
       };
       Vector.put(distributionHistory, currentDistIndex, updatedRecord);
+      Map.set(distributionStatsCache, nhash, updatedRecord.id, computeDistributionStats(updatedRecord)); // refresh stale stats
       logger.info("Admin", "Recalculated distribution #" # Nat.toText(existingRecord.id) # " (" # Nat.toText(existingRecord.neuronRewards.size()) # " neurons)", "recalculateDistributionsSequentially");
 
       ignore Timer.setTimer<system>(#nanoseconds(0), func() : async () {
@@ -5531,6 +5736,7 @@ shared (deployer) persistent actor class Rewards() = this {
       status = existingRecord.status;
     };
     Vector.put(distributionHistory, currentDistIndex, updatedRecord);
+    Map.set(distributionStatsCache, nhash, updatedRecord.id, computeDistributionStats(updatedRecord)); // refresh stale stats
 
     clearRecalcCaches();
     logger.info("Admin", "Backfilled distribution #" # Nat.toText(existingRecord.id) # ": added " # Nat.toText(neuronsAdded) # " neurons (" # Nat.toText(failedBuffer.size() - existingRecord.failedNeurons.size()) # " failed)", "backfillDistributionsSequentially");

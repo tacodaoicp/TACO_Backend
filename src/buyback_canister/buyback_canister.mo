@@ -62,6 +62,23 @@ shared (deployer) persistent actor class buyback_canister() = this {
   let SNS_BURN_OWNER : Principal = Principal.fromText("lhdfz-wqaaa-aaaaq-aae3q-cai");
   let OTC_PLACEHOLDER : Principal = Principal.fromText("aaaaa-aa");
 
+  // Issue 5: extra flash-arb start tokens beyond ICP/ckUSDC. Each tuple is
+  // (token, max_search_amount). Flash-arb consumes no buyback-side capital
+  // (exchange lends from feescollectedDAO or runs phantom mode), so these
+  // are pure size caps for the exchange's ternary search. Per-token min
+  // samples live in `arbMinSampleAmount` (config field, mutable at runtime).
+  let ARB_EXTRA_TOKENS : [(Principal, Nat)] = [
+    (Principal.fromText("hvgxa-wqaaa-aaaaq-aacia-cai"), 500_000_000),    // SNEED
+    (Principal.fromText("kknbx-zyaaa-aaaaq-aae4a-cai"), 500_000_000),    // TACO
+    (Principal.fromText("2ouva-viaaa-aaaaq-aaamq-cai"), 500_000_000),    // CHAT
+    (Principal.fromText("n6tkf-tqaaa-aaaal-qsneq-cai"), 500_000_000),    // cICP
+    (Principal.fromText("iwv6l-6iaaa-aaaal-ajjjq-cai"), 500_000_000),    // CLOWN
+    (Principal.fromText("zfcdd-tqaaa-aaaaq-aaaga-cai"), 500_000_000),    // DKP
+    (Principal.fromText("mxzaz-hqaaa-aaaar-qaada-cai"), 1_000_000),      // ckBTC (8 dec but high $/unit)
+    (Principal.fromText("i2s4q-syaaa-aaaan-qz4sq-cai"), 500_000_000),    // sGLDT
+    (Principal.fromText("pcj6u-uaaaa-aaaak-aewnq-cai"), 500_000_000),    // CLOUD (8 dec; high 1.0-CLOUD ledger fee — gas-floor set in arbMinSampleAmount)
+  ];
+
   transient let TREASURY_ID = canister_ids.getCanisterId(#treasury);
   transient let NACHOS_VAULT_ID = canister_ids.getCanisterId(#nachos_vault);
   transient let OTC_BACKEND_ID = canister_ids.getCanisterId(#OTC_backend);
@@ -124,6 +141,11 @@ shared (deployer) persistent actor class buyback_canister() = this {
   stable var buybackHistoryV2 : Vector.Vector<BuybackCycleRecord> = Vector.new<BuybackCycleRecord>();
   stable var nextBuybackCycleId : Nat = 0;
   stable var totalBurned : Nat = 0;
+
+  // Live exchange trading fee (basis points) captured from the most recent TACO quote (global
+  // ICPfee). Passed to the TACO adapter as exchangeFeeBps for deposit sizing, replacing the old
+  // hardcoded 5bp. Persisted across upgrades; default tracks the current 10bp.
+  stable var lastKnownTacoFeeBps : Nat = 10;
 
   // Local token details cache. Refreshed from treasury via syncTokenDetailsFromTreasury().
   stable let tokenDetailsCache = Map.new<Principal, CachedTokenDetails>();
@@ -281,6 +303,16 @@ shared (deployer) persistent actor class buyback_canister() = this {
   transient var skipKongPair : Map.Map<(Principal, Principal), Bool> = Map.new();
   transient var skipTacoPair : Map.Map<(Principal, Principal), Bool> = Map.new();
 
+  // Per-swap optimal TACO split plan. Set in findBestExecutionFullAmount after
+  // the optimizer runs; consumed by swapToken's #TACO branch to decide between
+  // single-route (executeTransferAndSwap) and asymmetric multi-route
+  // (executeTransferAndSwapMultiRoute). Empty when TACO isn't chosen for this
+  // swap, when the optimizer found no viable plan, or when single-route wins.
+  transient var lastTacoBuybackPlan : {
+    legs : [{ bp : Nat; route : [{ tokenIn : Text; tokenOut : Text }] }];
+    targetBp : Nat;
+  } = { legs = []; targetBp = 0 };
+
   transient let pairHash : Map.HashUtils<(Principal, Principal)> = (
     func((a, b) : (Principal, Principal)) : Nat32 {
       Principal.hash(a) +% Principal.hash(b)
@@ -368,14 +400,20 @@ shared (deployer) persistent actor class buyback_canister() = this {
 
     let sellTokenText = Principal.toText(sellToken);
     let buyTokenText = Principal.toText(buyToken);
+    // Probe 10 fractions (10%, 20%, ..., 100%) so the within-TACO optimizer
+    // below can enumerate asymmetric multi-route splits at the full amount.
+    // Same inter-canister call count as a 1-fraction probe (BatchMulti
+    // bundles all fractions into one query). Mirrors treasury.mo:10646.
     let tacoFutureOpt : ?(async Result.Result<[[swaptypes.TACOQuoteReply]], Text>) =
       if (skipTaco) { null }
       else {
         ?((with timeout = 65) TACOSwap.getQuoteWithRouteBatchMulti(
-          [{ tokenA = sellTokenText; tokenB = buyTokenText; amountIn = amountIn }],
+          Array.tabulate<{ tokenA : Text; tokenB : Text; amountIn : Nat }>(10, func(i) {
+            { tokenA = sellTokenText; tokenB = buyTokenText; amountIn = amountIn * (i + 1) / 10 }
+          }),
           sellDecimals,
           buyDecimals,
-          5, // maxRoutes — same default as treasury
+          5, // maxRoutes per fraction
         ))
       };
 
@@ -417,17 +455,322 @@ shared (deployer) persistent actor class buyback_canister() = this {
       case (#err(_)) { { out = 0; slipBP = 10000; valid = false } };
     };
 
-    let tacoQuote : Q = switch (tacoBatchResult) {
-      case (#ok(bundles)) {
-        if (bundles.size() > 0 and bundles[0].size() > 0) {
-          let r = bundles[0][0];
-          let slipBP : Nat = if (isFiniteFloat(r.slippage * 100.0)) { Int.abs(Float.toInt(r.slippage * 100.0)) } else { 10000 };
-          let valid = r.slippage <= maxSlippagePct and r.receive_amount > 0;
-          { out = r.receive_amount; slipBP; valid };
-        } else { { out = 0; slipBP = 10000; valid = false } };
-      };
-      case (#err(_)) { { out = 0; slipBP = 10000; valid = false } };
+    // ── SMART WITHIN-TACO SPLIT OPTIMIZER ──────────────────────────────────
+    //
+    // Pull the 10-fraction × top-N bundles out of the BatchMulti response,
+    // then run the same optimizer as treasury.mo: enumerate (bp, route)
+    // combinations summing to 10000 (i.e. the full amount), pool-disjoint by
+    // bidirectional edge match, pick the highest total expected_out. The
+    // result populates `tacoQuote.out` (= optimal multi-route total, ≥ the
+    // previous single-route best at bundles[0][0]) and `lastTacoBuybackPlan`
+    // for the executor below.
+
+    type TACOSplitLegPlanBB = {
+      bp : Nat;
+      route : [{ tokenIn : Text; tokenOut : Text }];
     };
+
+    type TACOOptimalPlanBB = {
+      legs : [TACOSplitLegPlanBB];
+      totalOut : Nat;
+      slipBP : Nat;
+      valid : Bool;
+    };
+
+    // Build the 10-bundle array (matches treasury.mo:10681 shape).
+    let emptyBundle : [swaptypes.TACOQuoteReply] = [];
+    let tacoBundles : [[swaptypes.TACOQuoteReply]] = switch (tacoBatchResult) {
+      case (#ok(r)) {
+        if (r.size() >= 10) {
+          Array.tabulate<[swaptypes.TACOQuoteReply]>(10, func(i) { r[i] });
+        } else {
+          Array.tabulate<[swaptypes.TACOQuoteReply]>(10, func(_) { emptyBundle });
+        };
+      };
+      case (#err(_)) {
+        Array.tabulate<[swaptypes.TACOQuoteReply]>(10, func(_) { emptyBundle });
+      };
+    };
+
+    // Capture the live exchange trading fee from the quote (global ICPfee) for deposit sizing.
+    label feeScanBB for (bundle in tacoBundles.vals()) {
+      for (q in bundle.vals()) {
+        if (q.tradingFeeBps > 0) { lastKnownTacoFeeBps := q.tradingFeeBps; break feeScanBB };
+      };
+    };
+
+    // Bidirectional pool-edge match. Two routes share a pool if any hop pair
+    // has the same {tokenA, tokenB} in either direction. Verbatim port from
+    // treasury.mo:hopsSharePool.
+    func hopsSharePool(
+      routeA : [{ tokenIn : Text; tokenOut : Text }],
+      routeB : [{ tokenIn : Text; tokenOut : Text }],
+    ) : Bool {
+      for (hopA in routeA.vals()) {
+        for (hopB in routeB.vals()) {
+          if ((hopA.tokenIn == hopB.tokenIn and hopA.tokenOut == hopB.tokenOut) or
+              (hopA.tokenIn == hopB.tokenOut and hopA.tokenOut == hopB.tokenIn)) {
+            return true;
+          };
+        };
+      };
+      false
+    };
+
+    func bpPairsForTarget(targetBp : Nat) : [(Nat, Nat)] {
+      let out = Vector.new<(Nat, Nat)>();
+      var a : Nat = 1000;
+      while (a * 2 <= targetBp) {
+        let b : Nat = targetBp - a;
+        if (b >= a) { Vector.add(out, (a, b)) };
+        a += 1000;
+      };
+      Vector.toArray(out)
+    };
+
+    func bpTriplesForTarget(targetBp : Nat) : [(Nat, Nat, Nat)] {
+      let out = Vector.new<(Nat, Nat, Nat)>();
+      var a : Nat = 1000;
+      while (a * 3 <= targetBp) {
+        var b : Nat = a;
+        while (a + b * 2 <= targetBp) {
+          let c : Nat = targetBp - a - b;
+          if (c >= b) { Vector.add(out, (a, b, c)) };
+          b += 1000;
+        };
+        a += 1000;
+      };
+      Vector.toArray(out)
+    };
+
+    type QuoteEntryBB = {
+      bp : Nat;
+      route : [{ tokenIn : Text; tokenOut : Text }];
+      out : Nat;
+      routeKey : Text;
+    };
+
+    func routeKeyOf(route : [{ tokenIn : Text; tokenOut : Text }]) : Text {
+      Array.foldLeft<{ tokenIn : Text; tokenOut : Text }, Text>(
+        route, "",
+        func(acc, h) { acc # h.tokenIn # ">" # h.tokenOut # ";" }
+      )
+    };
+
+    // Per-bundle validity — same simple criteria buyback already uses
+    // (slippage ≤ maxSlippagePct, receive_amount > 0). No dust filter here;
+    // buyback's top-level dust check at line 486-492 handles that.
+    func bundleQuoteValid(q : swaptypes.TACOQuoteReply) : Bool {
+      q.slippage <= maxSlippagePct and q.receive_amount > 0
+    };
+
+    func findOptimalTacoSplit(targetBp : Nat) : TACOOptimalPlanBB {
+      if (targetBp == 0 or targetBp > 10000) {
+        return { legs = []; totalOut = 0; slipBP = 10000; valid = false };
+      };
+      let targetIdx : Nat = (targetBp / 1000) - 1;
+
+      // 1-LEG BASELINE
+      var bestTotal : Nat = 0;
+      var bestPlan : [TACOSplitLegPlanBB] = [];
+      var baselineSlipBP : Nat = 10000;
+      let baselineBundle = tacoBundles[targetIdx];
+      if (baselineBundle.size() > 0) {
+        let q0 = baselineBundle[0];
+        if (bundleQuoteValid(q0)) {
+          let slipFloat = q0.slippage * 100.0;
+          baselineSlipBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
+          bestTotal := q0.receive_amount;
+          let synth : [{ tokenIn : Text; tokenOut : Text }] = if (q0.route.size() == 0) {
+            [{ tokenIn = sellTokenText; tokenOut = buyTokenText }]
+          } else { q0.route };
+          bestPlan := [{ bp = targetBp; route = synth }];
+        };
+      };
+
+      // MULTI-LEG FLATTEN: routes from bundles 0..targetIdx-1 with
+      // route.size() >= 2 only (matches treasury's exclusion of synthesized
+      // single-hop direct routes from multi-leg combos).
+      let entriesVec = Vector.new<QuoteEntryBB>();
+      let seenKeys = Map.new<Text, Bool>();
+      if (targetIdx > 0) {
+        var i : Nat = 0;
+        while (i < targetIdx) {
+          let bundle = tacoBundles[i];
+          let bp : Nat = (i + 1) * 1000;
+          for (q in bundle.vals()) {
+            if (q.receive_amount > 0 and q.route.size() >= 2 and bundleQuoteValid(q)) {
+              let rk = routeKeyOf(q.route);
+              let dedupeKey = Nat.toText(bp) # "|" # rk;
+              if (not Map.has(seenKeys, Map.thash, dedupeKey)) {
+                Map.set(seenKeys, Map.thash, dedupeKey, true);
+                Vector.add(entriesVec, { bp; route = q.route; out = q.receive_amount; routeKey = rk });
+              };
+            };
+          };
+          i += 1;
+        };
+      };
+
+      // GROUP BY BP + sort desc.
+      let groupByBp = Map.new<Nat, [Nat]>();
+      let totalEntries = Vector.size(entriesVec);
+      if (totalEntries > 0) {
+        let collect = Map.new<Nat, Vector.Vector<Nat>>();
+        var idx : Nat = 0;
+        while (idx < totalEntries) {
+          let e = Vector.get(entriesVec, idx);
+          let g = switch (Map.get(collect, Map.nhash, e.bp)) {
+            case (?v) { v };
+            case null { let v = Vector.new<Nat>(); Map.set(collect, Map.nhash, e.bp, v); v };
+          };
+          Vector.add(g, idx);
+          idx += 1;
+        };
+        for ((bp, g) in Map.entries(collect)) {
+          let arr = Vector.toArray(g);
+          let sorted = Array.sort<Nat>(arr, func(a, b) {
+            Nat.compare(Vector.get(entriesVec, b).out, Vector.get(entriesVec, a).out)
+          });
+          Map.set(groupByBp, Map.nhash, bp, sorted);
+        };
+      };
+      func entry(idx : Nat) : QuoteEntryBB { Vector.get(entriesVec, idx) };
+      func group(bp : Nat) : [Nat] {
+        switch (Map.get(groupByBp, Map.nhash, bp)) {
+          case (?arr) { arr };
+          case null { [] };
+        }
+      };
+      func groupTopOut(bp : Nat) : Nat {
+        let g = group(bp);
+        if (g.size() == 0) { 0 } else { entry(g[0]).out }
+      };
+      func pairCompatible(a : QuoteEntryBB, b : QuoteEntryBB) : Bool {
+        a.routeKey != b.routeKey and not hopsSharePool(a.route, b.route)
+      };
+
+      // 2-LEG SEARCH
+      for ((bpA, bpB) in bpPairsForTarget(targetBp).vals()) {
+        if (groupTopOut(bpA) + groupTopOut(bpB) > bestTotal) {
+          let gA = group(bpA);
+          if (bpA == bpB) {
+            let n = gA.size();
+            var xi : Nat = 0;
+            label sameLoop while (xi + 1 < n) {
+              let i = gA[xi];
+              let aOut = entry(i).out;
+              let nextOut = entry(gA[xi + 1]).out;
+              if (aOut + nextOut <= bestTotal) { break sameLoop };
+              var xj : Nat = xi + 1;
+              label sameInner while (xj < n) {
+                let j = gA[xj];
+                let total = aOut + entry(j).out;
+                if (total <= bestTotal) { break sameInner };
+                if (pairCompatible(entry(i), entry(j))) {
+                  bestTotal := total;
+                  bestPlan := [
+                    { bp = entry(i).bp; route = entry(i).route },
+                    { bp = entry(j).bp; route = entry(j).route },
+                  ];
+                };
+                xj += 1;
+              };
+              xi += 1;
+            };
+          } else {
+            let gB = group(bpB);
+            let maxBOut = groupTopOut(bpB);
+            let nA = gA.size();
+            let nB = gB.size();
+            var xi : Nat = 0;
+            label diffOuter while (xi < nA) {
+              let i = gA[xi];
+              let aOut = entry(i).out;
+              if (aOut + maxBOut <= bestTotal) { break diffOuter };
+              var xj : Nat = 0;
+              label diffInner while (xj < nB) {
+                let j = gB[xj];
+                let total = aOut + entry(j).out;
+                if (total <= bestTotal) { break diffInner };
+                if (pairCompatible(entry(i), entry(j))) {
+                  bestTotal := total;
+                  bestPlan := [
+                    { bp = entry(i).bp; route = entry(i).route },
+                    { bp = entry(j).bp; route = entry(j).route },
+                  ];
+                };
+                xj += 1;
+              };
+              xi += 1;
+            };
+          };
+        };
+      };
+
+      // 3-LEG SEARCH
+      for ((bpA, bpB, bpC) in bpTriplesForTarget(targetBp).vals()) {
+        if (groupTopOut(bpA) + groupTopOut(bpB) + groupTopOut(bpC) > bestTotal) {
+          let gA = group(bpA);
+          let gB = group(bpB);
+          let gC = group(bpC);
+          let sameAB = bpA == bpB;
+          let sameBC = bpB == bpC;
+          let maxCOut = groupTopOut(bpC);
+          let nA = gA.size();
+          let nB = gB.size();
+          let nC = gC.size();
+          var xi : Nat = 0;
+          label tA while (xi < nA) {
+            let i = gA[xi];
+            let aOut = entry(i).out;
+            let bStart : Nat = if (sameAB) { xi + 1 } else { 0 };
+            if (bStart < nB) {
+              let maxBStart = entry(gB[bStart]).out;
+              if (aOut + maxBStart + maxCOut <= bestTotal) { break tA };
+              var xj : Nat = bStart;
+              label tB while (xj < nB) {
+                let j = gB[xj];
+                let bOut = entry(j).out;
+                if (aOut + bOut + maxCOut <= bestTotal) { break tB };
+                if (pairCompatible(entry(i), entry(j))) {
+                  let cStart : Nat = if (sameBC) { xj + 1 } else { 0 };
+                  if (cStart < nC) {
+                    var xk : Nat = cStart;
+                    label tC while (xk < nC) {
+                      let k = gC[xk];
+                      let total = aOut + bOut + entry(k).out;
+                      if (total <= bestTotal) { break tC };
+                      if (pairCompatible(entry(i), entry(k)) and pairCompatible(entry(j), entry(k))) {
+                        bestTotal := total;
+                        bestPlan := [
+                          { bp = entry(i).bp; route = entry(i).route },
+                          { bp = entry(j).bp; route = entry(j).route },
+                          { bp = entry(k).bp; route = entry(k).route },
+                        ];
+                      };
+                      xk += 1;
+                    };
+                  };
+                };
+                xj += 1;
+              };
+            };
+            xi += 1;
+          };
+        };
+      };
+
+      if (bestTotal > 0) {
+        { legs = bestPlan; totalOut = bestTotal; slipBP = baselineSlipBP; valid = true }
+      } else {
+        { legs = []; totalOut = 0; slipBP = 10000; valid = false }
+      }
+    };
+
+    // Run optimizer at the full amount (100% = bp 10000).
+    let tacoOptimal = findOptimalTacoSplit(10000);
+    let tacoQuote : Q = { out = tacoOptimal.totalOut; slipBP = tacoOptimal.slipBP; valid = tacoOptimal.valid };
 
     // Update per-pair skip flags
     if (not skipKong and not kongQuote.valid) {
@@ -449,6 +792,17 @@ shared (deployer) persistent actor class buyback_canister() = this {
     };
     if (tacoQuote.valid and tacoQuote.out > bestOut) {
       bestExchange := ?(#TACO); bestOut := tacoQuote.out; bestSlipBP := tacoQuote.slipBP;
+    };
+
+    // Stash the optimal TACO split plan for the executor below. When TACO is
+    // chosen, this is the multi-leg (or 1-leg) plan from findOptimalTacoSplit;
+    // when Kong/ICP wins we clear it so the executor's #TACO branch can't see
+    // a stale plan from a previous swap in the same cycle.
+    lastTacoBuybackPlan := switch (bestExchange) {
+      case (?(#TACO)) {
+        { legs = tacoOptimal.legs; targetBp = 10000 }
+      };
+      case _ { { legs = []; targetBp = 0 } };
     };
 
     switch (bestExchange) {
@@ -583,15 +937,52 @@ shared (deployer) persistent actor class buyback_canister() = this {
           case (#TACO) {
             let exchangeTreasuryPrincipal = canister_ids.getCanisterId(#exchange_treasury);
             let exchangeTreasuryAccountId = Principal.toLedgerAccount(exchangeTreasuryPrincipal, null);
+            // When the optimizer produced a multi-leg plan, execute via
+            // executeTransferAndSwapMultiRoute with asymmetric per-leg amounts
+            // (leg.bp / targetBp of the total, last leg absorbs the rounding
+            // remainder). Falls through to single-route otherwise. Mirrors
+            // the executor pattern at treasury.mo:12556-12597.
             let r = try {
-              await TACOSwap.executeTransferAndSwap({
-                tokenIn = from;
-                tokenOut = to;
-                amountIn = amount;
-                minAmountOut = minAmountOut;
-                transferFee = tokenFeeOf(from);
-                exchangeTreasuryAccountId = exchangeTreasuryAccountId;
-              });
+              if (lastTacoBuybackPlan.legs.size() > 1) {
+                let plan = lastTacoBuybackPlan;
+                let totalBp = plan.targetBp;
+                let n = plan.legs.size();
+                let legs = Array.tabulate<swaptypes.TACOSplitLeg>(n, func(i) {
+                  let lp = plan.legs[i];
+                  let legAmount : Nat = if (i == n - 1) {
+                    var allocated : Nat = 0;
+                    var j : Nat = 0;
+                    while (j + 1 < n) {
+                      allocated += (amount * plan.legs[j].bp) / totalBp;
+                      j += 1;
+                    };
+                    if (allocated > amount) { 0 } else { amount - allocated }
+                  } else {
+                    (amount * lp.bp) / totalBp
+                  };
+                  let legMinOut : Nat = if (amount > 0) { (minAmountOut * legAmount) / amount } else { 0 };
+                  { amountIn = legAmount; route = lp.route; minLegOut = legMinOut }
+                });
+                await TACOSwap.executeTransferAndSwapMultiRoute({
+                  tokenIn = from;
+                  tokenOut = to;
+                  amountIn = amount;
+                  minAmountOut = minAmountOut;
+                  transferFee = tokenFeeOf(from);
+                  exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+                  exchangeFeeBps = lastKnownTacoFeeBps;
+                }, legs)
+              } else {
+                await TACOSwap.executeTransferAndSwap({
+                  tokenIn = from;
+                  tokenOut = to;
+                  amountIn = amount;
+                  minAmountOut = minAmountOut;
+                  transferFee = tokenFeeOf(from);
+                  exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+                  exchangeFeeBps = lastKnownTacoFeeBps;
+                })
+              };
             } catch (e) { return ({
               sellToken = from; amountIn = amount;
               dex = dexLabel; tacoOut = 0;
@@ -883,6 +1274,19 @@ shared (deployer) persistent actor class buyback_canister() = this {
           case null {};
         };
       };
+      // Issue 5: extra flash-arb start tokens. Each iterates the same
+      // pattern as ICP/ckUSDC above — per-token cap from ARB_EXTRA_TOKENS,
+      // per-token min from arbMinSampleAmount (lookupMinSample's fallback
+      // is 1M which is conservative-safe for most 8-decimal tokens).
+      for ((tok, cap) in ARB_EXTRA_TOKENS.vals()) {
+        let minSample = lookupMinSample(tok);
+        if (cap > minSample) {
+          switch (await findOptimalArbAmount(tok, buybackConfig.arbDepth, cap)) {
+            case (?c) { Vector.add(candidates, { token = tok; cand = c }) };
+            case null {};
+          };
+        };
+      };
 
       if (Vector.size(candidates) == 0) {
         status := #stoppedNoProfit;
@@ -1074,6 +1478,40 @@ shared (deployer) persistent actor class buyback_canister() = this {
       };
     };
 
+    // ── Step 2b: Exchange DAO fee claim ──
+    // Drains feescollectedDAO (multi-token DAO bucket) into this canister.
+    // All claimed token types flow into the same per-token → ICP → TACO → burn
+    // pipeline as vault fees.
+    let claimedFromExchange = Buffer.Buffer<(Principal, Nat)>(8);
+    if (buybackConfig.sweepExchange) {
+      let exClaim = try {
+        await exchange.claimDAOFeesToCaller();
+      } catch (e) {
+        logger.warn("BUYBACK", "exchange claimDAOFeesToCaller threw: " # Error.message(e), "executeBuybackCycle");
+        #Err(#SystemError("exception: " # Error.message(e)));
+      };
+      switch (exClaim) {
+        case (#Ok(claimed)) {
+          logger.info(
+            "BUYBACK",
+            "exchange fee claim: " # Nat.toText(claimed.size()) # " token buckets drained — " # debug_show(claimed),
+            "executeBuybackCycle",
+          );
+          for ((tokenText, amount) in claimed.vals()) {
+            try {
+              let p = Principal.fromText(tokenText);
+              claimedFromExchange.add((p, amount));
+            } catch (_) {
+              logger.warn("BUYBACK", "unparseable exchange token text: " # tokenText, "executeBuybackCycle");
+            };
+          };
+        };
+        case (#Err(e)) {
+          logger.warn("BUYBACK", "exchange fee claim returned err: " # debug_show(e), "executeBuybackCycle");
+        };
+      };
+    };
+
     // ── Step 3: Snapshot non-ICP/non-TACO tokens to convert to ICP first ──
     // Strategy: consolidate everything into ICP, then do a SINGLE ICP→TACO swap
     // before burn. Keeps slippage small and price discovery clean.
@@ -1089,6 +1527,7 @@ shared (deployer) persistent actor class buyback_canister() = this {
     let mgmtCanister = Principal.fromText("aaaaa-aa");
     let candidateSet = Map.new<Principal, Bool>();
     for ((t, _) in claimedFromVault.vals()) { Map.set(candidateSet, phash, t, true) };
+    for ((t, _) in claimedFromExchange.vals()) { Map.set(candidateSet, phash, t, true) };
     Map.set(candidateSet, phash, CKUSDC_LEDGER, true);
     // Sweep every cached token — catches any orphaned balance from prior
     // failed/wrong trades that left tokens in the default account. Filter out

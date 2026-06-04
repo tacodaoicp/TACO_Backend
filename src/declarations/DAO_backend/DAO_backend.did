@@ -47,6 +47,7 @@ type UpdateError =
  };
 type UpdateConfig = 
  record {
+   kongEnabled: opt bool;
    longSyncIntervalNS: opt nat;
    maxKongswapAttempts: opt nat;
    maxPriceHistoryEntries: opt nat;
@@ -56,6 +57,7 @@ type UpdateConfig =
    maxTradesStored: opt nat;
    minAllocationDiffBasisPoints: opt nat;
    minTradeValueICP: opt nat;
+   neutriniteEnabled: opt bool;
    portfolioRebalancePeriodNS: opt nat;
    priceUpdateIntervalNS: opt nat;
    rebalanceIntervalNS: opt nat;
@@ -715,6 +717,7 @@ type AdminFunction =
    addAdmin;
    addToken;
    backfillPerformanceData;
+   buybackAdminBurn;
    clearLogs;
    createAuction;
    deleteToken;
@@ -736,7 +739,10 @@ type AdminFunction =
    startRebalancing;
    stopRebalancing;
    stopToken;
+   syncBuybackTokenDetails;
+   triggerBuyback;
    unpauseToken;
+   updateBuybackConfig;
    updateMintingVaultConfig;
    updateSpamParameters;
    updateSystemParameter;

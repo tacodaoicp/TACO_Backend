@@ -62,6 +62,8 @@ export type AdminFunction = { 'removeToken' : null } |
   { 'removeAdmin' : null } |
   { 'stopToken' : null } |
   { 'backfillPerformanceData' : null } |
+  { 'updateBuybackConfig' : null } |
+  { 'buybackAdminBurn' : null } |
   { 'getNeuronUpdates' : null } |
   { 'unpauseToken' : null } |
   { 'updateSystemParameter' : null } |
@@ -71,9 +73,11 @@ export type AdminFunction = { 'removeToken' : null } |
   { 'updateSpamParameters' : null } |
   { 'addToken' : null } |
   { 'getAdminActions' : null } |
+  { 'triggerBuyback' : null } |
   { 'addAdmin' : null } |
   { 'stopRebalancing' : null } |
   { 'deleteToken' : null } |
+  { 'syncBuybackTokenDetails' : null } |
   { 'recoverPoolBalances' : null } |
   { 'setTacoAddress' : null } |
   { 'clearLogs' : null } |
@@ -601,6 +605,7 @@ export interface UnfollowRecord {
 export interface UpdateConfig {
   'maxPriceHistoryEntries' : [] | [bigint],
   'priceUpdateIntervalNS' : [] | [bigint],
+  'kongEnabled' : [] | [boolean],
   'tokenSyncTimeoutNS' : [] | [bigint],
   'maxSlippageBasisPoints' : [] | [bigint],
   'shortSyncIntervalNS' : [] | [bigint],
@@ -612,6 +617,7 @@ export interface UpdateConfig {
   'portfolioRebalancePeriodNS' : [] | [bigint],
   'longSyncIntervalNS' : [] | [bigint],
   'maxTradeAttemptsPerInterval' : [] | [bigint],
+  'neutriniteEnabled' : [] | [boolean],
   'maxKongswapAttempts' : [] | [bigint],
 }
 export type UpdateError = { 'NotAllowed' : null } |

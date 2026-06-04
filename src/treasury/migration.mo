@@ -4,12 +4,21 @@ import TreasuryTypes "./treasury_types";
 module {
   // =========================================
   // OLD TYPES (currently deployed on-chain)
-  // ExchangeType without #TACO, TreasuryAdminActionType without LP variants
+  // 3-case ExchangeType WITHOUT #Neutrinite.
+  // The previous (#TACO, 2->3) migration has already been deployed, so the on-chain
+  // ExchangeType is now {#ICPSwap; #KongSwap; #TACO}. This migration widens it 3->4 by
+  // adding #Neutrinite.
+  //
+  // Only rebalanceState carries ExchangeType (inside lastTrades : Vector<TradeRecord>),
+  // so this migration touches rebalanceState ONLY. All other stable vars (incl.
+  // treasuryAdminActions) pass through automatically and are NOT in the migration record.
+  // The upgrade dry-run (--wasm-memory-persistence keep) is the hard M0170 gate.
   // =========================================
 
   public type OldExchangeType = {
     #ICPSwap;
     #KongSwap;
+    #TACO;
   };
 
   public type OldTradeRecord = {
@@ -24,110 +33,29 @@ module {
     slippage : Float;
   };
 
-  public type RebalanceStatus = {
-    #Idle;
-    #Trading;
-    #Failed : Text;
-  };
-
-  public type SkipBreakdown = {
-    noPairsFound : Nat;
-    noExecutionPath : Nat;
-    tokensFiltered : Nat;
-    pausedTokens : Nat;
-    insufficientCandidates : Nat;
-  };
-
-  public type RebalanceMetrics = {
-    lastPriceUpdate : Int;
-    lastRebalanceAttempt : Int;
-    totalTradesExecuted : Nat;
-    totalTradesFailed : Nat;
-    totalTradesSkipped : Nat;
-    skipBreakdown : SkipBreakdown;
-    currentStatus : RebalanceStatus;
-    portfolioValueICP : Nat;
-    portfolioValueUSD : Float;
-  };
-
-  public type RebalanceConfig = {
-    rebalanceIntervalNS : Nat;
-    maxTradeAttemptsPerInterval : Nat;
-    minTradeValueICP : Nat;
-    maxTradeValueICP : Nat;
-    portfolioRebalancePeriodNS : Nat;
-    maxSlippageBasisPoints : Nat;
-    maxTradesStored : Nat;
-    maxKongswapAttempts : Nat;
-    shortSyncIntervalNS : Nat;
-    longSyncIntervalNS : Nat;
-    tokenSyncTimeoutNS : Nat;
-  };
-
+  // RebalanceState shape, but lastTrades holds OldTradeRecord.
+  // config / metrics contain NO ExchangeType references, so they reuse the current
+  // TreasuryTypes types unchanged.
   public type OldRebalanceState = {
-    status : RebalanceStatus;
-    config : RebalanceConfig;
-    metrics : RebalanceMetrics;
+    status : TreasuryTypes.RebalanceStatus;
+    config : TreasuryTypes.RebalanceConfig;
+    metrics : TreasuryTypes.RebalanceMetrics;
     lastTrades : Vector.Vector<OldTradeRecord>;
     priceUpdateTimerId : ?Nat;
     rebalanceTimerId : ?Nat;
   };
 
-  public type OldTreasuryAdminActionType = {
-    #StartRebalancing;
-    #StopRebalancing;
-    #ResetRebalanceState;
-    #UpdateRebalanceConfig: {oldConfig: Text; newConfig: Text};
-    #CanisterStart;
-    #CanisterStop;
-    #PauseTokenManual: {token: Principal; pauseType: Text};
-    #UnpauseToken: {token: Principal};
-    #ClearAllTradingPauses;
-    #AddTriggerCondition: {conditionId: Nat; conditionType: Text; details: Text};
-    #RemoveTriggerCondition: {conditionId: Nat};
-    #UpdateTriggerCondition: {conditionId: Nat; oldCondition: Text; newCondition: Text};
-    #SetTriggerConditionActive: {conditionId: Nat; isActive: Bool};
-    #ClearPriceAlerts;
-    #AddPortfolioCircuitBreaker: {conditionId: Nat; conditionType: Text; details: Text};
-    #RemovePortfolioCircuitBreaker: {conditionId: Nat};
-    #UpdatePortfolioCircuitBreaker: {conditionId: Nat; oldCondition: Text; newCondition: Text};
-    #SetPortfolioCircuitBreakerActive: {conditionId: Nat; isActive: Bool};
-    #UpdatePausedTokenThreshold: {oldThreshold: Nat; newThreshold: Nat};
-    #ClearPortfolioCircuitBreakerLogs;
-    #UpdateMaxPortfolioSnapshots: {oldLimit: Nat; newLimit: Nat};
-    #TakeManualSnapshot;
-    #StartPortfolioSnapshots;
-    #StopPortfolioSnapshots;
-    #UpdatePortfolioSnapshotInterval: {oldIntervalNS: Nat; newIntervalNS: Nat};
-    #ExecuteTradingCycle;
-    #SetTestMode: {isTestMode: Bool};
-    #ClearSystemLogs;
-  };
-
-  public type OldTreasuryAdminActionRecord = {
-    id: Nat;
-    timestamp: Int;
-    admin: Principal;
-    actionType: OldTreasuryAdminActionType;
-    reason: Text;
-    success: Bool;
-    errorMessage: ?Text;
-  };
-
   // =========================================
   // STATE WRAPPERS
-  // Old = on-chain deployed types
-  // New = current code types (from TreasuryTypes)
+  // A partial migration record lists ONLY the stable vars that change.
   // =========================================
 
   public type OldState = {
     rebalanceState : OldRebalanceState;
-    treasuryAdminActions : Vector.Vector<OldTreasuryAdminActionRecord>;
   };
 
   public type NewState = {
     rebalanceState : TreasuryTypes.RebalanceState;
-    treasuryAdminActions : Vector.Vector<TreasuryTypes.TreasuryAdminActionRecord>;
   };
 
   // =========================================
@@ -138,6 +66,8 @@ module {
     switch (old) {
       case (#ICPSwap) { #ICPSwap };
       case (#KongSwap) { #KongSwap };
+      case (#TACO) { #TACO };
+      // Old data never contains #Neutrinite; the variant is only widened.
     };
   };
 
@@ -155,53 +85,10 @@ module {
     };
   };
 
-  func migrateAdminActionType(old : OldTreasuryAdminActionType) : TreasuryTypes.TreasuryAdminActionType {
-    switch (old) {
-      case (#StartRebalancing) { #StartRebalancing };
-      case (#StopRebalancing) { #StopRebalancing };
-      case (#ResetRebalanceState) { #ResetRebalanceState };
-      case (#UpdateRebalanceConfig(v)) { #UpdateRebalanceConfig(v) };
-      case (#CanisterStart) { #CanisterStart };
-      case (#CanisterStop) { #CanisterStop };
-      case (#PauseTokenManual(v)) { #PauseTokenManual(v) };
-      case (#UnpauseToken(v)) { #UnpauseToken(v) };
-      case (#ClearAllTradingPauses) { #ClearAllTradingPauses };
-      case (#AddTriggerCondition(v)) { #AddTriggerCondition(v) };
-      case (#RemoveTriggerCondition(v)) { #RemoveTriggerCondition(v) };
-      case (#UpdateTriggerCondition(v)) { #UpdateTriggerCondition(v) };
-      case (#SetTriggerConditionActive(v)) { #SetTriggerConditionActive(v) };
-      case (#ClearPriceAlerts) { #ClearPriceAlerts };
-      case (#AddPortfolioCircuitBreaker(v)) { #AddPortfolioCircuitBreaker(v) };
-      case (#RemovePortfolioCircuitBreaker(v)) { #RemovePortfolioCircuitBreaker(v) };
-      case (#UpdatePortfolioCircuitBreaker(v)) { #UpdatePortfolioCircuitBreaker(v) };
-      case (#SetPortfolioCircuitBreakerActive(v)) { #SetPortfolioCircuitBreakerActive(v) };
-      case (#UpdatePausedTokenThreshold(v)) { #UpdatePausedTokenThreshold(v) };
-      case (#ClearPortfolioCircuitBreakerLogs) { #ClearPortfolioCircuitBreakerLogs };
-      case (#UpdateMaxPortfolioSnapshots(v)) { #UpdateMaxPortfolioSnapshots(v) };
-      case (#TakeManualSnapshot) { #TakeManualSnapshot };
-      case (#StartPortfolioSnapshots) { #StartPortfolioSnapshots };
-      case (#StopPortfolioSnapshots) { #StopPortfolioSnapshots };
-      case (#UpdatePortfolioSnapshotInterval(v)) { #UpdatePortfolioSnapshotInterval(v) };
-      case (#ExecuteTradingCycle) { #ExecuteTradingCycle };
-      case (#SetTestMode(v)) { #SetTestMode(v) };
-      case (#ClearSystemLogs) { #ClearSystemLogs };
-    };
-  };
-
-  func migrateAdminActionRecord(old : OldTreasuryAdminActionRecord) : TreasuryTypes.TreasuryAdminActionRecord {
-    {
-      id = old.id;
-      timestamp = old.timestamp;
-      admin = old.admin;
-      actionType = migrateAdminActionType(old.actionType);
-      reason = old.reason;
-      success = old.success;
-      errorMessage = old.errorMessage;
-    };
-  };
-
   // =========================================
   // MIGRATION FUNCTION
+  // Output type is EXACTLY { rebalanceState : TreasuryTypes.RebalanceState }, matching the
+  // actor's declared stable shape for the single changed var.
   // =========================================
 
   public func migrate(oldState : OldState) : NewState {
@@ -219,14 +106,8 @@ module {
       rebalanceTimerId = oldState.rebalanceState.rebalanceTimerId;
     };
 
-    let newActions = Vector.new<TreasuryTypes.TreasuryAdminActionRecord>();
-    for (action in Vector.vals(oldState.treasuryAdminActions)) {
-      Vector.add(newActions, migrateAdminActionRecord(action));
-    };
-
     {
       rebalanceState = newRebalanceState;
-      treasuryAdminActions = newActions;
     };
   };
 };

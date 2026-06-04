@@ -183,6 +183,8 @@ export const idlFactory = ({ IDL }) => {
     'removeAdmin' : IDL.Null,
     'stopToken' : IDL.Null,
     'backfillPerformanceData' : IDL.Null,
+    'updateBuybackConfig' : IDL.Null,
+    'buybackAdminBurn' : IDL.Null,
     'getNeuronUpdates' : IDL.Null,
     'unpauseToken' : IDL.Null,
     'updateSystemParameter' : IDL.Null,
@@ -192,9 +194,11 @@ export const idlFactory = ({ IDL }) => {
     'updateSpamParameters' : IDL.Null,
     'addToken' : IDL.Null,
     'getAdminActions' : IDL.Null,
+    'triggerBuyback' : IDL.Null,
     'addAdmin' : IDL.Null,
     'stopRebalancing' : IDL.Null,
     'deleteToken' : IDL.Null,
+    'syncBuybackTokenDetails' : IDL.Null,
     'recoverPoolBalances' : IDL.Null,
     'setTacoAddress' : IDL.Null,
     'clearLogs' : IDL.Null,
@@ -445,6 +449,7 @@ export const idlFactory = ({ IDL }) => {
   const UpdateConfig = IDL.Record({
     'maxPriceHistoryEntries' : IDL.Opt(IDL.Nat),
     'priceUpdateIntervalNS' : IDL.Opt(IDL.Nat),
+    'kongEnabled' : IDL.Opt(IDL.Bool),
     'tokenSyncTimeoutNS' : IDL.Opt(IDL.Nat),
     'maxSlippageBasisPoints' : IDL.Opt(IDL.Nat),
     'shortSyncIntervalNS' : IDL.Opt(IDL.Nat),
@@ -456,6 +461,7 @@ export const idlFactory = ({ IDL }) => {
     'portfolioRebalancePeriodNS' : IDL.Opt(IDL.Nat),
     'longSyncIntervalNS' : IDL.Opt(IDL.Nat),
     'maxTradeAttemptsPerInterval' : IDL.Opt(IDL.Nat),
+    'neutriniteEnabled' : IDL.Opt(IDL.Bool),
     'maxKongswapAttempts' : IDL.Opt(IDL.Nat),
   });
   const Result = IDL.Variant({

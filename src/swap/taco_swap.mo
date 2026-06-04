@@ -166,6 +166,7 @@ module {
         routeDescription = q.routeDescription;
         canFulfillFully = q.canFulfillFully;
         routeTokens;
+        tradingFeeBps = 0;
       });
     } catch (e) {
       Debug.print("TACO getQuoteWithRoute error: " # Error.message(e));
@@ -209,7 +210,7 @@ module {
         if (q.expectedBuyAmount == 0) {
           { receive_amount = 0; price = 0.0; mid_price = 0.0; slippage = 0.0;
             route = []; routeDescription = "No liquidity"; canFulfillFully = false;
-            routeTokens = [] };
+            routeTokens = []; tradingFeeBps = 0 };
         } else {
           let sellHuman = Float.fromInt(req.amountIn) / Float.fromInt(10 ** sellDecimals);
           let buyHuman = Float.fromInt(q.expectedBuyAmount) / Float.fromInt(10 ** buyDecimals);
@@ -234,7 +235,7 @@ module {
 
           { receive_amount = q.expectedBuyAmount; price = executionPrice; mid_price = spotPrice;
             slippage = slippage; route = finalRoute; routeDescription = q.routeDescription;
-            canFulfillFully = q.canFulfillFully; routeTokens };
+            canFulfillFully = q.canFulfillFully; routeTokens; tradingFeeBps = 0 };
         };
       });
 
@@ -298,7 +299,7 @@ module {
           if (q.expectedBuyAmount == 0) {
             { receive_amount = 0; price = 0.0; mid_price = 0.0; slippage = 0.0;
               route = []; routeDescription = "No liquidity"; canFulfillFully = false;
-              routeTokens = [] };
+              routeTokens = []; tradingFeeBps = q.tradingFeeBps };
           } else {
             let sellHuman = Float.fromInt(req.amountIn) / Float.fromInt(10 ** sellDecimals);
             let buyHuman = Float.fromInt(q.expectedBuyAmount) / Float.fromInt(10 ** buyDecimals);
@@ -319,7 +320,7 @@ module {
 
             { receive_amount = q.expectedBuyAmount; price = executionPrice; mid_price = spotPrice;
               slippage = slippage; route = finalRoute; routeDescription = q.routeDescription;
-              canFulfillFully = q.canFulfillFully; routeTokens = q.routeTokens };
+              canFulfillFully = q.canFulfillFully; routeTokens = q.routeTokens; tradingFeeBps = q.tradingFeeBps };
           };
         });
       });
@@ -401,8 +402,10 @@ module {
       return #err("TACO: token not accepted or paused on exchange");
     };
 
-    // Step 3: Calculate deposit (includes exchange fee 5bp)
-    let exchangeFeeBps : Nat = 5;
+    // Step 3: Calculate deposit. exchangeFeeBps is the live trading fee threaded from the quote
+    // (params.exchangeFeeBps). 0 means "unknown" → fall back to the max 50bp so we never
+    // under-deposit; the exchange auto-refunds any overpayment in checkReceive.
+    let exchangeFeeBps : Nat = if (params.exchangeFeeBps == 0) { 50 } else { params.exchangeFeeBps };
     let depositAmount = params.amountIn * (exchangeFeeBps + 10000) / 10000 + params.transferFee;
 
     // Step 4: Transfer to exchange treasury
@@ -556,8 +559,10 @@ module {
       return #err("TACO: token not accepted or paused on exchange");
     };
 
-    // Step 2: Calculate deposit (includes exchange fee 5bp)
-    let exchangeFeeBps : Nat = 5;
+    // Step 2: Calculate deposit. exchangeFeeBps is the live trading fee threaded from the quote
+    // (params.exchangeFeeBps). 0 means "unknown" → fall back to the max 50bp so we never
+    // under-deposit; the exchange auto-refunds any overpayment in checkReceive.
+    let exchangeFeeBps : Nat = if (params.exchangeFeeBps == 0) { 50 } else { params.exchangeFeeBps };
     let depositAmount = params.amountIn * (exchangeFeeBps + 10000) / 10000 + params.transferFee;
 
     // Step 3: Transfer to exchange treasury

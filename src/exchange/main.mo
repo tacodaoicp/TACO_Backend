@@ -3041,6 +3041,167 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // express because it silently drops the alternatives. Each request runs against the
   // SAME pre-batch state via snapshot+restore — both between requests and between the
   // direct/multi-hop simulations within a single request.
+  // Internal helper extracted from getExpectedReceiveAmountBatchMulti's per-request
+  // loop body. Bit-for-bit lift of the inline logic (direct route via orderPairing,
+  // multi-hop alternatives via simulateMultiHop, multiHopCap = cap * 2, sort + truncate).
+  // Used by BOTH the batch endpoint and the new Optimal endpoint so the per-request
+  // routing logic lives in one place.
+  //
+  // State invariant: caller must have computed `initialSnapshot` via snapshotQuoteState()
+  // and passed it in. Helper calls restoreQuoteState as needed (3 sites — direct route
+  // prep, findRoutes cache miss, before each simulateMultiHop). State is restored
+  // implicitly at end-of-query by the IC; explicit final restore is the caller's
+  // responsibility.
+  private func computeQuoteRoutesForRequest(
+    tokenSell : Text,
+    tokenBuy : Text,
+    amountSell : Nat,
+    cap : Nat,
+    initialSnapshot : QuoteStateSnapshot,
+    findRoutesCache : Map.Map<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>,
+    nowVar : Int,
+    caller : Principal,
+  ) : [{
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    routeDescription : Text;
+    canFulfillFully : Bool;
+    potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+    hopDetails : [HopDetail];
+    routeTokens : [Text];
+    tradingFeeBps : Nat;
+  }] {
+    if (amountSell == 0) { return [] };
+
+    type QuoteRoute = {
+      expectedBuyAmount : Nat;
+      fee : Nat;
+      priceImpact : Float;
+      routeDescription : Text;
+      canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
+      routeTokens : [Text];
+      tradingFeeBps : Nat;
+    };
+    let perRequestRoutes = Vector.new<QuoteRoute>();
+
+    // ── Route 1: direct (single-hop via orderPairing — AMM + orderbook combined) ──
+    restoreQuoteState(initialSnapshot);
+    let preSwapPoolKey = getPool(tokenSell, tokenBuy);
+    let preSwapReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKey)) {
+      case (?pool) {
+        let (rIn, rOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+        ?(rIn, rOut);
+      };
+      case null { null };
+    };
+    let preSwapV3Ratio : Nat = getPoolRatioV3(preSwapPoolKey);
+
+    let dummyTrade : TradePrivate = {
+      Fee = ICPfee;
+      amount_sell = 0;
+      amount_init = amountSell;
+      token_sell_identifier = tokenBuy;
+      token_init_identifier = tokenSell;
+      trade_done = 0;
+      seller_paid = 0;
+      init_paid = 1;
+      trade_number = 0;
+      SellerPrincipal = "0";
+      initPrincipal = Principal.toText(caller);
+      seller_paid2 = 0;
+      init_paid2 = 0;
+      RevokeFee = RevokeFeeNow;
+      OCname = "";
+      time = nowVar;
+      filledInit = 0;
+      filledSell = 0;
+      allOrNothing = false;
+      strictlyOTC = false;
+    };
+    let (remainingAmountInit, totalProtocolFeeAmount, totalPoolFeeAmount, transactions, _, _, _ammAmountIn) = orderPairing(dummyTrade);
+
+    var directOut : Nat = 0;
+    for (tx in transactions.vals()) {
+      if (tx.0 == #principal(caller) and tx.2 == tokenBuy) { directOut += tx.1 };
+    };
+
+    if (directOut > 0) {
+      let directImpact = if (amountSell > 10000) {
+        computeBlendedAmmImpact(preSwapPoolKey, tokenSell, directOut, amountSell, preSwapV3Ratio, preSwapReserves);
+      } else { 0.0 };
+      let directFulfillFully = remainingAmountInit < 10001;
+      let directPotential = if (not directFulfillFully and directOut > 0) {
+        ?{ amount_init = amountSell; amount_sell = directOut };
+      } else { null };
+      let directDesc = if (totalPoolFeeAmount > 0 and totalProtocolFeeAmount > 0) { "AMM and Orderbook" }
+                       else if (totalPoolFeeAmount > 0) { "AMM only" }
+                       else { "Orderbook only" };
+      Vector.add(perRequestRoutes, {
+        expectedBuyAmount = directOut;
+        fee = totalProtocolFeeAmount + totalPoolFeeAmount;
+        priceImpact = directImpact;
+        routeDescription = directDesc;
+        canFulfillFully = directFulfillFully;
+        potentialOrderDetails = directPotential;
+        hopDetails = [];
+        routeTokens = [tokenSell, tokenBuy];
+        tradingFeeBps = ICPfee;
+      });
+    };
+
+    // ── Routes 2..N: multi-hop alternatives (each via simulateMultiHop) ──
+    let pairKey = tokenSell # "|" # tokenBuy;
+    let candidateRoutes : [{ hops : [SwapHop]; estimatedOut : Nat }] = switch (Map.get(findRoutesCache, thash, pairKey)) {
+      case (?cached) { cached };
+      case null {
+        restoreQuoteState(initialSnapshot);
+        let fresh = findRoutes(tokenSell, tokenBuy, amountSell);
+        Map.set(findRoutesCache, thash, pairKey, fresh);
+        fresh;
+      };
+    };
+    let multiHopCap : Nat = cap * 2;
+    var multiHopCounter : Nat = 0;
+    for (r in candidateRoutes.vals()) {
+      if (r.hops.size() > 1 and multiHopCounter < multiHopCap) {
+        multiHopCounter += 1;
+        restoreQuoteState(initialSnapshot);
+        let sim = simulateMultiHop(r.hops, amountSell, caller);
+        if (sim.amountOut > 0) {
+          var totalMHImpact = 0.0;
+          for (hd in sim.hopDetails.vals()) { totalMHImpact += hd.priceImpact };
+          let tokenList = Vector.new<Text>();
+          Vector.add(tokenList, tokenSell);
+          for (hop in r.hops.vals()) { Vector.add(tokenList, hop.tokenOut) };
+          var mhDesc = "Multi-hop (" # Nat.toText(r.hops.size()) # " hops): " # tokenSell;
+          for (hop in r.hops.vals()) { mhDesc := mhDesc # " → " # hop.tokenOut };
+          Vector.add(perRequestRoutes, {
+            expectedBuyAmount = sim.amountOut;
+            fee = sim.totalFees;
+            priceImpact = totalMHImpact;
+            routeDescription = mhDesc;
+            canFulfillFully = true;
+            potentialOrderDetails = null;
+            hopDetails = sim.hopDetails;
+            routeTokens = Vector.toArray(tokenList);
+            tradingFeeBps = ICPfee;
+          });
+        };
+      };
+    };
+
+    let sorted = Array.sort<QuoteRoute>(Vector.toArray(perRequestRoutes), func(a, b) {
+      if (a.expectedBuyAmount > b.expectedBuyAmount) { #less }
+      else if (a.expectedBuyAmount < b.expectedBuyAmount) { #greater }
+      else { #equal };
+    });
+    let takeN : Nat = Nat.min(sorted.size(), cap);
+    Array.tabulate<QuoteRoute>(takeN, func(i) { sorted[i] })
+  };
+
   public query ({ caller }) func getExpectedReceiveAmountBatchMulti(
     requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }],
     maxRoutesPerRequest : Nat,
@@ -3076,131 +3237,392 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       tradingFeeBps : Nat;
     };
     let allResults = Vector.new<{ routes : [QuoteRoute] }>();
+    // Per-call findRoutes cache: same (tokenSell, tokenBuy) pair across multiple
+    // probe amounts in the batch shares topology, so we only enumerate once.
+    // AMM-estimate ranking is amount-monotone so reusing across probes preserves
+    // top-cap selection. simulateMultiHop still runs at the actual probe amount.
+    let findRoutesCache = Map.new<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>();
 
     for (req in requests.vals()) {
-      let tokenSell = req.tokenSell;
-      let tokenBuy = req.tokenBuy;
-      let amountSell = req.amountSell;
-
-      if (amountSell == 0) {
-        Vector.add(allResults, { routes = [] });
-      } else {
-        let perRequestRoutes = Vector.new<QuoteRoute>();
-
-        // ── Route 1: direct (single-hop via orderPairing — AMM + orderbook combined) ──
-        restoreQuoteState(initialSnapshot);
-        let preSwapPoolKey = getPool(tokenSell, tokenBuy);
-        let preSwapReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKey)) {
-          case (?pool) {
-            let (rIn, rOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
-            ?(rIn, rOut);
-          };
-          case null { null };
-        };
-        let preSwapV3Ratio : Nat = getPoolRatioV3(preSwapPoolKey);
-
-        let dummyTrade : TradePrivate = {
-          Fee = ICPfee;
-          amount_sell = 0;
-          amount_init = amountSell;
-          token_sell_identifier = tokenBuy;
-          token_init_identifier = tokenSell;
-          trade_done = 0;
-          seller_paid = 0;
-          init_paid = 1;
-          trade_number = 0;
-          SellerPrincipal = "0";
-          initPrincipal = Principal.toText(caller);
-          seller_paid2 = 0;
-          init_paid2 = 0;
-          RevokeFee = RevokeFeeNow;
-          OCname = "";
-          time = nowVar;
-          filledInit = 0;
-          filledSell = 0;
-          allOrNothing = false;
-          strictlyOTC = false;
-        };
-        let (remainingAmountInit, totalProtocolFeeAmount, totalPoolFeeAmount, transactions, _, _, ammAmountIn) = orderPairing(dummyTrade);
-
-        var directOut : Nat = 0;
-        for (tx in transactions.vals()) {
-          if (tx.0 == #principal(caller) and tx.2 == tokenBuy) { directOut += tx.1 };
-        };
-
-        if (directOut > 0) {
-          let directImpact = if (amountSell > 10000) {
-            computeBlendedAmmImpact(preSwapPoolKey, tokenSell, directOut, amountSell, preSwapV3Ratio, preSwapReserves);
-          } else { 0.0 };
-          let directFulfillFully = remainingAmountInit < 10001;
-          let directPotential = if (not directFulfillFully and directOut > 0) {
-            ?{ amount_init = amountSell; amount_sell = directOut };
-          } else { null };
-          let directDesc = if (totalPoolFeeAmount > 0 and totalProtocolFeeAmount > 0) { "AMM and Orderbook" }
-                           else if (totalPoolFeeAmount > 0) { "AMM only" }
-                           else { "Orderbook only" };
-          Vector.add(perRequestRoutes, {
-            expectedBuyAmount = directOut;
-            fee = totalProtocolFeeAmount + totalPoolFeeAmount;
-            priceImpact = directImpact;
-            routeDescription = directDesc;
-            canFulfillFully = directFulfillFully;
-            potentialOrderDetails = directPotential;
-            hopDetails = [];
-            routeTokens = [tokenSell, tokenBuy];
-            tradingFeeBps = ICPfee;
-          });
-        };
-
-        // ── Routes 2..N: multi-hop alternatives (each via simulateMultiHop) ──
-        // Restore BEFORE findRoutes too — its internal simulateSwap reads AMMpools/poolV3Data
-        // for route enumeration, so a stale post-direct-swap snapshot would bias route picks.
-        restoreQuoteState(initialSnapshot);
-        let candidateRoutes = findRoutes(tokenSell, tokenBuy, amountSell);
-        for (r in candidateRoutes.vals()) {
-          if (r.hops.size() > 1) {
-            restoreQuoteState(initialSnapshot);
-            let sim = simulateMultiHop(r.hops, amountSell, caller);
-            if (sim.amountOut > 0) {
-              var totalMHImpact = 0.0;
-              for (hd in sim.hopDetails.vals()) { totalMHImpact += hd.priceImpact };
-              let tokenList = Vector.new<Text>();
-              Vector.add(tokenList, tokenSell);
-              for (hop in r.hops.vals()) { Vector.add(tokenList, hop.tokenOut) };
-              var mhDesc = "Multi-hop (" # Nat.toText(r.hops.size()) # " hops): " # tokenSell;
-              for (hop in r.hops.vals()) { mhDesc := mhDesc # " → " # hop.tokenOut };
-              Vector.add(perRequestRoutes, {
-                expectedBuyAmount = sim.amountOut;
-                fee = sim.totalFees;
-                priceImpact = totalMHImpact;
-                routeDescription = mhDesc;
-                canFulfillFully = true;
-                potentialOrderDetails = null;
-                hopDetails = sim.hopDetails;
-                routeTokens = Vector.toArray(tokenList);
-                tradingFeeBps = ICPfee;
-              });
-            };
-          };
-        };
-
-        // Sort by expectedBuyAmount desc, take top `cap`
-        let sorted = Array.sort<QuoteRoute>(Vector.toArray(perRequestRoutes), func(a, b) {
-          if (a.expectedBuyAmount > b.expectedBuyAmount) { #less }
-          else if (a.expectedBuyAmount < b.expectedBuyAmount) { #greater }
-          else { #equal };
-        });
-        let takeN : Nat = Nat.min(sorted.size(), cap);
-        let topN = Array.tabulate<QuoteRoute>(takeN, func(i) { sorted[i] });
-
-        Vector.add(allResults, { routes = topN });
-      };
+      let routes = computeQuoteRoutesForRequest(
+        req.tokenSell, req.tokenBuy, req.amountSell, cap,
+        initialSnapshot, findRoutesCache, nowVar, caller,
+      );
+      Vector.add(allResults, { routes });
     };
 
     // Final restore — defensive; IC reverts at query end anyway.
     restoreQuoteState(initialSnapshot);
 
     Vector.toArray(allResults);
+  };
+
+  // Single-call quote with the split-route optimizer baked in. Runs the 10-fraction
+  // BatchMulti probe grid internally (via the shared computeQuoteRoutesForRequest
+  // helper), then the 2/3-leg combinatorial optimizer (same algorithm as the OC
+  // user_canister's build_swap_plan and the TACO treasury's findOptimalTacoSplit,
+  // with OC's 0.1% improvement threshold). Returns the chosen plan as a flat
+  // record: a single leg for the direct/multi-hop case, 2 or 3 legs for split.
+  // Callers route single-leg plans through swapMultiHop and multi-leg through
+  // swapSplitRoutes. Removes the need for clients (OC frontend/backend) to
+  // replicate the optimizer locally — one source of truth lives on the exchange.
+  public query ({ caller }) func getExpectedReceiveAmountBatchMultiOptimal(
+    tokenSell : Text,
+    tokenBuy : Text,
+    amountIn : Nat,
+  ) : async {
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    canFulfillFully : Bool;
+    tradingFeeBps : Nat;
+    routeDescription : Text;
+    legs : [{
+      bp : Nat;
+      expectedBuyAmount : Nat;
+      route : [SwapHop];
+      routeDescription : Text;
+    }];
+  } {
+    let emptyPlan = {
+      expectedBuyAmount = 0;
+      fee = 0;
+      priceImpact = 0.0;
+      canFulfillFully = false;
+      tradingFeeBps = ICPfee;
+      routeDescription = "No liquidity";
+      legs = [];
+    };
+    if (isAllowedQuery(caller) != 1) { return emptyPlan };
+    if (amountIn == 0) { return emptyPlan };
+    if (tokenSell == tokenBuy) { return emptyPlan };
+
+    let nowVar = Time.now();
+    let initialSnapshot = snapshotQuoteState();
+    let findRoutesCache = Map.new<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>();
+
+    // ── Build the 10-fraction probe grid ──
+    let TOP_ROUTES : Nat = 5;
+    type ProbeRoute = {
+      expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
+      routeDescription : Text; canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail]; routeTokens : [Text]; tradingFeeBps : Nat;
+    };
+    let probeResults = Vector.new<{ bp : Nat; routes : [ProbeRoute] }>();
+    for (i in Iter.range(0, 9)) {
+      let bp : Nat = (i + 1) * 1000;
+      let amount : Nat = (amountIn * bp) / 10000;
+      if (amount > 0) {
+        let routes = computeQuoteRoutesForRequest(
+          tokenSell, tokenBuy, amount, TOP_ROUTES,
+          initialSnapshot, findRoutesCache, nowVar, caller,
+        );
+        Vector.add(probeResults, { bp; routes });
+      };
+    };
+
+    if (Vector.size(probeResults) == 0) {
+      restoreQuoteState(initialSnapshot);
+      return emptyPlan;
+    };
+
+    // ── Flatten + dedup (matches OC's build_swap_plan / flatten_batch) ──
+    type FlatEntry = {
+      bp : Nat;
+      expectedOut : Nat;
+      fee : Nat;
+      priceImpact : Float;
+      route : [SwapHop];
+      routeDescription : Text;
+      canFulfillFully : Bool;
+      routeKey : Text;
+      edgeKeys : [Text];
+    };
+    let entries = Vector.new<FlatEntry>();
+    let seen = Map.new<Text, Bool>();
+    for (req in Vector.vals(probeResults)) {
+      for (route in req.routes.vals()) {
+        if (route.expectedBuyAmount > 0) {
+          // Materialize hops: prefer hopDetails (multi-hop); synthesize from routeTokens for direct.
+          let hops : [SwapHop] = if (route.hopDetails.size() > 0) {
+            Array.map<HopDetail, SwapHop>(route.hopDetails, func(h) {
+              { tokenIn = h.tokenIn; tokenOut = h.tokenOut }
+            })
+          } else if (route.routeTokens.size() == 2) {
+            [{ tokenIn = route.routeTokens[0]; tokenOut = route.routeTokens[1] }]
+          } else { [] };
+          if (hops.size() > 0) {
+            // route_key = joined tokens; edge_keys = normalized per-hop pool edges.
+            var rk : Text = if (route.routeTokens.size() > 0) { route.routeTokens[0] } else { "" };
+            if (route.routeTokens.size() > 1) {
+              var ri : Nat = 1;
+              while (ri < route.routeTokens.size()) {
+                rk := rk # "→" # route.routeTokens[ri];
+                ri += 1;
+              };
+            };
+            let dedupKey = Nat.toText(req.bp) # "|" # rk;
+            if (not Map.has(seen, thash, dedupKey)) {
+              Map.set(seen, thash, dedupKey, true);
+              let edgeKeys = Array.map<SwapHop, Text>(hops, func(h) {
+                if (h.tokenIn < h.tokenOut) { h.tokenIn # "|" # h.tokenOut }
+                else { h.tokenOut # "|" # h.tokenIn }
+              });
+              Vector.add(entries, {
+                bp = req.bp;
+                expectedOut = route.expectedBuyAmount;
+                fee = route.fee;
+                priceImpact = route.priceImpact;
+                route = hops;
+                routeDescription = route.routeDescription;
+                canFulfillFully = route.canFulfillFully;
+                routeKey = rk;
+                edgeKeys;
+              });
+            };
+          };
+        };
+      };
+    };
+
+    if (Vector.size(entries) == 0) {
+      restoreQuoteState(initialSnapshot);
+      return emptyPlan;
+    };
+
+    // ── Group by bp, sort each group by expectedOut descending ──
+    let byBp = Map.new<Nat, [Nat]>();
+    do {
+      let collect = Map.new<Nat, Vector.Vector<Nat>>();
+      var idx : Nat = 0;
+      let total = Vector.size(entries);
+      while (idx < total) {
+        let e = Vector.get(entries, idx);
+        let g = switch (Map.get(collect, Map.nhash, e.bp)) {
+          case (?v) { v };
+          case null { let v = Vector.new<Nat>(); Map.set(collect, Map.nhash, e.bp, v); v };
+        };
+        Vector.add(g, idx);
+        idx += 1;
+      };
+      for ((bp, g) in Map.entries(collect)) {
+        let arr = Vector.toArray(g);
+        let sorted = Array.sort<Nat>(arr, func(a, b) {
+          Nat.compare(Vector.get(entries, b).expectedOut, Vector.get(entries, a).expectedOut)
+        });
+        Map.set(byBp, Map.nhash, bp, sorted);
+      };
+    };
+
+    func entry(idx : Nat) : FlatEntry { Vector.get(entries, idx) };
+    func group(bp : Nat) : [Nat] {
+      switch (Map.get(byBp, Map.nhash, bp)) { case (?arr) { arr }; case null { [] } }
+    };
+    func groupTopOut(bp : Nat) : Nat {
+      let g = group(bp); if (g.size() == 0) { 0 } else { entry(g[0]).expectedOut }
+    };
+    func edgesOverlap(a : [Text], b : [Text]) : Bool {
+      for (ea in a.vals()) { for (eb in b.vals()) { if (ea == eb) { return true } } };
+      false
+    };
+    func pairCompatible(a : FlatEntry, b : FlatEntry) : Bool {
+      a.routeKey != b.routeKey and not edgesOverlap(a.edgeKeys, b.edgeKeys)
+    };
+
+    // ── Baseline: top 10000-bp entry ──
+    var hasBaseline : Bool = false;
+    var baselineIdx : Nat = 0;
+    var baselineOut : Nat = 0;
+    let baselineGroup = group(10000);
+    if (baselineGroup.size() > 0) {
+      baselineIdx := baselineGroup[0];
+      baselineOut := entry(baselineIdx).expectedOut;
+      hasBaseline := true;
+    };
+
+    // ── Pre-seed bestTotal to baseline × 1001 / 1000 (0.1% threshold) ──
+    var bestTotal : Nat = (baselineOut * 1001) / 1000;
+    var bestPlan : ?[Nat] = null;
+
+    // ── 2-leg search ──
+    let twoLegPairs : [(Nat, Nat)] = [(1000, 9000), (2000, 8000), (3000, 7000), (4000, 6000), (5000, 5000)];
+    for ((bpA, bpB) in twoLegPairs.vals()) {
+      if (groupTopOut(bpA) + groupTopOut(bpB) > bestTotal) {
+        let gA = group(bpA);
+        if (bpA == bpB) {
+          let n = gA.size();
+          var xi : Nat = 0;
+          label sLoop while (xi + 1 < n) {
+            let i = gA[xi];
+            let aOut = entry(i).expectedOut;
+            let nextOut = entry(gA[xi + 1]).expectedOut;
+            if (aOut + nextOut <= bestTotal) { break sLoop };
+            var xj : Nat = xi + 1;
+            label sInner while (xj < n) {
+              let j = gA[xj];
+              let t = aOut + entry(j).expectedOut;
+              if (t <= bestTotal) { break sInner };
+              if (pairCompatible(entry(i), entry(j))) {
+                bestTotal := t; bestPlan := ?[i, j];
+              };
+              xj += 1;
+            };
+            xi += 1;
+          };
+        } else {
+          let gB = group(bpB);
+          let maxBOut = groupTopOut(bpB);
+          let nA = gA.size(); let nB = gB.size();
+          var xi : Nat = 0;
+          label dOuter while (xi < nA) {
+            let i = gA[xi];
+            let aOut = entry(i).expectedOut;
+            if (aOut + maxBOut <= bestTotal) { break dOuter };
+            var xj : Nat = 0;
+            label dInner while (xj < nB) {
+              let j = gB[xj];
+              let t = aOut + entry(j).expectedOut;
+              if (t <= bestTotal) { break dInner };
+              if (pairCompatible(entry(i), entry(j))) {
+                bestTotal := t; bestPlan := ?[i, j];
+              };
+              xj += 1;
+            };
+            xi += 1;
+          };
+        };
+      };
+    };
+
+    // ── 3-leg search ──
+    let threeLegTriples : [(Nat, Nat, Nat)] = [
+      (1000, 1000, 8000), (1000, 2000, 7000), (1000, 3000, 6000), (1000, 4000, 5000),
+      (2000, 2000, 6000), (2000, 3000, 5000), (2000, 4000, 4000), (3000, 3000, 4000),
+    ];
+    for ((bpA, bpB, bpC) in threeLegTriples.vals()) {
+      if (groupTopOut(bpA) + groupTopOut(bpB) + groupTopOut(bpC) > bestTotal) {
+        let gA = group(bpA); let gB = group(bpB); let gC = group(bpC);
+        let sameAB = bpA == bpB; let sameBC = bpB == bpC;
+        let maxCOut = groupTopOut(bpC);
+        let nA = gA.size(); let nB = gB.size(); let nC = gC.size();
+        var xi : Nat = 0;
+        label tA while (xi < nA) {
+          let i = gA[xi];
+          let aOut = entry(i).expectedOut;
+          let bStart : Nat = if (sameAB) { xi + 1 } else { 0 };
+          if (bStart < nB) {
+            let maxBAtStart = entry(gB[bStart]).expectedOut;
+            if (aOut + maxBAtStart + maxCOut <= bestTotal) { break tA };
+            var xj : Nat = bStart;
+            label tB while (xj < nB) {
+              let j = gB[xj];
+              let bOut = entry(j).expectedOut;
+              if (aOut + bOut + maxCOut <= bestTotal) { break tB };
+              if (pairCompatible(entry(i), entry(j))) {
+                let cStart : Nat = if (sameBC) { xj + 1 } else { 0 };
+                if (cStart < nC) {
+                  var xk : Nat = cStart;
+                  label tC while (xk < nC) {
+                    let k = gC[xk];
+                    let t = aOut + bOut + entry(k).expectedOut;
+                    if (t <= bestTotal) { break tC };
+                    if (pairCompatible(entry(i), entry(k)) and pairCompatible(entry(j), entry(k))) {
+                      bestTotal := t; bestPlan := ?[i, j, k];
+                    };
+                    xk += 1;
+                  };
+                };
+              };
+              xj += 1;
+            };
+          };
+          xi += 1;
+        };
+      };
+    };
+
+    // ── Build response ──
+    // Final restore (defensive — mirrors BatchMulti's trailing restoreQuoteState).
+    // IC query semantics revert state at end-of-message anyway, but explicit
+    // restore keeps in-message state consistent for any subsequent helpers.
+    restoreQuoteState(initialSnapshot);
+
+    switch (bestPlan) {
+      case (?legIndices) {
+        // Multi-leg plan (2 or 3 legs).
+        var totalFee : Nat = 0;
+        var weightedImpact : Float = 0.0;
+        var allCanFulfill : Bool = true;
+        let legsOut = Array.map<Nat, {
+          bp : Nat; expectedBuyAmount : Nat; route : [SwapHop]; routeDescription : Text;
+        }>(legIndices, func(idx) {
+          let e = entry(idx);
+          totalFee += e.fee;
+          weightedImpact += (Float.fromInt(e.bp) * e.priceImpact) / 10000.0;
+          if (not e.canFulfillFully) { allCanFulfill := false };
+          { bp = e.bp; expectedBuyAmount = e.expectedOut; route = e.route; routeDescription = e.routeDescription }
+        });
+        var descParts : Text = "Split: ";
+        var firstPart : Bool = true;
+        for (l in legsOut.vals()) {
+          if (firstPart) { firstPart := false } else { descParts := descParts # " + " };
+          let pct = (l.bp + 50) / 100;  // round to nearest %
+          descParts := descParts # Nat.toText(pct) # "% (" # l.routeDescription # ")";
+        };
+        {
+          expectedBuyAmount = bestTotal;
+          fee = totalFee;
+          priceImpact = weightedImpact;
+          canFulfillFully = allCanFulfill;
+          tradingFeeBps = ICPfee;
+          routeDescription = descParts;
+          legs = legsOut;
+        };
+      };
+      case null {
+        // No accepted multi-leg plan. Use baseline if available; else fall back to
+        // the highest-output entry across the whole grid (best-effort).
+        if (hasBaseline) {
+          let e = entry(baselineIdx);
+          {
+            expectedBuyAmount = e.expectedOut;
+            fee = e.fee;
+            priceImpact = e.priceImpact;
+            canFulfillFully = e.canFulfillFully;
+            tradingFeeBps = ICPfee;
+            routeDescription = e.routeDescription;
+            legs = [{ bp = 10000; expectedBuyAmount = e.expectedOut; route = e.route; routeDescription = e.routeDescription }];
+          };
+        } else {
+          var bestIdx : Nat = 0;
+          var bestOut : Nat = 0;
+          let total = Vector.size(entries);
+          var i : Nat = 0;
+          while (i < total) {
+            let e = entry(i);
+            if (e.expectedOut > bestOut) { bestOut := e.expectedOut; bestIdx := i };
+            i += 1;
+          };
+          if (bestOut == 0) { emptyPlan }
+          else {
+            let e = entry(bestIdx);
+            // Force bp = 10000 for single-leg plans even if the source entry came from a
+            // partial-fraction probe. The executor (swap_multi_hop) runs at amount_in_total
+            // (set by the OC user_canister), not at amount × bp / 10000.
+            {
+              expectedBuyAmount = e.expectedOut;
+              fee = e.fee;
+              priceImpact = e.priceImpact;
+              canFulfillFully = e.canFulfillFully;
+              tradingFeeBps = ICPfee;
+              routeDescription = e.routeDescription;
+              legs = [{ bp = 10000; expectedBuyAmount = e.expectedOut; route = e.route; routeDescription = e.routeDescription }];
+            };
+          };
+        };
+      };
+    };
   };
 
   // Simulate a multi-leg split — returns the EXACT combined output and per-leg outputs
@@ -7642,6 +8064,36 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
     };
     return #Ok(endmessage);
+  };
+
+  // Drains feescollectedDAO to the caller (must be in FLASH_ARB_CALLERS).
+  // Mirrors collectFees() exactly, except recipient is the caller rather
+  // than owner3. Used by the buyback canister's daily fee-sweep cycle.
+  public shared ({ caller }) func claimDAOFeesToCaller() : async {
+    #Ok : [(Text, Nat)];
+    #Err : ExTypes.ExchangeError;
+  } {
+    if (not isFlashArbCaller(caller)) {
+      return #Err(#NotAuthorized);
+    };
+    logger.info("ADMIN", "claimDAOFeesToCaller called by " # Principal.toText(caller), "claimDAOFeesToCaller");
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    let claimed = Vector.new<(Text, Nat)>();
+    for ((key, value) in Map.entries(feescollectedDAO)) {
+      let Tfees = returnTfees(key);
+      if (value > Tfees) {
+        let payout : Nat = value - Tfees;
+        Vector.add(tempTransferQueueLocal, (#principal(caller), payout, key, genTxId()));
+        Map.set(feescollectedDAO, thash, key, 0);
+        Vector.add(claimed, (key, payout));
+      };
+    };
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
+
+    } else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+    return #Ok(Vector.toArray(claimed));
   };
 
   public shared ({ caller }) func addFeeCollector(p : Principal) : async ExTypes.ActionResult {
@@ -16019,13 +16471,67 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (probes < 1 or probes > 20) { return null };
     if (maxSample == 0 or minSample >= maxSample) { return null };
 
-    let MAX_ROUTES : Nat = 5000;
+    let MAX_ROUTES : Nat = 2000;
     let mids = Array.filter<Text>(acceptedTokens, func(t) { t != token });
 
-    // Helper: enumerate all routes at given sampleSize, return single best
-    // positive-profit candidate (or null if none).
-    // Identical simulation logic to adminAnalyzeRouteEfficiency's buildAndSimulate
-    // but tracks just the best instead of accumulating all routes — saves allocation.
+    // ── Topology cache + fee-adjusted ratio-product pre-screen ──
+    // findBestAt(sampleSize) only differs by simulateSwap math — the set of
+    // closed loops is amount-independent. We additionally drop cycles whose
+    // fee-adjusted zero-slippage mid-price product is ≤ 1.0: those cycles
+    // cannot produce arbitrage profit at any amount (mid-product is the
+    // upper bound on actual output ratio after slippage). Strictly safe —
+    // every cycle that could ever profit is retained.
+    let cycleTopologyCache = Vector.new<[SwapHop]>();
+    let feeNumerator : Nat = if (10000 > ICPfee) { 10000 - ICPfee : Nat } else { 0 };
+    var topologyExplored : Nat = 0;
+    func buildTopology(current : Text, hopsLeft : Nat, visited : [Text], routeSoFar : [SwapHop]) {
+      if (topologyExplored >= MAX_ROUTES) { return };
+      topologyExplored += 1;
+      if (hopsLeft == 0) {
+        if (isKnownPool(current, token)) {
+          let fullRoute = Array.append(routeSoFar, [{ tokenIn = current; tokenOut = token }]);
+          // Compute fee-adjusted mid-price product (zero-slippage upper bound).
+          var ratioProduct : Nat = tenToPower60;
+          var validRatio = true;
+          label hopLoop for (hop in fullRoute.vals()) {
+            let pk = getPool(hop.tokenIn, hop.tokenOut);
+            switch (Map.get(AMMpools, hashtt, pk)) {
+              case (?pool) {
+                switch (computePoolRatioFor(pool, hop.tokenIn)) {
+                  case (#Value(r)) {
+                    ratioProduct := (ratioProduct * r * feeNumerator) / (tenToPower60 * 10000);
+                  };
+                  case (#Max) { validRatio := false; break hopLoop };
+                  case (#Zero) { validRatio := false; break hopLoop };
+                };
+              };
+              case null { validRatio := false; break hopLoop };
+            };
+          };
+          if (validRatio and ratioProduct > tenToPower60) {
+            Vector.add(cycleTopologyCache, fullRoute);
+          };
+        };
+        return;
+      };
+      for (mid in mids.vals()) {
+        let alreadyVisited = switch (Array.find<Text>(visited, func(v) { v == mid })) {
+          case (?_) { true }; case null { false };
+        };
+        if (not alreadyVisited and isKnownPool(current, mid)) {
+          let newRoute = Array.append(routeSoFar, [{ tokenIn = current; tokenOut = mid }]);
+          let newVisited = Array.append(visited, [mid]);
+          buildTopology(mid, hopsLeft - 1, newVisited, newRoute);
+        };
+      };
+    };
+    for (d in Iter.range(1, depth - 1)) {
+      buildTopology(token, d, [token], []);
+    };
+
+    // findBestAt iterates the cached topology and simulates at the given amount.
+    // Recursion + adjacency overhead has been paid once above; per-probe cost
+    // is now just the simulateSwap chain per cached cycle.
     let findBestAt = func(sampleSize : Nat) : ?{
       route : [SwapHop];
       outputAmount : Nat;
@@ -16034,7 +16540,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       hopDetails : [HopDetail];
     } {
       if (sampleSize == 0) { return null };
-      var routesExplored : Nat = 0;
       var best : ?{
         route : [SwapHop];
         outputAmount : Nat;
@@ -16043,72 +16548,51 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         hopDetails : [HopDetail];
       } = null;
 
-      func buildAndSimulate(current : Text, hopsLeft : Nat, visited : [Text], routeSoFar : [SwapHop]) {
-        if (routesExplored >= MAX_ROUTES) { return };
-        routesExplored += 1;
-        if (hopsLeft == 0) {
-          if (isKnownPool(current, token)) {
-            let fullRoute = Array.append(routeSoFar, [{ tokenIn = current; tokenOut = token }]);
-            let simPools = Map.new<(Text, Text), AMMPool>();
-            let simV3 = Map.new<(Text, Text), PoolV3Data>();
-            var amount = sampleSize;
-            let hopDetailsVec = Vector.new<HopDetail>();
-            var failed = false;
-            for (hop in fullRoute.vals()) {
-              let pk = getPool(hop.tokenIn, hop.tokenOut);
-              let poolOpt = switch (Map.get(simPools, hashtt, pk)) { case (?p) { ?p }; case null { Map.get(AMMpools, hashtt, pk) } };
-              let v3Opt = switch (Map.get(simV3, hashtt, pk)) { case (?v) { ?v }; case null { Map.get(poolV3Data, hashtt, pk) } };
-              switch (poolOpt) {
-                case (?pool) {
-                  let (out, updatedPool, updatedV3) = simulateSwap(pool, v3Opt, hop.tokenIn, amount, ICPfee);
-                  if (out == 0) { failed := true };
-                  Map.set(simPools, hashtt, pk, updatedPool);
-                  switch (updatedV3) { case (?uv3) { Map.set(simV3, hashtt, pk, uv3) }; case null {} };
-                  let hopAmountIn = amount;
-                  Vector.add(hopDetailsVec, {
-                    tokenIn = hop.tokenIn; tokenOut = hop.tokenOut;
-                    amountIn = hopAmountIn; amountOut = out;
-                    fee = (hopAmountIn * ICPfee) / 10000;
-                    priceImpact = 0.0;
-                  });
-                  amount := out;
-                };
-                case null { failed := true };
+      for (fullRoute in Vector.vals(cycleTopologyCache)) {
+        let simPools = Map.new<(Text, Text), AMMPool>();
+        let simV3 = Map.new<(Text, Text), PoolV3Data>();
+        var amount = sampleSize;
+        let hopDetailsVec = Vector.new<HopDetail>();
+        var failed = false;
+        for (hop in fullRoute.vals()) {
+          if (not failed) {
+            let pk = getPool(hop.tokenIn, hop.tokenOut);
+            let poolOpt = switch (Map.get(simPools, hashtt, pk)) { case (?p) { ?p }; case null { Map.get(AMMpools, hashtt, pk) } };
+            let v3Opt = switch (Map.get(simV3, hashtt, pk)) { case (?v) { ?v }; case null { Map.get(poolV3Data, hashtt, pk) } };
+            switch (poolOpt) {
+              case (?pool) {
+                let (out, updatedPool, updatedV3) = simulateSwap(pool, v3Opt, hop.tokenIn, amount, ICPfee);
+                if (out == 0) { failed := true };
+                Map.set(simPools, hashtt, pk, updatedPool);
+                switch (updatedV3) { case (?uv3) { Map.set(simV3, hashtt, pk, uv3) }; case null {} };
+                let hopAmountIn = amount;
+                Vector.add(hopDetailsVec, {
+                  tokenIn = hop.tokenIn; tokenOut = hop.tokenOut;
+                  amountIn = hopAmountIn; amountOut = out;
+                  fee = (hopAmountIn * ICPfee) / 10000;
+                  priceImpact = 0.0;
+                });
+                amount := out;
               };
-              if (failed) { return };
-            };
-            if (not failed and amount > sampleSize) {
-              let eff : Int = amount - sampleSize;
-              let effBps : Int = if (sampleSize > 0) { (eff * 10000) / sampleSize } else { 0 };
-              let candidate = {
-                route = fullRoute;
-                outputAmount = amount;
-                efficiency = eff;
-                efficiencyBps = effBps;
-                hopDetails = Vector.toArray(hopDetailsVec);
-              };
-              switch (best) {
-                case null { best := ?candidate };
-                case (?b) { if (eff > b.efficiency) { best := ?candidate } };
-              };
+              case null { failed := true };
             };
           };
-          return;
         };
-        for (mid in mids.vals()) {
-          let alreadyVisited = switch (Array.find<Text>(visited, func(v) { v == mid })) {
-            case (?_) { true }; case null { false };
+        if (not failed and amount > sampleSize) {
+          let eff : Int = amount - sampleSize;
+          let effBps : Int = if (sampleSize > 0) { (eff * 10000) / sampleSize } else { 0 };
+          let candidate = {
+            route = fullRoute;
+            outputAmount = amount;
+            efficiency = eff;
+            efficiencyBps = effBps;
+            hopDetails = Vector.toArray(hopDetailsVec);
           };
-          if (not alreadyVisited and isKnownPool(current, mid)) {
-            let newRoute = Array.append(routeSoFar, [{ tokenIn = current; tokenOut = mid }]);
-            let newVisited = Array.append(visited, [mid]);
-            buildAndSimulate(mid, hopsLeft - 1, newVisited, newRoute);
+          switch (best) {
+            case null { best := ?candidate };
+            case (?b) { if (eff > b.efficiency) { best := ?candidate } };
           };
         };
-      };
-
-      for (d in Iter.range(1, depth - 1)) {
-        buildAndSimulate(token, d, [token], []);
       };
       best;
     };
@@ -16757,6 +17241,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #getAllowedCanisters : () -> ();
         #refundStuckFunds : () -> ();
         #checkFeesReferrer : () -> ();
+        #claimDAOFeesToCaller : () -> ();
         #claimFeesReferrer : () -> ();
         #collectFees : () -> ();
         #addFeeCollector : () -> (p : Principal);
@@ -16786,6 +17271,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #getExpectedReceiveAmountBatchMulti :
           () -> (requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }],
                  maxRoutesPerRequest : Nat);
+        #getExpectedReceiveAmountBatchMultiOptimal :
+          () -> (tokenSell : Text, tokenBuy : Text, amountIn : Nat);
         #getKlineData :
           () ->
             (token1 : Text, token2 : Text, timeFrame : TimeFrame,
@@ -16956,6 +17443,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#clearTokenArchiveOffset _) caller == owner2 or callerIsAdmin;
       case (#getTokenArchiveOffset _) true;
       case (#collectFees _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
+      case (#claimDAOFeesToCaller _) { isFlashArbCaller(caller) };
       case (#addFeeCollector _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
       case (#removeFeeCollector _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };
       case (#getFeeCollectors _) { caller == deployer.caller or (do { var found = false; for (p in feeCollectors.vals()) { if (p == caller) found := true }; found }) };

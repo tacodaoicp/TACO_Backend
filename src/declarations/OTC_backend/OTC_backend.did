@@ -178,6 +178,14 @@ type create_trading_canister =
                                  }) query;
    claimAllLPFees: () -> (ClaimAllLPFeesResult);
    claimConcentratedFees: (positionId: nat) -> (ClaimFeesResult);
+   claimDAOFeesToCaller: () ->
+    (variant {
+       Err: ExchangeError;
+       Ok: vec record {
+                 text;
+                 nat;
+               };
+     });
    claimFeesReferrer: () -> (vec record {
                                    text;
                                    nat;
@@ -396,6 +404,24 @@ type create_trading_canister =
             routeTokens: vec text;
             tradingFeeBps: nat;
           };}) query;
+   getExpectedReceiveAmountBatchMultiOptimal: (tokenSell: text, tokenBuy:
+    text, amountIn: nat) ->
+    (record {
+       canFulfillFully: bool;
+       expectedBuyAmount: nat;
+       fee: nat;
+       legs:
+        vec
+         record {
+           bp: nat;
+           expectedBuyAmount: nat;
+           route: vec SwapHop;
+           routeDescription: text;
+         };
+       priceImpact: float64;
+       routeDescription: text;
+       tradingFeeBps: nat;
+     }) query;
    getFeeCollectors: () -> (vec principal) query;
    getKlineData: (token1: text, token2: text, timeFrame: TimeFrame,
     initialGet: bool) -> (vec KlineData) query;

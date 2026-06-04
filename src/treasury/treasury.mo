@@ -108,6 +108,7 @@ import Order "mo:base/Order";
 import KongSwap "../swap/kong_swap";
 import ICPSwap "../swap/icp_swap";
 import TACOSwap "../swap/taco_swap";
+import NeutriniteSwap "../swap/neutrinite_swap";
 import SwapUtils "../swap/utils";
 import swaptypes "../swap/swap_types";
 import Fuzz "mo:fuzz";
@@ -118,9 +119,11 @@ import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 import Buffer "mo:base/Buffer";
 
-//import Migration "./migration";
-
-//(with migration = Migration.migrate)
+// The Neutrinite 3->4 ExchangeType migration (migration.mo) is already applied on the deployed
+// canister — rebalanceState now persists the 4-case TradeRecord. A spent migration left wired
+// makes the NEXT upgrade fail M0170 (deployed 4-case no longer matches the migration's 3-case
+// OldState), so it is removed here; later upgrades are plain compatible upgrades. migration.mo
+// is retained for history.
 shared (deployer) persistent actor class treasury() = this {
 
   private func this_canister_id() : Principal {
@@ -211,11 +214,13 @@ shared (deployer) persistent actor class treasury() = this {
       kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       taco : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+      neutrinite : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
     };
     #Partial : {
       kongswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       icpswap : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       taco : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
+      neutrinite : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat };
       totalPercentBP : Nat;
     };
   };
@@ -224,10 +229,33 @@ shared (deployer) persistent actor class treasury() = this {
   type QuoteData = { out : Nat; slipBP : Nat; valid : Bool };
 
   // Extended error with quote data for reduced amount fallback
+  // One leg of a chosen TACO split plan. Module-scope so it can flow through
+  // FindExecutionError into the reduced-trade caller and back into the
+  // estimator without re-defining the shape per call site.
+  type TACOSplitLegPlan = {
+    bp : Nat;
+    route : [{ tokenIn : Text; tokenOut : Text }];
+  };
+
+  // Per-fraction optimal TACO plan returned by findOptimalTacoSplit. Same
+  // shape as the findBestExecution-local TACOOptimalPlan (kept for clarity in
+  // that function's scope); both convert structurally.
+  type TACOOptimalPlanShape = {
+    legs : [TACOSplitLegPlan];
+    totalOut : Nat;
+    slipBP : Nat;
+    valid : Bool;
+  };
+
   type FindExecutionError = {
     reason : Text;
     kongQuotes : [QuoteData];
     icpQuotes : [QuoteData];
+    // TACO multi-route data plumbed through to the reduced-trade fallback so
+    // estimateMaxTradeableAmount can also consider TACO. Empty arrays at err
+    // sites where no quotes were fetched (early validation failures).
+    tacoQuotes : [QuoteData];
+    tacoPlans : [TACOOptimalPlanShape];
   };
 
   // Portfolio snapshot system type aliases
@@ -272,6 +300,52 @@ shared (deployer) persistent actor class treasury() = this {
   // Max safe Int value is ~9.2e18 (2^63 - 1), we use a conservative bound
   private func isFiniteFloat(x : Float) : Bool {
     not Float.isNaN(x) and x < 9.0e18 and x > -9.0e18
+  };
+
+  // Register the treasury principal with the Neutrinite (ICRC-55) pylon. Idempotent on the
+  // pylon; we cache success in neutriniteRegistered. On a "not credited"/"needs register" trade
+  // error the flag is reset so the next attempt re-registers (see executeTrade #Neutrinite).
+  private func ensureNeutriniteRegistered() : async () {
+    if (neutriniteRegistered) { return };
+    try {
+      switch (await NeutriniteSwap.register(this_canister_id())) {
+        case (#ok(())) {
+          neutriniteRegistered := true;
+          logger.info("NEUTRINITE", "Registered treasury principal with Neutrinite pylon", "ensureNeutriniteRegistered");
+        };
+        case (#err(e)) {
+          logger.warn("NEUTRINITE", "Neutrinite register failed (will retry): " # e, "ensureNeutriniteRegistered");
+        };
+      };
+    } catch (e) {
+      logger.warn("NEUTRINITE", "Neutrinite register exception (will retry): " # Error.message(e), "ensureNeutriniteRegistered");
+    };
+  };
+
+  // Sweep stranded balances out of the treasury's Neutrinite pylon virtual balance back to sub-0.
+  // tokens = [] sweeps all credited ledgers. async* to compose with the await* recovery chain.
+  // Logs the swept-ledger count so successful recoveries are auditable via getLogs (was silent before).
+  private func recoverNeutriniteBalancesWrapper(tokens : [Principal]) : async* () {
+    let swept = await* NeutriniteSwap.recoverNeutriniteBalances(this_canister_id(), tokens);
+    if (swept > 0) {
+      logger.info("NEUTRINITE_RECOVERY", "Swept " # Nat.toText(swept) # " Neutrinite pylon ledger balance(s) back to treasury", "recoverNeutriniteBalancesWrapper");
+    };
+  };
+
+  // Refresh the per-ledger pylon cadence cache (follow_interval_sec). Cheap query, called from the 5h
+  // Long Sync timer + once after upgrade. Never traps: on failure the prior cache is kept, so the
+  // proactive skip degrades to the reactive backstop, never worse.
+  private func refreshNeutriniteFollowSettings() : async () {
+    try {
+      switch (await NeutriniteSwap.getLedgerFollowSettings()) {
+        case (#ok(pairs)) {
+          Map.clear(neutriniteFollowIntervalSec);
+          for ((ledger, sec) in pairs.vals()) { Map.set(neutriniteFollowIntervalSec, phash, ledger, sec) };
+          logger.info("NEUTRINITE", "Refreshed follow-interval cache for " # Nat.toText(pairs.size()) # " ledgers", "refreshNeutriniteFollowSettings");
+        };
+        case (#err(e)) { logger.warn("NEUTRINITE", "follow-settings refresh failed (keeping prior cache): " # e, "refreshNeutriniteFollowSettings") };
+      };
+    } catch (e) { logger.warn("NEUTRINITE", "follow-settings refresh exception: " # Error.message(e), "refreshNeutriniteFollowSettings") };
   };
 
   // Pair skip helpers: normalize key so (A,B) and (B,A) produce the same entry
@@ -507,8 +581,34 @@ shared (deployer) persistent actor class treasury() = this {
 
   // Global kill switch for Kong: when false, all Kong quotes return #err immediately and
   // no Kong-containing scenario can be selected. Standalone stable var to avoid the
-  // RebalanceConfig EOP migration path (Migration.migrate is commented out at line ~123).
+  // RebalanceConfig EOP migration path.
   stable var kongEnabled : Bool = true;
+
+  // Global kill switch for Neutrinite (ICRC-55 pylon), mirroring kongEnabled. Standalone
+  // stable vars (default-initialized; NOT part of the migration record).
+  // Default FALSE: deploy dormant; enable via admin updateTreasuryConfig after the
+  // canister-caller mainnet dry-run confirms the pylon path works for a canister caller.
+  stable var neutriniteEnabled : Bool = false;
+  // Tracks whether the treasury principal is registered with the pylon (icrc55_account_register).
+  // Idempotent; reset to false on a "not credited"/"needs register" error so the next attempt re-registers.
+  stable var neutriniteRegistered : Bool = false;
+
+  // Pylon indexer cadence cache: ledger -> follow_interval_sec. Transient (repopulated on the 5h Long
+  // Sync timer + warmed ~5s after upgrade). Empty/missing entry => NO proactive skip (the reactive 90s
+  // poll + 3-day "N" skip remain the backstop). NOT stable -> no migration / no M0170.
+  transient var neutriniteFollowIntervalSec = Map.new<Principal, Nat>();
+  // Only sell tokens that credit fast enough to keep the poll SHORT are eligible. A token credits at
+  // ~its next indexer tick (≈ follow_interval_sec), and pollForCredit queries icrc55_accounts every
+  // ~1.5s until then, so this also bounds wasted poll queries (≈ follow_interval_sec/1.5). 30s default
+  // => ICP-cadence tokens (3s, ~2-4 polls) stay fully eligible, slow tokens (SNEED 218s, 7130s) are
+  // pre-skipped at 0 queries, and it sits well under the 90s poll cap. Tunable up to ~60 (still safe).
+  let NEUTRINITE_MAX_FOLLOW_INTERVAL_SEC : Nat = 30;
+  // Periodic-sweep gating: a Neutrinite failure may strand a deposit that credits LATE (within the
+  // token's follow_interval_sec, up to ~2h). The per-cycle sweep runs only inside this window after the
+  // last failure; outside it the per-cycle pylon query is skipped entirely. Transient (resets on
+  // upgrade; the one-time postupgrade sweep covers pre-upgrade strandings).
+  transient var neutriniteLastFailureTime : Int = 0;
+  let NEUTRINITE_SWEEP_WINDOW_NS : Int = 3 * 3_600_000_000_000; // 3h (> max follow_interval_sec + margin)
 
   // Rebalancing state
   stable var rebalanceState : RebalanceState = {
@@ -577,8 +677,25 @@ shared (deployer) persistent actor class treasury() = this {
   // Prevents trading cycle from selling tokens that are reserved for burn payouts
   // TACO multi-route detection: stores distinct routes found during last findBestExecution
   // Used by executeSplitTrade/executeTrade to decide single vs multi-route execution
-  transient var lastTacoMultiRoute : Bool = false;
-  transient var lastTacoRouteLegs : [{ route : [{ tokenIn : Text; tokenOut : Text }]; weight : Nat }] = [];
+  // Per-trade optimal TACO split plan, set by findBestExecution after
+  // scenario selection and consumed by executeSplitTrade / executeTrade
+  // (case #TACO) to construct asymmetric SplitLeg arrays.
+  // legs.size() == 0 → execute single-route (no plan chosen, fallback path).
+  // legs.size() == 1 → execute single-route via executeTransferAndSwap.
+  // legs.size() ≥ 2  → execute split via executeTransferAndSwapMultiRoute.
+  // targetBp is the chosen scenario's TACO portion in cross-DEX basis points
+  // (e.g. 5000 for a 50% TACO scenario), used as the denominator for
+  // per-leg amount/minOut pro-rata in the executors.
+  transient var lastTacoOptimalPlan : {
+    legs : [{ bp : Nat; route : [{ tokenIn : Text; tokenOut : Text }] }];
+    targetBp : Nat;
+  } = { legs = []; targetBp = 0 };
+
+  // Live exchange trading fee (basis points) captured from the most recent TACO quote.
+  // ICPfee is global, so one value covers every route. Used for deposit sizing in the TACO
+  // adapter (passed as exchangeFeeBps) and for the pre-quote fee headroom reserve, replacing
+  // the old hardcoded 5bp. Persisted across upgrades; default tracks the current 10bp.
+  stable var lastKnownTacoFeeBps : Nat = 10;
 
   stable let pendingBurnsByToken = Map.new<Principal, Nat>();
 
@@ -697,6 +814,20 @@ shared (deployer) persistent actor class treasury() = this {
   // Trading cycle backoff level (0 = base interval, capped at MAX_TRADING_BACKOFF)
   // Transient: resets to 0 on upgrade
   transient var tradingBackoffLevel : Nat = 0;
+
+  // Price-movement nudge boost: when the nachos vault detects a sharp price move it calls
+  // nudgeTradingCycle(), which resets backoff and sets nudgeTradeSizeMultiplier = nudgeBoostFactor.
+  // The first nudged cycle trades at nudgeBoostFactor× min/max; the multiplier then decays by 1
+  // each cycle until it returns to 1× (no boost). Transient: a nudge in flight at upgrade loses
+  // its boost, which is the safe default.
+  transient var nudgeTradeSizeMultiplier : Nat = 1;
+  stable var nudgeBoostFactor : Nat = 4; // admin-tunable, clamped >= 1
+
+  // Effective per-cycle trade-size bounds (base config × current nudge boost multiplier).
+  // Used ONLY at trade-size determination sites — never at eligibility/skip gates, so a boost
+  // can only make a qualifying trade bigger, never disqualify it.
+  func effMinTrade() : Nat { rebalanceConfig.minTradeValueICP * nudgeTradeSizeMultiplier };
+  func effMaxTrade() : Nat { rebalanceConfig.maxTradeValueICP * nudgeTradeSizeMultiplier };
 
   // Long Sync Timer tracking
   stable var lastLongSyncTime : Int = 0;  // Last time the long sync timer executed
@@ -1597,6 +1728,15 @@ shared (deployer) persistent actor class treasury() = this {
     switch (updates.kongEnabled) {
       case (?value) {
         kongEnabled := value;
+        hasChanges := true;
+      };
+      case null {}; // Keep existing value
+    };
+
+    // Neutrinite global kill switch (standalone stable var, not in RebalanceConfig)
+    switch (updates.neutriniteEnabled) {
+      case (?value) {
+        neutriniteEnabled := value;
         hasChanges := true;
       };
       case null {}; // Keep existing value
@@ -4406,6 +4546,81 @@ shared (deployer) persistent actor class treasury() = this {
   };
 
   /**
+   * Schedule a trading cycle to fire almost immediately (~2s), then resume the normal
+   * recurring schedule. Used by the price-movement nudge so the treasury reacts within
+   * seconds instead of waiting out the current (possibly backed-off) interval.
+   */
+  private func scheduleImmediateCycle<system>() {
+    switch (rebalanceState.rebalanceTimerId) {
+      case (?id) { cancelTimer(id) };
+      case null {};
+    };
+    let tid = setTimer<system>(
+      #nanoseconds(2_000_000_000),
+      func() : async () {
+        await* executeTradingCycle();
+        if (rebalanceState.status != #Idle) {
+          startTradingTimer<system>();
+        };
+      },
+    );
+    rebalanceState := {
+      rebalanceState with
+      rebalanceTimerId = ?tid;
+    };
+  };
+
+  /**
+   * Price-movement nudge entry point.
+   *
+   * Called by the nachos vault when it detects a sharp price move on a token. Resets the
+   * trading backoff and fires a cycle within ~2s, and sets a one-off trade-size boost
+   * (nudgeBoostFactor×) that decays by 1 each cycle back to 1×. Respects the admin stop:
+   * a nudge is ignored while trading is #Idle. `token` is advisory (logged only) — pair
+   * selection already favors the now-underweight token.
+   */
+  public shared ({ caller }) func nudgeTradingCycle(token : ?Principal, reason : ?Text) : async Result.Result<Text, Text> {
+    if (caller != NachosVaultPrincipal and not Principal.isController(caller)) {
+      return #err("Not authorized");
+    };
+    if (rebalanceState.status == #Idle) {
+      return #ok("Trading idle; nudge ignored");
+    };
+    tradingBackoffLevel := 0;
+    nudgeTradeSizeMultiplier := if (nudgeBoostFactor < 1) { 1 } else { nudgeBoostFactor };
+    scheduleImmediateCycle<system>();
+    logger.info("NUDGE",
+      "Nudge from vault — backoff reset, boost=" # Nat.toText(nudgeTradeSizeMultiplier) #
+      (switch (token) { case (?t) { " token=" # Principal.toText(t) }; case null { "" } }) #
+      (switch (reason) { case (?r) { " reason=" # r }; case null { "" } }),
+      "nudgeTradingCycle"
+    );
+    #ok("Nudged; backoff reset, boost=" # Nat.toText(nudgeTradeSizeMultiplier) # "x");
+  };
+
+  /**
+   * Admin: set the nudge trade-size boost factor (>= 1). Takes effect on the next nudge.
+   */
+  public shared ({ caller }) func admin_setNudgeBoostFactor(factor : Nat) : async Result.Result<Text, Text> {
+    if (((await hasAdminPermission(caller, #updateTreasuryConfig)) == false) and caller != DAOPrincipal and not Principal.isController(caller)) {
+      return #err("Not authorized");
+    };
+    if (factor < 1 or factor > 50) {
+      return #err("nudgeBoostFactor must be between 1 and 50");
+    };
+    nudgeBoostFactor := factor;
+    logger.info("NUDGE", "nudgeBoostFactor set to " # Nat.toText(factor) # " by " # Principal.toText(caller), "admin_setNudgeBoostFactor");
+    #ok("nudgeBoostFactor=" # Nat.toText(factor));
+  };
+
+  /**
+   * Observability: current price-movement nudge boost state.
+   */
+  public query func getNudgeStatus() : async { multiplier : Nat; boostFactor : Nat } {
+    { multiplier = nudgeTradeSizeMultiplier; boostFactor = nudgeBoostFactor }
+  };
+
+  /**
    * Watchdog timer for the trading cycle and sync chains
    *
    * Runs every 2 hours. Detects and restarts:
@@ -4591,6 +4806,15 @@ shared (deployer) persistent actor class treasury() = this {
     // Recover failed TACO exchange swaps
     await* recoverTacoSwapFunds();
 
+    // Sweep stranded Neutrinite (ICRC-55 pylon) virtual balances back to sub-0 — ONLY when enabled AND
+    // a recent failure may have stranded a late-crediting deposit. Steady state => 0 pylon queries/cycle
+    // (was an unconditional icrc55_accounts every cycle). Immediate on-failure + admin sweeps still apply.
+    if (neutriniteEnabled and neutriniteLastFailureTime > 0 and (now() - neutriniteLastFailureTime) < NEUTRINITE_SWEEP_WINDOW_NS) {
+      try { await* recoverNeutriniteBalancesWrapper([]) } catch (e) {
+        logger.error("NEUTRINITE_RECOVERY", "Periodic Neutrinite sweep failed: " # Error.message(e), "do_executeTradingCycle");
+      };
+    };
+
     // Recover any pending LP deposits from crashed operations
     if (lpConfig.enabled) { await* recoverLPPendingDeposits() };
 
@@ -4615,6 +4839,10 @@ shared (deployer) persistent actor class treasury() = this {
         };
       };
     };
+
+    // Nudge boost decay: the step above read the multiplier at its current level; step it down
+    // by one each cycle until back to 1× (no boost). Runs exactly once per cycle.
+    if (nudgeTradeSizeMultiplier > 1) { nudgeTradeSizeMultiplier -= 1 };
   };
 
   /**
@@ -5192,14 +5420,14 @@ shared (deployer) persistent actor class treasury() = this {
               );
 
               // Cap at liquid balance for pair-skip fallback (LP-locked tokens can't be traded)
-              // Reserve fee headroom: worst case TACO 5bp + transferFee
+              // Reserve fee headroom: live TACO exchange fee (lastKnownTacoFeeBps) + transferFee
               var skipTradeSize = tradeSize;
               switch (Map.get(liquidBalancePerToken, phash, sellToken)) {
                 case (?liquid) {
                   let pending = getPendingBurn(sellToken);
                   let avail = if (liquid > pending) { liquid - pending } else { 0 };
                   let sellFee = tokenDetailsSell.tokenTransferFee;
-                  let feeRoom = (avail * 5) / 10_000 + sellFee;
+                  let feeRoom = (avail * lastKnownTacoFeeBps) / 10_000 + sellFee;
                   let maxTrade = if (avail > feeRoom) { avail - feeRoom } else { 0 };
                   if (maxTrade < skipTradeSize) { skipTradeSize := maxTrade };
                 };
@@ -5364,11 +5592,17 @@ shared (deployer) persistent actor class treasury() = this {
                   let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
                   // Execute both trades IN PARALLEL to ICP
+                  // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                  let neutriniteLegParams = computeLegParams(split.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                  let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                  let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                  let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                   let splitResult = await* executeSplitTrade(
                     sellToken, ICPprincipal,
                     kongFinalAmount, kongMinAmountOut, kongIdealOut,
                     icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                   );
 
                   var kongSuccess = false;
@@ -5446,6 +5680,27 @@ shared (deployer) persistent actor class treasury() = this {
                       };
                     };
                   };
+                  // Handle Neutrinite result
+                  var neutriniteSuccess = false;
+                  switch (splitResult.neutriniteResult) {
+                    case (#ok(record)) {
+                      Vector.add(lastTrades, record);
+                      neutriniteSuccess := true;
+                      logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                    };
+                    case (#err(e)) {
+                      if (neutriniteFinalAmount > 0) {
+                        let failedRecord : TradeRecord = {
+                          tokenSold = sellToken; tokenBought = ICPprincipal;
+                          amountSold = neutriniteFinalAmount; amountBought = 0;
+                          exchange = #Neutrinite; timestamp = now();
+                          success = false; error = ?e; slippage = 0.0;
+                        };
+                        Vector.add(lastTrades, failedRecord);
+                        logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                      };
+                    };
+                  };
 
                   // Trim trade history
                   if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -5456,8 +5711,8 @@ shared (deployer) persistent actor class treasury() = this {
                     Vector.reverse(lastTrades);
                   };
 
-                  let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                  let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                  let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                  let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                   let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
 
                   rebalanceState := {
@@ -5470,7 +5725,7 @@ shared (deployer) persistent actor class treasury() = this {
                     lastTrades = lastTrades;
                   };
 
-                  if (kongSuccess or icpSuccess or tacoSuccess) {
+                  if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                     success := true;
                     tradingBackoffLevel := 0;
                     Debug.print("Pair skip ICP fallback split completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -5555,11 +5810,17 @@ shared (deployer) persistent actor class treasury() = this {
                   let tacoToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
                   let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
+                  // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                  let neutriniteLegParams = computeLegParams(partial.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                  let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                  let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                  let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                   let splitResult = await* executeSplitTrade(
                     sellToken, ICPprincipal,
                     kongFinalAmount, kongMinAmountOut, kongIdealOut,
                     icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                   );
 
                   var kongSuccess = false;
@@ -5635,9 +5896,30 @@ shared (deployer) persistent actor class treasury() = this {
                       };
                     };
                   };
+                  // Handle Neutrinite result
+                  var neutriniteSuccess = false;
+                  switch (splitResult.neutriniteResult) {
+                    case (#ok(record)) {
+                      Vector.add(lastTrades, record);
+                      neutriniteSuccess := true;
+                      logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                    };
+                    case (#err(e)) {
+                      if (neutriniteFinalAmount > 0) {
+                        let failedRecord : TradeRecord = {
+                          tokenSold = sellToken; tokenBought = ICPprincipal;
+                          amountSold = neutriniteFinalAmount; amountBought = 0;
+                          exchange = #Neutrinite; timestamp = now();
+                          success = false; error = ?e; slippage = 0.0;
+                        };
+                        Vector.add(lastTrades, failedRecord);
+                        logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                      };
+                    };
+                  };
 
-                  let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                  let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                  let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                  let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                   let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
                   rebalanceState := {
                     rebalanceState with
@@ -5649,7 +5931,7 @@ shared (deployer) persistent actor class treasury() = this {
                     lastTrades = lastTrades;
                   };
 
-                  if (kongSuccess or icpSuccess or tacoSuccess) {
+                  if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                     success := true;
                     tradingBackoffLevel := 0;
                     Debug.print("Pair skip ICP fallback partial completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -5677,8 +5959,10 @@ shared (deployer) persistent actor class treasury() = this {
 
                   // NEW: Try REDUCED amount for ICP fallback (reuses quotes from skipRouteError)
                   label reducedPairSkipFallback switch (estimateMaxTradeableAmount(
-                    skipRouteError.kongQuotes, skipRouteError.icpQuotes, tradeSize,
-                    rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                    skipRouteError.kongQuotes, skipRouteError.icpQuotes,
+                    skipRouteError.tacoQuotes, skipRouteError.tacoPlans,
+                    tradeSize, rebalanceConfig.maxSlippageBasisPoints,
+                    sellToken, ICPprincipal
                   )) {
                     case (?reduced) {
                       if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
@@ -5771,16 +6055,16 @@ shared (deployer) persistent actor class treasury() = this {
             };
 
             // Cap trade size at liquid balance (can't spend LP-locked tokens)
-            // Reserve headroom for exchange fees: TACO adds 5bp + transferFee on top of amountIn
-            // Worst case = 100% routed through TACO = amountIn * 10005/10000 + transferFee
+            // Reserve headroom for exchange fees: TACO adds lastKnownTacoFeeBps + transferFee on top of amountIn
+            // Worst case = 100% routed through TACO = amountIn * (10000+fee)/10000 + transferFee
             var cappedTradeSize = tradeSize;
             switch (Map.get(liquidBalancePerToken, phash, sellToken)) {
               case (?liquid) {
                 let pending = getPendingBurn(sellToken);
                 let availLiquid = if (liquid > pending) { liquid - pending } else { 0 };
-                // Subtract fee headroom: worst case all goes via TACO (5bp) + one transfer fee
+                // Subtract fee headroom: worst case all goes via TACO (lastKnownTacoFeeBps) + one transfer fee
                 let sellFee = tokenDetailsSell.tokenTransferFee;
-                let feeHeadroom = (availLiquid * 5) / 10_000 + sellFee;
+                let feeHeadroom = (availLiquid * lastKnownTacoFeeBps) / 10_000 + sellFee;
                 let maxTradeable = if (availLiquid > feeHeadroom) { availLiquid - feeHeadroom } else { 0 };
                 if (maxTradeable < cappedTradeSize) {
                   cappedTradeSize := maxTradeable;
@@ -5810,9 +6094,9 @@ shared (deployer) persistent actor class treasury() = this {
                       let denominator = 10000 + slippageBasisPoints;
                       let adjusted = (cappedTradeSize * 10000) / denominator;
 
-                      // Safety check: if adjusted size exceeds max, fall back to random
+                      // Safety check: if adjusted size exceeds max (nudge-scaled), fall back to random
                       let adjustedICP = (adjusted * tokenDetailsSell.priceInICP) / (10 ** tokenDetailsSell.tokenDecimals);
-                      if (adjustedICP > rebalanceConfig.maxTradeValueICP) {
+                      if (adjustedICP > effMaxTrade()) {
                         Debug.print("Adjusted trade exceeds max, falling back to random size");
                         ((calculateTradeSizeMinMax() * (10 ** tokenDetailsSell.tokenDecimals)) / tokenDetailsSell.priceInICP)
                       } else {
@@ -6007,7 +6291,7 @@ shared (deployer) persistent actor class treasury() = this {
                         // Works for both ICPSwap and KongSwap failures - tokens are available or will be claimed
                         var fallbackSucceeded = false;
 
-                        if ((execution.exchange == #ICPSwap or execution.exchange == #KongSwap) and
+                        if ((execution.exchange == #ICPSwap or execution.exchange == #KongSwap or execution.exchange == #Neutrinite) and
                             buyToken != ICPprincipal and
                             sellToken != ICPprincipal and
                             not isTokenPausedFromTrading(ICPprincipal)) {
@@ -6175,11 +6459,17 @@ shared (deployer) persistent actor class treasury() = this {
                               let tacoToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
                               let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
+                              // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                              let neutriniteLegParams = computeLegParams(split.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                              let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                              let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                              let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                               let splitResult = await* executeSplitTrade(
                                 sellToken, ICPprincipal,
                                 kongFinalAmount, kongMinAmountOut, kongIdealOut,
                                 icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                               );
 
                               var kongSuccess = false;
@@ -6256,6 +6546,27 @@ shared (deployer) persistent actor class treasury() = this {
                                   };
                                 };
                               };
+                              // Handle Neutrinite result
+                              var neutriniteSuccess = false;
+                              switch (splitResult.neutriniteResult) {
+                                case (#ok(record)) {
+                                  Vector.add(lastTrades, record);
+                                  neutriniteSuccess := true;
+                                  logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                                };
+                                case (#err(e)) {
+                                  if (neutriniteFinalAmount > 0) {
+                                    let failedRecord : TradeRecord = {
+                                      tokenSold = sellToken; tokenBought = ICPprincipal;
+                                      amountSold = neutriniteFinalAmount; amountBought = 0;
+                                      exchange = #Neutrinite; timestamp = now();
+                                      success = false; error = ?e; slippage = 0.0;
+                                    };
+                                    Vector.add(lastTrades, failedRecord);
+                                    logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                                  };
+                                };
+                              };
 
                               // Trim trade history
                               if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -6266,8 +6577,8 @@ shared (deployer) persistent actor class treasury() = this {
                                 Vector.reverse(lastTrades);
                               };
 
-                              let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                              let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                              let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                              let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                               let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
 
                               rebalanceState := {
@@ -6280,7 +6591,7 @@ shared (deployer) persistent actor class treasury() = this {
                                 lastTrades = lastTrades;
                               };
 
-                              if (kongSuccess or icpSuccess or tacoSuccess) {
+                              if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                                 success := true;
                                 fallbackSucceeded := true;  // CRITICAL: Set this for outer code check
                                 tradingBackoffLevel := 0;
@@ -6365,11 +6676,17 @@ shared (deployer) persistent actor class treasury() = this {
                               let tacoToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
                               let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
+                              // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                              let neutriniteLegParams = computeLegParams(partial.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                              let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                              let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                              let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                               let splitResult = await* executeSplitTrade(
                                 sellToken, ICPprincipal,
                                 kongFinalAmount, kongMinAmountOut, kongIdealOut,
                                 icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                               );
 
                               var kongSuccess = false;
@@ -6444,9 +6761,30 @@ shared (deployer) persistent actor class treasury() = this {
                                   };
                                 };
                               };
+                              // Handle Neutrinite result
+                              var neutriniteSuccess = false;
+                              switch (splitResult.neutriniteResult) {
+                                case (#ok(record)) {
+                                  Vector.add(lastTrades, record);
+                                  neutriniteSuccess := true;
+                                  logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                                };
+                                case (#err(e)) {
+                                  if (neutriniteFinalAmount > 0) {
+                                    let failedRecord : TradeRecord = {
+                                      tokenSold = sellToken; tokenBought = ICPprincipal;
+                                      amountSold = neutriniteFinalAmount; amountBought = 0;
+                                      exchange = #Neutrinite; timestamp = now();
+                                      success = false; error = ?e; slippage = 0.0;
+                                    };
+                                    Vector.add(lastTrades, failedRecord);
+                                    logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                                  };
+                                };
+                              };
 
-                              let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                              let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                              let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                              let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                               let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
                               rebalanceState := {
                                 rebalanceState with
@@ -6458,7 +6796,7 @@ shared (deployer) persistent actor class treasury() = this {
                                 lastTrades = lastTrades;
                               };
 
-                              if (kongSuccess or icpSuccess or tacoSuccess) {
+                              if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                                 success := true;
                                 fallbackSucceeded := true;  // CRITICAL: Set this for outer code check
                                 tradingBackoffLevel := 0;
@@ -6486,8 +6824,10 @@ shared (deployer) persistent actor class treasury() = this {
 
                               // NEW: Try REDUCED amount for ICP fallback (reuses quotes from icpRouteError)
                               label reducedIcpFallbackAfterSingle switch (estimateMaxTradeableAmount(
-                                icpRouteError.kongQuotes, icpRouteError.icpQuotes, finalTradeSize,
-                                rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                                icpRouteError.kongQuotes, icpRouteError.icpQuotes,
+                                icpRouteError.tacoQuotes, icpRouteError.tacoPlans,
+                                finalTradeSize, rebalanceConfig.maxSlippageBasisPoints,
+                                sellToken, ICPprincipal
                               )) {
                                 case (?reduced) {
                                   if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
@@ -6651,11 +6991,17 @@ shared (deployer) persistent actor class treasury() = this {
                     let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
                     // Execute both trades IN PARALLEL (no race conditions - uses executeTransferAndSwapNoTracking)
+                    // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                    let neutriniteLegParams = computeLegParams(split.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                    let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                    let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                    let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                     let splitResult = await* executeSplitTrade(
                       sellToken, buyToken,
                       kongFinalAmount, kongMinAmountOut, kongIdealOut,
                       icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                     );
 
                     // Track results
@@ -6726,6 +7072,27 @@ shared (deployer) persistent actor class treasury() = this {
                         };
                       };
                     };
+                    // Handle Neutrinite result
+                    var neutriniteSuccess = false;
+                    switch (splitResult.neutriniteResult) {
+                      case (#ok(record)) {
+                        Vector.add(lastTrades, record);
+                        neutriniteSuccess := true;
+                        logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                      };
+                      case (#err(e)) {
+                        if (neutriniteFinalAmount > 0) {
+                          let failedRecord : TradeRecord = {
+                            tokenSold = sellToken; tokenBought = buyToken;
+                            amountSold = neutriniteFinalAmount; amountBought = 0;
+                            exchange = #Neutrinite; timestamp = now();
+                            success = false; error = ?e; slippage = 0.0;
+                          };
+                          Vector.add(lastTrades, failedRecord);
+                          logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                        };
+                      };
+                    };
 
                     // Trim trade history if needed
                     if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -6737,8 +7104,8 @@ shared (deployer) persistent actor class treasury() = this {
                     };
 
                     // Update metrics
-                    let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                    let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                    let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                    let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                     let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
 
                     rebalanceState := {
@@ -6752,7 +7119,7 @@ shared (deployer) persistent actor class treasury() = this {
                     };
 
                     // At least one leg succeeded
-                    if (kongSuccess or icpSuccess or tacoSuccess) {
+                    if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                       success := true;
                       tradingBackoffLevel := 0;
                       Debug.print("Split trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -6931,11 +7298,17 @@ shared (deployer) persistent actor class treasury() = this {
                             let tacoToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
                             let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
+                            // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                            let neutriniteLegParams = computeLegParams(split.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                            let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                            let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                            let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
                               icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                             );
 
                             var kongSuccess = false;
@@ -7013,6 +7386,27 @@ shared (deployer) persistent actor class treasury() = this {
                                 };
                               };
                             };
+                            // Handle Neutrinite result
+                            var neutriniteSuccess = false;
+                            switch (splitResult.neutriniteResult) {
+                              case (#ok(record)) {
+                                Vector.add(lastTrades, record);
+                                neutriniteSuccess := true;
+                                logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(e)) {
+                                if (neutriniteFinalAmount > 0) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = neutriniteFinalAmount; amountBought = 0;
+                                    exchange = #Neutrinite; timestamp = now();
+                                    success = false; error = ?e; slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                                };
+                              };
+                            };
 
                             // Trim trade history
                             if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -7023,8 +7417,8 @@ shared (deployer) persistent actor class treasury() = this {
                               Vector.reverse(lastTrades);
                             };
 
-                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                             let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
 
                             rebalanceState := {
@@ -7037,7 +7431,7 @@ shared (deployer) persistent actor class treasury() = this {
                               lastTrades = lastTrades;
                             };
 
-                            if (kongSuccess or icpSuccess or tacoSuccess) {
+                            if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                               success := true;
                               tradingBackoffLevel := 0;
                               Debug.print("ICP fallback split after split failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -7122,11 +7516,17 @@ shared (deployer) persistent actor class treasury() = this {
                             let tacoToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
                             let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
+                            // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                            let neutriniteLegParams = computeLegParams(partial.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                            let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                            let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                            let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
                               icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                             );
 
                             var kongSuccess = false;
@@ -7202,9 +7602,30 @@ shared (deployer) persistent actor class treasury() = this {
                                 };
                               };
                             };
+                            // Handle Neutrinite result
+                            var neutriniteSuccess = false;
+                            switch (splitResult.neutriniteResult) {
+                              case (#ok(record)) {
+                                Vector.add(lastTrades, record);
+                                neutriniteSuccess := true;
+                                logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(e)) {
+                                if (neutriniteFinalAmount > 0) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = neutriniteFinalAmount; amountBought = 0;
+                                    exchange = #Neutrinite; timestamp = now();
+                                    success = false; error = ?e; slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                                };
+                              };
+                            };
 
-                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                             let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
                             rebalanceState := {
                               rebalanceState with
@@ -7216,7 +7637,7 @@ shared (deployer) persistent actor class treasury() = this {
                               lastTrades = lastTrades;
                             };
 
-                            if (kongSuccess or icpSuccess or tacoSuccess) {
+                            if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                               success := true;
                               tradingBackoffLevel := 0;
                               Debug.print("ICP fallback partial after split failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -7244,8 +7665,10 @@ shared (deployer) persistent actor class treasury() = this {
 
                             // NEW: Try REDUCED amount for ICP fallback (reuses quotes from icpRouteError)
                             label reducedIcpFallbackAfterSplit switch (estimateMaxTradeableAmount(
-                              icpRouteError.kongQuotes, icpRouteError.icpQuotes, tradeSize,
-                              rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                              icpRouteError.kongQuotes, icpRouteError.icpQuotes,
+                              icpRouteError.tacoQuotes, icpRouteError.tacoPlans,
+                              tradeSize, rebalanceConfig.maxSlippageBasisPoints,
+                              sellToken, ICPprincipal
                             )) {
                               case (?reduced) {
                                 if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
@@ -7404,11 +7827,17 @@ shared (deployer) persistent actor class treasury() = this {
                     let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
                     // Execute both trades IN PARALLEL
+                    // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                    let neutriniteLegParams = computeLegParams(partial.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                    let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                    let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                    let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                     let splitResult = await* executeSplitTrade(
                       sellToken, buyToken,
                       kongFinalAmount, kongMinAmountOut, kongIdealOut,
                       icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                     );
 
                     // Track results
@@ -7479,6 +7908,27 @@ shared (deployer) persistent actor class treasury() = this {
                         };
                       };
                     };
+                    // Handle Neutrinite result
+                    var neutriniteSuccess = false;
+                    switch (splitResult.neutriniteResult) {
+                      case (#ok(record)) {
+                        Vector.add(lastTrades, record);
+                        neutriniteSuccess := true;
+                        logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                      };
+                      case (#err(e)) {
+                        if (neutriniteFinalAmount > 0) {
+                          let failedRecord : TradeRecord = {
+                            tokenSold = sellToken; tokenBought = buyToken;
+                            amountSold = neutriniteFinalAmount; amountBought = 0;
+                            exchange = #Neutrinite; timestamp = now();
+                            success = false; error = ?e; slippage = 0.0;
+                          };
+                          Vector.add(lastTrades, failedRecord);
+                          logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                        };
+                      };
+                    };
 
                     // Trim trade history if needed
                     if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -7490,8 +7940,8 @@ shared (deployer) persistent actor class treasury() = this {
                     };
 
                     // Update metrics - count as partial trades
-                    let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                    let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                    let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                    let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                     let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
 
                     rebalanceState := {
@@ -7505,7 +7955,7 @@ shared (deployer) persistent actor class treasury() = this {
                     };
 
                     // At least one leg succeeded = overall success
-                    if (kongSuccess or icpSuccess or tacoSuccess) {
+                    if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                       success := true;
                       tradingBackoffLevel := 0;
                       Debug.print("Partial trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -7684,11 +8134,17 @@ shared (deployer) persistent actor class treasury() = this {
                             let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
                             // Execute both trades IN PARALLEL to ICP
+                            // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                            let neutriniteLegParams = computeLegParams(split.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                            let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                            let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                            let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
                               icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                             );
 
                             var kongSuccess = false;
@@ -7766,6 +8222,27 @@ shared (deployer) persistent actor class treasury() = this {
                                 };
                               };
                             };
+                            // Handle Neutrinite result
+                            var neutriniteSuccess = false;
+                            switch (splitResult.neutriniteResult) {
+                              case (#ok(record)) {
+                                Vector.add(lastTrades, record);
+                                neutriniteSuccess := true;
+                                logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(e)) {
+                                if (neutriniteFinalAmount > 0) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = neutriniteFinalAmount; amountBought = 0;
+                                    exchange = #Neutrinite; timestamp = now();
+                                    success = false; error = ?e; slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                                };
+                              };
+                            };
 
                             // Trim trade history
                             if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -7776,8 +8253,8 @@ shared (deployer) persistent actor class treasury() = this {
                               Vector.reverse(lastTrades);
                             };
 
-                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                             let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
 
                             rebalanceState := {
@@ -7790,7 +8267,7 @@ shared (deployer) persistent actor class treasury() = this {
                               lastTrades = lastTrades;
                             };
 
-                            if (kongSuccess or icpSuccess or tacoSuccess) {
+                            if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                               success := true;
                               tradingBackoffLevel := 0;
                               Debug.print("ICP fallback split after partial failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -7875,11 +8352,17 @@ shared (deployer) persistent actor class treasury() = this {
                             let tacoToleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
                             let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
+                            // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                            let neutriniteLegParams = computeLegParams(partial.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                            let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                            let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                            let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                             let splitResult = await* executeSplitTrade(
                               sellToken, ICPprincipal,
                               kongFinalAmount, kongMinAmountOut, kongIdealOut,
                               icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                             );
 
                             var kongSuccess = false;
@@ -7954,9 +8437,30 @@ shared (deployer) persistent actor class treasury() = this {
                                 };
                               };
                             };
+                            // Handle Neutrinite result
+                            var neutriniteSuccess = false;
+                            switch (splitResult.neutriniteResult) {
+                              case (#ok(record)) {
+                                Vector.add(lastTrades, record);
+                                neutriniteSuccess := true;
+                                logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                              };
+                              case (#err(e)) {
+                                if (neutriniteFinalAmount > 0) {
+                                  let failedRecord : TradeRecord = {
+                                    tokenSold = sellToken; tokenBought = ICPprincipal;
+                                    amountSold = neutriniteFinalAmount; amountBought = 0;
+                                    exchange = #Neutrinite; timestamp = now();
+                                    success = false; error = ?e; slippage = 0.0;
+                                  };
+                                  Vector.add(lastTrades, failedRecord);
+                                  logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                                };
+                              };
+                            };
 
-                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                            let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                            let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                             let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
                             rebalanceState := {
                               rebalanceState with
@@ -7968,7 +8472,7 @@ shared (deployer) persistent actor class treasury() = this {
                               lastTrades = lastTrades;
                             };
 
-                            if (kongSuccess or icpSuccess or tacoSuccess) {
+                            if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                               success := true;
                               tradingBackoffLevel := 0;
                               Debug.print("ICP fallback partial after partial failure completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -7996,8 +8500,10 @@ shared (deployer) persistent actor class treasury() = this {
 
                             // NEW: Try REDUCED amount for ICP fallback (reuses quotes from icpRouteError)
                             label reducedIcpFallbackAfterPartial switch (estimateMaxTradeableAmount(
-                              icpRouteError.kongQuotes, icpRouteError.icpQuotes, tradeSize,
-                              rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal
+                              icpRouteError.kongQuotes, icpRouteError.icpQuotes,
+                              icpRouteError.tacoQuotes, icpRouteError.tacoPlans,
+                              tradeSize, rebalanceConfig.maxSlippageBasisPoints,
+                              sellToken, ICPprincipal
                             )) {
                               case (?reduced) {
                                 if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
@@ -8122,7 +8628,7 @@ shared (deployer) persistent actor class treasury() = this {
                 } else {
                   // NEW: Try REDUCED amount before ICP fallback
                   // estimateMaxTradeableAmount already checked both exchanges and returns idealOut/minAmountOut
-                  label reducedDirect switch (estimateMaxTradeableAmount(e.kongQuotes, e.icpQuotes, cappedTradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, buyToken)) {
+                  label reducedDirect switch (estimateMaxTradeableAmount(e.kongQuotes, e.icpQuotes, e.tacoQuotes, e.tacoPlans, cappedTradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, buyToken)) {
                   case (?reduced) {
                     // Skip if reduced trade is too small to be worthwhile
                     if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
@@ -8463,11 +8969,17 @@ shared (deployer) persistent actor class treasury() = this {
                       let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
                       // Execute both trades IN PARALLEL (to ICP) - no race conditions
+                      // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                      let neutriniteLegParams = computeLegParams(split.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                      let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                      let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                      let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                       let splitResult = await* executeSplitTrade(
                         sellToken, ICPprincipal,
                         kongFinalAmount, kongMinAmountOut, kongIdealOut,
                         icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                       );
 
                       // Track results
@@ -8546,6 +9058,27 @@ shared (deployer) persistent actor class treasury() = this {
                           };
                         };
                       };
+                      // Handle Neutrinite result
+                      var neutriniteSuccess = false;
+                      switch (splitResult.neutriniteResult) {
+                        case (#ok(record)) {
+                          Vector.add(lastTrades, record);
+                          neutriniteSuccess := true;
+                          logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                        };
+                        case (#err(e)) {
+                          if (neutriniteFinalAmount > 0) {
+                            let failedRecord : TradeRecord = {
+                              tokenSold = sellToken; tokenBought = ICPprincipal;
+                              amountSold = neutriniteFinalAmount; amountBought = 0;
+                              exchange = #Neutrinite; timestamp = now();
+                              success = false; error = ?e; slippage = 0.0;
+                            };
+                            Vector.add(lastTrades, failedRecord);
+                            logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                          };
+                        };
+                      };
 
                       // Trim trade history if needed
                       if (Vector.size(lastTrades) > rebalanceConfig.maxTradesStored) {
@@ -8557,8 +9090,8 @@ shared (deployer) persistent actor class treasury() = this {
                       };
 
                       // Update metrics
-                      let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                      let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                      let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                      let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                       let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
 
                       rebalanceState := {
@@ -8572,7 +9105,7 @@ shared (deployer) persistent actor class treasury() = this {
                       };
 
                       // At least one leg succeeded
-                      if (kongSuccess or icpSuccess or tacoSuccess) {
+                      if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                         success := true;
                         tradingBackoffLevel := 0;
                         Debug.print("ICP fallback split trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -8658,11 +9191,17 @@ shared (deployer) persistent actor class treasury() = this {
                       let tacoMinAmountOut : Nat = (tacoAdjustedExpectedOut * tacoToleranceMultiplier) / 10000;
 
                       // Execute both trades IN PARALLEL (to ICP)
+                      // Neutrinite leg (helper replicates the per-leg slippage-adjustment math)
+                      let neutriniteLegParams = computeLegParams(partial.neutrinite, isExactTargeting, ourSlippageToleranceBasisPoints);
+                      let neutriniteFinalAmount : Nat = neutriniteLegParams.finalAmount;
+                      let neutriniteMinAmountOut : Nat = neutriniteLegParams.minOut;
+                      let neutriniteIdealOut : Nat = neutriniteLegParams.idealOut;
                       let splitResult = await* executeSplitTrade(
                         sellToken, ICPprincipal,
                         kongFinalAmount, kongMinAmountOut, kongIdealOut,
                         icpFinalAmount, icpMinAmountOut, icpIdealOut,
-                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut
+                    tacoFinalAmount, tacoMinAmountOut, tacoIdealOut,
+                    neutriniteFinalAmount, neutriniteMinAmountOut, neutriniteIdealOut
                       );
 
                       // Track results
@@ -8739,10 +9278,31 @@ shared (deployer) persistent actor class treasury() = this {
                           };
                         };
                       };
+                      // Handle Neutrinite result
+                      var neutriniteSuccess = false;
+                      switch (splitResult.neutriniteResult) {
+                        case (#ok(record)) {
+                          Vector.add(lastTrades, record);
+                          neutriniteSuccess := true;
+                          logger.info("TRADE_SPLIT", "Neutrinite leg succeeded - Amount_out=" # Nat.toText(record.amountBought), "do_executeTradingStep");
+                        };
+                        case (#err(e)) {
+                          if (neutriniteFinalAmount > 0) {
+                            let failedRecord : TradeRecord = {
+                              tokenSold = sellToken; tokenBought = ICPprincipal;
+                              amountSold = neutriniteFinalAmount; amountBought = 0;
+                              exchange = #Neutrinite; timestamp = now();
+                              success = false; error = ?e; slippage = 0.0;
+                            };
+                            Vector.add(lastTrades, failedRecord);
+                            logger.error("TRADE_SPLIT", "Neutrinite leg failed: " # e, "do_executeTradingStep");
+                          };
+                        };
+                      };
 
                       // Update metrics
-                      let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 });
-                      let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 });
+                      let successCount : Nat = (if kongSuccess { 1 } else { 0 }) + (if icpSuccess { 1 } else { 0 }) + (if tacoSuccess { 1 } else { 0 }) + (if neutriniteSuccess { 1 } else { 0 });
+                      let attemptedLegs : Nat = (if (kongFinalAmount > 0) { 1 } else { 0 }) + (if (icpFinalAmount > 0) { 1 } else { 0 }) + (if (tacoFinalAmount > 0) { 1 } else { 0 }) + (if (neutriniteFinalAmount > 0) { 1 } else { 0 });
                       let failCount : Nat = if (attemptedLegs > successCount) { attemptedLegs - successCount } else { 0 };
                       rebalanceState := {
                         rebalanceState with
@@ -8755,7 +9315,7 @@ shared (deployer) persistent actor class treasury() = this {
                       };
 
                       // At least one leg succeeded
-                      if (kongSuccess or icpSuccess or tacoSuccess) {
+                      if (kongSuccess or icpSuccess or tacoSuccess or neutriniteSuccess) {
                         success := true;
                         tradingBackoffLevel := 0;
                         Debug.print("ICP fallback partial trade completed - Kong=" # debug_show(kongSuccess) # " ICP=" # debug_show(icpSuccess));
@@ -8781,7 +9341,7 @@ shared (deployer) persistent actor class treasury() = this {
 
                       // NEW: Try REDUCED amount for ICP fallback
                       // estimateMaxTradeableAmount already checked both exchanges and returns idealOut/minAmountOut
-                      label reducedIcpFallback switch (estimateMaxTradeableAmount(icpRouteError.kongQuotes, icpRouteError.icpQuotes, cappedTradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal)) {
+                      label reducedIcpFallback switch (estimateMaxTradeableAmount(icpRouteError.kongQuotes, icpRouteError.icpQuotes, icpRouteError.tacoQuotes, icpRouteError.tacoPlans, cappedTradeSize, rebalanceConfig.maxSlippageBasisPoints, sellToken, ICPprincipal)) {
                         case (?reduced) {
                           // Skip if reduced trade is too small to be worthwhile
                           if (reduced.icpWorth < rebalanceConfig.minTradeValueICP / 3) {
@@ -10251,9 +10811,10 @@ shared (deployer) persistent actor class treasury() = this {
    * Calculate trade size based on min and max trade value
    */
   private func calculateTradeSizeMinMax() : Nat {
-    let range = rebalanceConfig.maxTradeValueICP - rebalanceConfig.minTradeValueICP;
+    // Nudge boost: scale both bounds so a random trade lands in [effMin, effMax].
+    let range = effMaxTrade() - effMinTrade();
     let randomOffset = fuzz.nat.randomRange(0, range);
-    rebalanceConfig.minTradeValueICP + randomOffset
+    effMinTrade() + randomOffset
   };
 
   /**
@@ -10271,7 +10832,7 @@ shared (deployer) persistent actor class treasury() = this {
     
     // Calculate what 50% of max trade size represents in basis points
     // This ensures exact targeting activates before a max trade would overshoot
-    let halfMaxTradeValueBasisPoints = (rebalanceConfig.maxTradeValueICP * 10000 / 2) / totalPortfolioValueICP;
+    let halfMaxTradeValueBasisPoints = (effMaxTrade() * 10000 / 2) / totalPortfolioValueICP;
     
     // Use exact targeting if either token is within 50% of max trade size of target
     let sellTokenCloseToTarget = Int.abs(sellTokenDiffBasisPoints) <= halfMaxTradeValueBasisPoints;
@@ -10324,7 +10885,7 @@ shared (deployer) persistent actor class treasury() = this {
       // Only check max bound - 15bp filter handles trivial trades
       // If trade exceeds max, use random sizing to confuse arb bots
       let tradeSizeICP = (exactTradeSize * sellTokenDetails.priceInICP) / (10 ** sellTokenDetails.tokenDecimals);
-      if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
+      if (tradeSizeICP > effMaxTrade()) {
         Debug.print("Exact trade size too large, using random trade size");
         (calculateTradeSizeMinMax(), false)  // Random, not exact targeting
       } else {
@@ -10356,7 +10917,7 @@ shared (deployer) persistent actor class treasury() = this {
       // Only check max bound - 15bp filter handles trivial trades
       // If trade exceeds max, use random sizing to confuse arb bots
       let tradeSizeICP = (exactTradeSize * sellTokenDetails.priceInICP) / (10 ** sellTokenDetails.tokenDecimals);
-      if (tradeSizeICP > rebalanceConfig.maxTradeValueICP) {
+      if (tradeSizeICP > effMaxTrade()) {
         Debug.print("Exact trade size too large, using random trade size");
         (calculateTradeSizeMinMax(), false)  // Random, not exact targeting
       } else {
@@ -10490,11 +11051,11 @@ shared (deployer) persistent actor class treasury() = this {
       // Get token symbols for exchange APIs
       let sellSymbol = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details.tokenSymbol };
-        case null { return #err({ reason = "Token details not found for sell token"; kongQuotes = []; icpQuotes = [] }) };
+        case null { return #err({ reason = "Token details not found for sell token"; kongQuotes = []; icpQuotes = []; tacoQuotes = []; tacoPlans = [] }) };
       };
       let buySymbol = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
         case (?details) { details.tokenSymbol };
-        case null { return #err({ reason = "Token details not found for buy token"; kongQuotes = []; icpQuotes = [] }) };
+        case null { return #err({ reason = "Token details not found for buy token"; kongQuotes = []; icpQuotes = []; tacoQuotes = []; tacoPlans = [] }) };
       };
       let sellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
         case (?details) { details.tokenDecimals };
@@ -10505,10 +11066,22 @@ shared (deployer) persistent actor class treasury() = this {
         case null { 8 };
       };
 
-      // Check if Kong/TACO should be skipped for this pair (all quotes invalid last time)
+      // Check if Kong/TACO/Neutrinite should be skipped for this pair (all quotes invalid last time)
       var skipKong = shouldSkipExchangePair("K", sellToken, buyToken);
       if (not kongEnabled) { skipKong := true };  // Global Kong kill switch
       let skipTaco = shouldSkipExchangePair("T", sellToken, buyToken);
+      var skipNeutrinite = shouldSkipExchangePair("N", sellToken, buyToken);
+      if (not neutriniteEnabled) { skipNeutrinite := true };  // Global Neutrinite kill switch
+      // Proactive cadence skip: if the pylon indexes the SELL token too slowly, the deposit can't
+      // credit inside the poll window -> skip Neutrinite WITHOUT a wasted attempt + fees, AND without
+      // firing the 10 dex_quote probes. Unknown cadence (no cache entry) => allow; the reactive 90s
+      // poll + 3-day "N" skip remain the backstop. (sellToken is the deposit/poll token in every leg.)
+      if (not skipNeutrinite) {
+        switch (Map.get(neutriniteFollowIntervalSec, phash, sellToken)) {
+          case (?sec) { if (sec > NEUTRINITE_MAX_FOLLOW_INTERVAL_SEC) { skipNeutrinite := true } };
+          case null {};
+        };
+      };
 
       // Get transfer fee for sell token (needed for ICPSwap quote adjustment)
       // ICPSwap executes swaps with (amountIn - fee), so quotes must reflect this
@@ -10533,6 +11106,8 @@ shared (deployer) persistent actor class treasury() = this {
             reason = "Transfer fee (" # Nat.toText(feeRatioBP) # "bp) exceeds 5% of trade amount";
             kongQuotes = [];
             icpQuotes = [];
+            tacoQuotes = [];
+            tacoPlans = [];
           });
         };
       };
@@ -10653,6 +11228,20 @@ shared (deployer) persistent actor class treasury() = this {
         ))
       };
 
+      // Neutrinite (ICRC-55 pylon) quotes for 10 percentages — RAW amounts like Kong (the pylon
+      // credits ~the full amountIn; sender pays the ledger fee on top), NOT fee-adjusted like ICPSwap.
+      // Pass Principals (no symbol mapping); gated by skipNeutrinite.
+      let neutriniteFutureOpt0 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[0], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt1 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[1], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt2 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[2], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt3 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[3], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt4 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[4], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt5 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[5], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt6 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[6], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt7 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[7], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt8 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[8], sellDecimals, buyDecimals)) };
+      let neutriniteFutureOpt9 : ?(async Result.Result<swaptypes.NeutriniteQuoteResult, Text>) = if (skipNeutrinite) { null } else { ?((with timeout = 65) NeutriniteSwap.getQuote(sellToken, buyToken, kongAmounts[9], sellDecimals, buyDecimals)) };
+
       // Await all 25 quotes (must await each individually in Motoko)
       let kongResult0 : Result.Result<swaptypes.SwapAmountsReply, Text> = switch (kongFutureOpt0) { case (?f) { try { await f } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) } }; case null { #err("KongSwap skipped: pair quotes invalid") } };
       let kongResult1 : Result.Result<swaptypes.SwapAmountsReply, Text> = switch (kongFutureOpt1) { case (?f) { try { await f } catch (e) { #err("KongSwap quote exception: " # Error.message(e)) } }; case null { #err("KongSwap skipped: pair quotes invalid") } };
@@ -10690,6 +11279,13 @@ shared (deployer) persistent actor class treasury() = this {
           Array.tabulate<[swaptypes.TACOQuoteReply]>(10, func(_) { emptyBundle });
         };
       };
+      // Capture the live exchange trading fee from the quote (global ICPfee, identical for every
+      // route) so deposit sizing + headroom reserve track the exchange instead of a hardcoded 5bp.
+      label feeScan for (bundle in tacoBundles.vals()) {
+        for (q in bundle.vals()) {
+          if (q.tradingFeeBps > 0) { lastKnownTacoFeeBps := q.tradingFeeBps; break feeScan };
+        };
+      };
       let tacoBatchErrMsg : ?Text = switch (tacoBatchResult) {
         case (#err(m)) { ?m };
         case (#ok(r)) {
@@ -10715,9 +11311,22 @@ shared (deployer) persistent actor class treasury() = this {
         tacoBestForFrac(5), tacoBestForFrac(6), tacoBestForFrac(7), tacoBestForFrac(8), tacoBestForFrac(9),
       );
 
+      // Await Neutrinite quotes (null future when skipped -> synthetic #err)
+      let neutriniteResult0 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt0) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult1 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt1) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult2 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt2) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult3 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt3) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult4 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt4) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult5 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt5) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult6 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt6) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult7 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt7) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult8 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt8) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+      let neutriniteResult9 : Result.Result<swaptypes.NeutriniteQuoteResult, Text> = switch (neutriniteFutureOpt9) { case (?f) { try { await f } catch (e) { #err("Neutrinite quote exception: " # Error.message(e)) } }; case null { #err("Neutrinite skipped: pair quotes invalid") } };
+
       let kongResults = [kongResult0, kongResult1, kongResult2, kongResult3, kongResult4, kongResult5, kongResult6, kongResult7, kongResult8, kongResult9];
       let icpResults = [icpResult0, icpResult1, icpResult2, icpResult3, icpResult4, icpResult5, icpResult6, icpResult7, icpResult8, icpResult9];
       let tacoResults = [tacoResult0, tacoResult1, tacoResult2, tacoResult3, tacoResult4, tacoResult5, tacoResult6, tacoResult7, tacoResult8, tacoResult9];
+      let neutriniteResults = [neutriniteResult0, neutriniteResult1, neutriniteResult2, neutriniteResult3, neutriniteResult4, neutriniteResult5, neutriniteResult6, neutriniteResult7, neutriniteResult8, neutriniteResult9];
 
       // Log raw quote results for debugging
       logger.info("QUOTE_DEBUG", "Raw Kong 100% result: " # debug_show(kongResult9), "findBestExecution");
@@ -10789,6 +11398,27 @@ shared (deployer) persistent actor class treasury() = this {
         extractIcp(icpResults[i], icpAmounts[i])
       });
 
+      // Helper to extract Neutrinite quote — verbatim shape of extractKong. r.slippage is already a
+      // PERCENTAGE (computed in neutrinite_swap.mo from the raw before_price; decimals cancel), so
+      // `* 100.0 -> slipBP` matches Kong, and `r.slippage <= maxSlippagePct` gates validity the same way.
+      func extractNeutrinite(result : Result.Result<swaptypes.NeutriniteQuoteResult, Text>, amountIn : Nat) : QuoteData {
+        switch (result) {
+          case (#ok(r)) {
+            let slipFloat = r.slippage * 100.0;
+            let slipBP = if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
+            let isDust = isDustOutput(amountIn, r.amount_out);
+            let valid = r.slippage <= maxSlippagePct and r.amount_out > 0 and not isDust;
+            { out = r.amount_out; slipBP = slipBP; valid = valid }
+          };
+          case (#err(_)) { { out = 0; slipBP = 10000; valid = false } };
+        }
+      };
+
+      // Extract Neutrinite quotes (indices 0-9 = 10%, 20%, ..., 100%) — RAW amounts like Kong.
+      let neutrinite = Array.tabulate<QuoteData>(10, func(i) : QuoteData {
+        extractNeutrinite(neutriniteResults[i], kongAmounts[i])
+      });
+
       // Helper to extract TACO quote — uses priceImpact (delivered as `r.slippage`
       // in percentage form, computed in taco_swap.mo as `priceImpact * 100`) to
       // gate validity. Rejects partial-fill quotes because their priceImpact
@@ -10835,63 +11465,21 @@ shared (deployer) persistent actor class treasury() = this {
         extractTacoWithRoute(tacoResults[i], amountIn * (i + 1) / 10)
       });
 
-      // Build regular QuoteData array for scenario evaluation (compatible with existing code)
-      let taco = Array.tabulate<QuoteData>(10, func(i) : QuoteData {
-        { out = tacoWithRoutes[i].out; slipBP = tacoWithRoutes[i].slipBP; valid = tacoWithRoutes[i].valid }
-      });
+      // ── SMART WITHIN-TACO SPLIT OPTIMIZER ───────────────────────────────
+      //
+      // For each fraction i ∈ [0..9] (10%..100% of cross-DEX total), enumerate
+      // every (bp, route) combination whose bps sum to (i+1)*1000 and whose
+      // routes are pairwise pool-disjoint (bidirectional check, mirrors the
+      // legacy hopsSharePool). Pick the combination with the highest sum of
+      // expected_out. The 1-leg baseline is tacoBundles[i][0] (the exchange's
+      // best single route at that fraction); multi-leg combos must beat it.
+      //
+      // Replaces the previous Pass-A/Pass-B + greedy `independentRoutes` +
+      // equal-split + tacoMultiRouteExpected pipeline. Asymmetric splits like
+      // 30/70 are naturally produced.
 
-      // Detect if TACO quotes use different routes at different amounts
-      // If so, we should use swapSplitRoutes instead of swapMultiHop
-      // Collect distinct routes from TACO quotes — now drawing from the full top-N
-      // bundle per fraction (not just the per-fraction best), so the downstream
-      // greedy pool-independence filter can pick the best disjoint set even when
-      // the canister wouldn't naturally pick different routes at different sizes.
-      var tacoDistinctRoutes = Map.new<Text, [{ tokenIn : Text; tokenOut : Text }]>();
-      // Pass A: best route per fraction (preserves prior behaviour as the primary signal).
-      // route.size() > 1 (not > 0) — the synthesized single-hop "direct" route from
-      // taco_swap.mo:313-316 represents the AMM+Orderbook path through the pair's own
-      // pool. It's the optimal SINGLE-ROUTE choice but doesn't belong in a multi-route
-      // SPLIT because (a) it's not pool-disjoint from any single-hop counterparty and
-      // (b) including it makes treasury's tacoExpectedOut overestimate split capacity
-      // (treasury infers the split's expected from this best single-route's full quote).
-      // Genuine multi-hops (size >= 2) remain eligible for splits.
-      for (i in Iter.range(0, 9)) {
-        if (tacoWithRoutes[i].valid and tacoWithRoutes[i].route.size() > 1) {
-          let routeKey = Array.foldLeft<{ tokenIn : Text; tokenOut : Text }, Text>(
-            tacoWithRoutes[i].route, "",
-            func(acc, h) { acc # h.tokenIn # ">" # h.tokenOut # ";" }
-          );
-          if (not Map.has(tacoDistinctRoutes, thash, routeKey)) {
-            Map.set(tacoDistinctRoutes, thash, routeKey, tacoWithRoutes[i].route);
-          };
-        };
-      };
-      // Pass B: alternative routes from each fraction's bundle (indices 1..N-1).
-      // No extra inter-canister calls — these are already in the same batch response.
-      // Pool-disjointness filter at hopsSharePool below rejects any overlapping routes
-      // before they reach lastTacoRouteLegs / the execution split.
-      for (fracIdx in Iter.range(0, 9)) {
-        let bundle = tacoBundles[fracIdx];
-        if (bundle.size() > 1) {
-          for (rIdx in Iter.range(1, bundle.size() - 1)) {
-            let q = bundle[rIdx];
-            // route.size() > 1: same reasoning as Pass A above — exclude synthesized
-            // single-hop direct routes from multi-route splits.
-            if (q.receive_amount > 0 and q.route.size() > 1) {
-              let routeKey = Array.foldLeft<{ tokenIn : Text; tokenOut : Text }, Text>(
-                q.route, "",
-                func(acc, h) { acc # h.tokenIn # ">" # h.tokenOut # ";" }
-              );
-              if (not Map.has(tacoDistinctRoutes, thash, routeKey)) {
-                Map.set(tacoDistinctRoutes, thash, routeKey, q.route);
-              };
-            };
-          };
-        };
-      };
-
-      // Filter routes for pool independence — routes sharing a pool must NOT be split
-      // Two routes share a pool if any hop pair has same tokens (in either direction)
+      // Pool-disjoint check — used by the optimizer to reject combinations
+      // where two legs share any pool edge (in either direction).
       func hopsSharePool(
         routeA : [{ tokenIn : Text; tokenOut : Text }],
         routeB : [{ tokenIn : Text; tokenOut : Text }],
@@ -10907,23 +11495,294 @@ shared (deployer) persistent actor class treasury() = this {
         false
       };
 
-      // Greedy: keep routes in discovery order, skip any that overlap with already-kept routes
-      let independentRoutes = Vector.new<{ route : [{ tokenIn : Text; tokenOut : Text }]; weight : Nat }>();
-      for ((_, route) in Map.entries(tacoDistinctRoutes)) {
-        var hasOverlap = false;
-        for (kept in Vector.vals(independentRoutes)) {
-          if (hopsSharePool(route, kept.route)) {
-            hasOverlap := true;
-          };
-        };
-        if (not hasOverlap and Vector.size(independentRoutes) < 3) {
-          Vector.add(independentRoutes, { route = route; weight = 1 });
-        };
+      type TACOSplitLegPlan = {
+        bp : Nat;
+        route : [{ tokenIn : Text; tokenOut : Text }];
       };
 
-      let tacoMultiRoute = Vector.size(independentRoutes) > 1;
-      if (tacoMultiRoute) {
-        Debug.print("TACO multi-route: " # Nat.toText(Vector.size(independentRoutes)) # " independent routes (from " # Nat.toText(Map.size(tacoDistinctRoutes)) # " distinct)");
+      type TACOOptimalPlan = {
+        legs : [TACOSplitLegPlan];
+        totalOut : Nat;
+        slipBP : Nat;
+        valid : Bool;
+      };
+
+      // Enumerate bp pairs (a ≤ b, a+b == targetBp, both ≥ 1000).
+      func bpPairsForTarget(targetBp : Nat) : [(Nat, Nat)] {
+        let out = Vector.new<(Nat, Nat)>();
+        var a : Nat = 1000;
+        while (a * 2 <= targetBp) {
+          let b : Nat = targetBp - a;
+          if (b >= a) { Vector.add(out, (a, b)) };
+          a += 1000;
+        };
+        Vector.toArray(out)
+      };
+
+      // Enumerate bp triples (a ≤ b ≤ c, a+b+c == targetBp, all ≥ 1000).
+      func bpTriplesForTarget(targetBp : Nat) : [(Nat, Nat, Nat)] {
+        let out = Vector.new<(Nat, Nat, Nat)>();
+        var a : Nat = 1000;
+        while (a * 3 <= targetBp) {
+          var b : Nat = a;
+          while (a + b * 2 <= targetBp) {
+            let c : Nat = targetBp - a - b;
+            if (c >= b) { Vector.add(out, (a, b, c)) };
+            b += 1000;
+          };
+          a += 1000;
+        };
+        Vector.toArray(out)
+      };
+
+      type QuoteEntry = {
+        bp : Nat;
+        route : [{ tokenIn : Text; tokenOut : Text }];
+        out : Nat;
+        routeKey : Text;
+      };
+
+      func routeKeyOf(route : [{ tokenIn : Text; tokenOut : Text }]) : Text {
+        Array.foldLeft<{ tokenIn : Text; tokenOut : Text }, Text>(
+          route, "",
+          func(acc, h) { acc # h.tokenIn # ">" # h.tokenOut # ";" }
+        )
+      };
+
+      // Per-bundle validity check — matches extractTacoWithRoute's criteria.
+      func bundleQuoteValid(bundleIdx : Nat, q : swaptypes.TACOQuoteReply) : Bool {
+        let amt = amountIn * (bundleIdx + 1) / 10;
+        let isDust = isDustOutput(amt, q.receive_amount);
+        q.canFulfillFully and q.slippage <= maxSlippagePct and q.receive_amount > 0 and not isDust
+      };
+
+      func findOptimalTacoSplit(targetBp : Nat) : TACOOptimalPlan {
+        if (targetBp == 0 or targetBp > 10000) {
+          return { legs = []; totalOut = 0; slipBP = 10000; valid = false };
+        };
+        let targetIdx : Nat = (targetBp / 1000) - 1;
+
+        // 1-LEG BASELINE: tacoBundles[targetIdx][0] is the best single route
+        // at this fraction. Direct (single-hop) routes are eligible here.
+        var bestTotal : Nat = 0;
+        var bestPlan : [TACOSplitLegPlan] = [];
+        var baselineSlipBP : Nat = 10000;
+        let baselineBundle = tacoBundles[targetIdx];
+        if (baselineBundle.size() > 0) {
+          let q0 = baselineBundle[0];
+          if (bundleQuoteValid(targetIdx, q0)) {
+            let slipFloat = q0.slippage * 100.0;
+            baselineSlipBP := if (isFiniteFloat(slipFloat)) { Int.abs(Float.toInt(slipFloat)) } else { 10000 };
+            bestTotal := q0.receive_amount;
+            let synth : [{ tokenIn : Text; tokenOut : Text }] = if (q0.route.size() == 0) {
+              [{ tokenIn = sellTokenText; tokenOut = buyTokenText }]
+            } else { q0.route };
+            bestPlan := [{ bp = targetBp; route = synth }];
+          };
+        };
+
+        // MULTI-LEG FLATTEN: routes from tacoBundles[0..targetIdx-1] with
+        // route.size() >= 2 (multi-hop only — matches the legacy Pass-A/B
+        // exclusion of synthesized single-hop direct routes from splits).
+        let entriesVec = Vector.new<QuoteEntry>();
+        let seenKeys = Map.new<Text, Bool>();
+        if (targetIdx > 0) {
+          var i : Nat = 0;
+          while (i < targetIdx) {
+            let bundle = tacoBundles[i];
+            let bp : Nat = (i + 1) * 1000;
+            for (q in bundle.vals()) {
+              if (q.receive_amount > 0 and q.route.size() >= 2 and bundleQuoteValid(i, q)) {
+                let rk = routeKeyOf(q.route);
+                let dedupeKey = Nat.toText(bp) # "|" # rk;
+                if (not Map.has(seenKeys, thash, dedupeKey)) {
+                  Map.set(seenKeys, thash, dedupeKey, true);
+                  Vector.add(entriesVec, { bp; route = q.route; out = q.receive_amount; routeKey = rk });
+                };
+              };
+            };
+            i += 1;
+          };
+        };
+
+        // GROUP BY BP and sort each group by `out` descending so inner-loop
+        // break-on-≤bestTotal is sound. Indices reference into `entriesVec`.
+        let groupByBp = Map.new<Nat, [Nat]>();
+        let totalEntries = Vector.size(entriesVec);
+        if (totalEntries > 0) {
+          // First pass: collect indices per bp.
+          let collect = Map.new<Nat, Vector.Vector<Nat>>();
+          var idx : Nat = 0;
+          while (idx < totalEntries) {
+            let e = Vector.get(entriesVec, idx);
+            let g = switch (Map.get(collect, Map.nhash, e.bp)) {
+              case (?v) { v };
+              case null { let v = Vector.new<Nat>(); Map.set(collect, Map.nhash, e.bp, v); v };
+            };
+            Vector.add(g, idx);
+            idx += 1;
+          };
+          // Second pass: sort each group and store as immutable array in groupByBp.
+          for ((bp, g) in Map.entries(collect)) {
+            let arr = Vector.toArray(g);
+            let sorted = Array.sort<Nat>(arr, func(a, b) {
+              Nat.compare(Vector.get(entriesVec, b).out, Vector.get(entriesVec, a).out)
+            });
+            Map.set(groupByBp, Map.nhash, bp, sorted);
+          };
+        };
+        func entry(idx : Nat) : QuoteEntry { Vector.get(entriesVec, idx) };
+        func group(bp : Nat) : [Nat] {
+          switch (Map.get(groupByBp, Map.nhash, bp)) {
+            case (?arr) { arr };
+            case null { [] };
+          }
+        };
+        func groupTopOut(bp : Nat) : Nat {
+          let g = group(bp);
+          if (g.size() == 0) { 0 } else { entry(g[0]).out }
+        };
+        func pairCompatible(a : QuoteEntry, b : QuoteEntry) : Bool {
+          a.routeKey != b.routeKey and not hopsSharePool(a.route, b.route)
+        };
+
+        // 2-LEG SEARCH
+        for ((bpA, bpB) in bpPairsForTarget(targetBp).vals()) {
+          if (groupTopOut(bpA) + groupTopOut(bpB) > bestTotal) {
+            let gA = group(bpA);
+            if (bpA == bpB) {
+              let n = gA.size();
+              var xi : Nat = 0;
+              label sameLoop while (xi + 1 < n) {
+                let i = gA[xi];
+                let aOut = entry(i).out;
+                let nextOut = entry(gA[xi + 1]).out;
+                if (aOut + nextOut <= bestTotal) { break sameLoop };
+                var xj : Nat = xi + 1;
+                label sameInner while (xj < n) {
+                  let j = gA[xj];
+                  let total = aOut + entry(j).out;
+                  if (total <= bestTotal) { break sameInner };
+                  if (pairCompatible(entry(i), entry(j))) {
+                    bestTotal := total;
+                    bestPlan := [
+                      { bp = entry(i).bp; route = entry(i).route },
+                      { bp = entry(j).bp; route = entry(j).route },
+                    ];
+                  };
+                  xj += 1;
+                };
+                xi += 1;
+              };
+            } else {
+              let gB = group(bpB);
+              let maxBOut = groupTopOut(bpB);
+              let nA = gA.size();
+              let nB = gB.size();
+              var xi : Nat = 0;
+              label diffOuter while (xi < nA) {
+                let i = gA[xi];
+                let aOut = entry(i).out;
+                if (aOut + maxBOut <= bestTotal) { break diffOuter };
+                var xj : Nat = 0;
+                label diffInner while (xj < nB) {
+                  let j = gB[xj];
+                  let total = aOut + entry(j).out;
+                  if (total <= bestTotal) { break diffInner };
+                  if (pairCompatible(entry(i), entry(j))) {
+                    bestTotal := total;
+                    bestPlan := [
+                      { bp = entry(i).bp; route = entry(i).route },
+                      { bp = entry(j).bp; route = entry(j).route },
+                    ];
+                  };
+                  xj += 1;
+                };
+                xi += 1;
+              };
+            };
+          };
+        };
+
+        // 3-LEG SEARCH
+        for ((bpA, bpB, bpC) in bpTriplesForTarget(targetBp).vals()) {
+          if (groupTopOut(bpA) + groupTopOut(bpB) + groupTopOut(bpC) > bestTotal) {
+            let gA = group(bpA);
+            let gB = group(bpB);
+            let gC = group(bpC);
+            let sameAB = bpA == bpB;
+            let sameBC = bpB == bpC;
+            let maxCOut = groupTopOut(bpC);
+            let nA = gA.size();
+            let nB = gB.size();
+            let nC = gC.size();
+            var xi : Nat = 0;
+            label tA while (xi < nA) {
+              let i = gA[xi];
+              let aOut = entry(i).out;
+              let bStart : Nat = if (sameAB) { xi + 1 } else { 0 };
+              if (bStart < nB) {
+                let maxBStart = entry(gB[bStart]).out;
+                if (aOut + maxBStart + maxCOut <= bestTotal) { break tA };
+                var xj : Nat = bStart;
+                label tB while (xj < nB) {
+                  let j = gB[xj];
+                  let bOut = entry(j).out;
+                  if (aOut + bOut + maxCOut <= bestTotal) { break tB };
+                  if (pairCompatible(entry(i), entry(j))) {
+                    let cStart : Nat = if (sameBC) { xj + 1 } else { 0 };
+                    if (cStart < nC) {
+                      var xk : Nat = cStart;
+                      label tC while (xk < nC) {
+                        let k = gC[xk];
+                        let total = aOut + bOut + entry(k).out;
+                        if (total <= bestTotal) { break tC };
+                        if (pairCompatible(entry(i), entry(k)) and pairCompatible(entry(j), entry(k))) {
+                          bestTotal := total;
+                          bestPlan := [
+                            { bp = entry(i).bp; route = entry(i).route },
+                            { bp = entry(j).bp; route = entry(j).route },
+                            { bp = entry(k).bp; route = entry(k).route },
+                          ];
+                        };
+                        xk += 1;
+                      };
+                    };
+                  };
+                  xj += 1;
+                };
+              };
+              xi += 1;
+            };
+          };
+        };
+
+        if (bestTotal > 0) {
+          { legs = bestPlan; totalOut = bestTotal; slipBP = baselineSlipBP; valid = true }
+        } else {
+          { legs = []; totalOut = 0; slipBP = 10000; valid = false }
+        }
+      };
+
+      // Pre-compute optimal plans for all 10 fractions.
+      let tacoOptimalSplit : [TACOOptimalPlan] = Array.tabulate<TACOOptimalPlan>(10, func(i) {
+        findOptimalTacoSplit((i + 1) * 1000)
+      });
+
+      // Build the QuoteData array consumed by the cross-DEX scenario builder.
+      // `out` is now the optimal MULTI-ROUTE total (when multi-route beats
+      // single-route), not just the best single route — this strictly
+      // dominates the previous tacoBundles[i][0]-only signal.
+      let taco = Array.tabulate<QuoteData>(10, func(i) : QuoteData {
+        let opt = tacoOptimalSplit[i];
+        { out = opt.totalOut; slipBP = opt.slipBP; valid = opt.valid }
+      });
+
+      if (tacoOptimalSplit[9].legs.size() > 1) {
+        Debug.print(
+          "TACO multi-route@100%: " # Nat.toText(tacoOptimalSplit[9].legs.size()) #
+          " legs, total=" # Nat.toText(tacoOptimalSplit[9].totalOut)
+        );
       };
 
       // Record exchange-pair skip for Kong if ALL quotes are invalid (saves 10
@@ -10932,6 +11791,14 @@ shared (deployer) persistent actor class treasury() = this {
         var allKongInvalid = true;
         for (q in kong.vals()) { if (q.valid) { allKongInvalid := false } };
         if (allKongInvalid) { addExchangePairSkip("K", sellToken, buyToken) };
+      };
+
+      // Record exchange-pair skip for Neutrinite if ALL quotes are invalid (saves 10
+      // separate inter-canister calls next time; "No price for exchange" = no liquidity).
+      if (not skipNeutrinite) {
+        var allNeutriniteInvalid = true;
+        for (q in neutrinite.vals()) { if (q.valid) { allNeutriniteInvalid := false } };
+        if (allNeutriniteInvalid) { addExchangePairSkip("N", sellToken, buyToken) };
       };
 
       // Intentionally NO skip-add for TACO: the entire 10-fraction batch is one
@@ -10947,120 +11814,6 @@ shared (deployer) persistent actor class treasury() = this {
         "findBestExecution"
       );
 
-      // Store multi-route info for execution (only pool-independent routes)
-      lastTacoMultiRoute := tacoMultiRoute;
-      lastTacoRouteLegs := if (tacoMultiRoute) {
-        Vector.toArray(independentRoutes)
-      } else { [] };
-
-      // Helper: when TACO multi-route fires, the delivered output is the SUM of
-      // per-route quotes at their leg sizes — NOT the best single-route's full quote.
-      // Pool-disjoint legs (enforced by hopsSharePool above) execute independently, so
-      // each leg's expected output is just its route's quote at the leg's amount.
-      //
-      // The bundle gives top-N routes' receive_amount at each of 10 fractions of
-      // amountIn. For a leg of size legAmt:
-      //   Tier 1 (exact-ish): use the bundle whose fraction is closest to but ≥ legAmt
-      //                       and contains the route. Scale linearly DOWN to legAmt
-      //                       (under-estimates → safe minAmountOut).
-      //   Tier 2 (any bundle): if no bundle ≥ legAmt has the route, scan all bundles
-      //                        for the route and pick the largest-fraction one that
-      //                        does. Same scale-to-legAmt formula (may scale UP if the
-      //                        only available bundle is smaller, but that would slightly
-      //                        OVER-estimate — protect against this by returning 0).
-      //   Tier 3 (defence): if no bundle contains the route at all, return 0 → trade
-      //                     aborts. Unreachable in practice (routes in lastTacoRouteLegs
-      //                     all came from some bundle), but defends against any
-      //                     accidental over-estimate that could fail at execution.
-      func tacoMultiRouteExpected(tacoAmt : Nat, scenarioBestOut : Nat) : Nat {
-        if (not lastTacoMultiRoute or lastTacoRouteLegs.size() <= 1 or amountIn == 0 or tacoAmt == 0) {
-          return scenarioBestOut;
-        };
-        if (tacoBundles.size() < 10) return scenarioBestOut;
-        let numLegs = Nat.min(lastTacoRouteLegs.size(), 3);
-        let legAmt = tacoAmt / numLegs;
-
-        func routeKeyFor(route : [{ tokenIn : Text; tokenOut : Text }]) : Text {
-          Array.foldLeft<{ tokenIn : Text; tokenOut : Text }, Text>(
-            route, "",
-            func(acc, h) { acc # h.tokenIn # ">" # h.tokenOut # ";" }
-          );
-        };
-
-        // Find route in tacoBundles[bundleIdx]; return its receive_amount or 0.
-        func findRouteOutInBundle(rk : Text, bundleIdx : Nat) : Nat {
-          let bundle = tacoBundles[bundleIdx];
-          var found : Nat = 0;
-          for (q in bundle.vals()) {
-            if (q.receive_amount > 0 and routeKeyFor(q.route) == rk) {
-              found := q.receive_amount;
-            };
-          };
-          found
-        };
-
-        var sum : Nat = 0;
-        for (legInfo in lastTacoRouteLegs.vals()) {
-          let rk = routeKeyFor(legInfo.route);
-          // Tier 1: smallest bundle whose amount ≥ legAmt and that contains the route.
-          // Bundle index i corresponds to amountIn*(i+1)/10.
-          var pickedBundleAmt : Nat = 0;
-          var pickedOut : Nat = 0;
-          label tier1 for (i in Iter.range(0, 9)) {
-            let bundleAmt = (amountIn * (i + 1)) / 10;
-            if (bundleAmt >= legAmt) {
-              let qOut = findRouteOutInBundle(rk, i);
-              if (qOut > 0) {
-                pickedBundleAmt := bundleAmt;
-                pickedOut := qOut;
-                break tier1;
-              };
-            };
-          };
-          // Tier 2: route not in any bundle ≥ legAmt — scan all bundles, pick the
-          // largest-fraction one containing the route. Scaling UP from a smaller bundle
-          // would over-estimate, so reject (set to 0) and let Tier 3 abort.
-          if (pickedOut == 0) {
-            var biggestSmallerOut : Nat = 0;
-            var biggestSmallerAmt : Nat = 0;
-            for (i in Iter.range(0, 9)) {
-              let bundleAmt = (amountIn * (i + 1)) / 10;
-              if (bundleAmt < legAmt) {
-                let qOut = findRouteOutInBundle(rk, i);
-                if (qOut > 0 and bundleAmt > biggestSmallerAmt) {
-                  biggestSmallerAmt := bundleAmt;
-                  biggestSmallerOut := qOut;
-                };
-              };
-            };
-            if (biggestSmallerOut > 0) {
-              // Found only smaller-fraction quotes. Scaling up overestimates → unsafe
-              // for minAmountOut. Use the smaller quote AS-IS (caps leg expected at
-              // the smaller quote's value — strict under-estimate, safe).
-              pickedBundleAmt := biggestSmallerAmt;
-              pickedOut := biggestSmallerOut;
-              // Treat as if the leg is the smaller bundle's amount: legAmt-equivalent
-              // output is at least biggestSmallerOut. Sum this bound.
-              sum += biggestSmallerOut;
-            } else {
-              // Tier 3: no bundle has the route. Unreachable in practice — every route
-              // in lastTacoRouteLegs came from some bundle in tacoBundles, and tacoBundles
-              // is captured immutably here. Returning scenarioBestOut as defence: it
-              // OVER-estimates split output (matches old unfixed behaviour for this
-              // edge case), so the trade's slippage check at execution will likely
-              // fail and Debug.trap atomic-rolls-back. That's strictly better than
-              // returning 0 (which would set minAmountOut=0 → unprotected execution).
-              return scenarioBestOut;
-            };
-          } else {
-            // Scale linearly DOWN to legAmt. Under-estimate (smaller swaps have lower
-            // price impact than linear scaling assumes) → safe for minAmountOut.
-            sum += (pickedOut * legAmt) / pickedBundleAmt;
-          };
-        };
-        sum
-      };
-
       // ========================================
       // CALCULATE ALL SCENARIOS
       // Singles (100%), Full splits (sum to 100%), and Partials (sum < 100%)
@@ -11073,7 +11826,7 @@ shared (deployer) persistent actor class treasury() = this {
       let STEP_BP : Nat = 1000;  // 10% per step
       let MIN_PARTIAL_TOTAL_BP : Nat = 4000;  // 40% minimum for partials
 
-      type Scenario = { name : Text; kongPct : Nat; icpPct : Nat; tacoPct : Nat; totalOut : Nat; kongSlipBP : Nat; icpSlipBP : Nat; tacoSlipBP : Nat; kongIdx : Nat; icpIdx : Nat; tacoIdx : Nat };
+      type Scenario = { name : Text; kongPct : Nat; icpPct : Nat; tacoPct : Nat; neutrinitePct : Nat; totalOut : Nat; kongSlipBP : Nat; icpSlipBP : Nat; tacoSlipBP : Nat; neutriniteSlipBP : Nat; kongIdx : Nat; icpIdx : Nat; tacoIdx : Nat; neutriniteIdx : Nat };
 
       var bestScenario : ?Scenario = null;
       var secondBestScenario : ?Scenario = null;
@@ -11101,10 +11854,10 @@ shared (deployer) persistent actor class treasury() = this {
       if (kong[9].valid) {
         updateBest({
           name = "SINGLE_KONG";
-          kongPct = 10000; icpPct = 0; tacoPct = 0;
+          kongPct = 10000; icpPct = 0; tacoPct = 0; neutrinitePct = 0;
           totalOut = kong[9].out;
-          kongSlipBP = kong[9].slipBP; icpSlipBP = 0; tacoSlipBP = 0;
-          kongIdx = 9; icpIdx = 9; tacoIdx = 9;
+          kongSlipBP = kong[9].slipBP; icpSlipBP = 0; tacoSlipBP = 0; neutriniteSlipBP = 0;
+          kongIdx = 9; icpIdx = 9; tacoIdx = 9; neutriniteIdx = 9;
         });
       };
 
@@ -11112,10 +11865,10 @@ shared (deployer) persistent actor class treasury() = this {
       if (icp[9].valid) {
         updateBest({
           name = "SINGLE_ICP";
-          kongPct = 0; icpPct = 10000; tacoPct = 0;
+          kongPct = 0; icpPct = 10000; tacoPct = 0; neutrinitePct = 0;
           totalOut = icp[9].out;
-          kongSlipBP = 0; icpSlipBP = icp[9].slipBP; tacoSlipBP = 0;
-          kongIdx = 9; icpIdx = 9; tacoIdx = 9;
+          kongSlipBP = 0; icpSlipBP = icp[9].slipBP; tacoSlipBP = 0; neutriniteSlipBP = 0;
+          kongIdx = 9; icpIdx = 9; tacoIdx = 9; neutriniteIdx = 9;
         });
       };
 
@@ -11123,10 +11876,21 @@ shared (deployer) persistent actor class treasury() = this {
       if (taco[9].valid) {
         updateBest({
           name = "SINGLE_TACO";
-          kongPct = 0; icpPct = 0; tacoPct = 10000;
+          kongPct = 0; icpPct = 0; tacoPct = 10000; neutrinitePct = 0;
           totalOut = taco[9].out;
-          kongSlipBP = 0; icpSlipBP = 0; tacoSlipBP = taco[9].slipBP;
-          kongIdx = 9; icpIdx = 9; tacoIdx = 9;
+          kongSlipBP = 0; icpSlipBP = 0; tacoSlipBP = taco[9].slipBP; neutriniteSlipBP = 0;
+          kongIdx = 9; icpIdx = 9; tacoIdx = 9; neutriniteIdx = 9;
+        });
+      };
+
+      // Scenario 4: Single Neutrinite (100%) - index 9
+      if (neutrinite[9].valid) {
+        updateBest({
+          name = "SINGLE_NEUTRINITE";
+          kongPct = 0; icpPct = 0; tacoPct = 0; neutrinitePct = 10000;
+          totalOut = neutrinite[9].out;
+          kongSlipBP = 0; icpSlipBP = 0; tacoSlipBP = 0; neutriniteSlipBP = neutrinite[9].slipBP;
+          kongIdx = 9; icpIdx = 9; tacoIdx = 9; neutriniteIdx = 9;
         });
       };
 
@@ -11148,10 +11912,10 @@ shared (deployer) persistent actor class treasury() = this {
             let totalOutCalc = kong[kongIdxIter].out + icp[icpIdxIter].out;
             let scenario : Scenario = {
               name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(icpPctCalc / 100) # "I";
-              kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = 0;
+              kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = 0; neutrinitePct = 0;
               totalOut = totalOutCalc;
-              kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = 0;
-              kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = 9;
+              kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = 0; neutriniteSlipBP = 0;
+              kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = 9; neutriniteIdx = 9;
             };
             if (totalPctCalc == 10000) { updateBest(scenario) }
             else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
@@ -11173,10 +11937,10 @@ shared (deployer) persistent actor class treasury() = this {
             let totalOutCalc = kong[kongIdxIter].out + taco[tacoIdxIter].out;
             let scenario : Scenario = {
               name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(tacoPctCalc / 100) # "T";
-              kongPct = kongPctCalc; icpPct = 0; tacoPct = tacoPctCalc;
+              kongPct = kongPctCalc; icpPct = 0; tacoPct = tacoPctCalc; neutrinitePct = 0;
               totalOut = totalOutCalc;
-              kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = 0; tacoSlipBP = taco[tacoIdxIter].slipBP;
-              kongIdx = kongIdxIter; icpIdx = 9; tacoIdx = tacoIdxIter;
+              kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = 0; tacoSlipBP = taco[tacoIdxIter].slipBP; neutriniteSlipBP = 0;
+              kongIdx = kongIdxIter; icpIdx = 9; tacoIdx = tacoIdxIter; neutriniteIdx = 9;
             };
             if (totalPctCalc == 10000) { updateBest(scenario) }
             else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
@@ -11198,10 +11962,10 @@ shared (deployer) persistent actor class treasury() = this {
             let totalOutCalc = icp[icpIdxIter].out + taco[tacoIdxIter].out;
             let scenario : Scenario = {
               name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(tacoPctCalc / 100) # "T";
-              kongPct = 0; icpPct = icpPctCalc; tacoPct = tacoPctCalc;
+              kongPct = 0; icpPct = icpPctCalc; tacoPct = tacoPctCalc; neutrinitePct = 0;
               totalOut = totalOutCalc;
-              kongSlipBP = 0; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP;
-              kongIdx = 9; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter;
+              kongSlipBP = 0; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP; neutriniteSlipBP = 0;
+              kongIdx = 9; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter; neutriniteIdx = 9;
             };
             if (totalPctCalc == 10000) { updateBest(scenario) }
             else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
@@ -11224,13 +11988,170 @@ shared (deployer) persistent actor class treasury() = this {
               let totalOutCalc = kong[kongIdxIter].out + icp[icpIdxIter].out + taco[tacoIdxIter].out;
               let scenario : Scenario = {
                 name = (if (totalPctCalc == 10000) { "SPLIT_" } else { "PARTIAL_" }) # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(tacoPctCalc / 100) # "T";
-                kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = tacoPctCalc;
+                kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = tacoPctCalc; neutrinitePct = 0;
                 totalOut = totalOutCalc;
-                kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP;
-                kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter;
+                kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP; neutriniteSlipBP = 0;
+                kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter; neutriniteIdx = 9;
               };
               if (totalPctCalc == 10000) { updateBest(scenario) }
               else if (totalPctCalc >= MIN_PARTIAL_TOTAL_BP) { Vector.add(partialScenarios, scenario) };
+            };
+          };
+        };
+      };
+
+      // ========================================
+      // NEUTRINITE (4th DEX) SCENARIOS
+      // Full splits only (totalPct == 10000): the #Partial executor is Kong/ICP-only and would
+      // no-op a TACO+Neutrinite partial, so Neutrinite scenarios are NEVER added to partialScenarios
+      // (mirrors how TACO is excluded from the partial executor). Neutrinite still participates in
+      // singles + full 2/3/4-way splits.
+      // ========================================
+      let NEUTRINITE_STEP_BP : Nat = 1000; // 10% per step (10 quotes, matching Kong/ICP/TACO)
+
+      // 2-way Kong+Neutrinite
+      label kongNeutriniteLoop for (kongIdxIter in Iter.range(0, 9)) {
+        label nLoop1 for (nIdx in Iter.range(0, 9)) {
+          let kongPctCalc = (kongIdxIter + 1) * STEP_BP;
+          let nPctCalc = (nIdx + 1) * NEUTRINITE_STEP_BP;
+          let totalPctCalc = kongPctCalc + nPctCalc;
+          if (totalPctCalc != 10000) { continue nLoop1 }; // full splits only
+          if (kong[kongIdxIter].valid and neutrinite[nIdx].valid) {
+            updateBest({
+              name = "SPLIT_" # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(nPctCalc / 100) # "N";
+              kongPct = kongPctCalc; icpPct = 0; tacoPct = 0; neutrinitePct = nPctCalc;
+              totalOut = kong[kongIdxIter].out + neutrinite[nIdx].out;
+              kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = 0; tacoSlipBP = 0; neutriniteSlipBP = neutrinite[nIdx].slipBP;
+              kongIdx = kongIdxIter; icpIdx = 9; tacoIdx = 9; neutriniteIdx = nIdx;
+            });
+          };
+        };
+      };
+
+      // 2-way ICP+Neutrinite
+      label icpNeutriniteLoop for (icpIdxIter in Iter.range(0, 9)) {
+        label nLoop2 for (nIdx in Iter.range(0, 9)) {
+          let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
+          let nPctCalc = (nIdx + 1) * NEUTRINITE_STEP_BP;
+          let totalPctCalc = icpPctCalc + nPctCalc;
+          if (totalPctCalc != 10000) { continue nLoop2 };
+          if (icp[icpIdxIter].valid and neutrinite[nIdx].valid) {
+            updateBest({
+              name = "SPLIT_" # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(nPctCalc / 100) # "N";
+              kongPct = 0; icpPct = icpPctCalc; tacoPct = 0; neutrinitePct = nPctCalc;
+              totalOut = icp[icpIdxIter].out + neutrinite[nIdx].out;
+              kongSlipBP = 0; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = 0; neutriniteSlipBP = neutrinite[nIdx].slipBP;
+              kongIdx = 9; icpIdx = icpIdxIter; tacoIdx = 9; neutriniteIdx = nIdx;
+            });
+          };
+        };
+      };
+
+      // 2-way TACO+Neutrinite
+      label tacoNeutriniteLoop for (tacoIdxIter in Iter.range(0, 9)) {
+        label nLoop3 for (nIdx in Iter.range(0, 9)) {
+          let tacoPctCalc = (tacoIdxIter + 1) * TACO_STEP_BP;
+          let nPctCalc = (nIdx + 1) * NEUTRINITE_STEP_BP;
+          let totalPctCalc = tacoPctCalc + nPctCalc;
+          if (totalPctCalc != 10000) { continue nLoop3 };
+          if (taco[tacoIdxIter].valid and neutrinite[nIdx].valid) {
+            updateBest({
+              name = "SPLIT_" # Nat.toText(tacoPctCalc / 100) # "T_" # Nat.toText(nPctCalc / 100) # "N";
+              kongPct = 0; icpPct = 0; tacoPct = tacoPctCalc; neutrinitePct = nPctCalc;
+              totalOut = taco[tacoIdxIter].out + neutrinite[nIdx].out;
+              kongSlipBP = 0; icpSlipBP = 0; tacoSlipBP = taco[tacoIdxIter].slipBP; neutriniteSlipBP = neutrinite[nIdx].slipBP;
+              kongIdx = 9; icpIdx = 9; tacoIdx = tacoIdxIter; neutriniteIdx = nIdx;
+            });
+          };
+        };
+      };
+
+      // 3-way Kong+ICP+Neutrinite
+      label kongIcpNeutLoop for (kongIdxIter in Iter.range(0, 7)) {
+        label icpNeutLoop for (icpIdxIter in Iter.range(0, 7)) {
+          label nLoopA for (nIdx in Iter.range(0, 7)) {
+            let kongPctCalc = (kongIdxIter + 1) * STEP_BP;
+            let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
+            let nPctCalc = (nIdx + 1) * NEUTRINITE_STEP_BP;
+            let totalPctCalc = kongPctCalc + icpPctCalc + nPctCalc;
+            if (totalPctCalc != 10000) { continue nLoopA };
+            if (kong[kongIdxIter].valid and icp[icpIdxIter].valid and neutrinite[nIdx].valid) {
+              updateBest({
+                name = "SPLIT_" # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(nPctCalc / 100) # "N";
+                kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = 0; neutrinitePct = nPctCalc;
+                totalOut = kong[kongIdxIter].out + icp[icpIdxIter].out + neutrinite[nIdx].out;
+                kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = 0; neutriniteSlipBP = neutrinite[nIdx].slipBP;
+                kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = 9; neutriniteIdx = nIdx;
+              });
+            };
+          };
+        };
+      };
+
+      // 3-way Kong+TACO+Neutrinite
+      label kongTacoNeutLoop for (kongIdxIter in Iter.range(0, 7)) {
+        label tacoNeutLoop for (tacoIdxIter in Iter.range(0, 7)) {
+          label nLoopB for (nIdx in Iter.range(0, 7)) {
+            let kongPctCalc = (kongIdxIter + 1) * STEP_BP;
+            let tacoPctCalc = (tacoIdxIter + 1) * TACO_STEP_BP;
+            let nPctCalc = (nIdx + 1) * NEUTRINITE_STEP_BP;
+            let totalPctCalc = kongPctCalc + tacoPctCalc + nPctCalc;
+            if (totalPctCalc != 10000) { continue nLoopB };
+            if (kong[kongIdxIter].valid and taco[tacoIdxIter].valid and neutrinite[nIdx].valid) {
+              updateBest({
+                name = "SPLIT_" # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(tacoPctCalc / 100) # "T_" # Nat.toText(nPctCalc / 100) # "N";
+                kongPct = kongPctCalc; icpPct = 0; tacoPct = tacoPctCalc; neutrinitePct = nPctCalc;
+                totalOut = kong[kongIdxIter].out + taco[tacoIdxIter].out + neutrinite[nIdx].out;
+                kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = 0; tacoSlipBP = taco[tacoIdxIter].slipBP; neutriniteSlipBP = neutrinite[nIdx].slipBP;
+                kongIdx = kongIdxIter; icpIdx = 9; tacoIdx = tacoIdxIter; neutriniteIdx = nIdx;
+              });
+            };
+          };
+        };
+      };
+
+      // 3-way ICP+TACO+Neutrinite
+      label icpTacoNeutLoop for (icpIdxIter in Iter.range(0, 7)) {
+        label tacoNeutLoop2 for (tacoIdxIter in Iter.range(0, 7)) {
+          label nLoopC for (nIdx in Iter.range(0, 7)) {
+            let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
+            let tacoPctCalc = (tacoIdxIter + 1) * TACO_STEP_BP;
+            let nPctCalc = (nIdx + 1) * NEUTRINITE_STEP_BP;
+            let totalPctCalc = icpPctCalc + tacoPctCalc + nPctCalc;
+            if (totalPctCalc != 10000) { continue nLoopC };
+            if (icp[icpIdxIter].valid and taco[tacoIdxIter].valid and neutrinite[nIdx].valid) {
+              updateBest({
+                name = "SPLIT_" # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(tacoPctCalc / 100) # "T_" # Nat.toText(nPctCalc / 100) # "N";
+                kongPct = 0; icpPct = icpPctCalc; tacoPct = tacoPctCalc; neutrinitePct = nPctCalc;
+                totalOut = icp[icpIdxIter].out + taco[tacoIdxIter].out + neutrinite[nIdx].out;
+                kongSlipBP = 0; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP; neutriniteSlipBP = neutrinite[nIdx].slipBP;
+                kongIdx = 9; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter; neutriniteIdx = nIdx;
+              });
+            };
+          };
+        };
+      };
+
+      // 4-way Kong+ICP+TACO+Neutrinite (bound 0..6 = <=70%/leg; only ==10000 builds a scenario).
+      label kong4 for (kongIdxIter in Iter.range(0, 6)) {
+        label icp4 for (icpIdxIter in Iter.range(0, 6)) {
+          label taco4 for (tacoIdxIter in Iter.range(0, 6)) {
+            label neut4 for (nIdx in Iter.range(0, 6)) {
+              let kongPctCalc = (kongIdxIter + 1) * STEP_BP;
+              let icpPctCalc = (icpIdxIter + 1) * STEP_BP;
+              let tacoPctCalc = (tacoIdxIter + 1) * TACO_STEP_BP;
+              let nPctCalc = (nIdx + 1) * NEUTRINITE_STEP_BP;
+              let totalPctCalc = kongPctCalc + icpPctCalc + tacoPctCalc + nPctCalc;
+              if (totalPctCalc != 10000) { continue neut4 };
+              if (kong[kongIdxIter].valid and icp[icpIdxIter].valid and taco[tacoIdxIter].valid and neutrinite[nIdx].valid) {
+                updateBest({
+                  name = "SPLIT_" # Nat.toText(kongPctCalc / 100) # "K_" # Nat.toText(icpPctCalc / 100) # "I_" # Nat.toText(tacoPctCalc / 100) # "T_" # Nat.toText(nPctCalc / 100) # "N";
+                  kongPct = kongPctCalc; icpPct = icpPctCalc; tacoPct = tacoPctCalc; neutrinitePct = nPctCalc;
+                  totalOut = kong[kongIdxIter].out + icp[icpIdxIter].out + taco[tacoIdxIter].out + neutrinite[nIdx].out;
+                  kongSlipBP = kong[kongIdxIter].slipBP; icpSlipBP = icp[icpIdxIter].slipBP; tacoSlipBP = taco[tacoIdxIter].slipBP; neutriniteSlipBP = neutrinite[nIdx].slipBP;
+                  kongIdx = kongIdxIter; icpIdx = icpIdxIter; tacoIdx = tacoIdxIter; neutriniteIdx = nIdx;
+                });
+              };
             };
           };
         };
@@ -11255,7 +12176,7 @@ shared (deployer) persistent actor class treasury() = this {
               "No viable execution path - all quotes invalid or exceed slippage threshold",
               "findBestExecution"
             );
-            #err({ reason = "No viable execution path found"; kongQuotes = kong; icpQuotes = icp })
+            #err({ reason = "No viable execution path found"; kongQuotes = kong; icpQuotes = icp; tacoQuotes = taco; tacoPlans = tacoOptimalSplit })
           } else {
             // Calculate trade value in ICP for filtering
             let tradeValueICP : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
@@ -11270,12 +12191,12 @@ shared (deployer) persistent actor class treasury() = this {
 
             // Helper: combined slippage (NO FLOAT)
             func combinedSlip(p : Scenario) : Nat {
-              p.kongSlipBP + p.icpSlipBP + p.tacoSlipBP
+              p.kongSlipBP + p.icpSlipBP + p.tacoSlipBP + p.neutriniteSlipBP
             };
 
             // Helper: partial total percentage
             func totalPctFunc(p : Scenario) : Nat {
-              p.kongPct + p.icpPct + p.tacoPct
+              p.kongPct + p.icpPct + p.tacoPct + p.neutrinitePct
             };
 
             // Helper: partial value in ICP (safe division)
@@ -11344,9 +12265,17 @@ shared (deployer) persistent actor class treasury() = this {
                   "No viable partial execution path found",
                   "findBestExecution"
                 );
-                #err({ reason = "No viable partial execution path"; kongQuotes = kong; icpQuotes = icp })
+                #err({ reason = "No viable partial execution path"; kongQuotes = kong; icpQuotes = icp; tacoQuotes = taco; tacoPlans = tacoOptimalSplit })
               };
               case (?partialBest) {
+                // Stash the optimal TACO split plan for the downstream executors.
+                lastTacoOptimalPlan := if (partialBest.tacoPct > 0) {
+                  let p = tacoOptimalSplit[partialBest.tacoIdx];
+                  { legs = p.legs; targetBp = (partialBest.tacoIdx + 1) * 1000 }
+                } else {
+                  { legs = []; targetBp = 0 }
+                };
+
                 // ============================================
                 // INTERPOLATION CHECK FOR PARTIALS
                 // ============================================
@@ -11484,6 +12413,9 @@ shared (deployer) persistent actor class treasury() = this {
                   taco = {
                     amount = 0; expectedOut = 0; slippageBP = 0; percentBP = 0;
                   };
+                  neutrinite = {
+                    amount = 0; expectedOut = 0; slippageBP = 0; percentBP = 0;
+                  };
                   totalPercentBP = finalTotalPct;
                 }))
               };
@@ -11572,25 +12504,48 @@ shared (deployer) persistent actor class treasury() = this {
           let finalTacoPct = best.tacoPct;
           let finalTacoSlipBP = best.tacoSlipBP;
 
+          // Extract Neutrinite percentage from best scenario. The interpolation block above
+          // only adjusts Kong/ICP percentages; Neutrinite (like TACO) uses best as-is.
+          let finalNeutrinitePct = best.neutrinitePct;
+          let finalNeutriniteSlipBP = best.neutriniteSlipBP;
+
+          // Stash the optimal TACO split plan for the downstream executors
+          // (executeSplitTrade / executeTrade #TACO). Empty plan when this
+          // scenario doesn't use TACO at all.
+          lastTacoOptimalPlan := if (best.tacoPct > 0) {
+            let p = tacoOptimalSplit[best.tacoIdx];
+            { legs = p.legs; targetBp = (best.tacoIdx + 1) * 1000 }
+          } else {
+            { legs = []; targetBp = 0 }
+          };
+
           if (finalKongPct == 10000) {
             #ok(#Single({ exchange = #KongSwap; expectedOut = best.totalOut; slippageBP = finalKongSlipBP }))
           } else if (finalIcpPct == 10000) {
             #ok(#Single({ exchange = #ICPSwap; expectedOut = best.totalOut; slippageBP = finalIcpSlipBP }))
           } else if (finalTacoPct == 10000) {
-            // 100% TACO: tacoMultiRouteExpected returns the multi-route split sum when
-            // multi-route fired, else falls through to scenarioBestOut for single-route.
-            let tacoExp = tacoMultiRouteExpected(amountIn, best.totalOut);
-            #ok(#Single({ exchange = #TACO; expectedOut = tacoExp; slippageBP = finalTacoSlipBP }))
+            // 100% TACO: best.totalOut already reflects the optimal multi-route
+            // total because `taco[i].out` was sourced from tacoOptimalSplit[i].totalOut.
+            #ok(#Single({ exchange = #TACO; expectedOut = best.totalOut; slippageBP = finalTacoSlipBP }))
+          } else if (finalNeutrinitePct == 10000) {
+            #ok(#Single({ exchange = #Neutrinite; expectedOut = best.totalOut; slippageBP = finalNeutriniteSlipBP }))
           } else {
-            // Split trade (2-way or 3-way)
+            // Split trade (2-way, 3-way, or 4-way)
             let kongAmount = (amountIn * finalKongPct) / 10000;
             let icpAmount = (amountIn * finalIcpPct) / 10000;
-            let tacoAmount = amountIn - kongAmount - icpAmount;
+            let neutriniteAmount = (amountIn * finalNeutrinitePct) / 10000;
+            // tacoAmount absorbs the integer-division remainder. Guard the Nat subtraction
+            // against underflow (kong+icp+neutrinite could exceed amountIn only via rounding).
+            let kinSum = kongAmount + icpAmount + neutriniteAmount;
+            let tacoAmount = if (amountIn > kinSum) { amountIn - kinSum } else { 0 };
 
             let kongExpectedOut = if (best.kongPct > 0) { (kong[best.kongIdx].out * finalKongPct) / best.kongPct } else { 0 };
             let icpExpectedOut = if (best.icpPct > 0) { (icp[best.icpIdx].out * finalIcpPct) / best.icpPct } else { 0 };
-            let tacoSingleEst = if (best.tacoPct > 0) { (taco[best.tacoIdx].out * finalTacoPct) / best.tacoPct } else { 0 };
-            let tacoExpectedOut = tacoMultiRouteExpected(tacoAmount, tacoSingleEst);
+            // taco[best.tacoIdx].out is the optimal multi-route total at this
+            // fraction (set by the smart optimizer), so the pro-rata estimate
+            // is already multi-route-aware.
+            let tacoExpectedOut = if (best.tacoPct > 0) { (taco[best.tacoIdx].out * finalTacoPct) / best.tacoPct } else { 0 };
+            let neutriniteExpectedOut = if (best.neutrinitePct > 0) { (neutrinite[best.neutriniteIdx].out * finalNeutrinitePct) / best.neutrinitePct } else { 0 };
 
             #ok(#Split({
               kongswap = {
@@ -11611,12 +12566,18 @@ shared (deployer) persistent actor class treasury() = this {
                 slippageBP = finalTacoSlipBP;
                 percentBP = finalTacoPct;
               };
+              neutrinite = {
+                amount = neutriniteAmount;
+                expectedOut = neutriniteExpectedOut;
+                slippageBP = finalNeutriniteSlipBP;
+                percentBP = finalNeutrinitePct;
+              };
             }))
           }
         };
       };
     } catch (e) {
-      #err({ reason = "Error finding best execution: " # Error.message(e); kongQuotes = []; icpQuotes = [] });
+      #err({ reason = "Error finding best execution: " # Error.message(e); kongQuotes = []; icpQuotes = []; tacoQuotes = []; tacoPlans = [] });
     };
   };
 
@@ -11637,24 +12598,62 @@ shared (deployer) persistent actor class treasury() = this {
   private func estimateMaxTradeableAmount(
     kongQuotes : [QuoteData],
     icpQuotes : [QuoteData],
+    tacoQuotes : [QuoteData],
+    tacoPlans : [TACOOptimalPlanShape],
     amountIn : Nat,
     maxSlippageBP : Nat,
     sellToken : Principal,
     buyToken : Principal
-  ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap }; idealOut : Nat; minAmountOut : Nat; icpWorth : Nat } {
-    // Need at least one quote at 10% (index 0)
+  ) : ?{ amount : Nat; exchange : { #KongSwap; #ICPSwap; #TACO }; idealOut : Nat; minAmountOut : Nat; icpWorth : Nat } {
+    // Need at least one quote at 10% (index 0) on Kong or ICP. TACO is
+    // optional — if its quotes are absent we still consider the other two.
     if (kongQuotes.size() == 0 or icpQuotes.size() == 0) { return null };
 
     // Get 10% quote data (index 0) - use 99999 as sentinel for invalid slippage
     let kong10Slip : Nat = if (kongQuotes[0].out > 0) { kongQuotes[0].slipBP } else { 99999 };
     let icp10Slip : Nat = if (icpQuotes[0].out > 0) { icpQuotes[0].slipBP } else { 99999 };
+    let taco10Slip : Nat = if (tacoQuotes.size() > 0 and tacoQuotes[0].out > 0) { tacoQuotes[0].slipBP } else { 99999 };
     let kong10Out : Nat = kongQuotes[0].out;
     let icp10Out : Nat = icpQuotes[0].out;
+    let taco10Out : Nat = if (tacoQuotes.size() > 0) { tacoQuotes[0].out } else { 0 };
 
-    // Find best (lowest slippage) exchange
-    let (bestSlip, bestExchange, best10Out) : (Nat, { #KongSwap; #ICPSwap }, Nat) =
-      if (kong10Slip <= icp10Slip) { (kong10Slip, #KongSwap, kong10Out) }
-      else { (icp10Slip, #ICPSwap, icp10Out) };
+    // Find best (lowest slippage) exchange — three-way comparison.
+    var bsSlip = kong10Slip;
+    var bsExch : { #KongSwap; #ICPSwap; #TACO } = #KongSwap;
+    var bsOut = kong10Out;
+    if (icp10Slip < bsSlip) { bsSlip := icp10Slip; bsExch := #ICPSwap; bsOut := icp10Out };
+    if (taco10Slip < bsSlip) { bsSlip := taco10Slip; bsExch := #TACO; bsOut := taco10Out };
+    let bestSlip = bsSlip;
+    let bestExchange = bsExch;
+    let best10Out = bsOut;
+
+    // Clear lastTacoOptimalPlan up front. If TACO wins below we'll set it to
+    // the appropriate pre-computed bundle plan before returning; if Kong or
+    // ICP wins we keep it empty so a stale plan from a previous full-size
+    // scenario can't leak into the reduced-trade execution path.
+    lastTacoOptimalPlan := { legs = []; targetBp = 0 };
+
+    // Helper: when TACO is the chosen exchange, pick the pre-computed bundle
+    // closest to (but not exceeding) `chosenAmount`. The plan there was
+    // optimized for that fraction's amount; executeTrade #TACO scales each
+    // leg pro-rata to the actual `chosenAmount` via the leg.bp ratios.
+    func applyTacoPlan(chosenAmount : Nat) {
+      if (amountIn == 0) { return };
+      let frac10 = (chosenAmount * 10) / amountIn;
+      let bundleIdx : Nat =
+        if (frac10 == 0) { 0 }
+        else if (frac10 >= 10) { 9 }
+        else { frac10 - 1 };
+      if (tacoPlans.size() > bundleIdx and tacoPlans[bundleIdx].valid and tacoPlans[bundleIdx].legs.size() > 0) {
+        lastTacoOptimalPlan := {
+          legs = tacoPlans[bundleIdx].legs;
+          targetBp = (bundleIdx + 1) * 1000;
+        };
+      };
+      // else: plan invalid/empty — leave lastTacoOptimalPlan empty so
+      // executeTrade #TACO falls through to executeTransferAndSwap (auto-routed
+      // single hop at chosenAmount).
+    };
 
     // Helper: calculate 1 ICP worth of sell token
     func oneIcpWorth() : Nat {
@@ -11727,6 +12726,7 @@ shared (deployer) persistent actor class treasury() = this {
         let amountIn10 = amountIn / 10;
         let expectedOut = if (amountIn10 > 0) { (best10Out * minAmount) / amountIn10 } else { 0 };
         let (idealOut, minAmountOut) = calcOutputs(expectedOut, bestSlip);
+        if (bestExchange == #TACO) { applyTacoPlan(minAmount) };
         return ?{ amount = minAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut; icpWorth = icpWorthOf(minAmount) };
       };
       return null;
@@ -11738,6 +12738,7 @@ shared (deployer) persistent actor class treasury() = this {
     let expectedOut = if (amountIn10 > 0) { (best10Out * maxAmount) / amountIn10 } else { 0 };
     let (idealOut, minAmountOut) = calcOutputs(expectedOut, bestSlip);
 
+    if (bestExchange == #TACO) { applyTacoPlan(maxAmount) };
     ?{ amount = maxAmount; exchange = bestExchange; idealOut = idealOut; minAmountOut = minAmountOut; icpWorth = icpWorthOf(maxAmount) }
   };
 
@@ -11747,6 +12748,21 @@ shared (deployer) persistent actor class treasury() = this {
    * Kong tracks failed swaps as claims - recovery via recoverKongswapClaims()
    * TACO tracks failed swaps via recoverWronglysent
    */
+  // Per-leg slippage-adjustment math, factored out of the 12 split/partial handler sites so the
+  // new Neutrinite leg can be computed identically. Mirrors the inlined formula at those sites.
+  private func computeLegParams(
+    leg : { amount : Nat; expectedOut : Nat; slippageBP : Nat; percentBP : Nat },
+    isExactTargeting : Bool,
+    ourSlippageToleranceBasisPoints : Nat,
+  ) : { finalAmount : Nat; minOut : Nat; idealOut : Nat } {
+    let finalAmount : Nat = if (isExactTargeting and leg.slippageBP > 0) { (leg.amount * 10000) / (10000 + leg.slippageBP) } else { leg.amount };
+    let adjustedExpectedOut : Nat = if (finalAmount < leg.amount and leg.amount > 0) { (leg.expectedOut * finalAmount) / leg.amount } else { leg.expectedOut };
+    let idealOut : Nat = if (leg.slippageBP < 9900) { (adjustedExpectedOut * 10000) / (10000 - leg.slippageBP) } else { adjustedExpectedOut };
+    let toleranceMultiplier : Nat = if (ourSlippageToleranceBasisPoints >= 10000) { 0 } else { 10000 - ourSlippageToleranceBasisPoints };
+    let minOut : Nat = (adjustedExpectedOut * toleranceMultiplier) / 10000;
+    { finalAmount = finalAmount; minOut = minOut; idealOut = idealOut };
+  };
+
   private func executeSplitTrade(
     sellToken : Principal,
     buyToken : Principal,
@@ -11759,7 +12775,10 @@ shared (deployer) persistent actor class treasury() = this {
     tacoAmount : Nat,
     tacoMinOut : Nat,
     tacoIdealOut : Nat,
-  ) : async* { kongResult : Result.Result<TradeRecord, Text>; icpResult : Result.Result<TradeRecord, Text>; tacoResult : Result.Result<TradeRecord, Text> } {
+    neutriniteAmount : Nat,
+    neutriniteMinOut : Nat,
+    neutriniteIdealOut : Nat,
+  ) : async* { kongResult : Result.Result<TradeRecord, Text>; icpResult : Result.Result<TradeRecord, Text>; tacoResult : Result.Result<TradeRecord, Text>; neutriniteResult : Result.Result<TradeRecord, Text> } {
     let startTime = now();
 
     // Get symbols for KongSwap
@@ -11842,16 +12861,31 @@ shared (deployer) persistent actor class treasury() = this {
       let exchangeTreasuryPrincipal = Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai");
       let exchangeTreasuryAccountId = Principal.toLedgerAccount(exchangeTreasuryPrincipal, null);
 
-      // Multi-route fires when treasury picked 2+ pool-disjoint routes for the TACO leg.
-      // Per-leg minLegOut is proportional to the global tacoMinOut (which itself was
-      // computed from tacoMultiRouteExpected × tolerance — see findBestExecution).
-      if (lastTacoMultiRoute and lastTacoRouteLegs.size() > 1) {
-        let numLegs = Nat.min(lastTacoRouteLegs.size(), 3);
-        let perLeg = tacoAmount / numLegs;
-        let legs : [swaptypes.TACOSplitLeg] = Array.tabulate<swaptypes.TACOSplitLeg>(numLegs, func(i) {
-          let legAmount = if (i == numLegs - 1) { tacoAmount - perLeg * (numLegs - 1) } else { perLeg };
+      // Multi-route fires when the optimizer (findBestExecution) picked 2+
+      // pool-disjoint routes for the TACO leg. Per-leg amount is now an
+      // ASYMMETRIC pro-rata of tacoAmount based on each leg's chosen bp
+      // (e.g. a 30/70 split delivers 30% / 70% of tacoAmount instead of
+      // 50/50). Per-leg minLegOut keeps the existing formula at line 11853:
+      // (tacoMinOut * legAmount) / tacoAmount — sub-linear by construction.
+      if (lastTacoOptimalPlan.legs.size() > 1) {
+        let plan = lastTacoOptimalPlan;
+        let totalBp = plan.targetBp;
+        let n = plan.legs.size();
+        let legs : [swaptypes.TACOSplitLeg] = Array.tabulate<swaptypes.TACOSplitLeg>(n, func(i) {
+          let lp = plan.legs[i];
+          let legAmount : Nat = if (i == n - 1) {
+            var allocated : Nat = 0;
+            var j : Nat = 0;
+            while (j + 1 < n) {
+              allocated += (tacoAmount * plan.legs[j].bp) / totalBp;
+              j += 1;
+            };
+            if (allocated > tacoAmount) { 0 } else { tacoAmount - allocated }
+          } else {
+            (tacoAmount * lp.bp) / totalBp
+          };
           let legMinOut : Nat = if (tacoAmount > 0) { (tacoMinOut * legAmount) / tacoAmount } else { 0 };
-          { amountIn = legAmount; route = lastTacoRouteLegs[i].route; minLegOut = legMinOut }
+          { amountIn = legAmount; route = lp.route; minLegOut = legMinOut }
         });
 
         ?((with timeout = 65) TACOSwap.executeTransferAndSwapMultiRouteNoTracking({
@@ -11861,6 +12895,7 @@ shared (deployer) persistent actor class treasury() = this {
           minAmountOut = tacoMinOut;
           transferFee = sellTokenFee;
           exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+          exchangeFeeBps = lastKnownTacoFeeBps;
         }, legs))
       } else {
         ?((with timeout = 65) TACOSwap.executeTransferAndSwapNoTracking({
@@ -11870,8 +12905,32 @@ shared (deployer) persistent actor class treasury() = this {
           minAmountOut = tacoMinOut;
           transferFee = sellTokenFee;
           exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+          exchangeFeeBps = lastKnownTacoFeeBps;
         }))
       };
+    } else { null };
+
+    // Neutrinite (ICRC-55 pylon) leg — slowest leg (register->deposit->poll up to 90s->swap->withdraw).
+    // This is a best-effort SELF-CALL whose deadline must EXCEED the module's 90s POLL_CAP plus the ~4
+    // fixed non-poll calls, so it is wrapped in `with timeout = 150` (legal: <= 300s best-effort cap).
+    // Register first when this leg is actually firing.
+    let neutriniteFutureOpt : ?(async Result.Result<swaptypes.NeutriniteSwapResult, Text>) = if (neutriniteAmount > 0) {
+      await ensureNeutriniteRegistered();
+      let nSellFee = switch (Map.get(tokenDetailsMap, phash, sellToken)) { case (?d) { d.tokenTransferFee }; case null { 10000 } };
+      let nBuyFee = switch (Map.get(tokenDetailsMap, phash, buyToken)) { case (?d) { d.tokenTransferFee }; case null { 10000 } };
+      let nSellDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, sellToken)) { case (?d) { d.tokenDecimals }; case null { 8 } };
+      let nBuyDecimals : Nat = switch (Map.get(tokenDetailsMap, phash, buyToken)) { case (?d) { d.tokenDecimals }; case null { 8 } };
+      ?((with timeout = 150) NeutriniteSwap.executeTransferAndSwapNoTracking({
+        selfPrincipal = this_canister_id();
+        sellLedger = sellToken;
+        buyLedger = buyToken;
+        amountIn = neutriniteAmount;
+        minAmountOut = neutriniteMinOut;
+        sellFee = nSellFee;
+        buyFee = nBuyFee;
+        sellDecimals = nSellDecimals;
+        buyDecimals = nBuyDecimals;
+      }))
     } else { null };
 
     // Await only the futures we actually fired. `null` short-circuits to a synthetic
@@ -11887,6 +12946,10 @@ shared (deployer) persistent actor class treasury() = this {
     let tacoRawResult : Result.Result<swaptypes.TACOSwapReply, Text> = switch (tacoFutureOptExec) {
       case (?fut) { await fut };
       case null   { #err("TACO: zero amount (not called)") };
+    };
+    let neutriniteRawResult : Result.Result<swaptypes.NeutriniteSwapResult, Text> = switch (neutriniteFutureOpt) {
+      case (?fut) { await fut };
+      case null   { #err("Neutrinite: zero amount (not called)") };
     };
 
     // Process KongSwap result
@@ -11975,7 +13038,46 @@ shared (deployer) persistent actor class treasury() = this {
     // Clear exchange-pair skip on success
     switch (tacoResult) { case (#ok(_)) { clearExchangePairSkip("T", sellToken, buyToken) }; case _ {} };
 
-    { kongResult = kongResult; icpResult = icpResult; tacoResult = tacoResult };
+    // Process Neutrinite result
+    let neutriniteResult : Result.Result<TradeRecord, Text> = switch (neutriniteRawResult) {
+      case (#ok(reply)) {
+        #ok({
+          tokenSold = sellToken;
+          tokenBought = buyToken;
+          amountSold = neutriniteAmount;
+          amountBought = reply.amountOut;
+          exchange = #Neutrinite;
+          timestamp = startTime;
+          success = true;
+          error = null;
+          slippage = reply.slippage;
+        });
+      };
+      case (#err(e)) {
+        // Open the periodic-sweep window: any failure may strand a late-crediting deposit.
+        neutriniteLastFailureTime := now();
+        // Force re-register next attempt if the pylon didn't credit / track us.
+        if (Text.contains(e, #text "not credited") or Text.contains(e, #text "needs register")) {
+          neutriniteRegistered := false;
+        };
+        #err(e);
+      };
+    };
+    // On success clear the skip; on a "not credited" stall, 3-day-skip this pair (stop re-picking
+    // Neutrinite + re-failing every cycle) and best-effort sweep the (late-crediting) deposit back.
+    switch (neutriniteResult) {
+      case (#ok(_)) { clearExchangePairSkip("N", sellToken, buyToken) };
+      case (#err(e)) {
+        if (Text.contains(e, #text "not credited")) {
+          addExchangePairSkip("N", sellToken, buyToken);
+          try { await* recoverNeutriniteBalancesWrapper([sellToken, buyToken]) } catch (re) {
+            logger.error("NEUTRINITE_RECOVERY", "Split-leg immediate sweep failed: " # Error.message(re), "executeSplitTrade");
+          };
+        };
+      };
+    };
+
+    { kongResult = kongResult; icpResult = icpResult; tacoResult = tacoResult; neutriniteResult = neutriniteResult };
   };
 
   /**
@@ -12320,13 +13422,25 @@ shared (deployer) persistent actor class treasury() = this {
           let exchangeTreasuryPrincipal = Principal.fromText("qbnpl-laaaa-aaaan-q52aq-cai");
           let exchangeTreasuryAccountId = Principal.toLedgerAccount(exchangeTreasuryPrincipal, null);
 
-          let result = if (lastTacoMultiRoute and lastTacoRouteLegs.size() > 1) {
-            let numLegs = Nat.min(lastTacoRouteLegs.size(), 3);
-            let perLeg = amountIn / numLegs;
-            let legs = Array.tabulate<swaptypes.TACOSplitLeg>(numLegs, func(i) {
-              let legAmount = if (i == numLegs - 1) { amountIn - perLeg * (numLegs - 1) } else { perLeg };
+          let result = if (lastTacoOptimalPlan.legs.size() > 1) {
+            let plan = lastTacoOptimalPlan;
+            let totalBp = plan.targetBp;
+            let n = plan.legs.size();
+            let legs = Array.tabulate<swaptypes.TACOSplitLeg>(n, func(i) {
+              let lp = plan.legs[i];
+              let legAmount : Nat = if (i == n - 1) {
+                var allocated : Nat = 0;
+                var j : Nat = 0;
+                while (j + 1 < n) {
+                  allocated += (amountIn * plan.legs[j].bp) / totalBp;
+                  j += 1;
+                };
+                if (allocated > amountIn) { 0 } else { amountIn - allocated }
+              } else {
+                (amountIn * lp.bp) / totalBp
+              };
               let legMinOut : Nat = if (amountIn > 0) { (minAmountOut * legAmount) / amountIn } else { 0 };
-              { amountIn = legAmount; route = lastTacoRouteLegs[i].route; minLegOut = legMinOut }
+              { amountIn = legAmount; route = lp.route; minLegOut = legMinOut }
             });
             await TACOSwap.executeTransferAndSwapMultiRoute({
               tokenIn = sellToken;
@@ -12335,6 +13449,7 @@ shared (deployer) persistent actor class treasury() = this {
               minAmountOut = minAmountOut;
               transferFee = sellTokenFee;
               exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+              exchangeFeeBps = lastKnownTacoFeeBps;
             }, legs)
           } else {
             await TACOSwap.executeTransferAndSwap({
@@ -12344,6 +13459,7 @@ shared (deployer) persistent actor class treasury() = this {
               minAmountOut = minAmountOut;
               transferFee = sellTokenFee;
               exchangeTreasuryAccountId = exchangeTreasuryAccountId;
+              exchangeFeeBps = lastKnownTacoFeeBps;
             })
           };
 
@@ -12381,6 +13497,75 @@ shared (deployer) persistent actor class treasury() = this {
                 case null {};
               };
               #err("TACO trade failed: " # e);
+            };
+          };
+        };
+        case (#Neutrinite) {
+          logger.info("TRADE_EXECUTION", "Executing Neutrinite (ICRC-55 pylon) swap", "executeTrade");
+
+          // Ensure the treasury principal is registered with the pylon before any deposit.
+          await ensureNeutriniteRegistered();
+
+          let sellFee = switch (Map.get(tokenDetailsMap, phash, sellToken)) {
+            case (?d) { d.tokenTransferFee }; case null { 10000 };
+          };
+          let buyFee = switch (Map.get(tokenDetailsMap, phash, buyToken)) {
+            case (?d) { d.tokenTransferFee }; case null { 10000 };
+          };
+
+          let neutriniteParams : swaptypes.NeutriniteParams = {
+            selfPrincipal = this_canister_id();
+            sellLedger = sellToken;
+            buyLedger = buyToken;
+            amountIn = amountIn;
+            minAmountOut = minAmountOut;
+            sellFee = sellFee;
+            buyFee = buyFee;
+            sellDecimals = sellDecimals;
+            buyDecimals = buyDecimals;
+          };
+
+          let result = await NeutriniteSwap.executeTransferAndSwap(neutriniteParams);
+
+          switch (result) {
+            case (#ok(reply)) {
+              logger.info("TRADE_EXECUTION",
+                "Neutrinite swap SUCCESS - In=" # Nat.toText(amountIn) # " Out=" # Nat.toText(reply.amountOut),
+                "executeTrade"
+              );
+              clearExchangePairSkip("N", sellToken, buyToken);
+              #ok({
+                tokenSold = sellToken;
+                tokenBought = buyToken;
+                amountSold = amountIn;
+                amountBought = reply.amountOut;
+                exchange = #Neutrinite;
+                timestamp = now();
+                success = true;
+                error = null;
+                slippage = reply.slippage;
+              });
+            };
+            case (#err(e)) {
+              logger.error("TRADE_EXECUTION", "Neutrinite swap FAILED: " # e, "executeTrade");
+              // Open the periodic-sweep window: any failure may strand a late-crediting deposit.
+              neutriniteLastFailureTime := now();
+              // If the pylon says we weren't credited / not registered, force re-register next attempt.
+              if (Text.contains(e, #text "not credited") or Text.contains(e, #text "needs register")) {
+                neutriniteRegistered := false;
+              };
+              // "not credited" = the deposit didn't land within the poll window (slow-indexed sell token);
+              // 3-day-skip this pair so we stop re-picking Neutrinite + re-failing every cycle.
+              if (Text.contains(e, #text "not credited")) {
+                addExchangePairSkip("N", sellToken, buyToken);
+              };
+              // Best-effort sweep of any stranded sell/buy tokens; do NOT clobber the original error.
+              try {
+                await* recoverNeutriniteBalancesWrapper([sellToken, buyToken]);
+              } catch (recoveryError) {
+                logger.error("NEUTRINITE_RECOVERY", "Immediate Neutrinite sweep failed: " # Error.message(recoveryError), "executeTrade");
+              };
+              #err("Neutrinite trade failed: " # e);
             };
           };
         };
@@ -12638,6 +13823,9 @@ shared (deployer) persistent actor class treasury() = this {
           } catch (_) {
             err := true;
           };
+          // Refresh the Neutrinite pylon cadence cache (~5h). Own try so a pylon hiccup never sets
+          // err / triggers the long-sync retry; the helper already swallows + logs internally.
+          try { await refreshNeutriniteFollowSettings(); } catch (_) {};
           if (err) {
             retryFunc<system>(50, 15, #longSync);
           } else {
@@ -14082,6 +15270,49 @@ shared (deployer) persistent actor class treasury() = this {
     #ok("TACO recovery completed. Remaining: " # Nat.toText(Map.size(tacoFailedSwapBlocks)));
   };
 
+  /**
+   * Execute recovery (sweep) of all stranded Neutrinite (ICRC-55 pylon) virtual balances
+   */
+  public shared ({ caller }) func admin_recoverNeutriniteBalances() : async Result.Result<Text, Text> {
+    if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
+      return #err("Unauthorized");
+    };
+    await* recoverNeutriniteBalancesWrapper([]);
+    #ok("Neutrinite recovery sweep completed.");
+  };
+
+  /**
+   * Manually (re)register the treasury principal with the Neutrinite (ICRC-55) pylon.
+   * Idempotent; forces a fresh attempt (useful for the canister-caller dry-run or to retry a
+   * failed auto-register). No funds move.
+   */
+  public shared ({ caller }) func admin_registerNeutrinite() : async Result.Result<Text, Text> {
+    if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
+      return #err("Unauthorized");
+    };
+    neutriniteRegistered := false; // force a fresh attempt
+    await ensureNeutriniteRegistered();
+    if (neutriniteRegistered) { #ok("Neutrinite registered.") }
+    else { #ok("Neutrinite registration attempted but not confirmed; check logs.") };
+  };
+
+  /**
+   * Manually refresh the Neutrinite pylon cadence cache (follow_interval_sec per ledger).
+   * Used to verify the proactive cadence-skip or force a refresh outside the 5h Long Sync timer.
+   */
+  public shared ({ caller }) func admin_refreshNeutriniteFollowSettings() : async Result.Result<Text, Text> {
+    if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
+      return #err("Unauthorized");
+    };
+    await refreshNeutriniteFollowSettings();
+    #ok("Refreshed; cached " # Nat.toText(Map.size(neutriniteFollowIntervalSec)) # " ledger cadences.");
+  };
+
+  /** Inspect the cached Neutrinite pylon cadences (ledger -> follow_interval_sec). */
+  public query func getNeutriniteFollowSettings() : async [(Principal, Nat)] {
+    Iter.toArray(Map.entries(neutriniteFollowIntervalSec));
+  };
+
   //=========================================================================
   // LP ADMIN ENDPOINTS
   //=========================================================================
@@ -14169,6 +15400,8 @@ shared (deployer) persistent actor class treasury() = this {
     if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
       return #err("Unauthorized");
     };
+    switch (config.customLpRatioBP) { case (?v) { if (v > 10_000) return #err("customLpRatioBP cannot exceed 10000") }; case null {} };
+    switch (config.customMaxPoolShareBP) { case (?v) { if (v > 10_000) return #err("customMaxPoolShareBP cannot exceed 10000") }; case null {} };
     Map.set(lpPoolConfig, thash, poolKey, config);
     logTreasuryAdminAction(caller, #LPPoolConfigUpdate({ pool = poolKey; details = "enabled=" # debug_show(config.enabled) }), "Pool LP config: " # poolKey, true, null);
     #ok("Pool LP config updated for " # poolKey);
@@ -14703,6 +15936,18 @@ public shared ({ caller }) func withdrawAllCyclesToSelf() : async Result.Result<
         portfolioSnapshotStatus := #Stopped;
       };
       portfolioSnapshotTimerId := 0;
+
+      // Auto-register with the Neutrinite (ICRC-55) pylon ~5s after upgrade. Idempotent and
+      // gated by the neutriniteRegistered stable flag, so it actually registers only once
+      // (even while neutriniteEnabled is false). No funds move — registration just makes the
+      // pylon's indexer track the treasury account, readying it for the dry-run + enablement.
+      ignore setTimer<system>(#nanoseconds(5_000_000_000), func() : async () {
+        await ensureNeutriniteRegistered();
+        // Warm the cadence cache so the proactive skip works immediately (not cold for 5h post-deploy).
+        await refreshNeutriniteFollowSettings();
+        // One-time sweep so the new failure-window sweep gating never misses funds stranded pre-upgrade.
+        try { await* recoverNeutriniteBalancesWrapper([]) } catch (_) {};
+      });
   };
 
   /**

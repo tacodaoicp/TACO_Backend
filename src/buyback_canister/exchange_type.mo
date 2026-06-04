@@ -139,5 +139,13 @@ module {
       };
       #Err : Text;
     };
+
+    // Drains all feescollectedDAO buckets to the caller's account.
+    // Auth: caller must be on FLASH_ARB_CALLERS (buyback is). Used by the
+    // daily fee-sweep cycle to claim multi-token DAO fees from the exchange.
+    claimDAOFeesToCaller : shared () -> async {
+      #Ok : [(Text, Nat)];
+      #Err : ExchangeError;
+    };
   };
 }

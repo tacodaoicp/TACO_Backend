@@ -532,6 +532,9 @@ module {
     minAmountOut : Nat;
     transferFee : Nat;
     exchangeTreasuryAccountId : Blob; // 32-byte account ID for ICP legacy transfers
+    // Live exchange trading fee (basis points) for sizing the deposit, sourced from the
+    // quote's tradingFeeBps. Replaces the old hardcoded 5bp. 0 = fall back to a safe floor.
+    exchangeFeeBps : Nat;
   };
 
   public type TACOSwapReply = {
@@ -556,6 +559,7 @@ module {
     routeDescription : Text;
     canFulfillFully : Bool;
     routeTokens : [Text];
+    tradingFeeBps : Nat; // live ICPfee snapshot from the exchange quote; thread into deposit sizing
   };
 
   // TACO split leg for swapSplitRoutes execution
@@ -592,5 +596,106 @@ module {
     price0 : Float;
     price1 : Float;
     totalLiquidity : Nat;
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Neutrinite ICRC-55 Pylon DEX Types  (canister togwv-zqaaa-aaaal-qr7aa-cai)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GOTCHA: ICRC-55 Account uses `subaccount : ?Blob` (NOT the ICRC1Account's
+  // `?[Nat8]`). Encode opt fields as null. Decode subtyping: declare only fields we READ.
+
+  public type NeutriniteAccount = { owner : Principal; subaccount : ?Blob };
+
+  // SupportedLedger variant. We only ever construct/read #ic(Principal).
+  public type SupportedLedger = {
+    #ic : Principal;
+    #other : { ledger : Blob; platform : Nat64 };
+  };
+
+  // ── dex_quote (query) ──
+  public type NeutriniteQuoteRequest = {
+    amount : Nat;
+    ledger_from : SupportedLedger;
+    ledger_to : SupportedLedger;
+  };
+  public type NeutriniteQuoteResponse = {
+    #ok : { amount_out : Nat; before_price : Float; after_price : Float };
+    #err : Text;
+  };
+
+  // ── dex_swap (update) ──
+  public type NeutriniteSwapRequest = {
+    account : NeutriniteAccount;
+    amount : Nat;
+    ledger_from : SupportedLedger;
+    ledger_to : SupportedLedger;
+    min_amount_out : Nat;
+  };
+  public type NeutriniteSwapResponse = { #ok : { amount_out : Nat }; #err : Text };
+
+  // ── icrc55_accounts (query) ──
+  public type NeutriniteAccountsRequest = { owner : Principal; subaccount : ?Blob };
+  public type NeutriniteEndpoint = {
+    #ic : { account : NeutriniteAccount; ledger : Principal };
+    #other : { account : Blob; ledger : Blob; platform : Nat64 };
+  };
+  public type NeutriniteAccountEndpoint = { balance : Nat; endpoint : NeutriniteEndpoint };
+  public type NeutriniteAccountsResponse = [NeutriniteAccountEndpoint];
+
+  // ── icrc55_command (update) ──
+  // TransferRequest.to is a DIFFERENT type from the icrc55_accounts Endpoint — do NOT conflate.
+  // withdraw: to = #external_account(#ic(Account)), from = #account(Account).
+  public type NeutriniteTransferRequest = {
+    amount : Nat;
+    from : { #account : NeutriniteAccount };
+    ledger : SupportedLedger;
+    memo : ?Blob;
+    to : { #external_account : { #ic : NeutriniteAccount; #icp : Blob; #other : Blob } };
+  };
+  public type NeutriniteCommand = { #transfer : NeutriniteTransferRequest };
+  public type NeutriniteController = { owner : Principal; subaccount : ?Blob };
+  public type NeutriniteBatchCommandRequest = {
+    commands : [NeutriniteCommand];
+    controller : NeutriniteController;
+    expire_at : ?Nat64;
+    request_id : ?Nat32;
+    signature : ?Blob;
+  };
+  public type NeutriniteBatchCommandResponse = {
+    #ok : {};
+    #err : { #caller_not_controller; #duplicate : Nat; #expired; #invalid_signature; #other : Text };
+  };
+
+  // ── ledger_follow_settings (query) ──
+  // Pylon publishes per-ledger indexer cadence. We read only these two of LedgerFollowSettingStatus;
+  // Candid decode-subtyping silently drops the other fields (follow_priority, last_*_at, pending, …).
+  public type NeutriniteLedgerFollowSetting = { ledger : Principal; follow_interval_sec : Nat };
+
+  // ── Pylon actor type ──
+  public type NeutritePylon = actor {
+    dex_quote : shared query (NeutriniteQuoteRequest) -> async NeutriniteQuoteResponse;
+    dex_swap : shared (NeutriniteSwapRequest) -> async NeutriniteSwapResponse;
+    icrc55_account_register : shared (NeutriniteAccount) -> async ();
+    icrc55_accounts : shared query (NeutriniteAccountsRequest) -> async NeutriniteAccountsResponse;
+    icrc55_command : shared (NeutriniteBatchCommandRequest) -> async NeutriniteBatchCommandResponse;
+    ledger_follow_settings : shared query () -> async [NeutriniteLedgerFollowSetting];
+  };
+
+  // ── Module-facing records (treasury <-> neutrinite_swap.mo) ──
+  // slippage is a PERCENT (computed from RAW before_price; see neutrinite_swap.getQuote).
+  public type NeutriniteQuoteResult = { amount_out : Nat; slippage : Float; before_price : Float };
+  // amountOut is GROSS swap output (pre-withdraw fee) to match Kong/ICP/TACO.
+  public type NeutriniteSwapResult = { amountOut : Nat; slippage : Float };
+  // amounts are RAW base units. minAmountOut is the FULL-leg minimum; the module re-scales it.
+  public type NeutriniteParams = {
+    selfPrincipal : Principal;
+    sellLedger : Principal;
+    buyLedger : Principal;
+    amountIn : Nat;
+    minAmountOut : Nat;
+    sellFee : Nat;
+    buyFee : Nat;
+    sellDecimals : Nat;
+    buyDecimals : Nat;
   };
 };

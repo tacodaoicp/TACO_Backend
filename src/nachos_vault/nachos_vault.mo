@@ -31,6 +31,7 @@ import AdminAuth "../helper/admin_authorization";
 import Cycles "mo:base/ExperimentalCycles";
 import SHA224 "../helper/SHA224";
 import CRC32 "../helper/CRC32";
+import ICRC3Service "mo:icrc3-mo/service";
 //import Migration "./migration";
 
 //(with migration = Migration.migrate)
@@ -131,6 +132,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       expectedAmount : Nat;
       poolsUsed : [Text];
     }, Text>;
+    nudgeTradingCycle : shared (?Principal, ?Text) -> async Result.Result<Text, Text>;
   };
 
   // Query-typed actor refs for composite query calls (same canister, query interface)
@@ -223,6 +225,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   stable var navDropThresholdPercent : Float = 10.0;
   stable var navDropTimeWindowNS : Nat = 3600 * 1_000_000_000;
 
+  // --- Treasury price-movement nudge ---
+  // When a token's price moves more than nudgePriceChangeThresholdPercent (up or down) within
+  // nudgePriceChangeWindowNS, the vault calls treasury.nudgeTradingCycle() so the treasury resets
+  // its trading backoff and reacts quickly with a larger first trade. Per-token cooldown prevents
+  // a token oscillating around the threshold from hammering the treasury.
+  stable var nudgeEnabled : Bool = true;
+  stable var nudgePriceChangeThresholdPercent : Float = 8.0;
+  stable var nudgePriceChangeWindowNS : Int = 30 * 60 * 1_000_000_000; // 30 minutes
+  stable var nudgeCooldownNS : Int = 3_600_000_000_000; // 1 hour
+  stable let lastNudgeTimePerToken = Map.new<Principal, Int>();
+
   // --- Portfolio Share Config ---
   stable var portfolioShareMaxDeviationBP : Nat = 500; // 5%
 
@@ -239,6 +252,7 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // --- Block Dedup ---
   stable let blocksDone = Map.new<Text, Int>(); // blockKey -> timestamp
+  stable let adminRecoveredBlocks = Map.new<Text, Int>(); // blockKey -> timestamp (admin bug-refunds; prevents double-recovery)
 
   // --- Active Deposits ---
   stable let activeDeposits = Map.new<Text, ActiveDeposit>(); // blockKey -> deposit
@@ -396,7 +410,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   type ArchivedBlocksRange = {
     start : Nat64;
     length : Nat64;
-    callback : shared query { start : Nat64; length : Nat64 } -> async { blocks : [ICPBlock] };
+    // Matches the ICP ledger's real QueryArchiveFn return (variant), not a plain record.
+    // A record-typed declaration is incompatible with the ledger's func type and traps
+    // ("incompatible function type") whenever a query_blocks reply actually carries an
+    // archive callback (i.e. for archived block indices).
+    callback : shared query { start : Nat64; length : Nat64 } -> async {
+      #Ok : { blocks : [ICPBlock] };
+      #Err : {
+        #BadFirstBlockIndex : { requested_index : Nat64; first_valid_index : Nat64 };
+        #Other : { error_code : Nat64; error_message : Text };
+      };
+    };
   };
   type QueryBlocksResponse = {
     chain_length : Nat64;
@@ -407,14 +431,13 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   };
 
   // --- ICRC-3 Value Type ---
-  type ICRC3Value = {
-    #Nat : Nat;
-    #Int : Int;
-    #Text : Text;
-    #Blob : Blob;
-    #Array : [ICRC3Value];
-    #Map : [(Text, ICRC3Value)];
-  };
+  // Alias the icrc3-mo library's Value (structurally identical: #Blob/#Text/#Nat/#Int/
+  // #Array/#Map) so the block-parsing helpers and the icrc3_get_blocks return type
+  // (ICRC3Service.GetBlocksResult) share one type. A hand-rolled icrc3_get_blocks
+  // interface did NOT byte-match what real ICRC-3 ledgers emit and trapped on decode
+  // with "incompatible function type"; using the library type (as the exchange/archives
+  // do) is the canonical, proven-correct interface.
+  type ICRC3Value = ICRC3Service.Value;
 
   // --- Account ID Computation ---
   private func computeAccountIdentifier(owner : Principal, subaccount : ?Blob) : Blob {
@@ -456,6 +479,28 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     switch (v) { case (#Map(m)) { ?m }; case _ { null } };
   };
 
+  // Decode an ICRC-3 account value. Standard encoding is an Array [owner_blob,
+  // subaccount_blob?]; some ledgers use a bare owner Blob (default subaccount).
+  private func extractIcrc3Account(v : ICRC3Value) : ?{ owner : Principal; subaccount : ?Blob } {
+    switch (v) {
+      case (#Array(arr)) {
+        if (arr.size() >= 1) {
+          switch (arr[0]) {
+            case (#Blob(owner)) {
+              let sub : ?Blob = if (arr.size() > 1) {
+                switch (arr[1]) { case (#Blob(s)) { ?s }; case _ { null } };
+              } else { null };
+              ?{ owner = Principal.fromBlob(owner); subaccount = sub };
+            };
+            case _ { null };
+          };
+        } else { null };
+      };
+      case (#Blob(owner)) { ?{ owner = Principal.fromBlob(owner); subaccount = null } };
+      case _ { null };
+    };
+  };
+
   private func isAllZeros(blob : Blob) : Bool {
     for (b in blob.vals()) { if (b != 0) return false };
     true;
@@ -490,8 +535,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           if (blockIdx >= archive.start and blockIdx < archive.start + archive.length) {
             try {
               let archiveResult = await archive.callback({ start = blockIdx; length = 1 });
-              if (archiveResult.blocks.size() > 0) {
-                foundBlock := ?archiveResult.blocks[0];
+              switch (archiveResult) {
+                case (#Ok(range)) { if (range.blocks.size() > 0) { foundBlock := ?range.blocks[0] } };
+                case (#Err(_)) {};
               };
             } catch (_) {};
           };
@@ -619,20 +665,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
   // --- ICRC-3 Block Verifier ---
   private func verifyICRC3Block(tokenPrincipal : Principal, blockNumber : Nat, expectedFrom : Principal, expectedFromSubaccount : ?Blob, expectedRecipient : Principal, expectedToSubaccount : Nat8) : async Result.Result<{ amount : Nat; from : Principal }, Text> {
-    let token : actor {
-      icrc3_get_blocks : shared query [{ start : Nat; length : Nat }] -> async {
-        log_length : Nat;
-        blocks : [{ id : Nat; block : ICRC3Value }];
-        archived_blocks : [{
-          args : [{ start : Nat; length : Nat }];
-          callback : shared query [{ start : Nat; length : Nat }] -> async {
-            log_length : Nat;
-            blocks : [{ id : Nat; block : ICRC3Value }];
-            archived_blocks : [None];
-          };
-        }];
-      };
-    } = actor (Principal.toText(tokenPrincipal));
+    // Use the icrc3-mo library's canonical Service type (same as the exchange/archives) —
+    // a hand-rolled interface did not match what real ICRC-3 ledgers emit and trapped.
+    let token : ICRC3Service.Service = actor (Principal.toText(tokenPrincipal));
 
     try {
       let response = await token.icrc3_get_blocks([{ start = blockNumber; length = 1 }]);
@@ -658,142 +693,63 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           switch (extractMap(val)) {
             case null { #err("Block is not a Map") };
             case (?map) {
-              // Check btype
-              switch (lookupInMap(map, "btype")) {
-                case (?btypeVal) {
-                  switch (extractText(btypeVal)) {
-                    case (?btype) {
-                      if (btype != "1xfer" and btype != "2xfer") return #err("Not a transfer block: " # btype);
-                    };
-                    case null { return #err("btype is not Text") };
-                  };
-                };
-                case null { return #err("No btype field") };
+              // Standard ICRC-3 transfer blocks nest the transfer under "tx" with the
+              // op in tx.op ("xfer"); some carry a top-level btype ("1xfer"/"2xfer").
+              // Support both: use the "tx" sub-map if present, else the block map itself.
+              let txMap : [(Text, ICRC3Value)] = switch (lookupInMap(map, "tx")) {
+                case (?txVal) { switch (extractMap(txVal)) { case (?m) { m }; case null { map } } };
+                case null { map };
               };
 
-              // Extract tx map
-              let txMap = switch (lookupInMap(map, "tx")) {
-                case (?txVal) {
-                  switch (extractMap(txVal)) {
-                    case (?m) { m };
-                    case null { return #err("tx is not a Map") };
+              // Transfer-type guard — reject mint/burn/approve; only count real transfers.
+              let isTransfer : Bool = switch (lookupInMap(map, "btype")) {
+                case (?bv) { switch (extractText(bv)) { case (?b) { b == "1xfer" or b == "2xfer" }; case null { false } } };
+                case null {
+                  switch (lookupInMap(txMap, "op")) {
+                    case (?ov) { switch (extractText(ov)) { case (?o) { o == "xfer" or o == "1xfer" or o == "2xfer" or o == "transfer" }; case null { false } } };
+                    case null { false };
                   };
                 };
-                case null { return #err("No tx field") };
               };
+              if (not isTransfer) return #err("Not a transfer block");
 
-              // Extract amount
+              // Amount
               let amount = switch (lookupInMap(txMap, "amt")) {
-                case (?amtVal) {
-                  switch (extractNat(amtVal)) {
-                    case (?n) { n };
-                    case null { return #err("amt is not Nat") };
-                  };
-                };
+                case (?amtVal) { switch (extractNat(amtVal)) { case (?n) { n }; case null { return #err("amt is not Nat") } } };
                 case null { return #err("No amt field") };
               };
 
-              // Extract and verify sender
-              let fromOwner = switch (lookupInMap(txMap, "from")) {
-                case (?fromVal) {
-                  switch (extractMap(fromVal)) {
-                    case (?fromMap) {
-                      switch (lookupInMap(fromMap, "owner")) {
-                        case (?ownerVal) {
-                          switch (extractBlob(ownerVal)) {
-                            case (?b) { Principal.fromBlob(b) };
-                            case null { return #err("from.owner not Blob") };
-                          };
-                        };
-                        case null { return #err("No from.owner") };
-                      };
-                    };
-                    case null { return #err("from is not Map") };
-                  };
-                };
+              // Sender — ICRC-3 account encoded as Array [owner_blob, subaccount_blob?].
+              let fromAcc = switch (lookupInMap(txMap, "from")) {
+                case (?fromVal) { switch (extractIcrc3Account(fromVal)) { case (?a) { a }; case null { return #err("from is not a valid account") } } };
                 case null { return #err("No from field") };
               };
-
-              if (fromOwner != expectedFrom) return #err("Sender mismatch");
-
-              // Validate sender subaccount matches expected
-              switch (lookupInMap(txMap, "from")) {
-                case (?fromVal) {
-                  switch (extractMap(fromVal)) {
-                    case (?fromMap) {
-                      switch (lookupInMap(fromMap, "subaccount")) {
-                        case (?subVal) {
-                          switch (extractBlob(subVal)) {
-                            case (?sub) {
-                              switch (expectedFromSubaccount) {
-                                case (null) { if (not isAllZeros(sub)) return #err("Sender subaccount mismatch") };
-                                case (?exp) { if (sub != exp) return #err("Sender subaccount mismatch") };
-                              };
-                            };
-                            case null {};
-                          };
-                        };
-                        case null {
-                          switch (expectedFromSubaccount) {
-                            case (?exp) { if (not isAllZeros(exp)) return #err("Sender subaccount mismatch") };
-                            case null {};
-                          };
-                        };
-                      };
-                    };
+              if (fromAcc.owner != expectedFrom) return #err("Sender mismatch");
+              switch (fromAcc.subaccount) {
+                case (?sub) {
+                  switch (expectedFromSubaccount) {
+                    case (null) { if (not isAllZeros(sub)) return #err("Sender subaccount mismatch") };
+                    case (?exp) { if (sub != exp) return #err("Sender subaccount mismatch") };
+                  };
+                };
+                case null {
+                  switch (expectedFromSubaccount) {
+                    case (?exp) { if (not isAllZeros(exp)) return #err("Sender subaccount mismatch") };
                     case null {};
                   };
                 };
-                case null {};
               };
 
-              // Extract and verify recipient
-              let toOwner = switch (lookupInMap(txMap, "to")) {
-                case (?toVal) {
-                  switch (extractMap(toVal)) {
-                    case (?toMap) {
-                      switch (lookupInMap(toMap, "owner")) {
-                        case (?ownerVal) {
-                          switch (extractBlob(ownerVal)) {
-                            case (?b) { Principal.fromBlob(b) };
-                            case null { return #err("to.owner not Blob") };
-                          };
-                        };
-                        case null { return #err("No to.owner") };
-                      };
-                    };
-                    case null { return #err("to is not Map") };
-                  };
-                };
+              // Recipient — must be the treasury at the expected subaccount.
+              let toAcc = switch (lookupInMap(txMap, "to")) {
+                case (?toVal) { switch (extractIcrc3Account(toVal)) { case (?a) { a }; case null { return #err("to is not a valid account") } } };
                 case null { return #err("No to field") };
               };
-
-              if (toOwner != expectedRecipient) return #err("Recipient mismatch");
-
-              // Verify subaccount
+              if (toAcc.owner != expectedRecipient) return #err("Recipient mismatch");
               let expectedToSub : Blob = subaccountByteToBlob(expectedToSubaccount);
-              switch (lookupInMap(txMap, "to")) {
-                case (?toVal) {
-                  switch (extractMap(toVal)) {
-                    case (?toMap) {
-                      switch (lookupInMap(toMap, "subaccount")) {
-                        case (?subVal) {
-                          switch (extractBlob(subVal)) {
-                            case (?sub) {
-                              if (sub != expectedToSub) return #err("Recipient subaccount mismatch");
-                            };
-                            case null { return #err("subaccount not Blob") };
-                          };
-                        };
-                        case null {
-                          if (expectedToSubaccount != 0) return #err("Expected non-zero subaccount but none found");
-                        };
-                      };
-                    };
-                    case null {};
-                  };
-                };
-                case null {};
+              switch (toAcc.subaccount) {
+                case (?sub) { if (sub != expectedToSub) return #err("Recipient subaccount mismatch") };
+                case null { if (expectedToSubaccount != 0) return #err("Expected non-zero subaccount but none found") };
               };
 
               #ok({ amount; from = expectedFrom });
@@ -825,7 +781,17 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     switch (tokenType) {
       case null { #err("Unknown token") };
-      case (?#ICP) { await verifyICPBlock(blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount) };
+      case (?#ICP) {
+        if (tokenPrincipal == ICPprincipal) {
+          await verifyICPBlock(blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount);
+        } else {
+          // ckUSDC (and MOTOKO/OGY/ICS) are ICRC ledgers mis-tagged #ICP in the treasury token list.
+          // verifyICPBlock is hardcoded to the ICP ledger (ryjl3) and only valid there; routing a
+          // non-ICP token here queries the wrong ledger and traps on the archive callback's func type.
+          // Verify against the token's own ICRC-3 ledger instead.
+          await verifyICRC3Block(tokenPrincipal, blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount);
+        };
+      };
       case (?#ICRC12) { await verifyICRC1Block(tokenPrincipal, blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount) };
       case (?#ICRC3) { await verifyICRC3Block(tokenPrincipal, blockNumber, expectedFrom, expectedFromSubaccount, expectedRecipient, expectedToSubaccount) };
     };
@@ -1264,6 +1230,61 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
       case null { #principal(caller) };
     };
     createTransferTask(caller, returnTo, refundAmount, tokenPrincipal, treasurySubaccount, opType, opId);
+  };
+
+  // Admin recovery for a deposit that reached TREASURY:NachosTreasurySubaccount but was never
+  // credited (e.g. a mint that trapped after the block was marked done, leaving funds stuck and
+  // cancelDeposit refusing with #DepositAlreadyConsumed). Verifies the deposit on-chain via the
+  // admin-supplied `tType` — so a token whose STORED type is on a broken path can still be
+  // verified via a working one (e.g. ckUSDC via #ICRC12 get_transactions) — and refunds the FULL
+  // amount (no cancellation fee; this is a bug refund) from treasury sub 2 back to the depositor.
+  // The on-chain verify forces `recipient` to equal the block's actual sender, so funds can only
+  // go back to whoever really deposited. Deduped via adminRecoveredBlocks.
+  public shared ({ caller }) func adminRecoverWronglysent(
+    recipient : Principal,
+    tokenPrincipal : Principal,
+    blockNumber : Nat,
+    tType : { #ICP; #ICRC12; #ICRC3 },
+    fromSubaccount : ?Blob,
+  ) : async Result.Result<{ refundTaskId : Nat }, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+
+    let blockKey = makeBlockKey(tokenPrincipal, blockNumber);
+    // Early-out (the authoritative checks run synchronously after verify, below).
+    if (Map.has(adminRecoveredBlocks, thash, blockKey)) return #err("Block already recovered");
+    // Only stuck/UNTRACKED deposits qualify. A tracked deposit (recorded by a mint — possibly
+    // already minted+forwarded to sub 0, or cancelled) must use the normal mint/cancel flow;
+    // refunding it here would double-pay from the commingled sub-2 balance.
+    if (Map.has(activeDeposits, thash, blockKey)) return #err("Deposit is tracked; use the normal mint/cancel flow");
+
+    // Verify on-chain via the admin-chosen path (read-only; no state mutated yet); confirms
+    // `recipient` sent `amount` to TREASURY:NachosTreasurySubaccount.
+    let verifyResult = switch (tType) {
+      case (#ICP) { await verifyICPBlock(blockNumber, recipient, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount) };
+      case (#ICRC12) { await verifyICRC1Block(tokenPrincipal, blockNumber, recipient, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount) };
+      case (#ICRC3) { await verifyICRC3Block(tokenPrincipal, blockNumber, recipient, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount) };
+    };
+    let amount = switch (verifyResult) {
+      case (#ok({ amount })) { amount };
+      case (#err(e)) { return #err("Block verification failed: " # e) };
+    };
+    if (amount == 0) return #err("Zero deposit amount");
+
+    // Atomic claim + queue: there is NO `await` between these re-checks and createTransferTask,
+    // so two concurrent calls for the same block cannot both pass (Motoko runs this tail without
+    // interleaving). Re-checking here closes the TOCTOU window opened by the verify await above.
+    if (Map.has(adminRecoveredBlocks, thash, blockKey)) return #err("Block already recovered");
+    if (Map.has(activeDeposits, thash, blockKey)) return #err("Deposit became tracked; use the normal mint/cancel flow");
+    Map.set(adminRecoveredBlocks, thash, blockKey, now());
+
+    let returnTo : TransferRecipient = switch (fromSubaccount) {
+      case (?sub) { #accountId({ owner = recipient; subaccount = ?sub }) };
+      case null { #principal(recipient) };
+    };
+    let taskId = createTransferTask(caller, returnTo, amount, tokenPrincipal, NachosTreasurySubaccount, #Recovery, blockNumber);
+
+    logger.info("RECOVERY", "Admin recovered wrongly-sent deposit blockKey=" # blockKey # " amount=" # Nat.toText(amount) # " -> " # Principal.toText(recipient) # " (task #" # Nat.toText(taskId) # ")", "adminRecoverWronglysent");
+    #ok({ refundTaskId = taskId });
   };
 
   public shared ({ caller }) func cancelDeposit(tokenPrincipal : Principal, blockNumber : Nat, fromSubaccount : ?Blob) : async Result.Result<{ refundTaskId : Nat }, NachosError> {
@@ -2413,6 +2434,67 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     rejected;
   };
 
+  // Detect sharp per-token price moves and nudge the treasury to react quickly.
+  // Reuses the same window-walk as checkPerTokenConditions: compares the latest recorded price
+  // against the oldest price still inside nudgePriceChangeWindowNS. Fires at most ONE treasury
+  // nudge per sync (the treasury rebalances toward the largest imbalance itself) and enforces a
+  // per-token cooldown so a token oscillating around the threshold can't hammer the treasury.
+  private func checkAndNudgeTreasury() : async () {
+    let nowTs = now();
+    let crossed = Vector.new<Principal>();
+    var biggestAbsChange : Float = 0.0;
+    var nudgeToken : ?Principal = null;
+
+    for ((token, details) in Map.entries(tokenDetailsMap)) {
+      if (details.Active and not details.isPaused) {
+        switch (Map.get(tokenPriceHistory, phash, token)) {
+          case (?history) {
+            let histSize = Vector.size(history);
+            if (histSize >= 2) {
+              let currentVal = Vector.get(history, histSize - 1).1;
+              let windowCutoff = nowTs - nudgePriceChangeWindowNS;
+              var oldestInWindow : Nat = currentVal;
+              var foundOlder = false;
+              var i = histSize;
+              while (i > 0) {
+                i -= 1;
+                let (ts, val) = Vector.get(history, i);
+                if (ts < windowCutoff) { i := 0 } // stop walking older entries
+                else { oldestInWindow := val; foundOlder := true };
+              };
+              if (foundOlder and oldestInWindow > 0) {
+                let changePercent = (Float.fromInt(currentVal) - Float.fromInt(oldestInWindow)) / Float.fromInt(oldestInWindow) * 100.0;
+                let absChange = Float.abs(changePercent);
+                if (absChange >= nudgePriceChangeThresholdPercent) {
+                  let lastNudge = switch (Map.get(lastNudgeTimePerToken, phash, token)) { case (?t) { t }; case null { 0 } };
+                  if (nowTs - lastNudge >= nudgeCooldownNS) {
+                    Map.set(lastNudgeTimePerToken, phash, token, nowTs);
+                    Vector.add(crossed, token);
+                    if (absChange > biggestAbsChange) { biggestAbsChange := absChange; nudgeToken := ?token };
+                    logger.info("NUDGE", details.tokenSymbol # " moved " # Float.toText(changePercent) # "% within window — flagged for treasury nudge", "checkAndNudgeTreasury");
+                  } else {
+                    logger.info("NUDGE", details.tokenSymbol # " moved " # Float.toText(changePercent) # "% but in cooldown — skipped", "checkAndNudgeTreasury");
+                  };
+                };
+              };
+            };
+          };
+          case null {};
+        };
+      };
+    };
+
+    if (Vector.size(crossed) > 0) {
+      let reason = "vault detected >=" # Float.toText(nudgePriceChangeThresholdPercent) # "% move on " # Nat.toText(Vector.size(crossed)) # " token(s)";
+      try {
+        ignore await treasury.nudgeTradingCycle(nudgeToken, ?reason);
+        logger.info("NUDGE", "Sent treasury nudge — " # reason, "checkAndNudgeTreasury");
+      } catch (e) {
+        logger.warn("NUDGE", "treasury.nudgeTradingCycle failed: " # Error.message(e), "checkAndNudgeTreasury");
+      };
+    };
+  };
+
   private func fireDecimalChangeAlerts(token : Principal, oldDecimals : Nat, newDecimals : Nat) {
     for ((_, cond) in Map.entries(circuitBreakerConditions)) {
       if (cond.enabled and cond.conditionType == #DecimalChange and isTokenApplicable(token, cond.applicableTokens)) {
@@ -2969,12 +3051,18 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         if (token != mgmtCanisterId and not isNachosLedger(token)) {
           switch (Map.get(tokenDetailsMap, phash, token)) {
             case (?existing) {
-              if (existing.isPaused != detail.isPaused or existing.pausedDueToSyncFailure != detail.pausedDueToSyncFailure or existing.Active != detail.Active) {
+              // Sync tokenType too: the vault dispatches block verification by tokenType
+              // (#ICP→query_blocks, #ICRC12→get_transactions, #ICRC3→icrc3_get_blocks). A
+              // stale/wrong type (e.g. ckUSDC cached as #ICP) routes a token to the wrong
+              // ledger interface and traps with "incompatible function type". Treasury is the
+              // source of truth, so keep it in sync here (self-corrects + prevents recurrence).
+              if (existing.isPaused != detail.isPaused or existing.pausedDueToSyncFailure != detail.pausedDueToSyncFailure or existing.Active != detail.Active or existing.tokenType != detail.tokenType) {
                 Map.set(tokenDetailsMap, phash, token, {
                   existing with
                   isPaused = detail.isPaused;
                   pausedDueToSyncFailure = detail.pausedDueToSyncFailure;
                   Active = detail.Active;
+                  tokenType = detail.tokenType;
                 });
               };
             };
@@ -3569,18 +3657,21 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     let blockKey = makeBlockKey(tokenPrincipal, blockNumber);
     if (Map.has(blocksDone, thash, blockKey)) { releaseLock(caller); return #err(#BlockAlreadyProcessed) };
 
-    Map.set(blocksDone, thash, blockKey, now());
-
-    // Verify block
+    // Verify block FIRST. Marking blocksDone is deferred until after a successful verify so
+    // that a verify trap (e.g. an incompatible ledger interface) can't permanently burn the
+    // block. The per-caller lock + verifyBlock's expectedFrom=caller check prevent replay /
+    // concurrent double-mint during the await.
     let verifyResult = await verifyBlock(tokenPrincipal, blockNumber, caller, fromSubaccount, TREASURY_ID, NachosTreasurySubaccount);
     let depositAmount = switch (verifyResult) {
       case (#ok({ amount })) { amount };
       case (#err(e)) {
-        ignore Map.remove(blocksDone, thash, blockKey);
         releaseLock(caller);
         return #err(#BlockVerificationFailed(e));
       };
     };
+
+    // Verified: now commit the block as consumed (idempotency / replay guard).
+    Map.set(blocksDone, thash, blockKey, now());
 
     recordDeposit(blockKey, caller, fromSubaccount, tokenPrincipal, depositAmount, blockNumber);
 
@@ -4783,9 +4874,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
 
     if (feeValue > 0) {
       Vector.add(feeHistory, { timestamp = now(); feeType = #Burn; feeAmountICP = feeValue; userPrincipal = caller; operationId = nextBurnId });
-      // Per-token burn fee tracking: fee = gross entitlement - net entitlement per token.
-      // Uses fullPortfolioValueLPInclusive as denominator to match Phase 2 LP-inclusive
-      // distribution math above so Σ feeTokenAmount in ICP = feeValueICP exactly.
+      // Per-token burn fee = gross entitlement − net entitlement. The fee is withheld in
+      // treasury sub 0; move it to sub 2 (op-type #Recovery, a plain sub0→sub2 transfer)
+      // so the existing claimAllFees — which sources fees from sub 2 — collects it on the
+      // next buyback cycle. The move debits sub 0 by (moveAmount + ledgerFee) = feeTokenAmount,
+      // and credits sub 2 by moveAmount; we record exactly moveAmount in accumulatedBurnFees
+      // so the recorded claimable matches what lands in sub 2.
       for (ts in Vector.vals(tokensToSend)) {
         switch (Map.get(tokenDetailsMap, phash, ts.token)) {
           case (?details) {
@@ -4795,9 +4889,28 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
               let grossEntitlementICP = (redemptionValueICP * tokenShareBP) / 10_000;
               let grossTokenAmount = (grossEntitlementICP * (10 ** details.tokenDecimals)) / details.priceInICP;
               let feeTokenAmount = if (grossTokenAmount > ts.amount) { grossTokenAmount - ts.amount } else { 0 };
-              if (feeTokenAmount > 0) {
+              let feeMoveFee = details.tokenTransferFee;
+              let freshBal = switch (Map.get(freshBalanceMap, phash, ts.token)) { case (?b) b; case null details.balance };
+              // Dust + payout-priority guard: only sweep when the fee clears 3× its ledger
+              // fee (so it survives BOTH the sub0→sub2 move fee AND the later claimAllFees
+              // transfer fee and still passes claimAllFees' `> tokenFee` filter) AND sub-0
+              // liquid balance covers the user payout first. If balance is tight, skip — the
+              // fee stays in sub 0 and is collected by a later burn or the backlog migration.
+              if (feeTokenAmount > feeMoveFee * 3 and freshBal >= ts.amount + feeTokenAmount + feeMoveFee * 2) {
+                let moveAmount : Nat = feeTokenAmount - feeMoveFee; // sub 0 loses exactly feeTokenAmount; sub 2 gains moveAmount
+                // Credit one fee LESS than what lands in sub 2 so claimAllFees can fully drain
+                // sub 2 (its transfer costs one more fee). Net to buyback ≈ feeTokenAmount − 2 fees.
                 let prevFee = switch (Map.get(accumulatedBurnFees, phash, ts.token)) { case (?v) v; case null 0 };
-                Map.set(accumulatedBurnFees, phash, ts.token, prevFee + feeTokenAmount);
+                Map.set(accumulatedBurnFees, phash, ts.token, prevFee + (moveAmount - feeMoveFee));
+                ignore createTransferTask(
+                  caller,
+                  #accountId({ owner = TREASURY_ID; subaccount = ?Blob.fromArray([NachosTreasurySubaccount, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) }),
+                  moveAmount,
+                  ts.token,
+                  0 : Nat8,
+                  #Recovery,
+                  nextBurnId,
+                );
               };
             };
           };
@@ -4909,6 +5022,10 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     switch (config.maxMintAmountICP) { case (?v) { maxMintAmountICP := v }; case null {} };
     switch (config.maxBurnAmountNachos) { case (?v) { maxBurnAmountNachos := v }; case null {} };
     switch (config.kongEnabled) { case (?v) { kongEnabled := v }; case null {} };
+    switch (config.nudgeEnabled) { case (?v) { nudgeEnabled := v }; case null {} };
+    switch (config.nudgePriceChangeThresholdPercent) { case (?v) { if (v > 0.0 and v <= 100.0) nudgePriceChangeThresholdPercent := v }; case null {} };
+    switch (config.nudgePriceChangeWindowNS) { case (?v) { if (v > 0) nudgePriceChangeWindowNS := v }; case null {} };
+    switch (config.nudgeCooldownNS) { case (?v) { if (v >= 0) nudgeCooldownNS := v }; case null {} };
 
     logger.info("ADMIN", "Config updated by " # Principal.toText(caller), "updateNachosConfig");
     #ok("Config updated");
@@ -5220,6 +5337,42 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
     ignore Map.remove(rateLimitExemptPrincipals, phash, principal);
     #ok("Removed rate limit exemption");
+  };
+
+  // One-time migration: relocate the historical burn-fee backlog stuck in treasury sub 0
+  // (fees accumulated before the at-burn sweep existed) into sub 2, where claimAllFees can
+  // collect it. Uses op-type #Recovery (NOT #BurnFeeSweep) so the transfer-queue success
+  // handler does NOT re-credit accumulatedBurnFees — these fees are already counted; we are
+  // only physically relocating the tokens. Idempotent per token+amount via transfer dedup.
+  public shared ({ caller }) func relocateBurnFeeBacklogToSub2() : async Result.Result<Text, Text> {
+    if (not isMasterAdmin(caller) and not Principal.isController(caller) and caller != taco_dao_sns_governance_canister_id) return #err("Not authorized");
+
+    let sub2 : TransferRecipient = #accountId({
+      owner = TREASURY_ID;
+      subaccount = ?Blob.fromArray([NachosTreasurySubaccount, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    });
+
+    var queued : Nat = 0;
+    for ((token, accum) in Map.entries(accumulatedBurnFees)) {
+      let claimedSoFar = switch (Map.get(claimedBurnFees, phash, token)) { case (?v) v; case null 0 };
+      let claimable = if (accum > claimedSoFar) (accum - claimedSoFar : Nat) else 0;
+      let (tokenFee, onChain) = switch (Map.get(tokenDetailsMap, phash, token)) {
+        case (?d) { (d.tokenTransferFee, d.balance) };
+        case null { (10_000, 0) };
+      };
+      // Cap so the move (debits target + 2 fees from sub 0) never exceeds sub-0 holdings.
+      let cap = if (onChain > tokenFee * 2) (onChain - tokenFee * 2 : Nat) else 0;
+      let target = if (claimable < cap) claimable else cap;
+      if (target > tokenFee) {
+        // Move (claimable + 1 fee) so sub 2 ends with exactly enough for claimAllFees to
+        // drain the recorded `claimable` (its transfer costs 1 fee). Accounting is left
+        // untouched → idempotent: re-running is dedup-guarded and won't change balances twice.
+        ignore createTransferTask(caller, sub2, target + tokenFee, token, 0 : Nat8, #Recovery, 0);
+        queued += 1;
+      };
+    };
+    logger.info("FEES", "relocateBurnFeeBacklogToSub2: queued " # Nat.toText(queued) # " sub0->sub2 backlog moves", "relocateBurnFeeBacklogToSub2");
+    #ok("Queued " # Nat.toText(queued) # " burn-fee backlog relocations to sub 2 (claim via buyback once settled)");
   };
 
   // Claim accumulated mint fees (per-token) — admin sends specific token to recipient
@@ -5725,6 +5878,73 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
     if (anyRetried) {
       ensureTransferQueueRunning();
       logger.info("TRANSFER_QUEUE", "Retried failed refund delivery for op #" # Nat.toText(opId) # " — " # Nat.toText(Vector.size(newTaskIds)) # " tasks created", "retryFailedRefundDelivery");
+    };
+
+    #ok(Vector.toArray(newTaskIds));
+  };
+
+  // Admin-only recovery for a stuck refund whose funds leaked out of sub-2 into sub-0.
+  // sub-2 is a commingled mint-transit account; concurrent mints' accepted-portion forwards
+  // (sub-2 -> sub-0) can drain it below a pending refund, so the refund's icrc1_transfer
+  // fails for insufficient funds and the normal retryFailedRefundDelivery — which re-sends
+  // from the same (still-underfunded) sub-2 — keeps failing. This pays the owed amount from
+  // sub-0 instead, where the leaked funds now sit. Conservation-safe: these refunds are for
+  // REJECTED/cancelled mints (no NACHOS was minted), so the amount was never legitimate NAV
+  // backing — paying it from sub-0 de-inflates an overstated NAV and is holder-neutral.
+  public shared ({ caller }) func adminRetryFailedRefundFromSub0(opId : Nat) : async Result.Result<[Nat], NachosError> {
+    if (not (isMasterAdmin(caller) or Principal.isController(caller))) return #err(#NotAuthorized);
+
+    let entries = switch (Map.get(failedRefundDeliveries, nhash, opId)) {
+      case (?e) { e }; case null { return #err(#UnexpectedError("No failed refund deliveries for this operation")) };
+    };
+
+    let newTaskIds = Vector.new<Nat>();
+    let updatedEntries = Vector.new<NachosTypes.FailedDeliveryEntry>();
+    var anyRetried = false;
+
+    for (entry in entries.vals()) {
+      if (entry.status == #Undelivered) {
+        // Look up the original task for recipient + opType (matches retryFailedRefundDelivery).
+        var foundCaller = Principal.fromText("aaaaa-aa");
+        var foundOpType : TransferOperationType = #MintReturn;
+        var ti = 0;
+        while (ti < Vector.size(pendingTransfers)) {
+          let task = Vector.get(pendingTransfers, ti);
+          if (task.id == entry.originalTaskId) {
+            foundCaller := task.caller;
+            foundOpType := task.operationType;
+          };
+          ti += 1;
+        };
+
+        let taskId = createTransferTask(
+          foundCaller,
+          #principal(foundCaller),
+          entry.amount,
+          entry.token,
+          0 : Nat8, // sub-0: where the funds leaked to (vs the normal sub-2 source)
+          foundOpType,
+          opId,
+        );
+
+        Vector.add(newTaskIds, taskId);
+        Vector.add(updatedEntries, {
+          entry with
+          status = #RetryQueued;
+          retryTaskId = ?taskId;
+          retriedAt = ?now();
+        });
+        anyRetried := true;
+      } else {
+        Vector.add(updatedEntries, entry);
+      };
+    };
+
+    Map.set(failedRefundDeliveries, nhash, opId, Vector.toArray(updatedEntries));
+
+    if (anyRetried) {
+      ensureTransferQueueRunning();
+      logger.info("TRANSFER_QUEUE", "adminRetryFailedRefundFromSub0 for op #" # Nat.toText(opId) # " — " # Nat.toText(Vector.size(newTaskIds)) # " task(s) sourced from sub-0", "adminRetryFailedRefundFromSub0");
     };
 
     #ok(Vector.toArray(newTaskIds));
@@ -8085,9 +8305,9 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
   // --- Timer: Periodic Sync (15 min) — token details, allocations, NAV snapshot, circuit breaker ---
   private func startPeriodicSyncTimer<system>() {
     switch (periodicSyncTimerId) { case (?id) { cancelTimer(id) }; case null {} };
-    periodicSyncTimerId := ?setTimer<system>(#nanoseconds(15 * 60 * 1_000_000_000), func() : async () {
+    periodicSyncTimerId := ?setTimer<system>(#nanoseconds(10 * 60 * 1_000_000_000), func() : async () {
       // 1. Sync token details from treasury (skip full sync if mint/burn just refreshed data)
-      if (now() - lastMintBurnTime >= 15 * 60 * 1_000_000_000) {
+      if (now() - lastMintBurnTime >= 10 * 60 * 1_000_000_000) {
         try {
           let cached = await treasury.getTokenDetailsCache();
           if (cached.icpPriceUSD > 0.0) {
@@ -8216,6 +8436,12 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
         for ((token, details) in Map.entries(tokenDetailsMap)) {
           if (details.Active and details.priceInICP > 0) {
             ignore recordAndCheckTokenSnapshot(token, details.priceInICP, details.balance, details.tokenDecimals);
+          };
+        };
+        // Detect sharp moves on the freshly-recorded prices and nudge the treasury.
+        if (nudgeEnabled) {
+          try { await checkAndNudgeTreasury() } catch (e) {
+            logger.warn("TIMER", "checkAndNudgeTreasury failed: " # Error.message(e), "periodicSync");
           };
         };
       } else {

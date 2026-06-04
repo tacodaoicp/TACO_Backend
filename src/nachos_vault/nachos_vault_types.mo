@@ -388,6 +388,10 @@ module {
     maxMintAmountICP : ?Nat;
     maxBurnAmountNachos : ?Nat;
     kongEnabled : ?Bool;
+    nudgeEnabled : ?Bool;
+    nudgePriceChangeThresholdPercent : ?Float;
+    nudgePriceChangeWindowNS : ?Int;
+    nudgeCooldownNS : ?Int;
   };
 
 };

@@ -694,6 +694,16 @@ export const idlFactory = ({ IDL }) => {
       ),
     'claimAllLPFees' : IDL.Func([], [ClaimAllLPFeesResult], []),
     'claimConcentratedFees' : IDL.Func([IDL.Nat], [ClaimFeesResult], []),
+    'claimDAOFeesToCaller' : IDL.Func(
+        [],
+        [
+          IDL.Variant({
+            'Ok' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat)),
+            'Err' : ExchangeError,
+          }),
+        ],
+        [],
+      ),
     'claimFeesReferrer' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat))],
@@ -992,6 +1002,28 @@ export const idlFactory = ({ IDL }) => {
               ),
             })
           ),
+        ],
+        ['query'],
+      ),
+    'getExpectedReceiveAmountBatchMultiOptimal' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Nat],
+        [
+          IDL.Record({
+            'fee' : IDL.Nat,
+            'tradingFeeBps' : IDL.Nat,
+            'routeDescription' : IDL.Text,
+            'canFulfillFully' : IDL.Bool,
+            'legs' : IDL.Vec(
+              IDL.Record({
+                'bp' : IDL.Nat,
+                'routeDescription' : IDL.Text,
+                'route' : IDL.Vec(SwapHop),
+                'expectedBuyAmount' : IDL.Nat,
+              })
+            ),
+            'priceImpact' : IDL.Float64,
+            'expectedBuyAmount' : IDL.Nat,
+          }),
         ],
         ['query'],
       ),

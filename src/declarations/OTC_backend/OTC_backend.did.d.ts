@@ -592,6 +592,11 @@ export interface create_trading_canister {
   'checkFeesReferrer' : ActorMethod<[], Array<[string, bigint]>>,
   'claimAllLPFees' : ActorMethod<[], ClaimAllLPFeesResult>,
   'claimConcentratedFees' : ActorMethod<[bigint], ClaimFeesResult>,
+  'claimDAOFeesToCaller' : ActorMethod<
+    [],
+    { 'Ok' : Array<[string, bigint]> } |
+      { 'Err' : ExchangeError }
+  >,
   'claimFeesReferrer' : ActorMethod<[], Array<[string, bigint]>>,
   'claimLPFees' : ActorMethod<[string, string], ClaimFeesResult>,
   'cleanTokenIds' : ActorMethod<[], ActionResult>,
@@ -826,6 +831,25 @@ export interface create_trading_canister {
         >,
       }
     >
+  >,
+  'getExpectedReceiveAmountBatchMultiOptimal' : ActorMethod<
+    [string, string, bigint],
+    {
+      'fee' : bigint,
+      'tradingFeeBps' : bigint,
+      'routeDescription' : string,
+      'canFulfillFully' : boolean,
+      'legs' : Array<
+        {
+          'bp' : bigint,
+          'routeDescription' : string,
+          'route' : Array<SwapHop>,
+          'expectedBuyAmount' : bigint,
+        }
+      >,
+      'priceImpact' : number,
+      'expectedBuyAmount' : bigint,
+    }
   >,
   'getFeeCollectors' : ActorMethod<[], Array<Principal>>,
   'getKlineData' : ActorMethod<

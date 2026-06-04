@@ -491,6 +491,7 @@ module {
       case (#KongSwap) { #Text("KongSwap") };
       case (#ICPSwap) { #Text("ICPSwap") };
       case (#TACO) { #Text("TACO") };
+      case (#Neutrinite) { #Text("Neutrinite") };
     };
   };
 

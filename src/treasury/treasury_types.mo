@@ -113,6 +113,7 @@ module {
     tokenSyncTimeoutNS : ?Nat;
     minAllocationDiffBasisPoints : ?Nat;
     kongEnabled : ?Bool;
+    neutriniteEnabled : ?Bool;
   };
 
   type hash<K> = (
@@ -129,6 +130,7 @@ module {
     #KongSwap;
     #ICPSwap;
     #TACO;
+    #Neutrinite;
   };
 
   // Price source for a token

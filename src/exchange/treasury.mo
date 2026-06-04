@@ -143,7 +143,20 @@ shared (deployer) persistent actor class treasury() = this {
 
     if (tempTransferQueue.size() != 0) {
       try {
-        Vector.addFromIter(transferQueue, tempTransferQueue.vals());
+        // Guard: only enqueue if amount > cached transfer fee. Dust
+        // (amount <= fee) can only return #BadFee from the ledger and would
+        // loop on the retry path at L309-312 below. When fee is unknown
+        // (metadata not cached) we accept the entry — retrying is safer
+        // than dropping silently with no fee reference.
+        for (t in tempTransferQueue.vals()) {
+          let fee = switch (Map.get(tokenInfo, thash, t.2)) {
+            case (?info) info.TransferFee;
+            case null 0;
+          };
+          if (fee == 0 or t.1 > fee) {
+            Vector.add(transferQueue, t);
+          };
+        };
         if (test or immediate) {
           // CORRECTNESS: every immediate caller MUST await until the queue is
           // empty. The previous `if (not transferTimerRunning)` guard was a
@@ -448,6 +461,53 @@ shared (deployer) persistent actor class treasury() = this {
     Vector.toArray(out);
   };
 
+  // Controller-only: remove pending transfers whose amount is <= the cached
+  // transfer fee. Such transfers cannot succeed (#BadFee / net-zero) and
+  // pollute the retry loop. Skips entries whose token fee is not yet cached
+  // (conservative). Returns counts so the operator sees what was dropped.
+  public shared ({ caller }) func admin_purgeBelowFeeTransfers() : async {
+    removedCount : Nat;
+    removedAmountByToken : [(Text, Nat)];
+    remaining : Nat;
+  } {
+    assert (Principal.isController(caller));
+
+    let keep = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    let removedSums = Map.new<Text, Nat>();
+    var removedCount : Nat = 0;
+
+    for (t in Vector.vals(transferQueue)) {
+      let fee = switch (Map.get(tokenInfo, thash, t.2)) {
+        case (?info) info.TransferFee;
+        case null 0;
+      };
+      if (fee > 0 and t.1 <= fee) {
+        removedCount += 1;
+        let cur = switch (Map.get(removedSums, thash, t.2)) {
+          case (?n) n;
+          case null 0;
+        };
+        Map.set(removedSums, thash, t.2, cur + t.1);
+      } else {
+        Vector.add(keep, t);
+      };
+    };
+
+    Vector.clear(transferQueue);
+    Vector.addFromIter(transferQueue, Vector.vals(keep));
+
+    let removedArr = Vector.new<(Text, Nat)>();
+    for ((token, amount) in Map.entries(removedSums)) {
+      Vector.add(removedArr, (token, amount));
+    };
+
+    {
+      removedCount;
+      removedAmountByToken = Vector.toArray(removedArr);
+      remaining = Vector.size(transferQueue);
+    };
+  };
+
   //This function is set to update each tokens decimals, transferfee and name. This is also important as the exchange calls the function named getTokenInfo to get the same data.
   private func updateTokenInfoTimer() : async () {
     let timersize = Vector.size(tokenInfoTimerIDs);
@@ -666,6 +726,7 @@ shared (deployer) persistent actor class treasury() = this {
     arg : Blob;
     caller : Principal;
     msg : {
+      #admin_purgeBelowFeeTransfers : () -> ();
       #drainTransferQueue : () -> ();
       #getAcceptedtokens : () -> (a : [Text]);
       #getCallStats24h : () -> ();
@@ -678,7 +739,10 @@ shared (deployer) persistent actor class treasury() = this {
       #setTest : () -> (a : Bool);
     };
   }) : Bool {
-    (caller == deployer.caller or caller == canisterOTCPrincipal or canisterOTC == "aaaaa-aa");
+    switch (msg) {
+      case (#admin_purgeBelowFeeTransfers _) Principal.isController(caller);
+      case _ (caller == deployer.caller or caller == canisterOTCPrincipal or canisterOTC == "aaaaa-aa");
+    };
   };
 
 };
