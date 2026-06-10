@@ -16451,7 +16451,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // Returns null if:
   //   - validation fails
   //   - no positive-profit route found in the searched range
-  public query func adminFindOptimalArb(
+  public query ({ caller }) func adminFindOptimalArb(
     token : Text,
     minSample : Nat,
     maxSample : Nat,
@@ -16580,17 +16580,31 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
         if (not failed and amount > sampleSize) {
           let eff : Int = amount - sampleSize;
-          let effBps : Int = if (sampleSize > 0) { (eff * 10000) / sampleSize } else { 0 };
-          let candidate = {
-            route = fullRoute;
-            outputAmount = amount;
-            efficiency = eff;
-            efficiencyBps = effBps;
-            hopDetails = Vector.toArray(hopDetailsVec);
-          };
-          switch (best) {
-            case null { best := ?candidate };
-            case (?b) { if (eff > b.efficiency) { best := ?candidate } };
+          // NET-OF-FEE GATE: only surface a cycle if its raw edge clears the fee
+          // the executor (adminFlashArb) will actually charge. Previously this
+          // returned the GROSS edge (amount > sampleSize), so the finder reported
+          // opps whose edge was below the fee; the bot fired them and the
+          // executor's profit-guard atomically trapped them (cost-free but noisy).
+          // Hurdle = calculateFee(notional) [the dominant ~ICPfee bp] + the
+          // outgoing transfer fee — the MINIMUM the executor always charges, so
+          // we never skip an opp the executor would accept. The route-dependent
+          // firstHopProtocolFee (+ optional input transfer fee) can't be known
+          // here; the executor's atomic guard stays the exact backstop for that
+          // thin residual.
+          let feeHurdle : Int = calculateFee(sampleSize, ICPfee, RevokeFeeNow) + returnTfees(token);
+          if (eff > feeHurdle) {
+            let effBps : Int = if (sampleSize > 0) { (eff * 10000) / sampleSize } else { 0 };
+            let candidate = {
+              route = fullRoute;
+              outputAmount = amount;
+              efficiency = eff;
+              efficiencyBps = effBps;
+              hopDetails = Vector.toArray(hopDetailsVec);
+            };
+            switch (best) {
+              case null { best := ?candidate };
+              case (?b) { if (eff > b.efficiency) { best := ?candidate } };
+            };
           };
         };
       };
@@ -16661,14 +16675,91 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     switch (bestSeen) {
       case null { null };
       case (?b) {
-        ?{
-          amount = b.amount;
-          route = b.route;
-          outputAmount = b.outputAmount;
-          efficiency = b.efficiency;
-          efficiencyBps = b.efficiencyBps;
-          hopDetails = b.hopDetails;
-          probesRun;
+        // TOP-K FAITHFUL VALIDATION. The cheap simulateSwap used for ranking
+        // over-prices stale/dead V3 pools (e.g. ckBTC/ckUSDC), so a phantom route
+        // can rank #1 and mask a smaller REAL one. So: collect the top-K candidate
+        // cycles by cheap edge at the winning size, re-simulate each through the
+        // SAME hybrid orderbook+AMM engine execution uses (simulateMultiHop ->
+        // orderPairing), and return the best one that ACTUALLY executes net-positive.
+        // orderPairing mutates pool state even in query, so snapshot/restore around
+        // each candidate, exactly like the batch quotes do.
+        let sample = b.amount;
+        let K : Nat = 10;
+
+        // --- gather candidates (route, cheapEdge) at `sample` via the cheap sim ---
+        let cands = Vector.new<([SwapHop], Int)>();
+        for (fullRoute in Vector.vals(cycleTopologyCache)) {
+          let simPools = Map.new<(Text, Text), AMMPool>();
+          let simV3 = Map.new<(Text, Text), PoolV3Data>();
+          var amount = sample;
+          var failed = false;
+          for (hop in fullRoute.vals()) {
+            if (not failed) {
+              let pk = getPool(hop.tokenIn, hop.tokenOut);
+              let poolOpt = switch (Map.get(simPools, hashtt, pk)) { case (?p) { ?p }; case null { Map.get(AMMpools, hashtt, pk) } };
+              let v3Opt = switch (Map.get(simV3, hashtt, pk)) { case (?v) { ?v }; case null { Map.get(poolV3Data, hashtt, pk) } };
+              switch (poolOpt) {
+                case (?pool) {
+                  let (out, up, uv3) = simulateSwap(pool, v3Opt, hop.tokenIn, amount, ICPfee);
+                  if (out == 0) { failed := true };
+                  Map.set(simPools, hashtt, pk, up);
+                  switch (uv3) { case (?x) { Map.set(simV3, hashtt, pk, x) }; case null {} };
+                  amount := out;
+                };
+                case null { failed := true };
+              };
+            };
+          };
+          if (not failed and amount > sample) {
+            Vector.add(cands, (fullRoute, (amount - sample) : Int));
+          };
+        };
+
+        // --- top-K by cheap edge (desc) ---
+        let sorted = Array.sort<([SwapHop], Int)>(
+          Vector.toArray(cands),
+          func(x, y) { Int.compare(y.1, x.1) },
+        );
+        let kCount = if (sorted.size() < K) { sorted.size() } else { K };
+
+        // --- faithfully validate the top-K; keep the BEST that truly executes ---
+        let hurdle : Int = calculateFee(sample, ICPfee, RevokeFeeNow) + returnTfees(token);
+        let snap = snapshotQuoteState();
+        var bestReal : Int = 0;
+        var bestRoute : ?[SwapHop] = null;
+        var bestOut : Nat = 0;
+        var bestHops : [HopDetail] = [];
+        var i = 0;
+        while (i < kCount) {
+          restoreQuoteState(snap);
+          let route = sorted[i].0;
+          let faithful = simulateMultiHop(route, sample, caller);
+          if (faithful.amountOut > sample) {
+            let realEff : Int = faithful.amountOut - sample;
+            if (realEff > hurdle and realEff > bestReal) {
+              bestReal := realEff;
+              bestRoute := ?route;
+              bestOut := faithful.amountOut;
+              bestHops := faithful.hopDetails;
+            };
+          };
+          i += 1;
+        };
+        restoreQuoteState(snap);
+
+        switch (bestRoute) {
+          case null { null };
+          case (?r) {
+            ?{
+              amount = sample;
+              route = r;
+              outputAmount = bestOut;       // REAL engine output, not phantom
+              efficiency = bestReal;
+              efficiencyBps = if (sample > 0) { (bestReal * 10000) / sample } else { 0 };
+              hopDetails = bestHops;
+              probesRun;
+            };
+          };
         };
       };
     };
