@@ -244,7 +244,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
   stable var test = false;
   //to afat regaring notes: any reference of the testing will be deleted in production, so also this function
-  public func setTest(a : Bool) : async () {
+  public shared ({ caller }) func setTest(a : Bool) : async () {
+    // Auth: inspect only gates ingress; inter-canister calls bypass it, so the
+    // caller MUST be re-checked in-body. Use isAdmin (NOT ownercheck) because
+    // ownercheck auto-passes once test==true, which would let test mode latch open.
+    if (not isAdmin(caller)) { return };
     test := a;
     let currentTreasury = actor (treasury_text) : treasuryType.Treasury;
     await currentTreasury.setTest(a);
@@ -3894,14 +3898,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     var deleteOld = false;
-    let MINIMUM_LIQUIDITY0 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal))) {
-      AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal);
-      minimumLiquidity;
-    } else { 0 };
-    let MINIMUM_LIQUIDITY1 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal))) {
-      AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal);
-      minimumLiquidity;
-    } else { 0 };
+    // F16: compute the withhold amounts but DO NOT mark the token here. Marking is
+    // deferred to the branch that actually withholds (reserve = amount - MIN_LIQ),
+    // so the reject/refund paths below (which never withhold) cannot leave a token
+    // marked-but-not-withheld — that mismatch made checkDiffs subtract a phantom
+    // -minimumLiquidity per polluted token forever.
+    let MINIMUM_LIQUIDITY0 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal))) { minimumLiquidity } else { 0 };
+    let MINIMUM_LIQUIDITY1 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal))) { minimumLiquidity } else { 0 };
     var oldProviders = TrieSet.empty<Principal>();
     let (liquidityMinted, refund0, refund1) = switch (Map.get(AMMpools, hashtt, poolKey)) {
       case (null) {
@@ -3923,6 +3926,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           };
           return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool"));
         };
+        // F16: now committed to withholding — mark the token(s) so checkDiffs credits
+        // back exactly the minimumLiquidity actually held out of reserves.
+        if (MINIMUM_LIQUIDITY0 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal) };
+        if (MINIMUM_LIQUIDITY1 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal) };
         registerPoolPair(token0, token1);
         let initialLiquidity = sqrt((amount0 -MINIMUM_LIQUIDITY0) * (amount1 -MINIMUM_LIQUIDITY1));
 
@@ -3988,6 +3995,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             };
             return #Err(#InsufficientFunds("Amounts below minimum liquidity for pool recreation"));
           };
+          // F16: committed to withholding — mark only now (see new-pool branch).
+          if (MINIMUM_LIQUIDITY0 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal) };
+          if (MINIMUM_LIQUIDITY1 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal) };
           registerPoolPair(token0, token1);
           let initialLiquidity = sqrt((amount0 -MINIMUM_LIQUIDITY0) * (amount1 -MINIMUM_LIQUIDITY1));
           oldProviders := existingPool.providers;
@@ -4488,9 +4498,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let refund1 = if (amount1 > used1) { amount1 - used1 } else { 0 };
     if (refund0 > returnTfees(token0)) {
       Vector.add(tempTransferQueueLocal, (#principal(caller), refund0 - returnTfees(token0), token0, genTxId()));
+    } else if (refund0 > 0) {
+      // [38] sub-Tfees refund dust can't be transferred — book to feescollectedDAO so
+      // it stays on the books instead of stranding as positive drift.
+      let cur = switch (Map.get(feescollectedDAO, thash, token0)) { case (?v) v; case null 0 };
+      Map.set(feescollectedDAO, thash, token0, cur + refund0);
     };
     if (refund1 > returnTfees(token1)) {
       Vector.add(tempTransferQueueLocal, (#principal(caller), refund1 - returnTfees(token1), token1, genTxId()));
+    } else if (refund1 > 0) {
+      let cur = switch (Map.get(feescollectedDAO, thash, token1)) { case (?v) v; case null 0 };
+      Map.set(feescollectedDAO, thash, token1, cur + refund1);
     };
 
     doInfoBeforeStep2();
@@ -4646,9 +4664,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (v3.activeLiquidity > actualLiquidityToRemove) { v3.activeLiquidity - actualLiquidityToRemove } else { 0 };
     } else { v3.activeLiquidity };
 
-    // Update pool reserves — subtract total amounts (base + fees)
-    let newReserve0 = if (pool.reserve0 > totalAmount0) { pool.reserve0 - totalAmount0 } else { 0 };
-    let newReserve1 = if (pool.reserve1 > totalAmount1) { pool.reserve1 - totalAmount1 } else { 0 };
+    // Update pool reserves — subtract ONLY the base amounts. The prorated fee is
+    // paid from the V3 residual (totalFeesClaimed += fee below), NOT from reserves
+    // (swapWithAMMV3 keeps fees out of reserves). Subtracting base+fee here AND
+    // booking the fee against totalFeesClaimed double-removed the fee from the books
+    // = +fee positive drift per removal. baseAmount0/1 are already capped at reserves.
+    let newReserve0 = if (pool.reserve0 > baseAmount0) { pool.reserve0 - baseAmount0 } else { 0 };
+    let newReserve1 = if (pool.reserve1 > baseAmount1) { pool.reserve1 - baseAmount1 } else { 0 };
     let newTotalLiq = if (pool.totalLiquidity > actualLiquidityToRemove) { pool.totalLiquidity - actualLiquidityToRemove } else { 0 };
 
     Map.set(AMMpools, hashtt, poolKey, {
@@ -4672,6 +4694,26 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Clean up pool on full drain
     if (newActiveLiquidity == 0 and newReserve0 == 0 and newReserve1 == 0) {
+      // [37] Flush any remaining V3 fee residual (collected − claimed, incl. parked
+      // 30% protocol fees) to feescollectedDAO BEFORE deleting poolV3Data. Otherwise
+      // the residual drops out of ammbalance while the tokens stay in the treasury =
+      // positive drift. Direct Map.set (not addFees) to mirror the pool-deletion dust
+      // path (≈7647) and avoid addFees's −1 bias accumulating to negative over flushes.
+      switch (Map.get(poolV3Data, hashtt, poolKey)) {
+        case (?v3Final) {
+          let resid0 = safeSub(v3Final.totalFeesCollected0, v3Final.totalFeesClaimed0);
+          let resid1 = safeSub(v3Final.totalFeesCollected1, v3Final.totalFeesClaimed1);
+          if (resid0 > 0) {
+            let cur0 = switch (Map.get(feescollectedDAO, thash, poolKey.0)) { case (?v) v; case null 0 };
+            Map.set(feescollectedDAO, thash, poolKey.0, cur0 + resid0);
+          };
+          if (resid1 > 0) {
+            let cur1 = switch (Map.get(feescollectedDAO, thash, poolKey.1)) { case (?v) v; case null 0 };
+            Map.set(feescollectedDAO, thash, poolKey.1, cur1 + resid1);
+          };
+        };
+        case null {};
+      };
       Map.delete(AMMpools, hashtt, poolKey);
       Map.delete(poolV3Data, hashtt, poolKey);
     };
@@ -5321,11 +5363,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               if (v3.activeLiquidity > removeAmt) { v3.activeLiquidity - removeAmt } else { 0 };
             } else { v3.activeLiquidity };
 
-            // Update pool — subtract total amounts (base + fees) from reserves
+            // Update pool — subtract ONLY base from reserves; the fee is paid from the
+            // V3 residual via totalFeesClaimed += fee below (fees are never in reserves).
+            // Subtracting base+fee here too double-removed the fee = +fee positive drift.
             Map.set(AMMpools, hashtt, poolKey, {
               pool with
-              reserve0 = if (pool.reserve0 > totalAmount0) { pool.reserve0 - totalAmount0 } else { 0 };
-              reserve1 = if (pool.reserve1 > totalAmount1) { pool.reserve1 - totalAmount1 } else { 0 };
+              reserve0 = if (pool.reserve0 > baseAmount0) { pool.reserve0 - baseAmount0 } else { 0 };
+              reserve1 = if (pool.reserve1 > baseAmount1) { pool.reserve1 - baseAmount1 } else { 0 };
               totalLiquidity = if (pool.totalLiquidity > removeAmt) { pool.totalLiquidity - removeAmt } else { 0 };
               lastUpdateTime = nowVar;
             });
@@ -14607,7 +14651,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     let nowVar = Time.now();
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
-    label a for (i in Iter.range(0, trades.size())) {
+    // trades.keys() yields exactly the valid indices 0..size-1 (Iter.range(0, size)
+    // was inclusive of size -> out-of-bounds trap that bricked BlocksDone keys).
+    label a for (i in trades.keys()) {
       if (Map.has(BlocksDone, thash, trades[i].0 # ":" # Nat64.toText(trades[i].1))) {
         continue a;
       };

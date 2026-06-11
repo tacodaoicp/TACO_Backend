@@ -49,7 +49,7 @@ echo ""
 echo "--- Step 1: Starting dfx ---"
 dfx stop 2>/dev/null || true
 sleep 1
-dfx start --background --clean --artificial-delay 1
+dfx start --background --clean --artificial-delay 10
 sleep 2
 
 # === Step 2: Set up identities ===
