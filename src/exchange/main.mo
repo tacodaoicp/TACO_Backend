@@ -7305,7 +7305,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 let Fee = liquidityToDelete.Fee;
 
                 let totalFee = (amount_init) * Fee;
-                let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
+                // F4 [51]: canonical retention = ((amount_init*Fee)/(10000*RevokeFee))*(RevokeFee-1),
+                // matching checkDiffs (14447). The old (totalFee - totalFee/RevokeFee)/10000 form
+                // over-refunded 0-49 atoms per order (divide-by-R before /10000) = negative drift.
+                let revoke_Fee = (totalFee / (10000 * RevokeFee)) * (RevokeFee - 1);
                 let toBeSent = amount_init + revoke_Fee;
                 Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
                 dbgObCount += 1;
@@ -7379,7 +7382,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 let Fee = liquidityToDelete.Fee;
 
                 let totalFee = (amount_init) * Fee;
-                let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
+                // F4 [51]: canonical retention = ((amount_init*Fee)/(10000*RevokeFee))*(RevokeFee-1),
+                // matching checkDiffs (14447). The old (totalFee - totalFee/RevokeFee)/10000 form
+                // over-refunded 0-49 atoms per order (divide-by-R before /10000) = negative drift.
+                let revoke_Fee = (totalFee / (10000 * RevokeFee)) * (RevokeFee - 1);
                 let toBeSent = amount_init + revoke_Fee;
                 Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
                 dbgForeignCount += 1;
@@ -7453,7 +7459,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         let Fee = liquidityToDelete.Fee;
 
         let totalFee = (amount_init) * Fee;
-        let revoke_Fee = (totalFee - (totalFee / RevokeFee)) / 10000;
+        // F4 [51]: canonical retention (matches checkDiffs 14447); old form over-refunded 0-49 atoms.
+        let revoke_Fee = (totalFee / (10000 * RevokeFee)) * (RevokeFee - 1);
         let toBeSent = amount_init + revoke_Fee;
 
         Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(init_principal)), toBeSent, token_init_identifier, genTxId()));
@@ -8832,6 +8839,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     var nowVar = Time.now();
+    // F9 [17]: snapshot the fee pair ONCE before any await. A synchronous
+    // ChangeTradingfees/ChangeRevokefees can interleave at an await and desync the order's
+    // recorded Fee/RevokeFee from what checkReceive validates and checkDiffs counts. Using one
+    // snapshot for the record, the deposit check, and the fill fees keeps collected == booked.
+    let ICPfeeSnap = ICPfee;
+    let RevokeFeeSnap = RevokeFeeNow;
 
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
 
@@ -8939,7 +8952,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let nowVar2 = nowVar;
     trade_number += 1;
     var trade : TradePrivate = {
-      Fee = ICPfee;
+      Fee = ICPfeeSnap; // F9 [17]: snapshotted fee pair (see ~8841)
       amount_sell = amount_sell2;
       amount_init = amount_init;
       token_sell_identifier = token_sell_identifier;
@@ -8952,7 +8965,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       initPrincipal = Principal.toText(caller);
       seller_paid2 = 0;
       init_paid2 = 0;
-      RevokeFee = RevokeFeeNow;
+      RevokeFee = RevokeFeeSnap; // F9 [17]: snapshotted fee pair
       OCname = OCname;
       time = nowVar;
       filledInit = 0;
@@ -9026,7 +9039,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     // revokeFees are already added in checkreceive, thats why we initiate the referrer loop already
     let (receiveBool, receiveTransfers) = if (blockData != #ICRC12([])) {
-      checkReceive(Block, caller, amount_init, token_init_identifier, ICPfee, RevokeFeeNow, false, true, blockData, tType, nowVar2);
+      checkReceive(Block, caller, amount_init, token_init_identifier, ICPfeeSnap, RevokeFeeSnap, false, true, blockData, tType, nowVar2); // F9 [17]: snapshotted fee pair (matches the order record + checkDiffs retention)
     } else { (false, []) };
     Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
     if (not receiveBool) {
@@ -9070,7 +9083,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       if (leftAmountInit != amount_init and leftAmountInit != 0 and tfees < leftAmountInit) {
         if (amount_sell2 > 1) {
 
-          let add = (((((amount_init - leftAmountInit) * ICPfee)) - (((((amount_init - leftAmountInit) * ICPfee) * 100000) / RevokeFeeNow) / 100000)) / 10000);
+          let add = (((((amount_init - leftAmountInit) * ICPfeeSnap)) - (((((amount_init - leftAmountInit) * ICPfeeSnap) * 100000) / RevokeFeeSnap) / 100000)) / 10000); // F9 [17]: snapshotted fee pair
           if (add > 0) {
             addFees(token_init_identifier, add, false, user, nowVar);
           };
@@ -9118,7 +9131,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       } else if (leftAmountInit == 0) {
 
-        let add = (((((amount_init) * ICPfee)) - (((((amount_init) * ICPfee) * 100000) / RevokeFeeNow) / 100000)) / 10000);
+        let add = (((((amount_init) * ICPfeeSnap)) - (((((amount_init) * ICPfeeSnap) * 100000) / RevokeFeeSnap) / 100000)) / 10000); // F9 [17]: snapshotted fee pair
         let posInputTfees = if (thePairing.4) { tfees } else { 0 };
         if (add + posInputTfees > 0) {
           addFees(token_init_identifier, add + posInputTfees, false, user, nowVar);
@@ -9596,6 +9609,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // Handle unfilled portion on first hop — only refund genuine partial fills
       if (hopIndex == 0 and remaining > returnTfees(hop.tokenIn) * 3) {
         Vector.add(tempTransferQueueLocal, (#principal(caller), remaining, hop.tokenIn, genTxId()));
+        // F5 [14]: this refund physically spends the user's single inputTfees buffer
+        // (treasury pays the ledger fee on the outflow). Mark hop-0 as buffer-consumed so
+        // the fee booking at ~9672 does NOT re-book inputTfees a second time (negative drift).
+        firstHopHadOrderbookMatch := true;
       };
 
       let prevCurrentAmount = currentAmount; // Save before overwrite for error path
@@ -12544,7 +12561,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         allOrNothing = false; strictlyOTC = false;
       };
 
-      let (_, _, _, transfers, _, _, _) = orderPairing(syntheticTrade);
+      // F6 [61]: capture orderPairing's REAL remaining (unconsumed tokenIn, in tokenIn units).
+      let (realRemaining, _, _, transfers, _, _, _) = orderPairing(syntheticTrade);
       var hopOutput : Nat = 0;
       for (tx in transfers.vals()) {
         if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
@@ -12557,10 +12575,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
 
-      // Handle unfilled portion on first hop
-      let remaining = safeSub(currentAmount, hopOutput);
-      if (remaining > returnTfees(hop.tokenIn) and hopIndex == 0) {
-        Vector.add(tempTransferQueueLocal, (#principal(caller), remaining, hop.tokenIn, genTxId()));
+      // F6 [61]: refund unconsumed tokenIn using realRemaining. The old
+      // safeSub(currentAmount, hopOutput) subtracted across DIFFERENT tokens
+      // (currentAmount in tokenIn units, hopOutput in tokenOut units) and could fabricate
+      // a refund of tokenIn the AMM already booked into reserveIn = negative drift.
+      // realRemaining = amount_init - amountCoveredSell (floored) <= amount_init.
+      if (realRemaining > returnTfees(hop.tokenIn) and hopIndex == 0) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), realRemaining, hop.tokenIn, genTxId()));
       };
 
       currentAmount := hopOutput;
@@ -13666,7 +13687,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case null { sendBack := true };
     };
     if sendBack {
-
+      // F2 [32]: the dao=false checkReceive @13667 (success path) booked
+      // (amountSelling*Fee)/(10000*RevokeFee) of token_sell_identifier into feescollectedDAO.
+      // The full refund below returns the WHOLE deposit, so that credit becomes unbacked
+      // (negative drift), and the overpay-refund entries queued @13670 would double-flush with
+      // the full refund. Reverse the credit (delfees=true floors at 0 -> never negative) and
+      // rebuild the queue to a single full refund. currentTrades2 is the ORIGINAL order here,
+      // matching the Fee/RevokeFee/token the @13667 call used.
+      addFees(currentTrades2.token_sell_identifier, ((amountSelling * currentTrades2.Fee) / (10000 * currentTrades2.RevokeFee)), true, "", nowVar2);
+      Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal);
       Vector.addFromIter(tempTransferQueueLocal, (checkReceive(nat64ToNat(Block), msg.caller, 0, currentTrades2.token_sell_identifier, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar2)).1.vals());
       if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
