@@ -13713,7 +13713,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Handle transfers and fees
     Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(currentTrades2.initPrincipal)), amountSelling, currentTrades2.token_sell_identifier, genTxId()));
-    Vector.add(tempTransferQueueLocal, (#principal(msg.caller), amountBuying, currentTrades2.token_init_identifier, genTxId()));
+    // F3 [60]: on a PARTIAL fill, dock the taker's token_init receipt by one Tfees. The maker
+    // deposited a single token_init buffer; a full fill consumes it on the final payout and the
+    // order is removed (releasing its booked +Tfees), but each partial payout also costs a ledger
+    // fee while the reduced order RE-BOOKS +Tfees in checkDiffs. Docking makes the taker fund
+    // their own partial-receipt ledger fee, preserving the maker buffer to back the persisting
+    // order. Without this the order is short one Tfees(token_init) per partial fill = negative
+    // drift (confirmed -9,999 via runDriftDiag). safeSub floors at 0 for sub-fee dust fills.
+    let takerPayout = if (partial) { safeSub(amountBuying, returnTfees(currentTrades2.token_init_identifier)) } else { amountBuying };
+    Vector.add(tempTransferQueueLocal, (#principal(msg.caller), takerPayout, currentTrades2.token_init_identifier, genTxId()));
     if pub {
       let pair1 = (currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier);
       let pair2 = (currentTrades2.token_sell_identifier, currentTrades2.token_init_identifier);

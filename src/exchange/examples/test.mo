@@ -6344,6 +6344,35 @@ shared (deployer) persistent actor class test() = this {
 
   stable var diffLogs : [Text] = [];
   public query func getDiffLogs() : async [Text] { diffLogs };
+
+  // [60] diagnostic: isolate the drift delta of a FinishSell PARTIAL fill on token_init.
+  // If the maker's Tfees buffer is spent paying the taker while the reduced order re-books
+  // +Tfees, the delta should be negative (~-transferFeeICRCA). Run after a full deploy
+  // (actors funded) via: dfx canister call exchange_test runDriftDiag
+  public func runDriftDiag() : async Text {
+    let feeLocal : Nat = 10; // current exchange trading fee (bp)
+    let amount_sell = 100000000; // token_sell = ICP
+    let amount_init = 100000000; // token_init = ICRCA
+    let token_sell_identifier = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+    let token_init_identifier = "mxzaz-hqaaa-aaaar-qaada-cai";
+    func driftOf(tok : Text) : async Int {
+      ignore await actorA.claimFees(); ignore await actorB.claimFees();
+      for (_ in Iter.range(0, 9)) { await async {} };
+      let (_, diffs, _) = switch (await exchange.checkDiffs(false, true)) { case (?n) n };
+      var d : Int = 0;
+      for ((amt, t) in diffs.vals()) { if (t == tok) d := amt };
+      d;
+    };
+    let blockA = await actorA.TransferICRCAtoExchange(amount_init, feeLocal, 1);
+    let secret = await actorA.CreatePrivatePosition(blockA, amount_sell, amount_init, token_sell_identifier, token_init_identifier);
+    let dBefore = await driftOf(token_init_identifier);
+    let blockB = await actorB.TransferICPtoExchange(amount_sell / 2, feeLocal, 1);
+    ignore await actorB.acceptPosition(blockB, secret, amount_sell / 2);
+    let dAfter = await driftOf(token_init_identifier);
+    let delta = dAfter - dBefore;
+    Debug.print("DRIFTDIAG partialFinishSell token_init(ICRCA): before=" # debug_show(dBefore) # " after=" # debug_show(dAfter) # " DELTA=" # debug_show(delta));
+    return "delta=" # debug_show(delta);
+  };
   func logDiffTable(stage : Text) : async () {
     // Yield to let in-flight async operations finish their treasury flushes
     for (_ in Iter.range(0, 9)) { await async {} };
@@ -6587,6 +6616,7 @@ shared (deployer) persistent actor class test() = this {
       #runStressTests : () -> Bool;
       #runTests : () -> (Bool, Bool);
       #resetAndRunStress : () -> ();
+      #runDriftDiag : () -> ();
     };
   }) : Bool {
     Debug.print(debug_show (arg.size()));
