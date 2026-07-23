@@ -981,49 +981,6 @@ shared (deployer) persistent actor class treasury() = this {
     0;
   };
 
-  // Sum of allocations of all tokens paired with `token` in LP-eligible pools
-  // Considers both existing pools on the exchange AND configured-but-not-yet-created pools
-  private func getPartnerAllocSum(token : Principal) : Nat {
-    var sum : Nat = 0;
-    let seen = Map.new<Text, Bool>();
-
-    // From existing pools on the exchange
-    for (pool in cachedPoolData.vals()) {
-      let poolKey = normalizePoolKeyText(pool.token0, pool.token1);
-      if (not isPoolLPEnabled(poolKey)) {} else {
-        Map.set(seen, thash, poolKey, true);
-        let t0 = Principal.fromText(pool.token0);
-        let t1 = Principal.fromText(pool.token1);
-        if (t0 == token) {
-          sum += switch (Map.get(currentAllocations, phash, t1)) { case (?v) { v }; case null { 0 } };
-        } else if (t1 == token) {
-          sum += switch (Map.get(currentAllocations, phash, t0)) { case (?v) { v }; case null { 0 } };
-        };
-      };
-    };
-
-    // From accepted token pairs not yet on the exchange
-    for (t0Text in cachedExchangeAcceptedTokens.vals()) {
-      for (t1Text in cachedExchangeAcceptedTokens.vals()) {
-        if (t0Text >= t1Text) {} else {
-          let poolKey = normalizePoolKeyText(t0Text, t1Text);
-          if (isPoolLPEnabled(poolKey) and not Map.has(seen, thash, poolKey)) {
-            let t0 = Principal.fromText(t0Text);
-            let t1 = Principal.fromText(t1Text);
-            if (Map.has(tokenDetailsMap, phash, t0) and Map.has(tokenDetailsMap, phash, t1)) {
-              if (t0 == token) {
-                sum += switch (Map.get(currentAllocations, phash, t1)) { case (?v) { v }; case null { 0 } };
-              } else if (t1 == token) {
-                sum += switch (Map.get(currentAllocations, phash, t0)) { case (?v) { v }; case null { 0 } };
-              };
-            };
-          };
-        };
-      };
-    };
-    sum;
-  };
-
   private func isMasterAdmin(caller : Principal) : Bool {
     AdminAuth.isMasterAdmin(caller, canister_ids.isKnownCanister)
   };
@@ -9618,7 +9575,11 @@ shared (deployer) persistent actor class treasury() = this {
   // 5B. LP MANAGEMENT — TARGET COMPUTATION & OPERATIONS
   //=========================================================================
 
-  // Compute target LP for each eligible pool
+  // Compute target LP for each eligible pool — deterministic budget water-fill.
+  // Per-token SIDE budgets: B_t = alloc_t × portfolio × lpRatioBP × (1 − nachosBuffer).
+  // A pool consumes equal side-value from both tokens; emitted targets are whole-pool value.
+  // Budgets are enforced by construction here — lpBudgetUsedPerToken is display-only
+  // (a used-headroom cap would oscillate at convergence: fill → cap collapses → remove → refill).
   // Returns: [(poolKey, token0, token1, targetLPValueICP, currentLPValueICP, currentLiquidity)]
   private func computeLPTargets() : [(Text, Principal, Principal, Nat, Nat, Nat)] {
     if (not lpConfig.enabled) return [];
@@ -9636,78 +9597,59 @@ shared (deployer) persistent actor class treasury() = this {
     };
     if (totalPortfolioICP == 0) return [];
 
+    let haircutBP : Nat = if (lpConfig.nachosRedemptionBufferBP < 10_000) { 10_000 - lpConfig.nachosRedemptionBufferBP } else { 0 };
+
+    // ---- Phase 1: unified pool universe (existing pools + synthetic pairs) ----
+    type FillPool = {
+      poolKey : Text;
+      t0 : Principal;
+      t1 : Principal;
+      alloc0 : Nat;
+      alloc1 : Nat;
+      capWhole : Nat; // whole-pool value cap from per-pool custom ratio (inert when ratio == global)
+      var targetWhole : Nat;
+      current : Nat;
+      liq : Nat;
+      existing : Bool;
+    };
+    let fillVec = Vector.new<FillPool>();
     let processedPools = Map.new<Text, Bool>();
 
-    // For each pool that has BOTH tokens in allocations:
     for (pool in cachedPoolData.vals()) {
-      let t0 = Principal.fromText(pool.token0);
-      let t1 = Principal.fromText(pool.token1);
       let poolKey = normalizePoolKeyText(pool.token0, pool.token1);
-      Map.set(processedPools, thash, poolKey, true);
-      let currentLPVal = getCurrentLPValueICP(poolKey);
-      let currentLiq = getCurrentLiquidity(poolKey);
-
-      if (not isPoolLPEnabled(poolKey)) {
-        // LP disabled for this pool — target = 0 (forces removal if position exists)
-        if (currentLPVal > 0) { Vector.add(targets, (poolKey, t0, t1, 0, currentLPVal, currentLiq)) };
-      } else {
+      if (not Map.has(processedPools, thash, poolKey)) {
+        Map.set(processedPools, thash, poolKey, true);
+        let t0 = Principal.fromText(pool.token0);
+        let t1 = Principal.fromText(pool.token1);
+        let currentLPVal = getCurrentLPValueICP(poolKey);
+        let currentLiq = getCurrentLiquidity(poolKey);
         let alloc0 = switch (Map.get(currentAllocations, phash, t0)) { case (?v) v; case null 0 };
         let alloc1 = switch (Map.get(currentAllocations, phash, t1)) { case (?v) v; case null 0 };
-        if (alloc0 == 0 or alloc1 == 0) {
-          // One or both tokens have no allocation — remove LP if present
+
+        if (not isPoolLPEnabled(poolKey) or alloc0 == 0 or alloc1 == 0) {
+          // LP disabled or no allocation — target = 0 (forces removal if position exists)
           if (currentLPVal > 0) { Vector.add(targets, (poolKey, t0, t1, 0, currentLPVal, currentLiq)) };
         } else {
-          // Step 1: How much of each token's allocation is available for THIS pool?
-          let partners0 = getPartnerAllocSum(t0);
-          let partners1 = getPartnerAllocSum(t1);
-          if (partners0 == 0 or partners1 == 0) {
-            if (currentLPVal > 0) { Vector.add(targets, (poolKey, t0, t1, 0, currentLPVal, currentLiq)) };
-          } else {
-            let available0BP = alloc0 * alloc1 / partners0;
-            let available1BP = alloc1 * alloc0 / partners1;
+          let capWhole = 2 * (Nat.min(alloc0, alloc1) * totalPortfolioICP * getPoolLpRatio(poolKey) * haircutBP) / (10_000 * 10_000 * 10_000);
+          Vector.add(fillVec, { poolKey; t0; t1; alloc0; alloc1; capWhole; var targetWhole = 0 : Nat; current = currentLPVal; liq = currentLiq; existing = true });
+        };
+      };
+    };
 
-            // Step 2: LP bounded by smaller side (50/50 by value)
-            let maxLPBP = Nat.min(available0BP, available1BP);
-            let maxLPValueICP = (maxLPBP * totalPortfolioICP) / 10_000;
-
-            // Step 3: Apply LP ratio with NACHOS buffer
-            let lpRatio = getPoolLpRatio(poolKey);
-            let effectiveRatioBP = (lpRatio * (10_000 - lpConfig.nachosRedemptionBufferBP)) / 10_000;
-
-            // Step 4: Final target — allocation formula × effective ratio is the only limit
-            // No pool depth cap: treasury can be sole LP, allocation formula naturally bounds deployment
-            let targetLPValueICP = maxLPValueICP * effectiveRatioBP / 10_000;
-
-            // Step 6: Subtract transfer fees and check minimum
-            let tfee0 = switch (Map.get(tokenDetailsMap, phash, t0)) { case (?d) { d.tokenTransferFee }; case null { 0 } };
-            let tfee1 = switch (Map.get(tokenDetailsMap, phash, t1)) { case (?d) { d.tokenTransferFee }; case null { 0 } };
-            let d0 = switch (Map.get(tokenDetailsMap, phash, t0)) { case (?d) { d.tokenDecimals }; case null { 8 : Nat } };
-            let d1 = switch (Map.get(tokenDetailsMap, phash, t1)) { case (?d) { d.tokenDecimals }; case null { 8 : Nat } };
-            let p0 = switch (Map.get(tokenDetailsMap, phash, t0)) { case (?d) { d.priceInICP }; case null { 0 } };
-            let p1 = switch (Map.get(tokenDetailsMap, phash, t1)) { case (?d) { d.priceInICP }; case null { 0 } };
-            let tfee0ICP = if (tfee0 > 0 and p0 > 0 and d0 > 0) { (tfee0 * p0) / (10 ** d0) } else { 0 };
-            let tfee1ICP = if (tfee1 > 0 and p1 > 0 and d1 > 0) { (tfee1 * p1) / (10 ** d1) } else { 0 };
-            let netTarget = if (targetLPValueICP > tfee0ICP + tfee1ICP) { targetLPValueICP - tfee0ICP - tfee1ICP } else { 0 };
-
-            if (netTarget < lpConfig.minLPValueICP) {
-              // Below minimum — set target to 0 (remove if exists)
-              if (currentLPVal > 0) { Vector.add(targets, (poolKey, t0, t1, 0, currentLPVal, currentLiq)) };
-            } else {
-              // Per-token LP budget constraint: total LP across all pools ≤ token allocation × lpRatio
-              // This prevents over-deploying a single token across many pools
-              let budget0 = (alloc0 * totalPortfolioICP * lpConfig.lpRatioBP) / (10_000 * 10_000);
-              let budget1 = (alloc1 * totalPortfolioICP * lpConfig.lpRatioBP) / (10_000 * 10_000);
-              let used0 = switch (Map.get(lpBudgetUsedPerToken, phash, t0)) { case (?v) v; case null 0 };
-              let used1 = switch (Map.get(lpBudgetUsedPerToken, phash, t1)) { case (?v) v; case null 0 };
-              let remaining0 = if (budget0 > used0) { budget0 - used0 } else { 0 };
-              let remaining1 = if (budget1 > used1) { budget1 - used1 } else { 0 };
-              let budgetCapped = Nat.min(netTarget, Nat.min(remaining0, remaining1));
-
-              if (budgetCapped < lpConfig.minLPValueICP) {
-                // After budget cap, below minimum — skip addition but keep existing
-                Vector.add(targets, (poolKey, t0, t1, Nat.min(budgetCapped, currentLPVal), currentLPVal, currentLiq));
-              } else {
-                Vector.add(targets, (poolKey, t0, t1, budgetCapped, currentLPVal, currentLiq));
+    // Synthetic pools: enabled pairs of accepted tokens not yet on the exchange
+    for (t0Text in cachedExchangeAcceptedTokens.vals()) {
+      for (t1Text in cachedExchangeAcceptedTokens.vals()) {
+        if (t0Text < t1Text) {
+          let poolKey = normalizePoolKeyText(t0Text, t1Text);
+          if (isPoolLPEnabled(poolKey) and not Map.has(processedPools, thash, poolKey)) {
+            let t0 = Principal.fromText(t0Text);
+            let t1 = Principal.fromText(t1Text);
+            if (Map.has(tokenDetailsMap, phash, t0) and Map.has(tokenDetailsMap, phash, t1)) {
+              let alloc0 = switch (Map.get(currentAllocations, phash, t0)) { case (?v) v; case null 0 };
+              let alloc1 = switch (Map.get(currentAllocations, phash, t1)) { case (?v) v; case null 0 };
+              if (alloc0 > 0 and alloc1 > 0) {
+                let capWhole = 2 * (Nat.min(alloc0, alloc1) * totalPortfolioICP * getPoolLpRatio(poolKey) * haircutBP) / (10_000 * 10_000 * 10_000);
+                Vector.add(fillVec, { poolKey; t0; t1; alloc0; alloc1; capWhole; var targetWhole = 0 : Nat; current = 0; liq = 0; existing = false });
               };
             };
           };
@@ -9715,63 +9657,92 @@ shared (deployer) persistent actor class treasury() = this {
       };
     };
 
-    // Second pass: pools derivable from accepted tokens that don't exist yet on the exchange
-    // Generate all pairs of (treasuryToken, ICP) where both are accepted by the exchange
-    for (t0Text in cachedExchangeAcceptedTokens.vals()) {
-      for (t1Text in cachedExchangeAcceptedTokens.vals()) {
-        if (t0Text >= t1Text) {} else { // Skip self-pairs and duplicates (only process t0 < t1)
-          let poolKey = normalizePoolKeyText(t0Text, t1Text);
-          if (not isPoolLPEnabled(poolKey) or Map.has(processedPools, thash, poolKey)) {} else {
-          let t0 = Principal.fromText(t0Text);
-          let t1 = Principal.fromText(t1Text);
-          // Only consider pairs where both tokens are in the treasury portfolio
-          let inPortfolio0 = Map.has(tokenDetailsMap, phash, t0);
-          let inPortfolio1 = Map.has(tokenDetailsMap, phash, t1);
-          if (inPortfolio0 and inPortfolio1) {
-          let alloc0 = switch (Map.get(currentAllocations, phash, t0)) { case (?v) v; case null 0 };
-          let alloc1 = switch (Map.get(currentAllocations, phash, t1)) { case (?v) v; case null 0 };
-          if (alloc0 > 0 and alloc1 > 0) {
-            let partners0 = getPartnerAllocSum(t0);
-            let partners1 = getPartnerAllocSum(t1);
-            if (partners0 > 0 and partners1 > 0) {
-              let available0BP = alloc0 * alloc1 / partners0;
-              let available1BP = alloc1 * alloc0 / partners1;
-              let maxLPBP = Nat.min(available0BP, available1BP);
-              let maxLPValueICP = (maxLPBP * totalPortfolioICP) / 10_000;
-              let lpRatio = getPoolLpRatio(poolKey);
-              let effectiveRatioBP = (lpRatio * (10_000 - lpConfig.nachosRedemptionBufferBP)) / 10_000;
-              // New pool, no depth cap
-              let targetLPValueICP = maxLPValueICP * effectiveRatioBP / 10_000;
+    // Sort by poolKey: full determinism regardless of cache order
+    let fillPools = Array.sort<FillPool>(
+      Vector.toArray(fillVec),
+      func(a, b) { Text.compare(a.poolKey, b.poolKey) },
+    );
 
-              // Transfer fees check
-              let tfee0 = switch (Map.get(tokenDetailsMap, phash, t0)) { case (?d) { d.tokenTransferFee }; case null { 0 } };
-              let tfee1 = switch (Map.get(tokenDetailsMap, phash, t1)) { case (?d) { d.tokenTransferFee }; case null { 0 } };
-              let d0 = switch (Map.get(tokenDetailsMap, phash, t0)) { case (?d) { d.tokenDecimals }; case null { 8 : Nat } };
-              let d1 = switch (Map.get(tokenDetailsMap, phash, t1)) { case (?d) { d.tokenDecimals }; case null { 8 : Nat } };
-              let p0 = switch (Map.get(tokenDetailsMap, phash, t0)) { case (?d) { d.priceInICP }; case null { 0 } };
-              let p1 = switch (Map.get(tokenDetailsMap, phash, t1)) { case (?d) { d.priceInICP }; case null { 0 } };
-              let tfee0ICP = if (tfee0 > 0 and p0 > 0 and d0 > 0) { (tfee0 * p0) / (10 ** d0) } else { 0 };
-              let tfee1ICP = if (tfee1 > 0 and p1 > 0 and d1 > 0) { (tfee1 * p1) / (10 ** d1) } else { 0 };
-              let netTarget = if (targetLPValueICP > tfee0ICP + tfee1ICP) { targetLPValueICP - tfee0ICP - tfee1ICP } else { 0 };
+    // ---- Phase 2: per-token SIDE-value budgets ----
+    let remaining = Map.new<Principal, Nat>();
+    for (p in fillPools.vals()) {
+      for (t in [p.t0, p.t1].vals()) {
+        if (not Map.has(remaining, phash, t)) {
+          let alloc = switch (Map.get(currentAllocations, phash, t)) { case (?v) v; case null 0 };
+          Map.set(remaining, phash, t, (alloc * totalPortfolioICP * lpConfig.lpRatioBP * haircutBP) / (10_000 * 10_000 * 10_000));
+        };
+      };
+    };
 
-              if (netTarget >= lpConfig.minLPValueICP) {
-                // Budget constraint
-                let budget0 = (alloc0 * totalPortfolioICP * lpConfig.lpRatioBP) / (10_000 * 10_000);
-                let budget1 = (alloc1 * totalPortfolioICP * lpConfig.lpRatioBP) / (10_000 * 10_000);
-                let used0 = switch (Map.get(lpBudgetUsedPerToken, phash, t0)) { case (?v) v; case null 0 };
-                let used1 = switch (Map.get(lpBudgetUsedPerToken, phash, t1)) { case (?v) v; case null 0 };
-                let remaining0 = if (budget0 > used0) { budget0 - used0 } else { 0 };
-                let remaining1 = if (budget1 > used1) { budget1 - used1 } else { 0 };
-                let budgetCapped = Nat.min(netTarget, Nat.min(remaining0, remaining1));
+    // ---- Phase 3: water-fill (pure sync; ≤ MAX_ROUNDS × #pools Nat ops) ----
+    let MAX_ROUNDS = 16;
+    let EPS : Nat = 1_000_000; // < 0.01 ICP total movement in a round → converged
+    var round = 0;
+    label fill while (round < MAX_ROUNDS) {
+      // Snapshot budgets: all offers this round read the snapshot → order-independent
+      let snap = Map.new<Principal, Nat>();
+      for ((k, v) in Map.entries(remaining)) { Map.set(snap, phash, k, v) };
 
-                if (budgetCapped >= lpConfig.minLPValueICP) {
-                  Vector.add(targets, (poolKey, t0, t1, budgetCapped, 0, 0));
-                };
-              };
+      // Active pools + per-token partner-allocation weight sums
+      let wSum = Map.new<Principal, Nat>();
+      for (p in fillPools.vals()) {
+        let r0 = switch (Map.get(snap, phash, p.t0)) { case (?v) v; case null 0 };
+        let r1 = switch (Map.get(snap, phash, p.t1)) { case (?v) v; case null 0 };
+        if (p.targetWhole < p.capWhole and r0 > 0 and r1 > 0) {
+          Map.set(wSum, phash, p.t0, (switch (Map.get(wSum, phash, p.t0)) { case (?v) v; case null 0 }) + p.alloc1);
+          Map.set(wSum, phash, p.t1, (switch (Map.get(wSum, phash, p.t1)) { case (?v) v; case null 0 }) + p.alloc0);
+        };
+      };
+
+      // Increments: offer_t = snap[t] × alloc_partner / wSum[t] (proportional floors ⇒
+      // Σ offers per token ≤ snap[t] ⇒ budgets can never be overspent, any order, any round)
+      var moved : Nat = 0;
+      for (p in fillPools.vals()) {
+        let r0 = switch (Map.get(snap, phash, p.t0)) { case (?v) v; case null 0 };
+        let r1 = switch (Map.get(snap, phash, p.t1)) { case (?v) v; case null 0 };
+        if (p.targetWhole < p.capWhole and r0 > 0 and r1 > 0) {
+          let w0 = switch (Map.get(wSum, phash, p.t0)) { case (?v) v; case null 0 };
+          let w1 = switch (Map.get(wSum, phash, p.t1)) { case (?v) v; case null 0 };
+          if (w0 > 0 and w1 > 0) {
+            let offer0Side = r0 * p.alloc1 / w0;
+            let offer1Side = r1 * p.alloc0 / w1;
+            let headroomSide = (p.capWhole - p.targetWhole) / 2;
+            let incSide = Nat.min(Nat.min(offer0Side, offer1Side), headroomSide);
+            if (incSide > 0) {
+              p.targetWhole += 2 * incSide;
+              let cur0 = switch (Map.get(remaining, phash, p.t0)) { case (?v) v; case null 0 };
+              let cur1 = switch (Map.get(remaining, phash, p.t1)) { case (?v) v; case null 0 };
+              Map.set(remaining, phash, p.t0, if (cur0 > incSide) { cur0 - incSide } else { 0 });
+              Map.set(remaining, phash, p.t1, if (cur1 > incSide) { cur1 - incSide } else { 0 });
+              moved += 2 * incSide;
             };
           };
-          }; // isPoolLPEnabled and not processed
-          }; // t0 < t1
+        };
+      };
+      if (moved < EPS) break fill;
+      round += 1;
+    };
+
+    // ---- Phase 4: transfer fees, dust filter, emit ----
+    for (p in fillPools.vals()) {
+      let tfee0 = switch (Map.get(tokenDetailsMap, phash, p.t0)) { case (?d) { d.tokenTransferFee }; case null { 0 } };
+      let tfee1 = switch (Map.get(tokenDetailsMap, phash, p.t1)) { case (?d) { d.tokenTransferFee }; case null { 0 } };
+      let d0 = switch (Map.get(tokenDetailsMap, phash, p.t0)) { case (?d) { d.tokenDecimals }; case null { 8 : Nat } };
+      let d1 = switch (Map.get(tokenDetailsMap, phash, p.t1)) { case (?d) { d.tokenDecimals }; case null { 8 : Nat } };
+      let p0 = switch (Map.get(tokenDetailsMap, phash, p.t0)) { case (?d) { d.priceInICP }; case null { 0 } };
+      let p1 = switch (Map.get(tokenDetailsMap, phash, p.t1)) { case (?d) { d.priceInICP }; case null { 0 } };
+      let tfee0ICP = if (tfee0 > 0 and p0 > 0 and d0 > 0) { (tfee0 * p0) / (10 ** d0) } else { 0 };
+      let tfee1ICP = if (tfee1 > 0 and p1 > 0 and d1 > 0) { (tfee1 * p1) / (10 ** d1) } else { 0 };
+      let netTarget = if (p.targetWhole > tfee0ICP + tfee1ICP) { p.targetWhole - tfee0ICP - tfee1ICP } else { 0 };
+      let finalTarget = if (netTarget < lpConfig.minLPValueICP) { 0 } else { netTarget };
+
+      if (p.existing) {
+        if (finalTarget > 0 or p.current > 0) {
+          Vector.add(targets, (p.poolKey, p.t0, p.t1, finalTarget, p.current, p.liq));
+        };
+      } else {
+        if (finalTarget > 0) {
+          Vector.add(targets, (p.poolKey, p.t0, p.t1, finalTarget, 0, 0));
         };
       };
     };
@@ -15396,6 +15367,9 @@ shared (deployer) persistent actor class treasury() = this {
   };
 
   // Set per-pool LP config (enable/disable specific pool, override ratios)
+  // NOTE (water-fill): customLpRatioBP acts as a CAP on this pool's whole-pool value
+  // (2 × min-side allocation budget at that ratio); it no longer scales the old
+  // pairwise-attribution slice. custom = 0 disables deployment; custom ≥ global is inert.
   public shared ({ caller }) func admin_setPoolLPConfig(poolKey : Text, config : { enabled : Bool; customLpRatioBP : ?Nat; customMaxPoolShareBP : ?Nat }) : async Result.Result<Text, Text> {
     if ((await hasAdminPermission(caller, #recoverPoolBalances)) == false) {
       return #err("Unauthorized");
@@ -15464,17 +15438,17 @@ shared (deployer) persistent actor class treasury() = this {
       };
     };
 
-    // Budget usage per token
+    // Budget usage per token (side-value; budget matches computeLPTargets incl. nachos haircut)
     let budgetVec = Vector.new<{ tokenSymbol : Text; usedICP : Nat; budgetICP : Nat }>();
+    var budgetPortfolioICP : Nat = 0;
+    for ((tk, d) in Map.entries(tokenDetailsMap)) {
+      if (d.Active and not isTokenPausedFromTrading(tk)) { budgetPortfolioICP += (tokenTotalBalanceUnits(tk, d) * d.priceInICP) / (10 ** d.tokenDecimals) };
+    };
+    let budgetHaircutBP : Nat = if (lpConfig.nachosRedemptionBufferBP < 10_000) { 10_000 - lpConfig.nachosRedemptionBufferBP } else { 0 };
     for ((token, used) in Map.entries(lpBudgetUsedPerToken)) {
       let sym = switch (Map.get(tokenDetailsMap, phash, token)) { case (?d) { d.tokenSymbol }; case null { Principal.toText(token) } };
       let alloc = switch (Map.get(currentAllocations, phash, token)) { case (?v) v; case null 0 };
-      // Phase 5 Fix 2: combined view for LP budget calculation.
-      var totalPortfolio : Nat = 0;
-      for ((tk, d) in Map.entries(tokenDetailsMap)) {
-        if (d.Active) { totalPortfolio += (tokenTotalBalanceUnits(tk, d) * d.priceInICP) / (10 ** d.tokenDecimals) };
-      };
-      let budget = (alloc * totalPortfolio * lpConfig.lpRatioBP) / (10_000 * 10_000);
+      let budget = (alloc * budgetPortfolioICP * lpConfig.lpRatioBP * budgetHaircutBP) / (10_000 * 10_000 * 10_000);
       Vector.add(budgetVec, { tokenSymbol = sym; usedICP = used; budgetICP = budget });
     };
 

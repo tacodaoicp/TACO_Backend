@@ -90,6 +90,18 @@ shared (deployer) persistent actor class treasury() = this {
   // Per-transaction idempotency: stores txId → timestamp of successful transfer
   stable let processedTxIds = Map.new<Text, Int>();
 
+  // Dead-letter queue: a transfer that has failed >10× is moved out of the hot
+  // 5s retry loop (transferTimer) into coldQueue, then retried at most once per 2h
+  // — event-driven (see maybeRetryCold), no timer. A permanently-stuck transfer
+  // stops burning cycles/instructions instead of looping ~17k×/day. Nothing is
+  // dropped. failCounts tracks consecutive failures per txId and is deleted on
+  // success / drop so it can't grow unbounded. Only the OTC canister can enqueue,
+  // so none of this state can be inflated externally.
+  stable let coldQueue = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+  stable let failCounts = Map.new<Text, Nat>();
+  stable var lastColdRetry : Int = 0; // ns of last cold→hot sweep; gates retries to ≤once/2h
+  transient let COLD_RETRY_INTERVAL_NS : Int = 7_200_000_000_000; // 2h
+
   // 24h rolling inter-canister call telemetry. Key = "<method>:<token>".
   // Each entry is a 24-slot ring buffer indexed by absolute hour; a slot whose
   // `hour` no longer matches the current absolute hour is reset on next write.
@@ -157,6 +169,10 @@ shared (deployer) persistent actor class treasury() = this {
             Vector.add(transferQueue, t);
           };
         };
+        // Fold in dead-letter entries due for their ≤2h retry so they drain with
+        // these. Skipped on the immediate/arb path to keep swaps low-latency —
+        // they ride the next regular (non-immediate) transfer instead.
+        if (not immediate) { maybeRetryCold() };
         if (test or immediate) {
           // CORRECTNESS: every immediate caller MUST await until the queue is
           // empty. The previous `if (not transferTimerRunning)` guard was a
@@ -204,6 +220,42 @@ shared (deployer) persistent actor class treasury() = this {
 
   // Function to handle all the transfers. removeLast is a perfect function for this as it removes the last item in the vector while also retuurning that item. If a transfer fails, it gets added to transferQueueTemp, so it can later be readded and retried.
   // Since weve seen token canisters in the past get overflooded with transactions, making each transfer take a long time, ive decided to not await each Transfer, instead adding the future to a Vector, so multiple transfers are sent at once.
+  // Single choke point for every failed-transfer re-enqueue. After >10 failures
+  // a transfer is demoted from the hot 5s loop into coldQueue (retried ≤once/2h via
+  // maybeRetryCold). The tuple is re-inserted VERBATIM — recipient/amount/txId are
+  // never changed here, only which queue it sits in (fund-safety invariant). It is
+  // added to EXACTLY ONE queue and only after being popped from the hot queue, so
+  // no tuple is ever in both. Called from both the dispatch-throw catches and the
+  // await-result handlers in transferTimer.
+  private func requeueFailed(data : (TransferRecipient, Nat, Text, Text)) {
+    let txId = data.3;
+    if (txId == "") { Vector.add(transferQueue, data); return }; // untrackable → keep hot
+    let n = (switch (Map.get(failCounts, thash, txId)) { case (?c) c; case null 0 }) + 1;
+    Map.set(failCounts, thash, txId, n);
+    if (n > 10) { Vector.add(coldQueue, data) } else { Vector.add(transferQueue, data) };
+  };
+
+  // Event-driven cold retry — NO timer. Called when a transfer arrives; if it's
+  // been ≥2h since the last sweep, fold the dead-letter entries back into the hot
+  // transferQueue so they ride the incoming transfers' normal drain. Re-failures
+  // are re-demoted by requeueFailed, so each stuck transfer is retried ≤once/2h.
+  //
+  // CAN'T-HAPPEN-TWICE safety:
+  //  • Single-copy invariant: requeueFailed puts a tuple in coldQueue XOR
+  //    transferQueue, so nothing folded here is already in the hot queue.
+  //  • add-then-clear is await-free ⇒ atomic: the entry is never in both queues,
+  //    and no two concurrent callers can double-fold (the second runs after the
+  //    first's synchronous body committed lastColdRetry and emptied coldQueue).
+  //  • Final backstop: transferTimer skips any txId already in processedTxIds, so a
+  //    folded entry that already succeeded is never re-sent.
+  private func maybeRetryCold() {
+    if (not Vector.isEmpty(coldQueue) and now() - lastColdRetry >= COLD_RETRY_INTERVAL_NS) {
+      lastColdRetry := now();
+      for (t in Vector.vals(coldQueue)) { Vector.add(transferQueue, t) };
+      Vector.clear(coldQueue);
+    };
+  };
+
   private func transferTimer(all : Bool) : async () {
     let transferBatch = Vector.new<(TransferRecipient, Nat, Text, Text)>();
     let transferTasksICP = Vector.new<(async TransferResultICP, (TransferRecipient, Nat, Text, Text))>();
@@ -233,7 +285,8 @@ shared (deployer) persistent actor class treasury() = this {
         // Idempotency: skip transfers already successfully processed
         let txId = data.3;
         if (txId != "" and Map.has(processedTxIds, thash, txId)) {
-          // Already processed — skip
+          // Already processed — skip. Drop any failCounts entry so it can't leak.
+          Map.delete(failCounts, thash, txId);
         } else {
         transferNonce += 1;
         nsAdd += 1;
@@ -273,7 +326,7 @@ shared (deployer) persistent actor class treasury() = this {
             Vector.add(transferTasksICRC1, (transferTask, data));
           } catch (_) {
             recordCall("icrc1_transfer", data.2, false);
-            Vector.add(transferQueue, data);
+            requeueFailed(data);
           };
         } else {
           // Transfer ICP. Same dispatch-throw protection as ICRC1 path.
@@ -303,7 +356,7 @@ shared (deployer) persistent actor class treasury() = this {
             Vector.add(transferTasksICP, (transferTask, data));
           } catch (_) {
             recordCall("icp_transfer", ICPprincipalText, false);
-            Vector.add(transferQueue, data);
+            requeueFailed(data);
           };
         };
         }; // end idempotency else
@@ -316,17 +369,41 @@ shared (deployer) persistent actor class treasury() = this {
           switch (result) {
             case (#Ok(_)) {
               let tid = transferTask.1.3;
-              if (tid != "") { Map.set(processedTxIds, thash, tid, now()) };
+              if (tid != "") { Map.set(processedTxIds, thash, tid, now()); Map.delete(failCounts, thash, tid) };
               recordCall("icrc1_transfer", transferTask.1.2, true);
             };
             case (#Err(transferError)) {
+              // BadFee self-heal: the ledger tells us its actual fee. A stale
+              // cached TransferFee (metadata refresh dead after an upgrade)
+              // otherwise makes every retry fail deterministically — this is
+              // what jammed the tyyy3/GOLDAO cold queue when the ledger's fee
+              // was raised 0.001→10. No funds moved on #BadFee, so correcting
+              // the cache and requeueing cannot double-pay. failCounts is
+              // reset ONLY when the cache actually changed, so the entry gets
+              // one immediate hot-loop retry with the corrected fee and cannot
+              // cycle hot forever if the ledger keeps rejecting.
+              switch (transferError) {
+                case (#BadFee({ expected_fee })) {
+                  switch (Map.get(tokenInfo, thash, transferTask.1.2)) {
+                    case (?info) {
+                      if (info.TransferFee != expected_fee) {
+                        Map.set(tokenInfo, thash, transferTask.1.2, { TransferFee = expected_fee; Decimals = info.Decimals; Name = info.Name; Symbol = info.Symbol });
+                        let tid = transferTask.1.3;
+                        if (tid != "") { Map.delete(failCounts, thash, tid) };
+                      };
+                    };
+                    case null {};
+                  };
+                };
+                case _ {};
+              };
               recordCall("icrc1_transfer", transferTask.1.2, false);
-              Vector.add(transferQueue, transferTask.1);
+              requeueFailed(transferTask.1);
             };
           };
         } catch (err) {
           recordCall("icrc1_transfer", transferTask.1.2, false);
-          Vector.add(transferQueue, transferTask.1);
+          requeueFailed(transferTask.1);
         };
       };
 
@@ -337,17 +414,17 @@ shared (deployer) persistent actor class treasury() = this {
           switch (result) {
             case (#Ok(_)) {
               let tid = transferTask.1.3;
-              if (tid != "") { Map.set(processedTxIds, thash, tid, now()) };
+              if (tid != "") { Map.set(processedTxIds, thash, tid, now()); Map.delete(failCounts, thash, tid) };
               recordCall("icp_transfer", ICPprincipalText, true);
             };
             case (#Err(transferError)) {
               recordCall("icp_transfer", ICPprincipalText, false);
-              Vector.add(transferQueue, transferTask.1);
+              requeueFailed(transferTask.1);
             };
           };
         } catch (err) {
           recordCall("icp_transfer", ICPprincipalText, false);
-          Vector.add(transferQueue, transferTask.1);
+          requeueFailed(transferTask.1);
         };
       };
 
@@ -422,6 +499,16 @@ shared (deployer) persistent actor class treasury() = this {
     Vector.size(transferQueue);
   };
 
+  // Cold (dead-letter) queue contents: (txId, amount, token) for each transfer
+  // that failed >10× and is now retried only once every 2h. Recipient is omitted
+  // (no payee disclosed). Public, for parity with the other telemetry queries.
+  public query func getColdQueue() : async [(Text, Nat, Text)] {
+    Array.map<(TransferRecipient, Nat, Text, Text), (Text, Nat, Text)>(
+      Vector.toArray(coldQueue),
+      func(t) = (t.3, t.1, t.2),
+    );
+  };
+
   // Aggregated inter-canister call counts over the rolling last 24 hours.
   // Returned as (key, ok, err) where key = "<method>:<token>".
   public query func getCallStats24h() : async [(Text, Nat, Nat)] {
@@ -449,6 +536,16 @@ shared (deployer) persistent actor class treasury() = this {
   public query ({ caller }) func getPendingTransfersByToken() : async [(Text, Nat)] {
     let sums = Map.new<Text, Nat>();
     for (transfer in Vector.vals(transferQueue)) {
+      let token = transfer.2;
+      let amount = transfer.1;
+      let cur = switch (Map.get(sums, thash, token)) { case (?n) { n }; case null { 0 } };
+      Map.set(sums, thash, token, cur + amount);
+    };
+    // Cold-queue entries are still owed to users (single-copy invariant: an
+    // entry is in coldQueue XOR transferQueue), so count them too — otherwise
+    // checkDiffs reads dead-letter payouts as reclaimable positive drift and
+    // computeDriftForToken's drain guard could let a recovery refund eat them.
+    for (transfer in Vector.vals(coldQueue)) {
       let token = transfer.2;
       let amount = transfer.1;
       let cur = switch (Map.get(sums, thash, token)) { case (?n) { n }; case null { 0 } };
@@ -483,6 +580,7 @@ shared (deployer) persistent actor class treasury() = this {
       };
       if (fee > 0 and t.1 <= fee) {
         removedCount += 1;
+        Map.delete(failCounts, thash, t.3); // drop counter so purged dust can't leak a failCounts entry
         let cur = switch (Map.get(removedSums, thash, t.2)) {
           case (?n) n;
           case null 0;
@@ -701,26 +799,36 @@ shared (deployer) persistent actor class treasury() = this {
     };
   };
 
-  if (Vector.size(tokenInfoTimerIDs) == 0) {
-    Vector.add(
-      tokenInfoTimerIDs,
-      setTimer<system>(
-        #seconds(1),
-        func() : async () {
-          try { await updateTokenInfoTimer() } catch (_) {
-            // Bootstrap path: if the very first invocation fails, schedule a
-            // 3000 s recovery so the timer chain is guaranteed to keep going.
-            ignore setTimer<system>(
-              #seconds(3000),
-              func() : async () {
-                try { await updateTokenInfoTimer() } catch (_) {};
-              },
-            );
-          };
-        },
-      ),
-    );
-  };
+  // Re-arm on EVERY install and upgrade. Timers do not survive an upgrade but
+  // these stable ID vectors do, so the old `if (size == 0)` guard saw the stale
+  // IDs and never re-armed — that froze the metadata refresh (and with it every
+  // cached TransferFee) after the last upgrade, and the stale transferTimerIDs
+  // additionally blocked non-immediate transfer scheduling (the size==0 guard
+  // in receiveTransferTasks). cancelTimer is a no-op for unknown IDs, so
+  // cancel-first also kills any genuinely live chain → exactly one chain after
+  // this block, on fresh install and upgrade alike.
+  for (id in Vector.vals(tokenInfoTimerIDs)) { cancelTimer(id) };
+  Vector.clear(tokenInfoTimerIDs);
+  for (id in Vector.vals(transferTimerIDs)) { cancelTimer(id) };
+  Vector.clear(transferTimerIDs);
+  Vector.add(
+    tokenInfoTimerIDs,
+    setTimer<system>(
+      #seconds(1),
+      func() : async () {
+        try { await updateTokenInfoTimer() } catch (_) {
+          // Bootstrap path: if the very first invocation fails, schedule a
+          // 3000 s recovery so the timer chain is guaranteed to keep going.
+          ignore setTimer<system>(
+            #seconds(3000),
+            func() : async () {
+              try { await updateTokenInfoTimer() } catch (_) {};
+            },
+          );
+        };
+      },
+    ),
+  );
 
   system func inspect({
     arg : Blob;
@@ -730,6 +838,7 @@ shared (deployer) persistent actor class treasury() = this {
       #drainTransferQueue : () -> ();
       #getAcceptedtokens : () -> (a : [Text]);
       #getCallStats24h : () -> ();
+      #getColdQueue : () -> ();
       #getPendingTransferCount : () -> ();
       #getPendingTransfersByToken : () -> ();
       #getTokenInfo : () -> ();

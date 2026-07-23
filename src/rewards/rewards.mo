@@ -538,6 +538,25 @@ shared (deployer) persistent actor class Rewards() = this {
     #VotingPowerChange;
   };
 
+  // Wire type for the DAO's getNeuronAllocationChangesForNeuron query. This MUST mirror the DAO's
+  // NeuronAllocationChangeRecord exactly — in particular it has NO `id` field (the DAO doesn't send
+  // one; declaring `id` here would trap candid decode). We add `id = 0` only when mapping to the
+  // local NeuronAllocationChangeBlockData below.
+  type DaoNeuronAllocChange = {
+    timestamp: Int;
+    neuronId: Blob;
+    changeType: AllocationChangeType;
+    oldAllocations: [Allocation];
+    newAllocations: [Allocation];
+    votingPower: Nat;
+    maker: Principal;
+    reason: ?Text;
+    penaltyMultiplier: ?Nat;
+  };
+
+  // Mirrors the DAO's AuthorizationError arm for the query result.
+  type DaoAuthError = { #NotAllowed; #NotAdmin; #UnexpectedError: Text };
+
   type ArchiveError = {
     #BlockNotFound;
     #InvalidBlockType;
@@ -594,6 +613,8 @@ shared (deployer) persistent actor class Rewards() = this {
     getActiveDecisionMakers: query () -> async [(Blob, [Principal])];  // Only active makers, excludes passive hotkeys
     admin_getAllActiveNeuronIds: query () -> async [Blob];
     getNeuronAllocation: query (Blob) -> async ?NeuronAllocation;
+    // Live-buffer fallback for VP + mid-window rebalances when the archive lacks this neuron's record.
+    getNeuronAllocationChangesForNeuron: query (Blob, Int) -> async Result.Result<{ changes: [DaoNeuronAllocChange]; totalCount: Nat }, DaoAuthError>;
   };
 
   private transient let neuronAllocationArchive : NeuronAllocationArchive = actor (Principal.toText(DAO_NEURON_ALLOCATION_ARCHIVE_ID));
@@ -637,10 +658,56 @@ shared (deployer) persistent actor class Rewards() = this {
       );
     };
 
-    let allocationData = switch (allocationResult) {
+    var allocationData = switch (allocationResult) {
       case (#ok(data)) { data };
       case (#err(error)) {
         return #err(#SystemError("Failed to get allocation data: " # debug_show(error)));
+      };
+    };
+
+    // Archive has no record for this neuron — fall back to the live DAO buffer so voting power AND
+    // mid-distribution rebalances are still captured (decouples reward correctness from the archive).
+    // Only on the live path (recalc cache uses its own DAO prefetch). Splits with the archive producer
+    // bounds: pre = latest record with timestamp < startTime; in = [startTime, endTime] inclusive.
+    if (not recalcAllocationCacheActive
+        and allocationData.preTimespanAllocation == null
+        and allocationData.inTimespanChanges.size() == 0) {
+      switch (await (with timeout = 65) daoCanister.getNeuronAllocationChangesForNeuron(neuronId, endTime)) {
+        case (#ok(resp)) {
+          if (resp.changes.size() > 0) {
+            // Map the id-less wire records to the local block-data shape (id = 0; never read).
+            let mapped = Array.map(resp.changes, func (c : DaoNeuronAllocChange) : NeuronAllocationChangeBlockData {
+              {
+                id = 0;
+                neuronId = c.neuronId;
+                timestamp = c.timestamp;
+                changeType = c.changeType;
+                oldAllocations = c.oldAllocations;
+                newAllocations = c.newAllocations;
+                votingPower = c.votingPower;
+                maker = c.maker;
+                reason = c.reason;
+                penaltyMultiplier = c.penaltyMultiplier;
+              }
+            });
+            // resp.changes is timestamp-ascending, so the last record with ts < startTime is the
+            // most-recent pre-timespan allocation (ties resolve to last-inserted, matching the archive).
+            var pre : ?NeuronAllocationChangeBlockData = null;
+            let inBuf = Buffer.Buffer<NeuronAllocationChangeBlockData>(mapped.size());
+            for (m in mapped.vals()) {
+              if (m.timestamp < startTime) {
+                pre := ?m;
+              } else if (m.timestamp <= endTime) {
+                inBuf.add(m);
+              };
+            };
+            allocationData := {
+              preTimespanAllocation = pre;
+              inTimespanChanges = Buffer.toArray(inBuf);
+            };
+          };
+        };
+        case (#err(_)) { /* leave allocationData empty; current-allocation fallback below applies */ };
       };
     };
 

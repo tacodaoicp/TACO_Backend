@@ -4672,6 +4672,48 @@ shared (deployer) persistent actor class ContinuousDAO() = this {
     #ok(response);
   };
 
+  // Per-neuron allocation history for the rewards canister, sourced from the live buffer so reward
+  // voting power and mid-distribution rebalances no longer depend on the archive being complete.
+  // Returns this neuron's changes with timestamp <= endTime (includes pre-window records so the
+  // caller can derive the pre-timespan allocation). Reuses the existing response type — no new type.
+  public shared query ({ caller }) func getNeuronAllocationChangesForNeuron(
+    neuronId : Blob,
+    endTime : Int
+  ) : async Result.Result<NeuronAllocationChangesSinceResponse, AuthorizationError> {
+    if (not isMasterAdmin(caller)) {
+      return #err(#NotAdmin);
+    };
+
+    // Empty buffer: avoid the Nat underflow in the Iter.range(0, size - 1) idiom below.
+    if (neuronAllocationChangesSize == 0) {
+      return #ok({ changes = []; totalCount = 0 });
+    };
+
+    var matches : [NeuronAllocationChangeRecord] = [];
+    for (i in Iter.range(0, neuronAllocationChangesSize - 1)) {
+      let pos = (neuronAllocationChangesHead + i) % MAX_NEURON_ALLOCATION_CHANGES;
+      switch (neuronAllocationChanges[pos]) {
+        case (?change) {
+          if (change.neuronId == neuronId and change.timestamp <= endTime) {
+            matches := Array.append(matches, [change]);
+          };
+        };
+        case null {};
+      };
+    };
+
+    // Stable ascending sort by timestamp; buffer iteration is insertion order, so equal timestamps
+    // keep last-inserted last (matches the archive producer's last-wins for the pre-timespan pick).
+    matches := Array.sort(
+      matches,
+      func(a : NeuronAllocationChangeRecord, b : NeuronAllocationChangeRecord) : Order.Order {
+        Int.compare(a.timestamp, b.timestamp);
+      },
+    );
+
+    #ok({ changes = matches; totalCount = matches.size() });
+  };
+
   // User token registration methods
   public shared(msg) func registerUserToken(tokenPrincipal: Principal): async Result.Result<Text, TokenRegistrationError> {
     let caller = msg.caller;
