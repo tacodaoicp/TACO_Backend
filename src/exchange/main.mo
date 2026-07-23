@@ -202,6 +202,7 @@ import Blob "mo:base/Blob";
 import Vector "mo:vector";
 import TrieSet "mo:base/TrieSet";
 import Time = "mo:base/Time";
+import EIC "mo:base/ExperimentalInternetComputer";
 import treasuryType "./src/treasuryType";
 import Logger "../helper/logger";
 import AdminAuth "../helper/admin_authorization";
@@ -2477,23 +2478,29 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     var continueCleanup = false;
 
     //RVVR-TACOX-3 - Inefficient Collection Storage- Fix
-    // Iterate through BlocksDone in reverse order
-    label cleanup for ((blockKey, timestamp) in Map.entriesDesc(BlocksDone)) {
-      if (timestamp < thirtyDaysAgo) {
-        if (processedCount >= 4000) {
-          continueCleanup := true;
-          break cleanup;
-        };
-
-        // Remove old entry
-        Map.delete(BlocksDone, thash, blockKey);
-
-        processedCount += 1;
-      } else {
-        // Stop if we've reached entries younger than 30 days
+    // Prune BlocksDone OLDEST-first (Map.entries = insertion/oldest order; the old
+    // Map.entriesDesc iterated newest-first and broke on the first <30d entry →
+    // deleted nothing on a live canister, so BlocksDone grew unbounded). Delete
+    // markers older than 30 days EXCEPT for #ICRC3 tokens: their getTimestamp
+    // age-check fails open, so BlocksDone is their ONLY replay guard — never delete
+    // those. Collect-then-delete to avoid delete-during-iteration.
+    let blocksToDelete = Vector.new<Text>();
+    label cleanup for ((blockKey, timestamp) in Map.entries(BlocksDone)) {
+      if (timestamp >= thirtyDaysAgo) {
+        // Reached entries younger than 30 days — all remaining are younger too.
         break cleanup;
       };
+      // Old marker. Skip #ICRC3 tokens (dynamic via live tokenType/returnType).
+      let tokenPart = switch (Text.split(blockKey, #char ':').next()) { case (?t) t; case null blockKey };
+      if (returnType(tokenPart) == #ICRC3) { continue cleanup };
+      if (processedCount >= 20000) {
+        continueCleanup := true;
+        break cleanup;
+      };
+      Vector.add(blocksToDelete, blockKey);
+      processedCount += 1;
     };
+    for (k in Vector.vals(blocksToDelete)) { Map.delete(BlocksDone, thash, k) };
     if (not continueCleanup) {
 
       // Scan the timeBasedTrades tree for old trades
@@ -2581,12 +2588,88 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // If there are more trades to process, set a timer to run cleanupOldTrades again
     if (continueCleanup) {
       ignore setTimer(
-        #seconds(fuzz.nat.randomRange(30, 60)),
+        #seconds(fuzz.nat.randomRange(8, 12)),
         func() : async () {
           await cleanupOldTrades();
         },
       );
     };
+  };
+
+  // Observability: total BlocksDone replay-guard markers (previously unobservable).
+  public query func getBlocksDoneSize() : async Nat { Map.size(BlocksDone) };
+
+  // Runtime toggle for verbose debug logging. verboseLogging drives debug_show dumps
+  // in hot/batch paths — e.g. getAllTradesDAOFilter builds O(trades^2) log strings in
+  // a Vector held for the whole call — which transiently spikes Wasm memory and
+  // ratchets the high-water toward the ~4 GiB ceiling. Keep OFF in production; turn
+  // on only briefly for debugging. Owner-only.
+  public query func getVerboseLogging() : async Bool { verboseLogging };
+  public shared ({ caller }) func admin_setVerboseLogging(on : Bool) : async Bool {
+    if (not ownercheck(caller)) { return verboseLogging };
+    verboseLogging := on;
+    verboseLogging;
+  };
+
+  // Memory diagnostic: RTS live-heap vs total Wasm memory (distinguishes a real
+  // leak from a high-water mark), plus per-structure entry counts to find the hog.
+  public query func getMemoryStats() : async {
+    memory_size : Nat;
+    heap_size : Nat;
+    max_live_size : Nat;
+    total_allocation : Nat;
+    reclaimed : Nat;
+    sizes : [(Text, Nat)];
+  } {
+    {
+      memory_size = Prim.rts_memory_size();
+      heap_size = Prim.rts_heap_size();
+      max_live_size = Prim.rts_max_live_size();
+      total_allocation = Prim.rts_total_allocation();
+      reclaimed = Prim.rts_reclaimed();
+      sizes = [
+        ("BlocksDone", Map.size(BlocksDone)),
+        ("AMMpools", Map.size(AMMpools)),
+        ("userLiquidityPositions", Map.size(userLiquidityPositions)),
+        ("poolV3Data", Map.size(poolV3Data)),
+        ("concentratedPositions", Map.size(concentratedPositions)),
+        ("poolDailySnapshots", Map.size(poolDailySnapshots)),
+        ("tradeStorePrivate", Map.size(tradeStorePrivate)),
+        ("tradeStorePublic", Map.size(tradeStorePublic)),
+        ("userSwapHistory", Map.size(userSwapHistory)),
+        ("liqMapSort", Map.size(liqMapSort)),
+        ("liqMapSortForeign", Map.size(liqMapSortForeign)),
+        ("klineDataStorage_buckets", Map.size(klineDataStorage)),
+        ("pool_history_buckets", Map.size(pool_history)),
+        ("referrerFeeMap", Map.size(referrerFeeMap)),
+      ];
+    };
+  };
+
+  // Owner-only manual drain of the BlocksDone backlog (incident tool). Same scoped
+  // logic as cleanupOldTrades: deletes up to batchSize markers older than 30 days,
+  // NEVER touching #ICRC3 tokens (their sole replay guard). Loop from the CLI until
+  // `deleted` hits 0. Returns counts so progress is visible.
+  public shared ({ caller }) func adminPruneBlocksDone(batchSize : Nat) : async {
+    deleted : Nat;
+    skippedICRC3 : Nat;
+    remaining : Nat;
+  } {
+    if (not ownercheck(caller)) {
+      return { deleted = 0; skippedICRC3 = 0; remaining = Map.size(BlocksDone) };
+    };
+    let cutoff = Time.now() - (30 * 24 * 3600 * 1_000_000_000);
+    let toDelete = Vector.new<Text>();
+    var skippedICRC3 = 0;
+    label scan for ((blockKey, timestamp) in Map.entries(BlocksDone)) {
+      if (timestamp >= cutoff) { break scan };
+      let tokenPart = switch (Text.split(blockKey, #char ':').next()) { case (?t) t; case null blockKey };
+      if (returnType(tokenPart) == #ICRC3) { skippedICRC3 += 1; continue scan };
+      if (Vector.size(toDelete) >= batchSize) { break scan };
+      Vector.add(toDelete, blockKey);
+    };
+    for (k in Vector.vals(toDelete)) { Map.delete(BlocksDone, thash, k) };
+    { deleted = Vector.size(toDelete); skippedICRC3; remaining = Map.size(BlocksDone) };
   };
 
   public shared ({ caller }) func claimFeesReferrer() : async [(Text, Nat)] {
@@ -2906,11 +2989,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (isAllowedQuery(caller) != 1 or requests.size() > 20) { return [] };
     let nowVar = Time.now();
 
-    // Snapshot ALL global state mutated by orderPairing so each batch request runs
-    // against the SAME pre-swap pool state — without this, request N is biased by
-    // the cumulative mutations of requests 0..N-1 within the same query call.
-    let initialSnapshot = snapshotQuoteState();
-
+    // Each request wraps its simulations in pair-scoped snapshot/restore so every
+    // request runs against the SAME pre-batch pool state — without this, request N
+    // is biased by the cumulative mutations of requests 0..N-1 within the same call.
     let results = Vector.new<{
       expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
       routeDescription : Text; canFulfillFully : Bool;
@@ -2919,13 +3000,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     }>();
 
     for (req in requests.vals()) {
-      // Restore to the pre-batch state before each request (no-op for first iteration)
-      restoreQuoteState(initialSnapshot);
       let tokenSell = req.tokenSell;
       let tokenBuy = req.tokenBuy;
       let amountSell = req.amountSell;
 
-      if (amountSell == 0) {
+      // Instruction-budget guard: past ~4B of the 5B limit, return empty results for
+      // the remaining requests (result length stays == requests length) instead of
+      // trapping the whole call with IC0522.
+      if (amountSell == 0 or EIC.performanceCounter(0) > 4_000_000_000) {
         Vector.add(results, {
           expectedBuyAmount = 0; fee = 0; priceImpact = 0.0;
           routeDescription = ""; canFulfillFully = false;
@@ -2933,6 +3015,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         });
       } else {
         // ── Mirror of getExpectedReceiveAmount body ──
+        // Pair-scoped snapshot: reverted after the direct sim (leave-clean per request)
+        let directSnapB = snapshotPairsState([(tokenSell, tokenBuy)]);
         // Snapshot pre-swap reserves AND V3 sqrtRatio for accurate price impact
         let preSwapPoolKeyB = getPool(tokenSell, tokenBuy);
         let preSwapReservesB : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKeyB)) {
@@ -2983,11 +3067,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         var multiHopDetails : [HopDetail] = [];
         // Restore BEFORE findRoutes + simulateMultiHop — otherwise route enumeration
         // and simulation read post-direct-swap state, biasing the multi-hop pick.
-        restoreQuoteState(initialSnapshot);
+        restorePairsState(directSnapB);
         let routes = findRoutes(tokenSell, tokenBuy, amountSell);
         label routeSearch for (r in routes.vals()) {
           if (r.hops.size() <= 1) continue routeSearch;
+          let mhSnapB = snapshotPairsState(hopsToPairs(r.hops));
           let sim = simulateMultiHop(r.hops, amountSell, caller);
+          restorePairsState(mhSnapB);
           if (sim.amountOut > expectedBuyAmount) {
             expectedBuyAmount := sim.amountOut;
             totalFee := sim.totalFees;
@@ -3051,17 +3137,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // Used by BOTH the batch endpoint and the new Optimal endpoint so the per-request
   // routing logic lives in one place.
   //
-  // State invariant: caller must have computed `initialSnapshot` via snapshotQuoteState()
-  // and passed it in. Helper calls restoreQuoteState as needed (3 sites — direct route
-  // prep, findRoutes cache miss, before each simulateMultiHop). State is restored
-  // implicitly at end-of-query by the IC; explicit final restore is the caller's
-  // responsibility.
+  // State invariant (leave-clean protocol): caller invokes this with clean state;
+  // every simulation inside is wrapped in a pair-scoped snapshot/restore
+  // (snapshotPairsState/restorePairsState — O(touched pair entries), replacing the
+  // former full-canister restoreQuoteState that blew the 5B instruction limit),
+  // so the helper RETURNS with clean state. Query-only context.
   private func computeQuoteRoutesForRequest(
     tokenSell : Text,
     tokenBuy : Text,
     amountSell : Nat,
     cap : Nat,
-    initialSnapshot : QuoteStateSnapshot,
     findRoutesCache : Map.Map<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>,
     nowVar : Int,
     caller : Principal,
@@ -3092,7 +3177,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let perRequestRoutes = Vector.new<QuoteRoute>();
 
     // ── Route 1: direct (single-hop via orderPairing — AMM + orderbook combined) ──
-    restoreQuoteState(initialSnapshot);
+    let directSnap = snapshotPairsState([(tokenSell, tokenBuy)]);
     let preSwapPoolKey = getPool(tokenSell, tokenBuy);
     let preSwapReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKey)) {
       case (?pool) {
@@ -3155,13 +3240,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         tradingFeeBps = ICPfee;
       });
     };
+    // Revert the direct sim's mutations (AFTER computeBlendedAmmImpact read post-swap state)
+    restorePairsState(directSnap);
 
     // ── Routes 2..N: multi-hop alternatives (each via simulateMultiHop) ──
     let pairKey = tokenSell # "|" # tokenBuy;
     let candidateRoutes : [{ hops : [SwapHop]; estimatedOut : Nat }] = switch (Map.get(findRoutesCache, thash, pairKey)) {
       case (?cached) { cached };
       case null {
-        restoreQuoteState(initialSnapshot);
+        // state is clean here (leave-clean protocol) — no restore needed
         let fresh = findRoutes(tokenSell, tokenBuy, amountSell);
         Map.set(findRoutesCache, thash, pairKey, fresh);
         fresh;
@@ -3172,8 +3259,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     for (r in candidateRoutes.vals()) {
       if (r.hops.size() > 1 and multiHopCounter < multiHopCap) {
         multiHopCounter += 1;
-        restoreQuoteState(initialSnapshot);
+        let mhSnap = snapshotPairsState(hopsToPairs(r.hops));
         let sim = simulateMultiHop(r.hops, amountSell, caller);
+        restorePairsState(mhSnap);
         if (sim.amountOut > 0) {
           var totalMHImpact = 0.0;
           for (hd in sim.hopDetails.vals()) { totalMHImpact += hd.priceImpact };
@@ -3227,7 +3315,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     else if (maxRoutesPerRequest > 10) { 10 }
                     else { maxRoutesPerRequest };
     let nowVar = Time.now();
-    let initialSnapshot = snapshotQuoteState();
 
     type QuoteRoute = {
       expectedBuyAmount : Nat;
@@ -3248,15 +3335,19 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let findRoutesCache = Map.new<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>();
 
     for (req in requests.vals()) {
-      let routes = computeQuoteRoutesForRequest(
-        req.tokenSell, req.tokenBuy, req.amountSell, cap,
-        initialSnapshot, findRoutesCache, nowVar, caller,
-      );
-      Vector.add(allResults, { routes });
+      // Instruction-budget guard: past ~4B of the 5B limit, return empty routes for
+      // the remaining requests (result length stays == requests length) instead of
+      // trapping the whole call with IC0522.
+      if (EIC.performanceCounter(0) > 4_000_000_000) {
+        Vector.add(allResults, { routes = ([] : [QuoteRoute]) });
+      } else {
+        let routes = computeQuoteRoutesForRequest(
+          req.tokenSell, req.tokenBuy, req.amountSell, cap,
+          findRoutesCache, nowVar, caller,
+        );
+        Vector.add(allResults, { routes });
+      };
     };
-
-    // Final restore — defensive; IC reverts at query end anyway.
-    restoreQuoteState(initialSnapshot);
 
     Vector.toArray(allResults);
   };
@@ -3302,7 +3393,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (tokenSell == tokenBuy) { return emptyPlan };
 
     let nowVar = Time.now();
-    let initialSnapshot = snapshotQuoteState();
     let findRoutesCache = Map.new<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>();
 
     // ── Build the 10-fraction probe grid ──
@@ -3314,20 +3404,21 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       hopDetails : [HopDetail]; routeTokens : [Text]; tradingFeeBps : Nat;
     };
     let probeResults = Vector.new<{ bp : Nat; routes : [ProbeRoute] }>();
-    for (i in Iter.range(0, 9)) {
+    label probeGrid for (i in Iter.range(0, 9)) {
+      // Instruction-budget guard: a partial probe grid still yields a valid plan.
+      if (EIC.performanceCounter(0) > 4_000_000_000) { break probeGrid };
       let bp : Nat = (i + 1) * 1000;
       let amount : Nat = (amountIn * bp) / 10000;
       if (amount > 0) {
         let routes = computeQuoteRoutesForRequest(
           tokenSell, tokenBuy, amount, TOP_ROUTES,
-          initialSnapshot, findRoutesCache, nowVar, caller,
+          findRoutesCache, nowVar, caller,
         );
         Vector.add(probeResults, { bp; routes });
       };
     };
 
     if (Vector.size(probeResults) == 0) {
-      restoreQuoteState(initialSnapshot);
       return emptyPlan;
     };
 
@@ -3391,7 +3482,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     if (Vector.size(entries) == 0) {
-      restoreQuoteState(initialSnapshot);
       return emptyPlan;
     };
 
@@ -3547,10 +3637,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     // ── Build response ──
-    // Final restore (defensive — mirrors BatchMulti's trailing restoreQuoteState).
-    // IC query semantics revert state at end-of-message anyway, but explicit
-    // restore keeps in-message state consistent for any subsequent helpers.
-    restoreQuoteState(initialSnapshot);
+    // No restore needed: computeQuoteRoutesForRequest leaves state clean, and IC
+    // query semantics revert everything at end-of-message anyway.
 
     switch (bestPlan) {
       case (?legIndices) {
@@ -3645,7 +3733,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       return { totalOut = 0; perLegOut = []; error = "1-3 splits required" };
     };
 
-    let snap = snapshotQuoteState();
+    // Pair-scoped snapshot over the union of all legs' hop pairs. Legs still
+    // propagate mutations leg→leg (mirrors real swapSplitRoutes execution);
+    // only the call boundary is restored.
+    let snap = snapshotPairsState(Array.flatten(Array.map<{ amountIn : Nat; route : [SwapHop] }, [(Text, Text)]>(splits, func(s) { hopsToPairs(s.route) })));
     var total : Nat = 0;
     var err : Text = "";
     let perLegBuf = Vector.new<Nat>();
@@ -3666,7 +3757,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       total += res.amountOut;
     };
 
-    restoreQuoteState(snap);
+    restorePairsState(snap);
     { totalOut = total; perLegOut = Vector.toArray(perLegBuf); error = err }
   };
 
@@ -6471,12 +6562,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // callers (treasury, DAO entries, owners, registered bot principals) get
   // immediate transfers; regular users continue with the async setTimer
   // queue.
+  // Principals with spam/ban immunity but WITHOUT the immediate-transfer
+  // privilege: they ride the regular 5s treasury queue like normal users.
+  let immediateExcluded : [Principal] = [Principal.fromText("svggt-dmjvr-ucmjh-z7s3t-eivnj-hhe3g-vq6do-jx7ty-72lac-w7lfx-kae")];
   private func isInAllowedCanisters(caller : Principal) : Bool {
+    if (Array.find<Principal>(immediateExcluded, func(t) { t == caller }) != null) return false;
     Array.find<Principal>(allowedCanisters, func(t) { t == caller }) != null;
   };
 
   private func isAllowed(caller : Principal) : Nat {
-    let callerText = Principal.toText(caller);
     let allowed = Array.find<Principal>(allowedCanisters, func(t) { t == caller });
     if (exchangeState == #Frozen and allowed == null) {
       return 0;
@@ -6493,10 +6587,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       dayBan := TrieSet.empty();
       timeStartSpamDayCheck := nowVar;
     };
-    if (callerText.size() < 29 and allowed == null) {
+    // Block only anonymous callers from executing (an unsigned anon caller can't
+    // produce a real deposit anyway). Canister callers — e.g. OpenChat's per-user
+    // canisters — fall through to the spam rate-limiter below; the old
+    // `callerText.size() < 29` gate wrongly blocked every canister.
+    if (Principal.isAnonymous(caller)) {
       return 0;
-    } else if (allowed != null) {
-      return 1;
     };
     let temp = Map.get(spamCheck, phash, caller);
     let num = (if (temp == null) { 0 } else { switch (temp) { case (?t) { t }; case (_) { 0 } } }) + 1;
@@ -6514,8 +6610,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             dayBanRegister := TrieSet.put(dayBanRegister, caller, Principal.hash(caller), Principal.equal);
             return 3;
           } else {
-            allTimeBan := TrieSet.put(allTimeBan, caller, Principal.hash(caller), Principal.equal);
-            return 4;
+            // No auto permanent bans — repeat offenders just get day-banned again.
+            dayBan := TrieSet.put(dayBan, caller, Principal.hash(caller), Principal.equal);
+            return 3;
           };
         } else {
           Map.set(spamCheckOver10, phash, caller, num);
@@ -6535,8 +6632,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           dayBanRegister := TrieSet.put(dayBanRegister, caller, Principal.hash(caller), Principal.equal);
           return 3;
         } else {
-          allTimeBan := TrieSet.put(allTimeBan, caller, Principal.hash(caller), Principal.equal);
-          return 4;
+          // No auto permanent bans — repeat offenders just get day-banned again.
+          dayBan := TrieSet.put(dayBan, caller, Principal.hash(caller), Principal.equal);
+          return 3;
         };
       };
     };
@@ -6901,7 +6999,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   };
 
   private func isAllowedQuery(caller : Principal) : Nat {
-    let callerText = Principal.toText(caller);
     // check if the caller is in the blacklist (dayBan or allTimeBan)
     if (
       (
@@ -6914,12 +7011,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       return 0; // not allowed
     };
 
-    // check for minimum principal length (to prevent certain types of attacks)
-    if (callerText.size() < 29 and Array.indexOf<Principal>(caller, allowedCanisters, Principal.equal) == null and not Principal.isAnonymous(caller) and not test) {
-
-      return 0; // not allowed
-    };
-
+    // Canister callers (27-char principals — e.g. OpenChat's per-user canisters) may
+    // quote. The old `callerText.size() < 29` gate blocked them and returned a fake
+    // "No liquidity" plan; the blacklist check above still applies.
     return 1; // allowed
   };
 
@@ -8246,11 +8340,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       let batchEnd = Nat.min(idx + 5, pending.size());
 
       // Fire up to 5 futures
-      let f0 = if (idx + 0 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 0].identifier, pending[idx + 0].block, pending[idx + 0].tType)) } else { null };
-      let f1 = if (idx + 1 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 1].identifier, pending[idx + 1].block, pending[idx + 1].tType)) } else { null };
-      let f2 = if (idx + 2 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 2].identifier, pending[idx + 2].block, pending[idx + 2].tType)) } else { null };
-      let f3 = if (idx + 3 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 3].identifier, pending[idx + 3].block, pending[idx + 3].tType)) } else { null };
-      let f4 = if (idx + 4 < batchEnd) { ?((with timeout = 65) recoverWronglysent(pending[idx + 4].identifier, pending[idx + 4].block, pending[idx + 4].tType)) } else { null };
+      let f0 = if (idx + 0 < batchEnd) { ?((with timeout = 65) recoverWronglysentFor(caller, pending[idx + 0].identifier, pending[idx + 0].block, pending[idx + 0].tType)) } else { null };
+      let f1 = if (idx + 1 < batchEnd) { ?((with timeout = 65) recoverWronglysentFor(caller, pending[idx + 1].identifier, pending[idx + 1].block, pending[idx + 1].tType)) } else { null };
+      let f2 = if (idx + 2 < batchEnd) { ?((with timeout = 65) recoverWronglysentFor(caller, pending[idx + 2].identifier, pending[idx + 2].block, pending[idx + 2].tType)) } else { null };
+      let f3 = if (idx + 3 < batchEnd) { ?((with timeout = 65) recoverWronglysentFor(caller, pending[idx + 3].identifier, pending[idx + 3].block, pending[idx + 3].tType)) } else { null };
+      let f4 = if (idx + 4 < batchEnd) { ?((with timeout = 65) recoverWronglysentFor(caller, pending[idx + 4].identifier, pending[idx + 4].block, pending[idx + 4].tType)) } else { null };
 
       // Await all in this batch
       let r0 = switch (f0) { case (?f) { try { await f } catch (_) { false } }; case null { false } };
@@ -8592,6 +8686,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (isAllowed(caller) != 1) {
       return false;
     };
+    await recoverWronglysentFor(caller, identifier, Block, tType);
+  };
+
+  // Body of recoverWronglysent with the sender passed explicitly. recoverBatch
+  // must call this (not the shared method): a self-call to a shared function is
+  // a message, so its `caller` becomes the exchange itself — which can never
+  // match the ledger block's sender, and would also receive the refund.
+  private func recoverWronglysentFor(sender : Principal, identifier : Text, Block : Nat, tType : { #ICP; #ICRC12; #ICRC3 }) : async Bool {
     var nowVar = Time.now();
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
     if (Map.has(BlocksDone, thash, identifier # ":" #Nat.toText(Block))) {
@@ -8625,12 +8727,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               case (? #Transfer({ amount; fee; from; to })) {
                 let check_from = Utils.accountToText({ hash = from });
                 let check_to = Utils.accountToText({ hash = to });
-                let from2 = Utils.accountToText(Utils.principalToAccount(caller));
+                let from2 = Utils.accountToText(Utils.principalToAccount(sender));
                 let to2 = Utils.accountToText(Utils.principalToAccount(treasury_principal));
                 if (Text.endsWith(check_from, #text from2) and Text.endsWith(check_to, #text to2)) {
                   try {
                     if (amount.e8s > fee.e8s) {
-                      Vector.add(tempTransferQueueLocal, (#principal(caller), nat64ToNat(amount.e8s) - nat64ToNat(fee.e8s), identifier, genTxId()));
+                      Vector.add(tempTransferQueueLocal, (#principal(sender), nat64ToNat(amount.e8s) - nat64ToNat(fee.e8s), identifier, genTxId()));
                     } else {
                       addFees(identifier, nat64ToNat(amount.e8s), false, "", nowVar);
                     };
@@ -8638,7 +8740,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     Map.delete(BlocksDone, thash, identifier # ":" #Nat.toText(Block));
                     return false;
                   };
-                  if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+                  if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(sender)) } catch (err) { false })) {} else {
                     Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
                   };
                   return true;
@@ -8658,13 +8760,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               case null {};
               case (?fees2) { fees := (fees2) };
             };
-            if (to.owner == treasury_principal and from.owner == caller) {
+            if (to.owner == treasury_principal and from.owner == sender) {
               if (nat64ToInt64(natToNat64(howMuchReceived)) > nat64ToInt64(natToNat64(fees))) {
-                Vector.add(tempTransferQueueLocal, (#principal(caller), howMuchReceived -(fees), identifier, genTxId()));
+                Vector.add(tempTransferQueueLocal, (#principal(sender), howMuchReceived -(fees), identifier, genTxId()));
               } else {
                 addFees(identifier, howMuchReceived, false, "", nowVar);
               };
-              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(sender)) } catch (err) { false })) {} else {
                 Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
               };
               return true;
@@ -8755,13 +8857,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                 switch (to, fee, from, amount) {
                   case (?to, ?fee, ?from, ?howMuchReceived) {
                     var fees : Nat = fee;
-                    if (to.owner == treasury_principal and from.owner == caller) {
+                    if (to.owner == treasury_principal and from.owner == sender) {
                       if (howMuchReceived > fees) {
-                        Vector.add(tempTransferQueueLocal, (#principal(caller), howMuchReceived - fees, identifier, genTxId()));
+                        Vector.add(tempTransferQueueLocal, (#principal(sender), howMuchReceived - fees, identifier, genTxId()));
                       } else {
                         addFees(identifier, howMuchReceived, false, "", nowVar);
                       };
-                      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+                      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(sender)) } catch (err) { false })) {} else {
                         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
                       };
                       return true;
@@ -10543,6 +10645,144 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // 24h volume cache (mirrors AllExchangeInfo.volume_24h)
     volume_24hArray := snap.vol24h;
     AllExchangeInfo := { AllExchangeInfo with volume_24h = snap.vol24h };
+  };
+
+  // ── Pair-scoped quote isolation ──
+  // Captures ONLY the entries a simulation over the given pairs can mutate
+  // (orderPairing / swapWithAMM / updateLastTradedPrice / removeTrade surface).
+  // Restore is O(touched entries) instead of restoreQuoteState's full-canister
+  // rebuild — that full rebuild × one-per-sim is what pushed batch quotes past
+  // the 5B instruction limit as tokens grew. QUERY-context only: the IC discards
+  // query mutations at message end, so these exist purely to isolate successive
+  // sims within one call. Like restoreQuoteState, deliberately does NOT cover
+  // foreignPools/foreignPrivatePools/privateAccessCodes/driftOpTracker/nextTxId.
+  type HistTree = RBTree.Tree<Time, [{ amount_init : Nat; amount_sell : Nat; init_principal : Text; sell_principal : Text; accesscode : Text; token_init_identifier : Text; filledInit : Nat; filledSell : Nat; strictlyOTC : Bool; allOrNothing : Bool }]>;
+
+  type PairStateSnapshot = {
+    amm : [((Text, Text), ?AMMPool)];
+    v3 : [((Text, Text), ?PoolV3Data)];
+    hist : [((Text, Text), ?HistTree)];
+    liqPub : [((Text, Text), ?liqmapsort)];
+    liqFor : [((Text, Text), ?liqmapsort)];
+    tsPub : [(Text, ?TradePrivate)];
+    tsPriv : [(Text, ?TradePrivate)];
+    fees : [(Text, ?Nat)];
+    ltp : [(Nat, Float)];
+    klines : [(KlineKey, ?RBTree.Tree<Int, KlineData>)];
+    vol24h : [Nat];
+    exchVol24h : [Nat];
+    tempQueueSize : Nat;
+  };
+
+  private func hopsToPairs(hops : [SwapHop]) : [(Text, Text)] {
+    Array.map<SwapHop, (Text, Text)>(hops, func(h) { (h.tokenIn, h.tokenOut) });
+  };
+
+  private func snapshotPairsState(pairs : [(Text, Text)]) : PairStateSnapshot {
+    let poolKeys = Vector.new<(Text, Text)>(); // canonical getPool keys, dedup'd
+    let orientKeys = Vector.new<(Text, Text)>(); // both orientations, dedup'd
+    let tokens = Vector.new<Text>();
+    let seenPK = Map.new<(Text, Text), Bool>();
+    let seenOK = Map.new<(Text, Text), Bool>();
+    let seenTok = Map.new<Text, Bool>();
+    for ((a, b) in pairs.vals()) {
+      let pk = getPool(a, b);
+      if (not Map.has(seenPK, hashtt, pk)) { Map.set(seenPK, hashtt, pk, true); Vector.add(poolKeys, pk) };
+      for (k in [(a, b), (b, a)].vals()) {
+        if (not Map.has(seenOK, hashtt, k)) { Map.set(seenOK, hashtt, k, true); Vector.add(orientKeys, k) };
+      };
+      for (t in [a, b].vals()) {
+        if (not Map.has(seenTok, thash, t)) { Map.set(seenTok, thash, t, true); Vector.add(tokens, t) };
+      };
+    };
+
+    let amm = Vector.new<((Text, Text), ?AMMPool)>();
+    let v3 = Vector.new<((Text, Text), ?PoolV3Data)>();
+    let hist = Vector.new<((Text, Text), ?HistTree)>();
+    let klines = Vector.new<(KlineKey, ?RBTree.Tree<Int, KlineData>)>();
+    let ltp = Vector.new<(Nat, Float)>();
+    let timeFrames : [TimeFrame] = [#fivemin, #hour, #fourHours, #day, #week]; // MUST match updateKlineData
+    for (pk in Vector.vals(poolKeys)) {
+      Vector.add(amm, (pk, Map.get(AMMpools, hashtt, pk)));
+      Vector.add(v3, (pk, Map.get(poolV3Data, hashtt, pk)));
+      Vector.add(hist, (pk, Map.get(pool_history, hashtt, pk)));
+      for (tf in timeFrames.vals()) {
+        let kk : KlineKey = (pk.0, pk.1, tf);
+        Vector.add(klines, (kk, Map.get(klineDataStorage, hashkl, kk)));
+      };
+      switch (Map.get(poolIndexMap, hashtt, pk)) {
+        case (?idx) { if (idx < Vector.size(last_traded_price)) { Vector.add(ltp, (idx, Vector.get(last_traded_price, idx))) } };
+        case null {};
+      };
+    };
+
+    let liqPub = Vector.new<((Text, Text), ?liqmapsort)>();
+    let liqFor = Vector.new<((Text, Text), ?liqmapsort)>();
+    let tsPub = Vector.new<(Text, ?TradePrivate)>();
+    let tsPriv = Vector.new<(Text, ?TradePrivate)>();
+    let seenAC = Map.new<Text, Bool>();
+    func captureTradesFromTree(treeOpt : ?liqmapsort) {
+      switch (treeOpt) {
+        case null {};
+        case (?tree) {
+          for ((_, trades) in RBTree.entries(tree)) {
+            for (t in trades.vals()) {
+              if (not Map.has(seenAC, thash, t.accesscode)) {
+                Map.set(seenAC, thash, t.accesscode, true);
+                if (Text.startsWith(t.accesscode, #text "Public")) {
+                  Vector.add(tsPub, (t.accesscode, Map.get(tradeStorePublic, thash, t.accesscode)));
+                } else {
+                  Vector.add(tsPriv, (t.accesscode, Map.get(tradeStorePrivate, thash, t.accesscode)));
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+    for (ok in Vector.vals(orientKeys)) {
+      let lp = Map.get(liqMapSort, hashtt, ok);
+      let lf = Map.get(liqMapSortForeign, hashtt, ok);
+      Vector.add(liqPub, (ok, lp));
+      Vector.add(liqFor, (ok, lf));
+      captureTradesFromTree(lp);
+      captureTradesFromTree(lf);
+    };
+
+    let fees = Vector.new<(Text, ?Nat)>();
+    for (t in Vector.vals(tokens)) { Vector.add(fees, (t, Map.get(feescollectedDAO, thash, t))) };
+
+    {
+      amm = Vector.toArray(amm);
+      v3 = Vector.toArray(v3);
+      hist = Vector.toArray(hist);
+      liqPub = Vector.toArray(liqPub);
+      liqFor = Vector.toArray(liqFor);
+      tsPub = Vector.toArray(tsPub);
+      tsPriv = Vector.toArray(tsPriv);
+      fees = Vector.toArray(fees);
+      ltp = Vector.toArray(ltp);
+      klines = Vector.toArray(klines);
+      vol24h = volume_24hArray; // immutable array — O(1) ref copy
+      exchVol24h = AllExchangeInfo.volume_24h; // idem
+      tempQueueSize = Vector.size(tempTransferQueue);
+    };
+  };
+
+  private func restorePairsState(s : PairStateSnapshot) {
+    for ((k, v) in s.amm.vals()) { switch (v) { case (?x) { Map.set(AMMpools, hashtt, k, x) }; case null { ignore Map.remove(AMMpools, hashtt, k) } } };
+    for ((k, v) in s.v3.vals()) { switch (v) { case (?x) { Map.set(poolV3Data, hashtt, k, x) }; case null { ignore Map.remove(poolV3Data, hashtt, k) } } };
+    for ((k, v) in s.hist.vals()) { switch (v) { case (?x) { Map.set(pool_history, hashtt, k, x) }; case null { ignore Map.remove(pool_history, hashtt, k) } } };
+    for ((k, v) in s.liqPub.vals()) { switch (v) { case (?x) { Map.set(liqMapSort, hashtt, k, x) }; case null { ignore Map.remove(liqMapSort, hashtt, k) } } };
+    for ((k, v) in s.liqFor.vals()) { switch (v) { case (?x) { Map.set(liqMapSortForeign, hashtt, k, x) }; case null { ignore Map.remove(liqMapSortForeign, hashtt, k) } } };
+    for ((k, v) in s.tsPub.vals()) { switch (v) { case (?x) { Map.set(tradeStorePublic, thash, k, x) }; case null { ignore Map.remove(tradeStorePublic, thash, k) } } };
+    for ((k, v) in s.tsPriv.vals()) { switch (v) { case (?x) { Map.set(tradeStorePrivate, thash, k, x) }; case null { ignore Map.remove(tradeStorePrivate, thash, k) } } };
+    for ((k, v) in s.fees.vals()) { switch (v) { case (?x) { Map.set(feescollectedDAO, thash, k, x) }; case null { ignore Map.remove(feescollectedDAO, thash, k) } } };
+    for ((i, f) in s.ltp.vals()) { if (i < Vector.size(last_traded_price)) { Vector.put(last_traded_price, i, f) } };
+    for ((k, v) in s.klines.vals()) { switch (v) { case (?x) { Map.set(klineDataStorage, hashkl, k, x) }; case null { ignore Map.remove(klineDataStorage, hashkl, k) } } };
+    volume_24hArray := s.vol24h;
+    AllExchangeInfo := { AllExchangeInfo with volume_24h = s.exchVol24h };
+    while (Vector.size(tempTransferQueue) > s.tempQueueSize) { ignore Vector.removeLast(tempTransferQueue) };
   };
 
   // Compute the AMM's pool ratio in the same `out/in × 10^60` convention as orderRatio.
@@ -14547,7 +14787,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let balanceFutures = Vector.toArray(balanceFuturesVec);
     var balIdx : Nat = 0;
     for (i in acceptedTokens.vals()) {
-      let raw = await balanceFutures[balIdx];
+      // Unreachable ledger (e.g. IC0207 out of cycles) → treat balance as 0
+      // instead of trapping the whole checkDiffs call. Shows as negative
+      // drift for that token; reclaim (test-mode only) can't fire on 0.
+      let raw = try { await balanceFutures[balIdx] } catch (_) {
+        logger.warn("DRIFT", "checkDiffs: ledger unreachable, balance treated as 0 for " # i, "checkDiffs");
+        0;
+      };
       let pending : Nat = switch (Map.get(pendingByToken, thash, i)) { case (?n) n; case null 0 };
       let adjusted : Nat = if (raw >= pending) { raw - pending } else { 0 };
       Vector.add(balancesVec, innie + adjusted);
@@ -16287,11 +16533,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     recalculateAllActiveLiquidity();
     rebuildPoolIndex();
     checkAndAggregateAllPools();
-    // Reset all bans on every upgrade
+    // Reset all bans AND spam counters on every upgrade — clean slate for callers,
+    // incl. canister integrators (e.g. OpenChat) newly allowed past the caller gate.
     dayBan := TrieSet.empty();
     dayBanRegister := TrieSet.empty();
     allTimeBan := TrieSet.empty();
     warnings := TrieSet.empty();
+    over10 := TrieSet.empty();
+    Map.clear(spamCheck);
+    Map.clear(spamCheckOver10);
   };
 
   // Periodically process tempTransferQueue to avoid tokens getting stuck
@@ -16807,16 +17057,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
         // --- faithfully validate the top-K; keep the BEST that truly executes ---
         let hurdle : Int = calculateFee(sample, ICPfee, RevokeFeeNow) + returnTfees(token);
-        let snap = snapshotQuoteState();
         var bestReal : Int = 0;
         var bestRoute : ?[SwapHop] = null;
         var bestOut : Nat = 0;
         var bestHops : [HopDetail] = [];
         var i = 0;
         while (i < kCount) {
-          restoreQuoteState(snap);
           let route = sorted[i].0;
+          // Pair-scoped isolation per route sim (replaces full-state restore)
+          let routeSnap = snapshotPairsState(hopsToPairs(route));
           let faithful = simulateMultiHop(route, sample, caller);
+          restorePairsState(routeSnap);
           if (faithful.amountOut > sample) {
             let realEff : Int = faithful.amountOut - sample;
             if (realEff > hurdle and realEff > bestReal) {
@@ -16828,7 +17079,6 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           };
           i += 1;
         };
-        restoreQuoteState(snap);
 
         switch (bestRoute) {
           case null { null };
@@ -17369,6 +17619,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
              special : [Nat]);
         #FixStuckTX : () -> (accesscode : Text);
         #Freeze : () -> ();
+        #adminPruneBlocksDone : () -> (batchSize : Nat);
+        #admin_setVerboseLogging : () -> (on : Bool);
+        #getBlocksDoneSize : () -> ();
+        #getVerboseLogging : () -> ();
+        #getMemoryStats : () -> ();
         #addAcceptedToken :
           () ->
             (action : {#Add; #Opposite; #Remove}, added2 : Text,
