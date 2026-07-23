@@ -2999,15 +2999,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       hopDetails : [HopDetail];
     }>();
 
+    // Instruction-budget guard: hard line at ~4.8B of the 5B limit, PLUS an adaptive
+    // check — skip when the remaining budget can't fit 1.5× the most expensive
+    // request measured so far in this call. Skipped requests get empty results so
+    // result length stays == requests length.
+    var maxReqCost : Nat64 = 0;
     for (req in requests.vals()) {
       let tokenSell = req.tokenSell;
       let tokenBuy = req.tokenBuy;
       let amountSell = req.amountSell;
 
-      // Instruction-budget guard: past ~4B of the 5B limit, return empty results for
-      // the remaining requests (result length stays == requests length) instead of
-      // trapping the whole call with IC0522.
-      if (amountSell == 0 or EIC.performanceCounter(0) > 4_000_000_000) {
+      let spent = EIC.performanceCounter(0);
+      if (amountSell == 0 or spent > 4_800_000_000 or spent + maxReqCost + maxReqCost / 2 > 5_000_000_000) {
         Vector.add(results, {
           expectedBuyAmount = 0; fee = 0; priceImpact = 0.0;
           routeDescription = ""; canFulfillFully = false;
@@ -3119,6 +3122,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           potentialOrderDetails = potentialOrderDetails;
           hopDetails = multiHopDetails;
         });
+        let cost = EIC.performanceCounter(0) - spent;
+        if (cost > maxReqCost) { maxReqCost := cost };
       };
     };
 
@@ -3334,11 +3339,15 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // top-cap selection. simulateMultiHop still runs at the actual probe amount.
     let findRoutesCache = Map.new<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>();
 
+    // Instruction-budget guard: hard line at ~4.8B of the 5B limit, PLUS an adaptive
+    // check — skip when the remaining budget can't fit 1.5× the most expensive
+    // request measured so far in this call (a single heavy request can cost >200M,
+    // so a fixed line alone can still trap). Skipped requests get empty routes so
+    // result length stays == requests length.
+    var maxReqCost : Nat64 = 0;
     for (req in requests.vals()) {
-      // Instruction-budget guard: past ~4B of the 5B limit, return empty routes for
-      // the remaining requests (result length stays == requests length) instead of
-      // trapping the whole call with IC0522.
-      if (EIC.performanceCounter(0) > 4_000_000_000) {
+      let spent = EIC.performanceCounter(0);
+      if (spent > 4_800_000_000 or spent + maxReqCost + maxReqCost / 2 > 5_000_000_000) {
         Vector.add(allResults, { routes = ([] : [QuoteRoute]) });
       } else {
         let routes = computeQuoteRoutesForRequest(
@@ -3346,6 +3355,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           findRoutesCache, nowVar, caller,
         );
         Vector.add(allResults, { routes });
+        let cost = EIC.performanceCounter(0) - spent;
+        if (cost > maxReqCost) { maxReqCost := cost };
       };
     };
 
@@ -3404,9 +3415,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       hopDetails : [HopDetail]; routeTokens : [Text]; tradingFeeBps : Nat;
     };
     let probeResults = Vector.new<{ bp : Nat; routes : [ProbeRoute] }>();
+    // Instruction-budget guard: hard line at ~4.8B plus adaptive headroom for 1.5×
+    // the most expensive probe so far — a partial probe grid still yields a valid plan.
+    var maxProbeCost : Nat64 = 0;
     label probeGrid for (i in Iter.range(0, 9)) {
-      // Instruction-budget guard: a partial probe grid still yields a valid plan.
-      if (EIC.performanceCounter(0) > 4_000_000_000) { break probeGrid };
+      let spent = EIC.performanceCounter(0);
+      if (spent > 4_800_000_000 or spent + maxProbeCost + maxProbeCost / 2 > 5_000_000_000) { break probeGrid };
       let bp : Nat = (i + 1) * 1000;
       let amount : Nat = (amountIn * bp) / 10000;
       if (amount > 0) {
@@ -3415,6 +3429,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           findRoutesCache, nowVar, caller,
         );
         Vector.add(probeResults, { bp; routes });
+        let cost = EIC.performanceCounter(0) - spent;
+        if (cost > maxProbeCost) { maxProbeCost := cost };
       };
     };
 
