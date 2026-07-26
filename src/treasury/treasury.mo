@@ -12530,10 +12530,12 @@ shared (deployer) persistent actor class treasury() = this {
             let kongAmount = (amountIn * finalKongPct) / 10000;
             let icpAmount = (amountIn * finalIcpPct) / 10000;
             let neutriniteAmount = (amountIn * finalNeutrinitePct) / 10000;
-            // tacoAmount absorbs the integer-division remainder. Guard the Nat subtraction
-            // against underflow (kong+icp+neutrinite could exceed amountIn only via rounding).
+            // tacoAmount absorbs the integer-division remainder — but only when TACO is
+            // actually in the winning plan. Otherwise a 1-3 e8s rounding remainder becomes
+            // a doomed dust leg on route-less pairs (e.g. ICP/cICP → "no route found" spam).
+            // Guard the Nat subtraction against underflow.
             let kinSum = kongAmount + icpAmount + neutriniteAmount;
-            let tacoAmount = if (amountIn > kinSum) { amountIn - kinSum } else { 0 };
+            let tacoAmount = if (finalTacoPct > 0 and amountIn > kinSum) { amountIn - kinSum } else { 0 };
 
             let kongExpectedOut = if (best.kongPct > 0) { (kong[best.kongIdx].out * finalKongPct) / best.kongPct } else { 0 };
             let icpExpectedOut = if (best.icpPct > 0) { (icp[best.icpIdx].out * finalIcpPct) / best.icpPct } else { 0 };
