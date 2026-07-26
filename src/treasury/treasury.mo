@@ -561,6 +561,11 @@ shared (deployer) persistent actor class treasury() = this {
   // Note: This is a standalone stable var to avoid EOP migration issues
   stable var minAllocationDiffBasisPoints : Nat = 15;
 
+  // Anti-flip: target allocations are only refreshed from the DAO at this interval,
+  // so short-lived allocation flips never reach the trader. Standalone stable vars (EOP-safe).
+  stable var allocationSyncIntervalNS : Nat = 36_000_000_000_000; // 10 hours
+  stable var lastAllocationSyncTime : Int = 0;
+
   // Pair skip: when a pair fails and falls to ICP fallback,
   // skip direct trading for this pair for this duration (nanoseconds)
   // 5 days = 5 * 24 * 3600 * 1_000_000_000
@@ -1681,6 +1686,24 @@ shared (deployer) persistent actor class treasury() = this {
       case null {}; // Keep existing value
     };
 
+    // Validate allocation sync interval (standalone stable var, anti-flip gate)
+    switch (updates.allocationSyncIntervalNS) {
+      case (?value) {
+        let minAllowed = 1_800_000_000_000; // 30 minutes
+        let maxAllowed = 172_800_000_000_000; // 48 hours
+
+        if (value < minAllowed) {
+          validationErrors #= "Allocation sync interval cannot be less than 30 minutes; ";
+        } else if (value > maxAllowed) {
+          validationErrors #= "Allocation sync interval cannot be more than 48 hours; ";
+        } else {
+          allocationSyncIntervalNS := value;
+          hasChanges := true;
+        };
+      };
+      case null {}; // Keep existing value
+    };
+
     // Kong global kill switch (standalone stable var, not in RebalanceConfig)
     switch (updates.kongEnabled) {
       case (?value) {
@@ -1752,6 +1775,7 @@ shared (deployer) persistent actor class treasury() = this {
       longSyncIntervalNS = rebalanceConfig.longSyncIntervalNS;
       tokenSyncTimeoutNS = rebalanceConfig.tokenSyncTimeoutNS;
       minAllocationDiffBasisPoints = minAllocationDiffBasisPoints;
+      allocationSyncIntervalNS = allocationSyncIntervalNS;
     };
   };
 
@@ -2006,6 +2030,7 @@ shared (deployer) persistent actor class treasury() = this {
         longSyncIntervalNS = rebalanceConfig.longSyncIntervalNS;
         tokenSyncTimeoutNS = rebalanceConfig.tokenSyncTimeoutNS;
         minAllocationDiffBasisPoints = minAllocationDiffBasisPoints;
+        allocationSyncIntervalNS = allocationSyncIntervalNS;
       };
     });
   };
@@ -4751,7 +4776,7 @@ shared (deployer) persistent actor class treasury() = this {
 
     // Sync allocations from DAO if empty (e.g., after upgrade or first cycle)
     if (Map.size(currentAllocations) == 0) {
-      await syncFromDAO();
+      await syncFromDAO(true);
     };
 
     // Update balances before any trading decisions
@@ -13637,7 +13662,7 @@ shared (deployer) persistent actor class treasury() = this {
       func() : async () {
         lastShortSyncTime := now();
         try {
-          await syncFromDAO();
+          await syncFromDAO(false);
           // P1-1: Skip if another updateBalances is already in-flight (avoids wasted concurrent ledger queries).
           // Trading cycle and other essential callers do NOT check this flag — they always run.
           if (not isUpdateBalancesRunning()) {
@@ -13690,7 +13715,7 @@ shared (deployer) persistent actor class treasury() = this {
 
     try {
       Debug.print("Debug sync DAO");
-      await syncFromDAO();
+      await syncFromDAO(true);
       Debug.print("Update balances");
       await updateBalances();
       try {
@@ -13820,13 +13845,20 @@ shared (deployer) persistent actor class treasury() = this {
    * Gets the latest target allocations and token metadata
    * from the DAO canister.
    */
-  private func syncFromDAO() : async () {
+  private func syncFromDAO(forceAllocationSync : Bool) : async () {
+    // Anti-flip: only refresh target allocations every allocationSyncIntervalNS
+    // (short-lived allocation flips never reach the trader). Token details always sync.
+    let refreshAllocations = forceAllocationSync
+      or Map.size(currentAllocations) == 0
+      or now() >= lastAllocationSyncTime + allocationSyncIntervalNS;
+
     // Run token details and allocation fetches in parallel
 
     let tokenDetailsFuture = (with timeout = 65) dao.getTokenDetailsWithoutPastPrices();
-    let allocationFuture = (with timeout = 65) dao.getAggregateAllocation();
+    let allocationFuture = if (refreshAllocations) {
+      ?((with timeout = 65) dao.getAggregateAllocation());
+    } else { null };
     let tokenDetailsResult = await tokenDetailsFuture;
-    let allocationResult = await allocationFuture;
     Debug.print("Token details result: " # debug_show (tokenDetailsResult));
     // Update token info map
     for ((principal, details) in tokenDetailsResult.vals()) {
@@ -13873,10 +13905,17 @@ shared (deployer) persistent actor class treasury() = this {
       };
     };
 
-    // Update allocations map
-    Map.clear(currentAllocations);
-    for ((principal, allocation) in allocationResult.vals()) {
-      Map.set(currentAllocations, phash, principal, allocation);
+    // Update allocations map (only when due — see anti-flip gate above)
+    switch (allocationFuture) {
+      case (?future) {
+        let allocationResult = await future;
+        Map.clear(currentAllocations);
+        for ((principal, allocation) in allocationResult.vals()) {
+          Map.set(currentAllocations, phash, principal, allocation);
+        };
+        lastAllocationSyncTime := now();
+      };
+      case null {};
     };
   };
 
@@ -15650,7 +15689,7 @@ public shared ({ caller }) func withdrawAllCyclesToSelf() : async Result.Result<
         func() : async () {
           lastShortSyncTime := now();
           try {
-            await syncFromDAO();
+            await syncFromDAO(false);
             await updateBalances();
             try {
               await* syncPriceWithDEX();

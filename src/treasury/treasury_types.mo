@@ -95,6 +95,7 @@ module {
     longSyncIntervalNS : Nat;
     tokenSyncTimeoutNS : Nat;
     minAllocationDiffBasisPoints : Nat; // Included in response for API compatibility
+    allocationSyncIntervalNS : Nat; // Anti-flip: how often targets refresh from DAO
   };
 
   public type UpdateConfig = {
@@ -112,6 +113,7 @@ module {
     maxPriceHistoryEntries : ?Nat;
     tokenSyncTimeoutNS : ?Nat;
     minAllocationDiffBasisPoints : ?Nat;
+    allocationSyncIntervalNS : ?Nat;
     kongEnabled : ?Bool;
     neutriniteEnabled : ?Bool;
   };

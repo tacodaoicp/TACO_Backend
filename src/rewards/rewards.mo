@@ -377,6 +377,11 @@ shared (deployer) persistent actor class Rewards() = this {
   stable var distributionEnabled : Bool = true;
   stable var performanceScorePower : Float = 1.0; // Power to raise performance scores to (0 = no effect, 1 = linear, 2 = quadratic, etc.)
   stable var votingPowerPower : Float = 1.0; // Power to raise voting power to (0 = no effect, 1 = linear, 2 = quadratic, etc.)
+  // Anti-flip: allocation changes only count from the next checkpoint boundary
+  // (boundaries = periodStart + k * interval). 0 = every change counts immediately (old behavior).
+  stable var allocationCheckpointIntervalNS : Int = 36_000_000_000_000; // 10 hours
+  // Anti-flip safety net: when > 1.0, each segment's portfolio return is clamped to [1/x, x]. 0 = disabled.
+  stable var maxSegmentReturnClamp : Float = 0.0;
 
   // getDistributionStats histogram config (single source of truth for the adaptive window)
   transient let HIST_BIN_WIDTH : Float = 5.0;  // each histogram bin spans 5 percentage points
@@ -622,6 +627,47 @@ shared (deployer) persistent actor class Rewards() = this {
   private transient let daoCanister : DAOCanister = actor (Principal.toText(DAO_ID));
 
   //=========================================================================
+  // Anti-flip helpers
+  //=========================================================================
+
+  // Quantize an allocation-change timestamp UP to the next checkpoint boundary.
+  // Flips made and reverted within one window never affect scoring; anything
+  // captured at a boundary carries a full window of real market exposure.
+  private func quantizeChangeTime(startTime : Int, t : Int) : Int {
+    let interval = allocationCheckpointIntervalNS;
+    if (interval == 0 or t <= startTime) { return t };
+    startTime + (((t - startTime + interval - 1) / interval) * interval);
+  };
+
+  // Append a change to a timeline at its quantized effect time.
+  // Drops changes landing past endTime (they belong to the next period);
+  // when several changes quantize to the same boundary, the latest wins.
+  private func addQuantizedTimelineEntry(
+    buffer : Buffer.Buffer<(Int, [Allocation], ?Principal, ?Text)>,
+    startTime : Int,
+    endTime : Int,
+    changeTime : Int,
+    allocations : [Allocation],
+    maker : ?Principal,
+    reason : ?Text
+  ) {
+    let eff = quantizeChangeTime(startTime, changeTime);
+    if (eff > endTime) { return };
+    if (buffer.size() > 0 and buffer.get(buffer.size() - 1).0 == eff) {
+      ignore buffer.removeLast();
+    };
+    buffer.add((eff, allocations, maker, reason));
+  };
+
+  private func clampSegmentReturn(r : Float) : Float {
+    if (maxSegmentReturnClamp <= 1.0) { return r };
+    if (r > maxSegmentReturnClamp) { return maxSegmentReturnClamp };
+    let lo = 1.0 / maxSegmentReturnClamp;
+    if (r < lo) { return lo };
+    r;
+  };
+
+  //=========================================================================
   // Main Performance Calculation Method
   //=========================================================================
 
@@ -775,9 +821,9 @@ shared (deployer) persistent actor class Rewards() = this {
     };
     timelineBuffer.add((startTime, startAllocation, startMaker, startReason));
 
-    // Add all in-timespan changes with their makers and reasons
+    // Add all in-timespan changes (quantized to anti-flip checkpoint boundaries)
     for (change in allocationData.inTimespanChanges.vals()) {
-      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker, change.reason));
+      addQuantizedTimelineEntry(timelineBuffer, startTime, endTime, change.timestamp, change.newAllocations, ?change.maker, change.reason);
     };
 
     // Add end time if it's different from the last change
@@ -813,6 +859,7 @@ shared (deployer) persistent actor class Rewards() = this {
     
     // Track asset values between checkpoints
     var assetValues = Buffer.Buffer<(Principal, Float)>(10); // (token, current_value)
+    var previousTotalValue : Float = 1.0; // for per-segment clamp
     var previousPrices = Buffer.Buffer<(Principal, Float)>(10); // (token, price)
     
     for (i in timeline.keys()) {
@@ -1071,6 +1118,12 @@ shared (deployer) persistent actor class Rewards() = this {
           // If no previous assets, maintain portfolio value of 1.0 for proper rebalancing
           totalValueAfterPriceChanges := 1.0;
         };
+
+        // Anti-flip safety net: clamp per-segment portfolio move
+        if (maxSegmentReturnClamp > 1.0 and previousTotalValue > 0.0) {
+          totalValueAfterPriceChanges := previousTotalValue * clampSegmentReturn(totalValueAfterPriceChanges / previousTotalValue);
+        };
+        previousTotalValue := totalValueAfterPriceChanges;
         
         // Step 3: Rebalance to new allocations using the updated total value
         // Also build previousPrices for ALL tokens in the new allocation (fixes bug where
@@ -1209,7 +1262,7 @@ shared (deployer) persistent actor class Rewards() = this {
     timelineBuffer.add((startTime, startAllocation, startMaker, startReason));
 
     for (change in allocationData.inTimespanChanges.vals()) {
-      timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker, change.reason));
+      addQuantizedTimelineEntry(timelineBuffer, startTime, endTime, change.timestamp, change.newAllocations, ?change.maker, change.reason);
     };
 
     timelineBuffer.add((endTime, [], null, null));
@@ -1220,6 +1273,7 @@ shared (deployer) persistent actor class Rewards() = this {
     let checkpointsBuffer = Buffer.Buffer<CheckpointData>(timeline.size());
     var assetValues = Buffer.Buffer<(Principal, Float)>(10);
     var previousPrices = Buffer.Buffer<(Principal, Float)>(10);
+    var previousTotalValue : Float = 1.0; // for per-segment clamp
 
     for (i in Iter.range(0, timeline.size() - 2)) {
       let (timestamp, allocations, maker, reason) = timeline[i];
@@ -1334,6 +1388,12 @@ shared (deployer) persistent actor class Rewards() = this {
       } else {
         totalValueAfterPriceChanges := 1.0;
       };
+
+      // Anti-flip safety net: clamp per-segment portfolio move
+      if (maxSegmentReturnClamp > 1.0 and previousTotalValue > 0.0) {
+        totalValueAfterPriceChanges := previousTotalValue * clampSegmentReturn(totalValueAfterPriceChanges / previousTotalValue);
+      };
+      previousTotalValue := totalValueAfterPriceChanges;
 
       // Rebalance to new allocations
       // Also build previousPrices for ALL tokens in the new allocation (fixes bug where
@@ -2681,32 +2741,19 @@ shared (deployer) persistent actor class Rewards() = this {
     };
     timelineBuffer.add((startTime, startAllocation, startMaker, startReason));
 
-    // Add all in-timespan changes
+    // Add all in-timespan changes (quantized to anti-flip checkpoint boundaries)
     for (change in allocationData.inTimespanChanges.vals()) {
       if (change.timestamp > startTime and change.timestamp <= endTime) {
-        timelineBuffer.add((change.timestamp, change.newAllocations, ?change.maker, change.reason));
+        addQuantizedTimelineEntry(timelineBuffer, startTime, endTime, change.timestamp, change.newAllocations, ?change.maker, change.reason);
       };
     };
 
-    // Add end point with final allocation
-    let finalAllocation = if (allocationData.inTimespanChanges.size() > 0) {
-      let lastChange = allocationData.inTimespanChanges[allocationData.inTimespanChanges.size() - 1];
-      lastChange.newAllocations
-    } else {
-      startAllocation
+    // Add end point with final allocation (from last RETAINED entry, so
+    // quantize-dropped changes never leak into the end point)
+    let lastEntry = timelineBuffer.get(timelineBuffer.size() - 1);
+    if (lastEntry.0 != endTime) {
+      timelineBuffer.add((endTime, lastEntry.1, lastEntry.2, lastEntry.3));
     };
-
-    let lastMaker = if (allocationData.inTimespanChanges.size() > 0) {
-      ?allocationData.inTimespanChanges[allocationData.inTimespanChanges.size() - 1].maker
-    } else {
-      startMaker
-    };
-    let lastReason : ?Text = if (allocationData.inTimespanChanges.size() > 0) {
-      allocationData.inTimespanChanges[allocationData.inTimespanChanges.size() - 1].reason
-    } else {
-      startReason
-    };
-    timelineBuffer.add((endTime, finalAllocation, lastMaker, lastReason));
 
     let timeline = Buffer.toArray(timelineBuffer);
 
@@ -2854,7 +2901,7 @@ shared (deployer) persistent actor class Rewards() = this {
         tokenValuesBuffer.add((validAlloc.token, normalizedWeight * validAlloc.endPrice));
         pricesUsedBuffer.add((validAlloc.token, validAlloc.endPriceInfo));
       };
-      cumulativeReturn *= segmentReturn;
+      cumulativeReturn *= clampSegmentReturn(segmentReturn);
 
       // Create checkpoint
       let checkpoint : CheckpointData = {
@@ -3467,6 +3514,41 @@ shared (deployer) persistent actor class Rewards() = this {
     #ok("Voting power power updated");
   };
 
+  // Set anti-flip allocation checkpoint interval (0 = every change counts immediately)
+  public shared ({ caller }) func setAllocationCheckpointInterval(intervalNS: Int) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    if (intervalNS < 0) {
+      return #err(#SystemError("Allocation checkpoint interval must be >= 0"));
+    };
+    if (intervalNS > 604_800_000_000_000) {
+      return #err(#SystemError("Allocation checkpoint interval must be <= 7 days"));
+    };
+    if (recalcInProgress) {
+      return #err(#SystemError("Recalculation in progress; try again later"));
+    };
+    allocationCheckpointIntervalNS := intervalNS;
+    logger.info("Config", "Allocation checkpoint interval set to " # Int.toText(intervalNS) # " ns", "setAllocationCheckpointInterval");
+    #ok("Allocation checkpoint interval updated");
+  };
+
+  // Set anti-flip per-segment return clamp (0 = disabled, else must be > 1.0)
+  public shared ({ caller }) func setMaxSegmentReturnClamp(maxMove: Float) : async Result.Result<Text, RewardsError> {
+    if (not isAdmin(caller)) {
+      return #err(#NotAuthorized);
+    };
+    if (maxMove != 0.0 and maxMove <= 1.0) {
+      return #err(#SystemError("Clamp must be 0 (disabled) or > 1.0"));
+    };
+    if (recalcInProgress) {
+      return #err(#SystemError("Recalculation in progress; try again later"));
+    };
+    maxSegmentReturnClamp := maxMove;
+    logger.info("Config", "Max segment return clamp set to " # Float.toText(maxMove), "setMaxSegmentReturnClamp");
+    #ok("Max segment return clamp updated");
+  };
+
   // Set max distribution history (number of distributions to keep)
   public shared ({ caller }) func setMaxDistributionHistory(max: Nat) : async Result.Result<Text, RewardsError> {
     if (not isAdmin(caller)) {
@@ -3750,6 +3832,8 @@ shared (deployer) persistent actor class Rewards() = this {
     distributionEnabled: Bool;
     performanceScorePower: Float;
     votingPowerPower: Float;
+    allocationCheckpointIntervalNS: Int;
+    maxSegmentReturnClamp: Float;
     timerRunning: Bool;
     nextScheduledDistribution: ?Int;
     lastDistributionTime: Int;
@@ -3769,6 +3853,8 @@ shared (deployer) persistent actor class Rewards() = this {
       distributionEnabled = distributionEnabled;
       performanceScorePower = performanceScorePower;
       votingPowerPower = votingPowerPower;
+      allocationCheckpointIntervalNS = allocationCheckpointIntervalNS;
+      maxSegmentReturnClamp = maxSegmentReturnClamp;
       timerRunning = switch (distributionTimerId) { case (?_) { true }; case null { false } };
       nextScheduledDistribution = nextScheduledDistributionTime;
       lastDistributionTime = lastDistributionTime;
