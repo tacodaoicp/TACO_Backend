@@ -1,0 +1,1598 @@
+{
+  "budgetUsage": [
+    {
+      "budgetICP": "53_448_996_425",
+      "tokenSymbol": "DKP",
+      "usedICP": "39_373_239_942"
+    },
+    {
+      "budgetICP": "227_758_535_515",
+      "tokenSymbol": "ICP",
+      "usedICP": "207_583_791_379"
+    },
+    {
+      "budgetICP": "70_879_950_334",
+      "tokenSymbol": "ckBTC",
+      "usedICP": "68_831_369_872"
+    },
+    {
+      "budgetICP": "184_714_751_372",
+      "tokenSymbol": "TACO",
+      "usedICP": "137_859_139_808"
+    },
+    {
+      "budgetICP": "100_850_519_045",
+      "tokenSymbol": "SNEED",
+      "usedICP": "95_756_909_638"
+    },
+    {
+      "budgetICP": "90_000_639_571",
+      "tokenSymbol": "sGLDT",
+      "usedICP": "68_312_938_303"
+    },
+    {
+      "budgetICP": "38_597_112_227",
+      "tokenSymbol": "CHAT",
+      "usedICP": "24_631_990_753"
+    },
+    {
+      "budgetICP": "24_545_628_973",
+      "tokenSymbol": "CLOWN",
+      "usedICP": "10_894_024_455"
+    },
+    {
+      "budgetICP": "46_867_921_990",
+      "tokenSymbol": "cICP",
+      "usedICP": "44_948_557_154"
+    },
+    {
+      "budgetICP": "3_112_670_340",
+      "tokenSymbol": "ICS",
+      "usedICP": "2_038_378_924"
+    },
+    {
+      "budgetICP": "15_029_751_074",
+      "tokenSymbol": "NTN",
+      "usedICP": "9_948_397_620"
+    },
+    {
+      "budgetICP": "7_737_209_133",
+      "tokenSymbol": "EXE",
+      "usedICP": "5_633_468_470"
+    },
+    {
+      "budgetICP": "4_090_938_162",
+      "tokenSymbol": "ckUSDC",
+      "usedICP": "880_102_882"
+    },
+    {
+      "budgetICP": "1_689_735_327",
+      "tokenSymbol": "ckETH",
+      "usedICP": "1_036_223_791"
+    },
+    {
+      "budgetICP": "4_002_004_724",
+      "tokenSymbol": "MOTOKO",
+      "usedICP": "1_253_908_460"
+    },
+    {
+      "budgetICP": "3_201_603_779",
+      "tokenSymbol": "ckUSDT",
+      "usedICP": "1_203_127_813"
+    },
+    {
+      "budgetICP": "10_938_812_912",
+      "tokenSymbol": "GOLDAO",
+      "usedICP": "2_390_655_983"
+    },
+    {
+      "budgetICP": "1_067_201_259",
+      "tokenSymbol": "OGY",
+      "usedICP": "411_455_975"
+    }
+  ],
+  "config": {
+    "enabled": true,
+    "lpRatioBP": "5_500",
+    "maxAdjustmentsPerCycle": "3",
+    "maxPoolShareBP": "10_000",
+    "minLPValueICP": "100_000_000",
+    "nachosHighVolumeThresholdBP": "500",
+    "nachosRedemptionBufferBP": "1_000",
+    "priceDeviationMaxBP": "30",
+    "rebalanceThresholdBP": "50"
+  },
+  "depositsInFlight": [],
+  "inTransit": [],
+  "lastQueryAgeSeconds": "278",
+  "pendingDepositsCount": "0",
+  "poolConfigs": [
+    {
+      "0": "kknbx-zyaaa-aaaaq-aae4a-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "mxzaz-hqaaa-aaaar-qaada-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ryjl3-tyaaa-aaaaa-aaaba-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "k45jy-aiaaa-aaaaq-aadcq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "2ouva-viaaa-aaaaq-aaamq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ryjl3-tyaaa-aaaaa-aaaba-cai:tyyy3-4aaaa-aaaaq-aab7a-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "f54if-eqaaa-aaaaq-aacea-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "n6tkf-tqaaa-aaaal-qsneq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "iwv6l-6iaaa-aaaal-ajjjq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ryjl3-tyaaa-aaaaa-aaaba-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "lkwrt-vyaaa-aaaaq-aadhq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ca6gz-lqaaa-aaaaq-aacwa-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "rh2pm-ryaaa-aaaan-qeniq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ryjl3-tyaaa-aaaaa-aaaba-cai:xevnm-gaaaa-aaaar-qafnq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "cngnf-vqaaa-aaaar-qag4q-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:kknbx-zyaaa-aaaaq-aae4a-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:kknbx-zyaaa-aaaaq-aae4a-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "kknbx-zyaaa-aaaaq-aae4a-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "kknbx-zyaaa-aaaaq-aae4a-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "mxzaz-hqaaa-aaaar-qaada-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "n6tkf-tqaaa-aaaal-qsneq-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "2ouva-viaaa-aaaaq-aaamq-cai:hvgxa-wqaaa-aaaaq-aacia-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "2ouva-viaaa-aaaaq-aaamq-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "2ouva-viaaa-aaaaq-aaamq-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "2ouva-viaaa-aaaaq-aaamq-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "iwv6l-6iaaa-aaaal-ajjjq-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "iwv6l-6iaaa-aaaal-ajjjq-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "f54if-eqaaa-aaaaq-aacea-cai:hvgxa-wqaaa-aaaaq-aacia-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "f54if-eqaaa-aaaaq-aacea-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "f54if-eqaaa-aaaaq-aacea-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "f54if-eqaaa-aaaaq-aacea-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "mxzaz-hqaaa-aaaar-qaada-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "n6tkf-tqaaa-aaaal-qsneq-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "mxzaz-hqaaa-aaaar-qaada-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "n6tkf-tqaaa-aaaal-qsneq-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ca6gz-lqaaa-aaaaq-aacwa-cai:hvgxa-wqaaa-aaaaq-aacia-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ca6gz-lqaaa-aaaaq-aacwa-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "ca6gz-lqaaa-aaaaq-aacwa-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:k45jy-aiaaa-aaaaq-aadcq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "hvgxa-wqaaa-aaaaq-aacia-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "i2s4q-syaaa-aaaan-qz4sq-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    },
+    {
+      "0": "mxzaz-hqaaa-aaaar-qaada-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "1": {
+        "customLpRatioBP": [],
+        "customMaxPoolShareBP": [],
+        "enabled": true
+      }
+    }
+  ],
+  "positions": [
+    {
+      "backing0": "253_900_073_303_133",
+      "backing1": "20_745_818_087",
+      "firstDeployTimestamp": "1_776_947_524_768_620_386",
+      "lastFeeClaimTimestamp": "1_777_310_419_330_445_217",
+      "liquidity": "2_295_074_014_724",
+      "poolKey": "ryjl3-tyaaa-aaaaa-aaaba-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "shareOfPool": 0.8352338392304535,
+      "token0": "zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "661_847_866_647_979",
+      "totalDeposited1": "53_631_968_871",
+      "totalFeesEarned0": "55_623_637_065",
+      "totalFeesEarned1": "10_162_673",
+      "totalWithdrawn0": "466_291_728_909_763",
+      "totalWithdrawn1": "37_945_074_379",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "674_266",
+      "backing1": "20_251_253_551",
+      "firstDeployTimestamp": "1_776_947_542_018_191_452",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "116_853_519",
+      "poolKey": "mxzaz-hqaaa-aaaar-qaada-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "2_462_166",
+      "totalDeposited1": "70_341_150_928",
+      "totalFeesEarned0": "199",
+      "totalFeesEarned1": "14_428_231",
+      "totalWithdrawn0": "1_550_979",
+      "totalWithdrawn1": "44_190_161_339",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "6_970_770_187_679",
+      "backing1": "72_097_241_570",
+      "firstDeployTimestamp": "1_776_947_559_842_954_592",
+      "lastFeeClaimTimestamp": "1_777_310_420_773_557_419",
+      "liquidity": "708_924_045_407",
+      "poolKey": "kknbx-zyaaa-aaaaq-aae4a-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "kknbx-zyaaa-aaaaq-aae4a-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "15_846_133_710_835",
+      "totalDeposited1": "136_589_421_270",
+      "totalFeesEarned0": "1_394_362_452",
+      "totalFeesEarned1": "19_491_864",
+      "totalWithdrawn0": "8_807_140_594_654",
+      "totalWithdrawn1": "69_157_795_171",
+      "unclaimedFees0": "4_023_728",
+      "unclaimedFees1": "238_963"
+    },
+    {
+      "backing0": "2_743_694_835",
+      "backing1": "30_020_883_136",
+      "firstDeployTimestamp": "1_776_950_025_925_784_226",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "9_075_689_616",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "6_302_820_632",
+      "totalDeposited1": "95_204_989_508",
+      "totalFeesEarned0": "520_989",
+      "totalFeesEarned1": "7_630_710",
+      "totalWithdrawn0": "3_997_095_544",
+      "totalWithdrawn1": "58_589_421_719",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "37_421_390_569",
+      "backing1": "18_367_233_762",
+      "firstDeployTimestamp": "1_776_953_304_217_181_443",
+      "lastFeeClaimTimestamp": "1_777_310_422_122_293_751",
+      "liquidity": "26_216_930_185",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "139_636_462_841",
+      "totalDeposited1": "67_475_047_733",
+      "totalFeesEarned0": "8_324_876",
+      "totalFeesEarned1": "6_049_039",
+      "totalWithdrawn0": "103_394_606_441",
+      "totalWithdrawn1": "48_532_991_398",
+      "unclaimedFees0": "307_929",
+      "unclaimedFees1": "174_890"
+    },
+    {
+      "backing0": "400_715_846_474",
+      "backing1": "9_080_326_842",
+      "firstDeployTimestamp": "1_776_953_320_686_432_439",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "60_321_064_785",
+      "poolKey": "2ouva-viaaa-aaaaq-aaamq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "2ouva-viaaa-aaaaq-aaamq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "1_723_073_363_535",
+      "totalDeposited1": "45_169_030_413",
+      "totalFeesEarned0": "98_011_585",
+      "totalFeesEarned1": "3_450_823",
+      "totalWithdrawn0": "1_363_818_479_190",
+      "totalWithdrawn1": "34_695_396_128",
+      "unclaimedFees0": "1_537_753",
+      "unclaimedFees1": "46_387"
+    },
+    {
+      "backing0": "376_679_398_218_141",
+      "backing1": "5_722_169_086",
+      "firstDeployTimestamp": "1_776_953_727_416_376_428",
+      "lastFeeClaimTimestamp": "1_777_310_424_074_334_960",
+      "liquidity": "1_468_135_963_670",
+      "poolKey": "iwv6l-6iaaa-aaaal-ajjjq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "1_015_073_208_777_004",
+      "totalDeposited1": "26_803_749_746",
+      "totalFeesEarned0": "62_319_128_271",
+      "totalFeesEarned1": "2_904_413",
+      "totalWithdrawn0": "820_879_456_806_721",
+      "totalWithdrawn1": "17_590_201_109",
+      "unclaimedFees0": "2_281_241_054",
+      "unclaimedFees1": "5_351"
+    },
+    {
+      "backing0": "21_101_823_082",
+      "backing1": "13_059_127_858",
+      "firstDeployTimestamp": "1_776_954_131_330_134_840",
+      "lastFeeClaimTimestamp": "1_777_310_424_905_706_078",
+      "liquidity": "16_600_343_541",
+      "poolKey": "n6tkf-tqaaa-aaaal-qsneq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "43_070_113_984",
+      "totalDeposited1": "26_216_505_579",
+      "totalFeesEarned0": "2_322_836",
+      "totalFeesEarned1": "2_206_341",
+      "totalWithdrawn0": "25_216_345_161",
+      "totalWithdrawn1": "17_761_084_450",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "1_096_738_046_474",
+      "backing1": "1_209_176_025",
+      "firstDeployTimestamp": "1_776_954_560_035_209_850",
+      "lastFeeClaimTimestamp": "1_776_959_128_402_220_362",
+      "liquidity": "36_416_333_589",
+      "poolKey": "ca6gz-lqaaa-aaaaq-aacwa-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "ca6gz-lqaaa-aaaaq-aacwa-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "5_305_256_864_519",
+      "totalDeposited1": "6_292_573_209",
+      "totalFeesEarned0": "75_002_730",
+      "totalFeesEarned1": "118_666",
+      "totalWithdrawn0": "4_325_004_428_005",
+      "totalWithdrawn1": "5_208_703_984",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "9_752_181_897",
+      "backing1": "5_820_664_507",
+      "firstDeployTimestamp": "1_776_955_313_073_538_107",
+      "lastFeeClaimTimestamp": "1_776_959_128_948_500_027",
+      "liquidity": "7_534_200_624",
+      "poolKey": "f54if-eqaaa-aaaaq-aacea-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "f54if-eqaaa-aaaaq-aacea-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "24_094_903_681",
+      "totalDeposited1": "16_689_215_252",
+      "totalFeesEarned0": "1_132_407",
+      "totalFeesEarned1": "1_286_465",
+      "totalWithdrawn0": "14_577_448_798",
+      "totalWithdrawn1": "10_584_137_228",
+      "unclaimedFees0": "8_490",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "62_309_788_004",
+      "backing1": "2_948_020_395",
+      "firstDeployTimestamp": "1_776_955_322_418_517_448",
+      "lastFeeClaimTimestamp": "1_776_959_129_376_941_347",
+      "liquidity": "13_553_247_799",
+      "poolKey": "rh2pm-ryaaa-aaaan-qeniq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 0.10893971096969592,
+      "token0": "rh2pm-ryaaa-aaaan-qeniq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "131_334_199_863",
+      "totalDeposited1": "5_943_409_073",
+      "totalFeesEarned0": "3_253_472",
+      "totalFeesEarned1": "282_117",
+      "totalWithdrawn0": "96_319_155_754",
+      "totalWithdrawn1": "4_245_072_093",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "942_415_104",
+      "backing1": "19_404_664",
+      "firstDeployTimestamp": "1_776_956_033_175_300_459",
+      "lastFeeClaimTimestamp": "1_776_959_130_378_581_045",
+      "liquidity": "135_230_354",
+      "poolKey": "ryjl3-tyaaa-aaaaa-aaaba-cai:xevnm-gaaaa-aaaar-qafnq-cai",
+      "shareOfPool": 1.0,
+      "token0": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "token1": "xevnm-gaaaa-aaaar-qafnq-cai",
+      "totalDeposited0": "4_777_077_176",
+      "totalDeposited1": "72_927_042",
+      "totalFeesEarned0": "1_458_325",
+      "totalFeesEarned1": "28_618",
+      "totalWithdrawn0": "4_071_501_191",
+      "totalWithdrawn1": "39_034_833",
+      "unclaimedFees0": "176_530",
+      "unclaimedFees1": "2_698"
+    },
+    {
+      "backing0": "7_519_414_547_666_290",
+      "backing1": "656_759_795",
+      "firstDeployTimestamp": "1_776_956_680_804_954_588",
+      "lastFeeClaimTimestamp": "1_776_959_130_944_358_639",
+      "liquidity": "2_222_262_171_684",
+      "poolKey": "ryjl3-tyaaa-aaaaa-aaaba-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "shareOfPool": 1.0,
+      "token0": "ss2fx-dyaaa-aaaar-qacoq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "80_483_396_485_406_340",
+      "totalDeposited1": "6_175_154_914",
+      "totalFeesEarned0": "22_300_439_719_272",
+      "totalFeesEarned1": "1_914_680",
+      "totalWithdrawn0": "74_273_206_742_374_263",
+      "totalWithdrawn1": "5_648_433_486",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "362_314_331_256",
+      "backing1": "899_222_428",
+      "firstDeployTimestamp": "1_776_956_699_508_781_928",
+      "lastFeeClaimTimestamp": "1_777_310_429_697_208_673",
+      "liquidity": "18_049_963_238",
+      "poolKey": "k45jy-aiaaa-aaaaq-aadcq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "k45jy-aiaaa-aaaaq-aadcq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "1_100_148_205_190",
+      "totalDeposited1": "2_993_914_262",
+      "totalFeesEarned0": "125_114_266",
+      "totalFeesEarned1": "474_642",
+      "totalWithdrawn0": "802_159_056_256",
+      "totalWithdrawn1": "2_153_897_898",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "12_963"
+    },
+    {
+      "backing0": "26_626_119",
+      "backing1": "1_184_877_808",
+      "firstDeployTimestamp": "1_776_958_150_017_924_933",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "177_619_532",
+      "poolKey": "cngnf-vqaaa-aaaar-qag4q-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "cngnf-vqaaa-aaaar-qag4q-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "98_697_890",
+      "totalDeposited1": "3_870_079_131",
+      "totalFeesEarned0": "7_931",
+      "totalFeesEarned1": "506_712",
+      "totalWithdrawn0": "70_911_394",
+      "totalWithdrawn1": "2_732_251_060",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "1_470_629_911_209",
+      "backing1": "2_477_524_267",
+      "firstDeployTimestamp": "1_776_958_167_588_913_916",
+      "lastFeeClaimTimestamp": "1_776_959_133_868_750_428",
+      "liquidity": "60_361_587_896",
+      "poolKey": "ryjl3-tyaaa-aaaaa-aaaba-cai:tyyy3-4aaaa-aaaaq-aab7a-cai",
+      "shareOfPool": 1.0,
+      "token0": "tyyy3-4aaaa-aaaaq-aab7a-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "9_867_515_020_434",
+      "totalDeposited1": "13_654_172_609",
+      "totalFeesEarned0": "377_905_226",
+      "totalFeesEarned1": "2_225_972",
+      "totalWithdrawn0": "7_878_717_925_057",
+      "totalWithdrawn1": "12_170_019_476",
+      "unclaimedFees0": "20_442_581",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "1_094_559_803_226",
+      "backing1": "417_388_785",
+      "firstDeployTimestamp": "1_776_958_819_146_315_169",
+      "lastFeeClaimTimestamp": "1_776_980_760_774_189_139",
+      "liquidity": "21_374_213_139",
+      "poolKey": "lkwrt-vyaaa-aaaaq-aadhq-cai:ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "shareOfPool": 1.0,
+      "token0": "lkwrt-vyaaa-aaaaq-aadhq-cai",
+      "token1": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "totalDeposited0": "3_152_647_054_330",
+      "totalDeposited1": "1_047_223_006",
+      "totalFeesEarned0": "117_619_965",
+      "totalFeesEarned1": "63_360",
+      "totalWithdrawn0": "2_136_765_139_175",
+      "totalWithdrawn1": "731_289_204",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "1_038_229_538_315",
+      "backing1": "17_114_630_275",
+      "firstDeployTimestamp": "1_778_626_603_568_890_447",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "133_300_092_608",
+      "poolKey": "kknbx-zyaaa-aaaaq-aae4a-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "shareOfPool": 0.08515282485649525,
+      "token0": "kknbx-zyaaa-aaaaq-aae4a-cai",
+      "token1": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "totalDeposited0": "1_826_888_752_766",
+      "totalDeposited1": "4_859_463_498",
+      "totalFeesEarned0": "50_047_165",
+      "totalFeesEarned1": "872_987",
+      "totalWithdrawn0": "1_297_496_318_894",
+      "totalWithdrawn1": "3_806_731_146",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "8_528"
+    },
+    {
+      "backing0": "1_606_103_638_348",
+      "backing1": "543_783",
+      "firstDeployTimestamp": "1_778_626_622_434_909_207",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "934_544_447",
+      "poolKey": "kknbx-zyaaa-aaaaq-aae4a-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "shareOfPool": 1.0,
+      "token0": "kknbx-zyaaa-aaaaq-aae4a-cai",
+      "token1": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "totalDeposited0": "3_984_409_662_701",
+      "totalDeposited1": "1_709_746",
+      "totalFeesEarned0": "608_720_441",
+      "totalFeesEarned1": "76",
+      "totalWithdrawn0": "2_496_282_017_501",
+      "totalWithdrawn1": "1_027_585",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "821_893_082",
+      "backing1": "298_843",
+      "firstDeployTimestamp": "1_778_626_641_467_429_895",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "15_672_185",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "totalDeposited0": "2_100_398_628",
+      "totalDeposited1": "1_064_638",
+      "totalFeesEarned0": "354_900",
+      "totalFeesEarned1": "29",
+      "totalWithdrawn0": "1_480_524_052",
+      "totalWithdrawn1": "678_737",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "2_233_712_467",
+      "backing1": "2_400_327_331_701",
+      "firstDeployTimestamp": "1_778_629_323_882_350_495",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "73_223_227_784",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:kknbx-zyaaa-aaaaq-aae4a-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "kknbx-zyaaa-aaaaq-aae4a-cai",
+      "totalDeposited0": "4_963_295_651",
+      "totalDeposited1": "6_074_886_536_536",
+      "totalFeesEarned0": "345_518",
+      "totalFeesEarned1": "326_939_177",
+      "totalWithdrawn0": "2_997_224_466",
+      "totalWithdrawn1": "3_338_627_961_584",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "762_060_679",
+      "backing1": "17_085_679_311",
+      "firstDeployTimestamp": "1_778_629_332_896_969_053",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "3_608_368_661",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "totalDeposited0": "1_869_341_613",
+      "totalDeposited1": "58_281_706_164",
+      "totalFeesEarned0": "143_363",
+      "totalFeesEarned1": "2_741_353",
+      "totalWithdrawn0": "1_247_241_526",
+      "totalWithdrawn1": "36_933_814_210",
+      "unclaimedFees0": "6_137",
+      "unclaimedFees1": "135_614"
+    },
+    {
+      "backing0": "16_176_097_468",
+      "backing1": "265_709",
+      "firstDeployTimestamp": "1_778_629_720_751_075_746",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "65_560_187",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "totalDeposited0": "38_937_807_631",
+      "totalDeposited1": "648_797",
+      "totalFeesEarned0": "2_889_195",
+      "totalFeesEarned1": "4",
+      "totalWithdrawn0": "22_955_298_052",
+      "totalWithdrawn1": "380_220",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "31_336_250_275",
+      "backing1": "1_506_826_317_800",
+      "firstDeployTimestamp": "1_778_629_731_823_681_253",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "217_297_691_235",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:kknbx-zyaaa-aaaaq-aae4a-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "kknbx-zyaaa-aaaaq-aae4a-cai",
+      "totalDeposited0": "103_434_255_914",
+      "totalDeposited1": "3_938_318_303_417",
+      "totalFeesEarned0": "3_826_433",
+      "totalFeesEarned1": "356_170_895",
+      "totalWithdrawn0": "68_071_443_879",
+      "totalWithdrawn1": "2_598_120_070_828",
+      "unclaimedFees0": "53_000",
+      "unclaimedFees1": "760_512"
+    },
+    {
+      "backing0": "647_948_130",
+      "backing1": "86_341_427_089_336",
+      "firstDeployTimestamp": "1_778_630_150_797_405_844",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "236_526_459_893",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "totalDeposited0": "1_914_650_843",
+      "totalDeposited1": "319_786_441_813_634",
+      "totalFeesEarned0": "296_140",
+      "totalFeesEarned1": "23_829_120_030",
+      "totalWithdrawn0": "1_372_186_957",
+      "totalWithdrawn1": "218_012_330_892_345",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "7_967_451_928",
+      "backing1": "47_731_651_607_972",
+      "firstDeployTimestamp": "1_778_630_517_899_112_215",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "616_684_392_255",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "totalDeposited0": "28_938_957_221",
+      "totalDeposited1": "159_409_700_026_371",
+      "totalFeesEarned0": "2_521_291",
+      "totalFeesEarned1": "12_480_195_662",
+      "totalWithdrawn0": "20_386_888_393",
+      "totalWithdrawn1": "114_894_465_912_358",
+      "unclaimedFees0": "270_419",
+      "unclaimedFees1": "1_214_356_275"
+    },
+    {
+      "backing0": "158_828",
+      "backing1": "57_824_479_719_557",
+      "firstDeployTimestamp": "1_778_630_534_339_358_606",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "3_030_540_275",
+      "poolKey": "mxzaz-hqaaa-aaaar-qaada-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "shareOfPool": 1.0,
+      "token0": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "token1": "zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "totalDeposited0": "463_094",
+      "totalDeposited1": "166_976_692_705_498",
+      "totalFeesEarned0": "31",
+      "totalFeesEarned1": "29_538_988_062",
+      "totalWithdrawn0": "234_000",
+      "totalWithdrawn1": "85_643_390_837_315",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "222_894_041_704",
+      "backing1": "463_113_806",
+      "firstDeployTimestamp": "1_778_630_558_211_619_407",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "10_159_985_630",
+      "poolKey": "2ouva-viaaa-aaaaq-aaamq-cai:hvgxa-wqaaa-aaaaq-aacia-cai",
+      "shareOfPool": 1.0,
+      "token0": "2ouva-viaaa-aaaaq-aaamq-cai",
+      "token1": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "totalDeposited0": "682_161_198_086",
+      "totalDeposited1": "1_250_076_643",
+      "totalFeesEarned0": "51_127_013",
+      "totalFeesEarned1": "97_933",
+      "totalWithdrawn0": "428_131_566_879",
+      "totalWithdrawn1": "836_387_507",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "528_436_728",
+      "backing1": "9_320_138_125",
+      "firstDeployTimestamp": "1_778_630_942_197_006_372",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "2_219_257_375",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "totalDeposited0": "913_415_087",
+      "totalDeposited1": "15_037_108_100",
+      "totalFeesEarned0": "34_613",
+      "totalFeesEarned1": "838_103",
+      "totalWithdrawn0": "400_819_001",
+      "totalWithdrawn1": "6_025_071_984",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "10_412_685_380",
+      "backing1": "8_286_655_096",
+      "firstDeployTimestamp": "1_778_630_954_197_562_252",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "9_289_043_674",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "totalDeposited0": "21_202_609_172",
+      "totalDeposited1": "12_248_742_803",
+      "totalFeesEarned0": "477_736",
+      "totalFeesEarned1": "425_214",
+      "totalWithdrawn0": "9_585_252_175",
+      "totalWithdrawn1": "4_682_479_712",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "195_313_003_907",
+      "backing1": "9_076_975_297",
+      "firstDeployTimestamp": "1_778_630_964_300_550_736",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "42_105_240_905",
+      "poolKey": "2ouva-viaaa-aaaaq-aaamq-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "shareOfPool": 1.0,
+      "token0": "2ouva-viaaa-aaaaq-aaamq-cai",
+      "token1": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "totalDeposited0": "418_474_775_308",
+      "totalDeposited1": "23_067_505_316",
+      "totalFeesEarned0": "34_040_209",
+      "totalFeesEarned1": "1_174_700",
+      "totalWithdrawn0": "240_214_674_342",
+      "totalWithdrawn1": "13_076_913_545",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "2_284"
+    },
+    {
+      "backing0": "134_039",
+      "backing1": "6_581_957_185",
+      "firstDeployTimestamp": "1_778_631_340_578_800_348",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "29_702_598",
+      "poolKey": "mxzaz-hqaaa-aaaar-qaada-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "shareOfPool": 1.0,
+      "token0": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "token1": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "totalDeposited0": "328_354",
+      "totalDeposited1": "12_013_305_430",
+      "totalFeesEarned0": "1",
+      "totalFeesEarned1": "1_092_183",
+      "totalWithdrawn0": "159_205",
+      "totalWithdrawn1": "6_695_143_765",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "151_468_866_826",
+      "backing1": "114_140",
+      "firstDeployTimestamp": "1_778_631_359_115_504_703",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "131_486_419",
+      "poolKey": "2ouva-viaaa-aaaaq-aaamq-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "shareOfPool": 1.0,
+      "token0": "2ouva-viaaa-aaaaq-aaamq-cai",
+      "token1": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "totalDeposited0": "408_169_810_189",
+      "totalDeposited1": "383_124",
+      "totalFeesEarned0": "69_760_712",
+      "totalFeesEarned1": "17",
+      "totalWithdrawn0": "214_515_738_506",
+      "totalWithdrawn1": "189_555",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "4_936_918_964",
+      "backing1": "36_954_206_739_312",
+      "firstDeployTimestamp": "1_778_631_378_465_730_049",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "427_129_867_926",
+      "poolKey": "n6tkf-tqaaa-aaaal-qsneq-cai:zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "shareOfPool": 1.0,
+      "token0": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "token1": "zfcdd-tqaaa-aaaaq-aaaga-cai",
+      "totalDeposited0": "9_084_473_183",
+      "totalDeposited1": "102_114_388_107_581",
+      "totalFeesEarned0": "1_157_660",
+      "totalFeesEarned1": "3_415_938_316",
+      "totalWithdrawn0": "5_087_249_409",
+      "totalWithdrawn1": "57_576_440_386_947",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "12_992_291"
+    },
+    {
+      "backing0": "207_629_040",
+      "backing1": "149_982_027_204_185",
+      "firstDeployTimestamp": "1_778_631_763_907_283_005",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "176_467_063_043",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "totalDeposited0": "703_862_803",
+      "totalDeposited1": "388_179_060_683_002",
+      "totalFeesEarned0": "50_503",
+      "totalFeesEarned1": "19_928_635_763",
+      "totalWithdrawn0": "461_834_406",
+      "totalWithdrawn1": "259_172_847_266_800",
+      "unclaimedFees0": "1_530",
+      "unclaimedFees1": "2_180_287_914"
+    },
+    {
+      "backing0": "2_031_086_136",
+      "backing1": "66_237_019_068_184",
+      "firstDeployTimestamp": "1_778_631_778_214_847_137",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "366_787_528_604",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "totalDeposited0": "11_768_796_445",
+      "totalDeposited1": "191_632_527_429_638",
+      "totalFeesEarned0": "749_952",
+      "totalFeesEarned1": "19_409_692_823",
+      "totalWithdrawn0": "8_579_002_265",
+      "totalWithdrawn1": "150_340_683_723_361",
+      "unclaimedFees0": "22_556",
+      "unclaimedFees1": "4_161_082_698"
+    },
+    {
+      "backing0": "91_522_998_178_616",
+      "backing1": "45_987",
+      "firstDeployTimestamp": "1_778_631_802_168_646_764",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "2_051_572_066",
+      "poolKey": "iwv6l-6iaaa-aaaal-ajjjq-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "shareOfPool": 1.0,
+      "token0": "iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "token1": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "totalDeposited0": "217_899_343_462_489",
+      "totalDeposited1": "214_884",
+      "totalFeesEarned0": "27_618_304_066",
+      "totalFeesEarned1": "2",
+      "totalWithdrawn0": "160_294_298_090_457",
+      "totalWithdrawn1": "142_502",
+      "unclaimedFees0": "12_489_766_115",
+      "unclaimedFees1": "1"
+    },
+    {
+      "backing0": "3_299_680_972",
+      "backing1": "180_148_416",
+      "firstDeployTimestamp": "1_778_632_191_854_244_984",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "770_994_359",
+      "poolKey": "f54if-eqaaa-aaaaq-aacea-cai:hvgxa-wqaaa-aaaaq-aacia-cai",
+      "shareOfPool": 1.0,
+      "token0": "f54if-eqaaa-aaaaq-aacea-cai",
+      "token1": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "totalDeposited0": "8_287_981_240",
+      "totalDeposited1": "398_475_680",
+      "totalFeesEarned0": "443_768",
+      "totalFeesEarned1": "35_842",
+      "totalWithdrawn0": "4_574_017_348",
+      "totalWithdrawn1": "232_524_236",
+      "unclaimedFees0": "15_228",
+      "unclaimedFees1": "525"
+    },
+    {
+      "backing0": "2_958_043_564",
+      "backing1": "3_459_214_354",
+      "firstDeployTimestamp": "1_778_632_202_018_117_270",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "3_198_828_967",
+      "poolKey": "f54if-eqaaa-aaaaq-aacea-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "shareOfPool": 1.0,
+      "token0": "f54if-eqaaa-aaaaq-aacea-cai",
+      "token1": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "totalDeposited0": "5_615_428_759",
+      "totalDeposited1": "8_278_981_894",
+      "totalFeesEarned0": "341_993",
+      "totalFeesEarned1": "458_517",
+      "totalWithdrawn0": "2_807_705_298",
+      "totalWithdrawn1": "4_639_024_779",
+      "unclaimedFees0": "25_867",
+      "unclaimedFees1": "8_939"
+    },
+    {
+      "backing0": "97_596_282_840",
+      "backing1": "3_601_376_019",
+      "firstDeployTimestamp": "1_778_632_219_342_058_057",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "18_747_824_210",
+      "poolKey": "2ouva-viaaa-aaaaq-aaamq-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "shareOfPool": 1.0,
+      "token0": "2ouva-viaaa-aaaaq-aaamq-cai",
+      "token1": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "totalDeposited0": "237_403_150_198",
+      "totalDeposited1": "6_966_226_844",
+      "totalFeesEarned0": "3_043_277",
+      "totalFeesEarned1": "210_562",
+      "totalWithdrawn0": "127_313_997_876",
+      "totalWithdrawn1": "3_844_464_964",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "2_224_663_348",
+      "backing1": "44_354",
+      "firstDeployTimestamp": "1_778_632_615_193_526_912",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "9_933_424",
+      "poolKey": "f54if-eqaaa-aaaaq-aacea-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "shareOfPool": 1.0,
+      "token0": "f54if-eqaaa-aaaaq-aacea-cai",
+      "token1": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "totalDeposited0": "4_577_698_154",
+      "totalDeposited1": "119_834",
+      "totalFeesEarned0": "622_918",
+      "totalFeesEarned1": "2",
+      "totalWithdrawn0": "1_850_268_948",
+      "totalWithdrawn1": "49_225",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "56_668_656_469_404",
+      "backing1": "1_387_260_417",
+      "firstDeployTimestamp": "1_778_632_639_398_271_663",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "280_382_210_624",
+      "poolKey": "iwv6l-6iaaa-aaaal-ajjjq-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "shareOfPool": 1.0,
+      "token0": "iwv6l-6iaaa-aaaal-ajjjq-cai",
+      "token1": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "totalDeposited0": "116_271_812_206_950",
+      "totalDeposited1": "3_291_126_355",
+      "totalFeesEarned0": "5_949_227_257",
+      "totalFeesEarned1": "247_514",
+      "totalWithdrawn0": "65_578_028_030_090",
+      "totalWithdrawn1": "1_830_404_261",
+      "unclaimedFees0": "1_804_643_371",
+      "unclaimedFees1": "7_151"
+    },
+    {
+      "backing0": "953_027_314",
+      "backing1": "920_550_025",
+      "firstDeployTimestamp": "1_778_632_660_432_246_120",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "936_647_916",
+      "poolKey": "f54if-eqaaa-aaaaq-aacea-cai:n6tkf-tqaaa-aaaal-qsneq-cai",
+      "shareOfPool": 1.0,
+      "token0": "f54if-eqaaa-aaaaq-aacea-cai",
+      "token1": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "totalDeposited0": "2_546_057_907",
+      "totalDeposited1": "1_949_423_841",
+      "totalFeesEarned0": "210_344",
+      "totalFeesEarned1": "179_490",
+      "totalWithdrawn0": "1_487_809_845",
+      "totalWithdrawn1": "1_164_812_566",
+      "unclaimedFees0": "30_352",
+      "unclaimedFees1": "28_747"
+    },
+    {
+      "backing0": "10_988_704",
+      "backing1": "1_414_670_085_219_397",
+      "firstDeployTimestamp": "1_778_633_005_868_360_797",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "124_681_161_727",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "ss2fx-dyaaa-aaaar-qacoq-cai",
+      "totalDeposited0": "125_429_369",
+      "totalDeposited1": "25_801_760_462_560_708",
+      "totalFeesEarned0": "63_511",
+      "totalFeesEarned1": "9_728_085_558_903",
+      "totalWithdrawn0": "119_888_380",
+      "totalWithdrawn1": "23_237_853_684_280_954",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "41_643_504_833"
+    },
+    {
+      "backing0": "248_572_813",
+      "backing1": "1_463_660_055_296_987",
+      "firstDeployTimestamp": "1_778_633_015_436_405_619",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "603_179_987_588",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "ss2fx-dyaaa-aaaar-qacoq-cai",
+      "totalDeposited0": "2_915_829_578",
+      "totalDeposited1": "17_856_451_662_242_047",
+      "totalFeesEarned0": "146_018",
+      "totalFeesEarned1": "616_911_242_673",
+      "totalWithdrawn0": "2_671_517_641",
+      "totalWithdrawn1": "16_386_779_122_473_658",
+      "unclaimedFees0": "12_008",
+      "unclaimedFees1": "72_795_567_599"
+    },
+    {
+      "backing0": "2_013",
+      "backing1": "728_040_202_292_860",
+      "firstDeployTimestamp": "1_778_633_031_618_146_155",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "1_210_868_510",
+      "poolKey": "mxzaz-hqaaa-aaaar-qaada-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "shareOfPool": 1.0,
+      "token0": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "token1": "ss2fx-dyaaa-aaaar-qacoq-cai",
+      "totalDeposited0": "40_047",
+      "totalDeposited1": "14_296_558_894_441_493",
+      "totalFeesEarned0": "0",
+      "totalFeesEarned1": "1_241_257_599_649",
+      "totalWithdrawn0": "37_906",
+      "totalWithdrawn1": "13_525_647_093_066_041",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "1_263_293_108",
+      "backing1": "13_104_282_618",
+      "firstDeployTimestamp": "1_778_633_699_171_209_981",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "4_068_728_293",
+      "poolKey": "i2s4q-syaaa-aaaan-qz4sq-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "shareOfPool": 1.0,
+      "token0": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "token1": "rh2pm-ryaaa-aaaan-qeniq-cai",
+      "totalDeposited0": "3_274_050_514",
+      "totalDeposited1": "28_900_733_789",
+      "totalFeesEarned0": "79_171",
+      "totalFeesEarned1": "964_117",
+      "totalWithdrawn0": "1_914_295_402",
+      "totalWithdrawn1": "16_723_302_116",
+      "unclaimedFees0": "3_794",
+      "unclaimedFees1": "168_909"
+    },
+    {
+      "backing0": "92_118_282",
+      "backing1": "21_058_316_365",
+      "firstDeployTimestamp": "1_778_633_714_980_607_446",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "1_392_787_107",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "rh2pm-ryaaa-aaaan-qeniq-cai",
+      "totalDeposited0": "186_828_361",
+      "totalDeposited1": "47_718_754_940",
+      "totalFeesEarned0": "5_184",
+      "totalFeesEarned1": "990_668",
+      "totalWithdrawn0": "99_580_800",
+      "totalWithdrawn1": "24_959_246_514",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "15_051",
+      "backing1": "9_343_526_841",
+      "firstDeployTimestamp": "1_778_634_958_368_835_602",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "11_859_058",
+      "poolKey": "mxzaz-hqaaa-aaaar-qaada-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "shareOfPool": 1.0,
+      "token0": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "token1": "rh2pm-ryaaa-aaaan-qeniq-cai",
+      "totalDeposited0": "35_699",
+      "totalDeposited1": "16_825_129_162",
+      "totalFeesEarned0": "0",
+      "totalFeesEarned1": "2_709_567",
+      "totalWithdrawn0": "17_779",
+      "totalWithdrawn1": "8_843_554_227",
+      "unclaimedFees0": "1",
+      "unclaimedFees1": "1_773_444"
+    },
+    {
+      "backing0": "371_730_105_455",
+      "backing1": "37_733_801",
+      "firstDeployTimestamp": "1_778_634_982_029_645_649",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "3_745_235_647",
+      "poolKey": "ca6gz-lqaaa-aaaaq-aacwa-cai:hvgxa-wqaaa-aaaaq-aacia-cai",
+      "shareOfPool": 1.0,
+      "token0": "ca6gz-lqaaa-aaaaq-aacwa-cai",
+      "token1": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "totalDeposited0": "1_640_673_891_820",
+      "totalDeposited1": "144_632_554",
+      "totalFeesEarned0": "53_801_259",
+      "totalFeesEarned1": "4_304",
+      "totalWithdrawn0": "1_219_574_776_481",
+      "totalWithdrawn1": "109_916_778",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "97_333_098",
+      "backing1": "716_353_626_254_589",
+      "firstDeployTimestamp": "1_778_635_002_766_527_859",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "264_054_763_228",
+      "poolKey": "n6tkf-tqaaa-aaaal-qsneq-cai:ss2fx-dyaaa-aaaar-qacoq-cai",
+      "shareOfPool": 1.0,
+      "token0": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "token1": "ss2fx-dyaaa-aaaar-qacoq-cai",
+      "totalDeposited0": "669_399_963",
+      "totalDeposited1": "9_215_913_868_790_536",
+      "totalFeesEarned0": "29_197",
+      "totalFeesEarned1": "176_729_022_786",
+      "totalWithdrawn0": "624_691_646",
+      "totalWithdrawn1": "7_924_935_480_326_341",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "37_739_478_699"
+    },
+    {
+      "backing0": "227_991_762_629",
+      "backing1": "520_126_395",
+      "firstDeployTimestamp": "1_778_637_458_965_513_010",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "10_889_652_602",
+      "poolKey": "ca6gz-lqaaa-aaaaq-aacwa-cai:i2s4q-syaaa-aaaan-qz4sq-cai",
+      "shareOfPool": 1.0,
+      "token0": "ca6gz-lqaaa-aaaaq-aacwa-cai",
+      "token1": "i2s4q-syaaa-aaaan-qz4sq-cai",
+      "totalDeposited0": "1_079_661_715_323",
+      "totalDeposited1": "2_871_047_295",
+      "totalFeesEarned0": "10_563_994",
+      "totalFeesEarned1": "52_893",
+      "totalWithdrawn0": "859_171_860_573",
+      "totalWithdrawn1": "2_326_989_089",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "29_268_635",
+      "backing1": "131_482_614_787",
+      "firstDeployTimestamp": "1_778_637_478_994_573_261",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "1_961_712_691",
+      "poolKey": "hvgxa-wqaaa-aaaaq-aacia-cai:k45jy-aiaaa-aaaaq-aadcq-cai",
+      "shareOfPool": 1.0,
+      "token0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+      "token1": "k45jy-aiaaa-aaaaq-aadcq-cai",
+      "totalDeposited0": "106_833_074",
+      "totalDeposited1": "579_628_846_720",
+      "totalFeesEarned0": "7_057",
+      "totalFeesEarned1": "19_951_131",
+      "totalWithdrawn0": "81_505_450",
+      "totalWithdrawn1": "428_440_203_623",
+      "unclaimedFees0": "340",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "708_754_583",
+      "backing1": "9_167_825_333",
+      "firstDeployTimestamp": "1_778_637_490_420_893_464",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "2_549_066_148",
+      "poolKey": "n6tkf-tqaaa-aaaal-qsneq-cai:rh2pm-ryaaa-aaaan-qeniq-cai",
+      "shareOfPool": 1.0,
+      "token0": "n6tkf-tqaaa-aaaal-qsneq-cai",
+      "token1": "rh2pm-ryaaa-aaaan-qeniq-cai",
+      "totalDeposited0": "1_365_662_870",
+      "totalDeposited1": "22_492_874_337",
+      "totalFeesEarned0": "5_148",
+      "totalFeesEarned1": "40_199",
+      "totalWithdrawn0": "725_682_972",
+      "totalWithdrawn1": "12_235_024_954",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    },
+    {
+      "backing0": "159_159_094_788",
+      "backing1": "5_569",
+      "firstDeployTimestamp": "1_778_639_936_101_644_827",
+      "lastFeeClaimTimestamp": "0",
+      "liquidity": "29_771_779",
+      "poolKey": "ca6gz-lqaaa-aaaaq-aacwa-cai:mxzaz-hqaaa-aaaar-qaada-cai",
+      "shareOfPool": 1.0,
+      "token0": "ca6gz-lqaaa-aaaaq-aacwa-cai",
+      "token1": "mxzaz-hqaaa-aaaar-qaada-cai",
+      "totalDeposited0": "504_193_181_345",
+      "totalDeposited1": "22_127",
+      "totalFeesEarned0": "35_424_365",
+      "totalFeesEarned1": "0",
+      "totalWithdrawn0": "255_226_916_325",
+      "totalWithdrawn1": "11_056",
+      "unclaimedFees0": "0",
+      "unclaimedFees1": "0"
+    }
+  ]
+}

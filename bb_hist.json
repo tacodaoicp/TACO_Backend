@@ -1,0 +1,224 @@
+[
+  {
+    "burnBlockIndex": [],
+    "claimedFromVault": [],
+    "finishedAt": "1_784_755_586_951_575_617",
+    "id": "191",
+    "postArb": [],
+    "preArb": [],
+    "startedAt": "1_784_755_586_951_575_617",
+    "status": {
+      "skipped_already_running": null
+    },
+    "swapResults": [],
+    "totalTacoBurned": "0"
+  },
+  {
+    "burnBlockIndex": [
+      "109_500"
+    ],
+    "claimedFromVault": [
+      {
+        "0": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+        "1": "21_275_428"
+      },
+      {
+        "0": "kknbx-zyaaa-aaaaq-aae4a-cai",
+        "1": "1_452_158_098"
+      },
+      {
+        "0": "mxzaz-hqaaa-aaaar-qaada-cai",
+        "1": "181"
+      },
+      {
+        "0": "zfcdd-tqaaa-aaaaq-aaaga-cai",
+        "1": "65_644_721_990"
+      },
+      {
+        "0": "hvgxa-wqaaa-aaaaq-aacia-cai",
+        "1": "685_511"
+      },
+      {
+        "0": "k45jy-aiaaa-aaaaq-aadcq-cai",
+        "1": "127_071_210"
+      },
+      {
+        "0": "2ouva-viaaa-aaaaq-aaamq-cai",
+        "1": "155_078_300"
+      },
+      {
+        "0": "f54if-eqaaa-aaaaq-aacea-cai",
+        "1": "1_883_402"
+      },
+      {
+        "0": "n6tkf-tqaaa-aaaal-qsneq-cai",
+        "1": "5_242_281"
+      },
+      {
+        "0": "iwv6l-6iaaa-aaaal-ajjjq-cai",
+        "1": "95_946_423_017"
+      },
+      {
+        "0": "lkwrt-vyaaa-aaaaq-aadhq-cai",
+        "1": "309_445_067"
+      },
+      {
+        "0": "ca6gz-lqaaa-aaaaq-aacwa-cai",
+        "1": "226_955_919"
+      },
+      {
+        "0": "rh2pm-ryaaa-aaaan-qeniq-cai",
+        "1": "11_491_197"
+      }
+    ],
+    "finishedAt": "1_784_761_164_484_696_607",
+    "id": "192",
+    "postArb": [
+      {
+        "iterations": [],
+        "phase": {
+          "post": null
+        },
+        "status": {
+          "skipped": "runArb disabled"
+        },
+        "totalProfitPerToken": []
+      }
+    ],
+    "preArb": [
+      {
+        "iterations": [],
+        "phase": {
+          "pre": null
+        },
+        "status": {
+          "skipped": "runArb disabled"
+        },
+        "totalProfitPerToken": []
+      }
+    ],
+    "startedAt": "1_784_760_828_693_259_295",
+    "status": {
+      "partial": null
+    },
+    "swapResults": [
+      {
+        "amountIn": "1_493",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "mxzaz-hqaaa-aaaar-qaada-cai",
+        "tacoOut": "44_094_934"
+      },
+      {
+        "amountIn": "350_321_034_142",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "zfcdd-tqaaa-aaaaq-aaaga-cai",
+        "tacoOut": "0"
+      },
+      {
+        "amountIn": "2_017_007",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "hvgxa-wqaaa-aaaaq-aacia-cai",
+        "tacoOut": "21_962_056"
+      },
+      {
+        "amountIn": "175_800_073",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "k45jy-aiaaa-aaaaq-aadcq-cai",
+        "tacoOut": "432_541"
+      },
+      {
+        "amountIn": "425_612_949",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "2ouva-viaaa-aaaaq-aaamq-cai",
+        "tacoOut": "9_706_826"
+      },
+      {
+        "amountIn": "4_400_332",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "f54if-eqaaa-aaaaq-aacea-cai",
+        "tacoOut": "2_289_876"
+      },
+      {
+        "amountIn": "69_911_803",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "n6tkf-tqaaa-aaaal-qsneq-cai",
+        "tacoOut": "42_264_922"
+      },
+      {
+        "amountIn": "213_757_863_845",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "iwv6l-6iaaa-aaaal-ajjjq-cai",
+        "tacoOut": "3_124_532"
+      },
+      {
+        "amountIn": "400_728_067",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "lkwrt-vyaaa-aaaaq-aadhq-cai",
+        "tacoOut": "137_232"
+      },
+      {
+        "amountIn": "329_460_628",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "ca6gz-lqaaa-aaaaq-aacwa-cai",
+        "tacoOut": "349_864"
+      },
+      {
+        "amountIn": "65_116_235",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "rh2pm-ryaaa-aaaan-qeniq-cai",
+        "tacoOut": "3_165_697"
+      },
+      {
+        "amountIn": "2_849_215",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "i2s4q-syaaa-aaaan-qz4sq-cai",
+        "tacoOut": "1_405_958"
+      },
+      {
+        "amountIn": "1_143_916",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "xevnm-gaaaa-aaaar-qafnq-cai",
+        "tacoOut": "51_239_406"
+      },
+      {
+        "amountIn": "31_249_091_495_343",
+        "dex": "skip-no-route",
+        "error": [
+          "Transfer fee (640bp) exceeds 5% of amount"
+        ],
+        "sellToken": "ss2fx-dyaaa-aaaar-qacoq-cai",
+        "tacoOut": "0"
+      },
+      {
+        "amountIn": "132_766",
+        "dex": "skip-no-route",
+        "error": [
+          "Transfer fee (753bp) exceeds 5% of amount"
+        ],
+        "sellToken": "cngnf-vqaaa-aaaar-qag4q-cai",
+        "tacoOut": "0"
+      },
+      {
+        "amountIn": "291_421_200",
+        "dex": "ICPSwap",
+        "error": [],
+        "sellToken": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+        "tacoOut": "28_287_861_139"
+      }
+    ],
+    "totalTacoBurned": "31_377_211_808"
+  }
+]

@@ -2599,6 +2599,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // Observability: total BlocksDone replay-guard markers (previously unobservable).
   public query func getBlocksDoneSize() : async Nat { Map.size(BlocksDone) };
 
+  // Read-only: is a specific deposit block already consumed (traded/verified/recovered)?
+  // BlocksDone-empty for a real deposit == never verified == safely recoverable.
+  public query func getBlockDoneStatus(token : Text, block : Nat) : async Bool {
+    Map.has(BlocksDone, thash, token # ":" # Nat.toText(block));
+  };
+
   // Runtime toggle for verbose debug logging. verboseLogging drives debug_show dumps
   // in hot/batch paths — e.g. getAllTradesDAOFilter builds O(trades^2) log strings in
   // a Vector held for the whole call — which transiently spikes Wasm memory and
@@ -3966,6 +3972,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         await* getBlockData(if (token == token0) { token0 } else { token1 }, if (token == token0) { block0 } else { block1 }, tType);
       } catch (err) {
         Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block));
+        receiveBool := false;
         continue a;
         #ICRC12([]);
       };
@@ -4402,6 +4409,11 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
     // Verify on-chain transfers
     var receiveBool = true;
+    // Track per-token acceptance so we can explicitly refund tokens that were
+    // accepted when the OTHER token's validation failed. checkReceive with exact amount
+    // generates NO refund transfer — an accepted token would be stuck otherwise.
+    var token0Accepted = false;
+    var token1Accepted = false;
     let receiveTransfersVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
     label a for ((token, Block, amount, tType) in ([(token1, block1, amount1, tType1), (token0, block0, amount0, tType0)]).vals()) {
       if (Map.has(BlocksDone, thash, token # ":" #Nat.toText(Block))) {
@@ -4409,14 +4421,27 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       Map.set(BlocksDone, thash, token # ":" #Nat.toText(Block), nowVar);
       let blockData = try { await* getBlockData(token, Block, tType) } catch (err) {
-        Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block)); continue a; #ICRC12([]);
+        Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block)); receiveBool := false; continue a; #ICRC12([]);
       };
       let receiveData = checkReceive(Block, caller, amount, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, nowVar);
       Vector.addFromIter(receiveTransfersVec, receiveData.1.vals());
-      receiveBool := receiveBool and receiveData.0;
+      let thisResult = receiveData.0;
+      if (thisResult) {
+        if (token == token0) { token0Accepted := true } else { token1Accepted := true };
+      };
+      receiveBool := receiveBool and thisResult;
     };
     Vector.addFromIter(tempTransferQueueLocal, Vector.vals(receiveTransfersVec));
     if (not receiveBool) {
+      // Explicitly refund any accepted token to prevent one-sided deposit loss.
+      // checkReceive only generates refund transfers for overpayment; exact amounts produce
+      // no transfers, leaving accepted tokens stuck. Queue explicit refunds here.
+      if (token0Accepted and amount0 > returnTfees(token0)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - returnTfees(token0), token0, genTxId()));
+      };
+      if (token1Accepted and amount1 > returnTfees(token1)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - returnTfees(token1), token1, genTxId()));
+      };
       if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
@@ -8428,10 +8453,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#ICRC3(result)) {
         for (block in result.blocks.vals()) {
           switch (block.block) {
-            case (#Map(entries)) {
+            case (#Map(outerEntries)) {
               var to : ?ICRC1.Account = null;
               var from : ?ICRC1.Account = null;
               var amount : ?Nat = null;
+              // ICRC3 blocks may nest tx fields inside a "tx" sub-map; merge both
+              // levels (verbatim from checkReceive) so tx-nested SNS blocks parse.
+              let entries = Buffer.fromArray<(Text, ICRC3.Value)>(outerEntries);
+              for ((k, v) in outerEntries.vals()) {
+                if (k == "tx") {
+                  switch (v) {
+                    case (#Map(txEntries)) {
+                      for (entry in txEntries.vals()) { entries.add(entry) };
+                    };
+                    case _ {};
+                  };
+                };
+              };
               for ((key, value) in entries.vals()) {
                 switch (key) {
                   case "to" {
@@ -8463,10 +8501,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   case "from" {
                     switch (value) {
                       case (#Array(arr)) {
-                        if (arr.size() == 1) {
+                        if (arr.size() >= 1) {
                           switch (arr[0]) {
                             case (#Blob(owner)) {
-                              from := ?{ owner = Principal.fromBlob(owner); subaccount = null };
+                              from := ?{
+                                owner = Principal.fromBlob(owner);
+                                subaccount = if (arr.size() > 1) {
+                                  switch (arr[1]) {
+                                    case (#Blob(s)) ?s;
+                                    case _ null;
+                                  };
+                                } else null;
+                              };
                             };
                             case _ {};
                           };
@@ -8663,6 +8709,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let refundAmount = depositAmount - Tfees;
 
     Map.set(BlocksAdminRecovered, thash, blockKey, nowVar);
+    // Unconditional, BEFORE dispatch: every swap/user-recovery replay path gates on
+    // BlocksDone, so marking it here closes the cross-path double-pay even if the
+    // dispatch below throws and the refund is re-queued to tempTransferQueue.
+    Map.set(BlocksDone, thash, blockKey, nowVar);
 
     let q = Vector.new<(TransferRecipient, Nat, Text, Text)>();
     Vector.add(q, (#principal(recipient), refundAmount, identifier, genTxId()));
@@ -8712,7 +8762,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   private func recoverWronglysentFor(sender : Principal, identifier : Text, Block : Nat, tType : { #ICP; #ICRC12; #ICRC3 }) : async Bool {
     var nowVar = Time.now();
     let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
-    if (Map.has(BlocksDone, thash, identifier # ":" #Nat.toText(Block))) {
+    // Cross-dedup: block recovered via the admin path (BlocksAdminRecovered) must not be
+    // re-payable here, and vice-versa (this path sets BlocksAdminRecovered on success below).
+    if (Map.has(BlocksDone, thash, identifier # ":" #Nat.toText(Block))
+        or Map.has(BlocksAdminRecovered, thash, identifier # ":" #Nat.toText(Block))) {
       return false;
     };
     Map.set(BlocksDone, thash, identifier # ":" #Nat.toText(Block), nowVar);
@@ -8792,11 +8845,26 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         case (#ICRC3(result)) {
           for (block in result.blocks.vals()) {
             switch (block.block) {
-              case (#Map(entries)) {
+              case (#Map(outerEntries)) {
                 var to : ?ICRC1.Account = null;
                 var fee : ?Nat = null;
                 var from : ?ICRC1.Account = null;
                 var amount : ?Nat = null;
+
+                // ICRC3 blocks may nest tx fields inside a "tx" sub-map; merge both levels
+                // (same as checkReceive / extractRecipientToTreasuryAmount) so tx-nested SNS
+                // blocks (e.g. sGLDT) parse for user self-recovery.
+                let entries = Buffer.fromArray<(Text, ICRC3.Value)>(outerEntries);
+                for ((k, v) in outerEntries.vals()) {
+                  if (k == "tx") {
+                    switch (v) {
+                      case (#Map(txEntries)) {
+                        for (entry in txEntries.vals()) { entries.add(entry) };
+                      };
+                      case _ {};
+                    };
+                  };
+                };
 
                 for ((key, value) in entries.vals()) {
                   switch (key) {
@@ -8844,12 +8912,17 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                     case "from" {
                       switch (value) {
                         case (#Array(fromArray)) {
-                          if (fromArray.size() == 1) {
+                          if (fromArray.size() >= 1) {
                             switch (fromArray[0]) {
                               case (#Blob(owner)) {
                                 from := ?{
                                   owner = Principal.fromBlob(owner);
-                                  subaccount = null;
+                                  subaccount = if (fromArray.size() > 1) {
+                                    switch (fromArray[1]) {
+                                      case (#Blob(s)) ?s;
+                                      case _ null;
+                                    };
+                                  } else null;
                                 };
                               };
                               case _ {};
@@ -8879,6 +8952,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                       } else {
                         addFees(identifier, howMuchReceived, false, "", nowVar);
                       };
+                      // Cross-dedup: mark admin-recovered too so adminRecoverWronglysent (which
+                      // bypasses BlocksDone) can't re-pay this same block.
+                      Map.set(BlocksAdminRecovered, thash, identifier # ":" #Nat.toText(Block), nowVar);
                       if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(sender)) } catch (err) { false })) {} else {
                         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
                       };
@@ -17638,6 +17714,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #adminPruneBlocksDone : () -> (batchSize : Nat);
         #admin_setVerboseLogging : () -> (on : Bool);
         #getBlocksDoneSize : () -> ();
+        #getBlockDoneStatus : () -> (token : Text, block : Nat);
         #getVerboseLogging : () -> ();
         #getMemoryStats : () -> ();
         #addAcceptedToken :

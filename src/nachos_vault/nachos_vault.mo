@@ -2288,9 +2288,16 @@ shared (deployer) persistent actor class NachosVaultDAO() = this {
           reason;
           icpPriceUSD = if (lastKnownICPPriceUSD > 0.0) ?lastKnownICPPriceUSD else null;
         });
-        // Trim to last 10000
-        while (Vector.size(navHistory) > 10000) {
-          ignore Vector.removeLast(navHistory);
+        // Trim to last 10000 — drop OLDEST. Batch-rebuild: O(n) amortized over 500 adds.
+        // ponytail: removeLast on a tail-append vector deletes the NEWEST; rebuild keeps the tail.
+        if (Vector.size(navHistory) > 10000) {
+          let keep = 9500;
+          let size = Vector.size(navHistory);
+          let tail = Vector.new<NavSnapshot>();
+          var i : Nat = size - keep;
+          while (i < size) { Vector.add(tail, Vector.get(navHistory, i)); i += 1; };
+          while (Vector.size(navHistory) > 0) { ignore Vector.removeLast(navHistory); };
+          for (s in Vector.vals(tail)) { Vector.add(navHistory, s); };
         };
       };
       case null {};
