@@ -3895,6 +3895,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (
       ((switch (Array.find<Text>(pausedTokens, func(t) { t == token0 })) { case null { false }; case (?_) { true } })) or ((switch (Array.find<Text>(pausedTokens, func(t) { t == token1 })) { case null { false }; case (?_) { true } })) or ((returnMinimum(token0, amount0, true) and returnMinimum(token1, amount1, true)) == false)
     ) {
+      // SECURITY FIX (P22): a getBlockData throw on one token skips that token's
+      // checkReceive(…, 0, …), so its refund is never queued while the other token's
+      // is — and the generic error hid it. Track the affected token(s) so the error
+      // names them. Deliberately NO blind refund transfer here: at this point amount
+      // and ownership are unverified. The catch's Map.delete releases the block key,
+      // so the deposit stays refundable on a later attempt.
+      var refundIncomplete = false;
+      var refundIncompleteTokens = "";
       label a for ((token, Block, amount, tType) in ([(token1, block1, amount1, tType1), (token0, block0, amount0, tType0)]).vals()) {
         if (Map.has(BlocksDone, thash, token # ":" #Nat.toText(Block))) {
           continue a;
@@ -3904,6 +3912,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           await* getBlockData(if (token == token0) { token0 } else { token1 }, if (token == token0) { block0 } else { block1 }, tType);
         } catch (err) {
           Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block));
+          refundIncomplete := true;
+          refundIncompleteTokens := if (refundIncompleteTokens == "") { token } else { refundIncompleteTokens # ", " # token };
           continue a;
           #ICRC12([]);
         };
@@ -3918,6 +3928,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
       } else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      if (refundIncomplete) {
+        // P22: name the token(s) whose refund could not be queued.
+        return #Err(#TokenPaused("Token paused or below minimum; refund could NOT be queued for: " # refundIncompleteTokens # " (block verification failed — deposit block released, retry later)"));
       };
       return #Err(#TokenPaused("Token paused or below minimum"));
     };
@@ -3938,11 +3952,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // DRIFT FIX: refund both tokens before rejecting. Tokens were transferred
       // on-chain to the exchange; without refund they strand (treasury ledger
       // grows, nothing in ord/amm/fee buckets claims them → drift).
+      // SECURITY FIX (P22): a getBlockData throw on one token skips that token's
+      // checkReceive(…, 0, …) refund while the other token's IS queued. Track the
+      // affected token(s) so the error names them. NO blind refund — amount and
+      // ownership are unverified; the catch's Map.delete releases the block key so
+      // the deposit stays refundable on a later attempt.
+      var refundIncomplete = false;
+      var refundIncompleteTokens = "";
       label a for ((token, Block, tType) in ([(token1, block1, tType1), (token0, block0, tType0)]).vals()) {
         if (Map.has(BlocksDone, thash, token # ":" # Nat.toText(Block))) { continue a };
         Map.set(BlocksDone, thash, token # ":" # Nat.toText(Block), nowVar);
         let blockData = try { await* getBlockData(token, Block, tType) } catch (_) {
           Map.delete(BlocksDone, thash, token # ":" # Nat.toText(Block));
+          refundIncomplete := true;
+          refundIncompleteTokens := if (refundIncompleteTokens == "") { token } else { refundIncompleteTokens # ", " # token };
           continue a;
           #ICRC12([]);
         };
@@ -3950,6 +3973,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      if (refundIncomplete) {
+        // P22: name the token(s) whose refund could not be queued.
+        return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool (pre-check); refund could NOT be queued for: " # refundIncompleteTokens # " (block verification failed — deposit block released, retry later)"));
       };
       return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool (pre-check)"));
     };
@@ -4323,11 +4350,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // refunds, then flush to treasury. Without this, tokens strand in the
     // treasury ledger, uncountered by any bookkeeping bucket → drift.
     func refundAndReject(errMsg : ExTypes.ExchangeError) : async ExTypes.AddConcentratedResult {
+      // SECURITY FIX (P22): a getBlockData throw on one token skips that token's
+      // checkReceive(…, 0, …) refund while the other token's IS queued. Track the
+      // affected token(s) so the returned error names them. NO blind refund — amount
+      // and ownership are unverified; the catch's Map.delete releases the block key
+      // so the deposit stays refundable on a later attempt.
+      var refundIncomplete = false;
+      var refundIncompleteTokens = "";
       label a for ((token, Block, tType) in ([(token1, block1, tType1), (token0, block0, tType0)]).vals()) {
         if (Map.has(BlocksDone, thash, token # ":" # Nat.toText(Block))) { continue a };
         Map.set(BlocksDone, thash, token # ":" # Nat.toText(Block), nowVar);
         let blockData = try { await* getBlockData(token, Block, tType) } catch (_) {
           Map.delete(BlocksDone, thash, token # ":" # Nat.toText(Block));
+          refundIncomplete := true;
+          refundIncompleteTokens := if (refundIncompleteTokens == "") { token } else { refundIncompleteTokens # ", " # token };
           continue a;
           #ICRC12([]);
         };
@@ -4335,6 +4371,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      if (refundIncomplete) {
+        // P22: same error variant, message extended to name the token(s) whose
+        // refund could not be queued. Every current caller passes a Text-payload
+        // variant; payloadless variants pass through unchanged.
+        let note = " | refund could NOT be queued for: " # refundIncompleteTokens # " (block verification failed — deposit block released, retry later)";
+        return #Err(
+          switch (errMsg) {
+            case (#InvalidInput(t)) { #InvalidInput(t # note) };
+            case (#TokenPaused(t)) { #TokenPaused(t # note) };
+            case (#InsufficientFunds(t)) { #InsufficientFunds(t # note) };
+            case (other) { other };
+          }
+        );
       };
       #Err(errMsg);
     };
@@ -4393,16 +4443,31 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       ((returnMinimum(token0, amount0, true) and returnMinimum(token1, amount1, true)) == false)
     ) {
       // Refund both tokens
+      // SECURITY FIX (P22): a getBlockData throw on one token skips that token's
+      // checkReceive(…, 0, …) refund while the other token's IS queued. Track the
+      // affected token(s) so the error names them. NO blind refund — amount and
+      // ownership are unverified; the catch's Map.delete releases the block key so
+      // the deposit stays refundable on a later attempt.
+      var refundIncomplete = false;
+      var refundIncompleteTokens = "";
       label a for ((token, Block, tType) in ([(token1, block1, tType1), (token0, block0, tType0)]).vals()) {
         if (Map.has(BlocksDone, thash, token # ":" #Nat.toText(Block))) { continue a };
         Map.set(BlocksDone, thash, token # ":" #Nat.toText(Block), nowVar);
         let blockData = try { await* getBlockData(token, Block, tType) } catch (err) {
-          Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block)); continue a; #ICRC12([]);
+          Map.delete(BlocksDone, thash, token # ":" #Nat.toText(Block));
+          refundIncomplete := true;
+          refundIncompleteTokens := if (refundIncompleteTokens == "") { token } else { refundIncompleteTokens # ", " # token };
+          continue a;
+          #ICRC12([]);
         };
         Vector.addFromIter(tempTransferQueueLocal, (checkReceive(Block, caller, 0, token, ICPfee, RevokeFeeNow, true, true, blockData, tType, Time.now())).1.vals());
       };
       if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      if (refundIncomplete) {
+        // P22: name the token(s) whose refund could not be queued.
+        return #Err(#TokenPaused("Validation failed; refund could NOT be queued for: " # refundIncompleteTokens # " (block verification failed — deposit block released, retry later)"));
       };
       return #Err(#TokenPaused("Validation failed"));
     };
@@ -4449,8 +4514,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     // Get or create pool and V3 data — register pair if not yet in pool_canister
+    // SECURITY FIX (P12): remember whether THIS call created the pool, so the
+    // `liquidity == 0` bail-out below can roll it back instead of leaving an empty
+    // 0/0 pool registered.
+    var poolWasCreatedHere = false;
     var pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
       case null {
+        poolWasCreatedHere := true;
         registerPoolPair(token0, token1);
         let newPool : AMMPool = {
           token0; token1;
@@ -4495,7 +4565,20 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let used1 = Nat.min(rawUsed1 + 1, amount1);
 
     if (liquidity == 0) {
-      // Refund
+      // SECURITY FIX (P12): tempTransferQueueLocal holds ONLY checkReceive's overpay
+      // dust at this point — both deposits passed checkReceive with their exact amount,
+      // which generates no refund transfer. Flushing that alone stranded BOTH deposits
+      // outright. Queue explicit full refunds, mirroring the verified idiom on the
+      // `not receiveBool` branch above.
+      if (amount0 > returnTfees(token0)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - returnTfees(token0), token0, genTxId()));
+      };
+      if (amount1 > returnTfees(token1)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - returnTfees(token1), token1, genTxId()));
+      };
+      // ...and undo a pool this same call created + registered above, so a rejected
+      // add never leaves an empty 0/0 pool behind.
+      if (poolWasCreatedHere) { Map.delete(AMMpools, hashtt, poolKey) };
       if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
         Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
       };
@@ -8705,7 +8788,14 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     let Tfees = returnTfees(identifier);
-    if (depositAmount <= Tfees) { adminRecoveryRunning := false; return false };
+    // SECURITY FIX (P3): the guard was `depositAmount <= Tfees`. For
+    // `Tfees < depositAmount <= 2*Tfees` the refund `depositAmount - Tfees` is <= the
+    // ledger fee, so exchange/treasury.mo:168 (`if (fee == 0 or t.1 > fee)`) DROPS it
+    // silently — yet BlocksAdminRecovered and BlocksDone were then set below, bricking
+    // the block forever while logging a false "refunded N". 2x is the tight bound.
+    // This guard sits ABOVE both marks, so a refused call marks nothing and the block
+    // stays recoverable through every other path.
+    if (depositAmount <= 2 * Tfees) { adminRecoveryRunning := false; return false };
     let refundAmount = depositAmount - Tfees;
 
     Map.set(BlocksAdminRecovered, thash, blockKey, nowVar);
@@ -8777,14 +8867,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // Check if the transaction is not older than 21 days
       let timestamp = getTimestamp(blockData);
       if (timestamp == 0) {
-
+        // SECURITY FIX (P21): this `return false` sits INSIDE the try opened above, so it
+        // bypassed both the catch's Map.delete(BlocksDone) and the tail delete — leaving
+        // the marker set at :8790 in place forever. Since nothing was paid, keeping it
+        // serves no dedup purpose; it only bricks the block key. An unreadable block
+        // (getTimestamp returns 0 for #ICRC12([])) is permissionlessly reachable, so this
+        // let any caller permanently freeze up to 20 block keys per recoverBatch call.
+        // Every other non-paying exit in this function already deletes first.
+        Map.delete(BlocksDone, thash, identifier # ":" #Nat.toText(Block));
         return false;
       } else {
         let currentTime = Int.abs(nowVar2);
         let timeDiff : Int = currentTime - timestamp;
         if (timeDiff > 1814400000000000) {
           // 21 days in nanoseconds
-
+          // SECURITY FIX (P21): same as above — delete the marker before returning,
+          // this block was never paid.
+          Map.delete(BlocksDone, thash, identifier # ":" #Nat.toText(Block));
           return false;
         };
       };
@@ -8823,22 +8922,36 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           };
         };
         case (#ICRC12(transactions)) {
-          for ({ transfer = ?{ to; fee; from; amount = howMuchReceived } } in transactions.vals()) {
-            var fees : Nat = 0;
-            switch (fee) {
-              case null {};
-              case (?fees2) { fees := (fees2) };
-            };
-            if (to.owner == treasury_principal and from.owner == sender) {
-              if (nat64ToInt64(natToNat64(howMuchReceived)) > nat64ToInt64(natToNat64(fees))) {
-                Vector.add(tempTransferQueueLocal, (#principal(sender), howMuchReceived -(fees), identifier, genTxId()));
-              } else {
-                addFees(identifier, howMuchReceived, false, "", nowVar);
+          // SECURITY FIX (P10): was a REFUTABLE loop binder
+          // `for ({ transfer = ?{...} } in transactions.vals())`, which TRAPS on an
+          // approve / mint / burn block and leaves the BlocksDone marker (set at :8790,
+          // before the first await) committed while the trap rolls everything else back.
+          // That poisoned the key AND broke the escape hatch itself. Non-refutable
+          // switch, `case null` mirroring the ICP branch's `case _` above.
+          for (tx in transactions.vals()) {
+            switch (tx.transfer) {
+              case (?{ to; fee; from; amount = howMuchReceived }) {
+                var fees : Nat = 0;
+                switch (fee) {
+                  case null {};
+                  case (?fees2) { fees := (fees2) };
+                };
+                if (to.owner == treasury_principal and from.owner == sender) {
+                  if (nat64ToInt64(natToNat64(howMuchReceived)) > nat64ToInt64(natToNat64(fees))) {
+                    Vector.add(tempTransferQueueLocal, (#principal(sender), howMuchReceived -(fees), identifier, genTxId()));
+                  } else {
+                    addFees(identifier, howMuchReceived, false, "", nowVar);
+                  };
+                  if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(sender)) } catch (err) { false })) {} else {
+                    Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+                  };
+                  return true;
+                };
               };
-              if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(sender)) } catch (err) { false })) {} else {
-                Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+              case null {
+                Map.delete(BlocksDone, thash, identifier # ":" #Nat.toText(Block));
+                return false;
               };
-              return true;
             };
           };
         };
@@ -9173,9 +9286,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
-          Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        };
+        // SECURITY FIX (P9a): snapshot + clear BEFORE the await, restore on failure.
+        // The old shape passed Vector.toArray(tempTransferQueue) as the await ARGUMENT
+        // and ran Vector.clear AFTER the await returned, so any refund appended by a
+        // concurrent message during that await window was destroyed — user refunds
+        // vanished silently (positive drift, no alarm). FixStuckTXRunning serialises
+        // flushers, not appenders. Pattern copied verbatim from the settle loop at :14753.
+        let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false };
+        if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
         FixStuckTXRunning := false;
       };
     };
@@ -9667,9 +9787,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
-          Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        };
+        // SECURITY FIX (P9a): snapshot + clear BEFORE the await, restore on failure.
+        // The old shape passed Vector.toArray(tempTransferQueue) as the await ARGUMENT
+        // and ran Vector.clear AFTER the await returned, so any refund appended by a
+        // concurrent message during that await window was destroyed — user refunds
+        // vanished silently (positive drift, no alarm). FixStuckTXRunning serialises
+        // flushers, not appenders. Pattern copied verbatim from the settle loop at :14753.
+        let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false };
+        if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
         FixStuckTXRunning := false;
       };
     };
@@ -10061,9 +10188,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
-          Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        };
+        // SECURITY FIX (P9a): snapshot + clear BEFORE the await, restore on failure.
+        // The old shape passed Vector.toArray(tempTransferQueue) as the await ARGUMENT
+        // and ran Vector.clear AFTER the await returned, so any refund appended by a
+        // concurrent message during that await window was destroyed — user refunds
+        // vanished silently (positive drift, no alarm). FixStuckTXRunning serialises
+        // flushers, not appenders. Pattern copied verbatim from the settle loop at :14753.
+        let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false };
+        if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
         FixStuckTXRunning := false;
       };
     };
@@ -11704,7 +11838,36 @@ shared (deployer) persistent actor class create_trading_canister() = this {
 
       let filtered = Array.filter<{ time : Int; accesscode : Text; amount_init : Nat; amount_sell : Nat; Fee : Nat; RevokeFee : Nat; initPrincipal : Text; OCname : Text; token_init_identifier : Text; token_sell_identifier : Text; strictlyOTC : Bool; allOrNothing : Bool }>(currentTrades2sort2, func(o) { o.accesscode != accesscode });
 
-      if (filtered.size() == 0) {
+      if (filtered.size() == currentTrades2sort2.size()) {
+        // SECURITY FIX (P18): the accesscode is NOT in the map `nonPoolOrder` selected.
+        // `nonPoolOrder` is recomputed from isKnownPool AT DELETE TIME, but the entry was
+        // filed under whatever isKnownPool said at POST time — and the public
+        // addLiquidity / addConcentratedLiquidity mutate poolIndexMap (registerPoolPair)
+        // in between, flipping the flag. removeTrade below then runs unconditionally, so
+        // the sort-map entry was orphaned: a permanent phantom liability of
+        // attacker-chosen size that checkDiffs and computeDriftForToken count
+        // unconditionally (disabling adminRecoverWronglysent and poisoning drift), plus a
+        // latent double-pay if the token is later removed. Run the identical
+        // filter/delete against the OTHER map and write back only the map that held it.
+        let otherMapSel = if nonPoolOrder { liqMapSort } else { liqMapSortForeign };
+        switch (Map.get(otherMapSel, hashtt, key1)) {
+          case null {};
+          case (?otherSort) {
+            let otherAtRatio = switch (RBTree.get(otherSort, compareRatio, ratio)) {
+              case null { [] };
+              case (?f) { f };
+            };
+            let otherFiltered = Array.filter<{ time : Int; accesscode : Text; amount_init : Nat; amount_sell : Nat; Fee : Nat; RevokeFee : Nat; initPrincipal : Text; OCname : Text; token_init_identifier : Text; token_sell_identifier : Text; strictlyOTC : Bool; allOrNothing : Bool }>(otherAtRatio, func(o) { o.accesscode != accesscode });
+            if (otherFiltered.size() != otherAtRatio.size()) {
+              if (otherFiltered.size() == 0) {
+                Map.set(otherMapSel, hashtt, key1, RBTree.delete(otherSort, compareRatio, ratio));
+              } else {
+                Map.set(otherMapSel, hashtt, key1, RBTree.put(otherSort, compareRatio, ratio, otherFiltered));
+              };
+            };
+          };
+        };
+      } else if (filtered.size() == 0) {
         Map.set(if nonPoolOrder { liqMapSortForeign } else { liqMapSort }, hashtt, key1, RBTree.delete(currentTrades2sort, compareRatio, ratio));
       } else {
         Map.set(if nonPoolOrder { liqMapSortForeign } else { liqMapSort }, hashtt, key1, RBTree.put(currentTrades2sort, compareRatio, ratio, filtered));
@@ -12161,14 +12324,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Check if the transaction is not older than 21 days
     let timestamp = getTimestamp(blockData);
     if (timestamp == 0) {
-
+      // SECURITY FIX (P20): every caller sets the BlocksDone marker immediately before
+      // calling checkReceive. This exit queues NOTHING, so keeping the marker only
+      // poisons the block key — the victim's deposit then needs adminRecoverWronglysent.
+      // Deleting restores the exact pre-call state. Same idiom as :12200 / the ICRC3
+      // fall-through arms below. NEVER extend this to the amount-short arms in
+      // processTransaction: those queued a refund and MUST keep the marker.
+      Map.delete(BlocksDone, thash, tkn # ":" # Nat.toText(block));
       return (false, []);
     } else {
       let currentTime = Int.abs(nowVar2);
       let timeDiff : Int = currentTime - timestamp;
       if (timeDiff > 1814400000000000) {
         // 21 days in nanoseconds
-
+        // SECURITY FIX (P20): as above — nothing queued, so release the key.
+        // Also closes A2 (retrieveFundsDao / adminExecuteRouteStrategy burning keys
+        // on >21-day blocks).
+        Map.delete(BlocksDone, thash, tkn # ":" # Nat.toText(block));
         return (false, []);
       };
     };
@@ -12198,17 +12370,35 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         };
       };
       case (#ICRC12, #ICRC12(transactions)) {
-        for ({ transfer = ?{ to; fee; from; amount } } in transactions.vals()) {
-          var fees : Nat = 0;
-          var sub : ?Subaccount = if (from.subaccount == null) { null } else {
-            ?Blob.fromArray(switch (from.subaccount) { case (?a) { a } });
-          };
-          switch (fee) {
-            case null {};
-            case (?fees2) { fees := fees2 };
-          };
+        // SECURITY FIX (P10): this used to be a REFUTABLE pattern in the loop binder —
+        // `for ({ transfer = ?{...} } in transactions.vals())` — which TRAPS on any
+        // non-transfer block (approve / mint / burn). Callers set BlocksDone before the
+        // `await* getBlockData`, so the marker commits while the trap rolls the rest
+        // back: a free permanent poisoning of that block key for anyone who pastes an
+        // approve block index. Use a non-refutable switch, mirroring the ICP sibling.
+        for (tx in transactions.vals()) {
+          switch (tx.transfer) {
+            case (?{ to; fee; from; amount }) {
+              var fees : Nat = 0;
+              var sub : ?Subaccount = if (from.subaccount == null) { null } else {
+                ?Blob.fromArray(switch (from.subaccount) { case (?a) { a } });
+              };
+              switch (fee) {
+                case null {};
+                case (?fees2) { fees := fees2 };
+              };
 
-          return processTransaction(amount, fees, Principal.toText(from.owner), Principal.toText(to.owner), false, sub);
+              return processTransaction(amount, fees, Principal.toText(from.owner), Principal.toText(to.owner), false, sub);
+            };
+            case null {
+              // Not a transfer block. Deliberately do NOT delete the marker here: the
+              // didFallback path in getBlockData can return several transactions, and a
+              // later one may still be the real transfer whose processTransaction queues
+              // a refund — deleting first would re-open that block for a replay
+              // double-pay. Simply skip; if NO transfer is found in any of them the
+              // default `(false, ...)` return below releases the key (P20 exit 3).
+            };
+          };
         };
       };
       case (#ICRC3, #ICRC3(result)) {
@@ -12329,6 +12519,10 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case _ {};
     };
 
+    // SECURITY FIX (P20): the tType/blockData mismatch + empty-block fall-through. This
+    // exit queues nothing, so the BlocksDone marker the caller set moments ago must be
+    // released rather than burning the key permanently.
+    Map.delete(BlocksDone, thash, tkn # ":" # Nat.toText(block));
     (false, Vector.toArray(tempTransferQueueLocal));
   };
 
@@ -13142,7 +13336,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
 
     logWithRunId("Entering step 5: managing trade entries:\n" #debug_show (tradeResult.trades));
-    for (i in Iter.range(0, tradeResult.trades.size() -1)) {
+    label step5 for (i in Iter.range(0, tradeResult.trades.size() -1)) {
       let pub = Text.startsWith(tradeResult.trades[i].accesscode, #text "Public");
       var currentTrades2 : TradePrivate = Faketrade;
       if (pub) {
@@ -13162,6 +13356,13 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           };
         };
       };
+      // HARDENING (P18): both lookups above can miss (`case null {}` leaves the
+      // Faketrade sentinel, whose amount_sell is 0), so the division below is a
+      // div-by-zero trap on an orphaned/absent order. Same guard
+      // recalibrateDAOpositions already applies, and the file's own documented
+      // convention — see the `trade_number == 0` sentinel note at :533.
+      if (currentTrades2.trade_number == 0 or currentTrades2.amount_sell == 0) { continue step5 };
+
       // Calculate the ratio before the trade was partially filled
       let oldRatio = #Value((currentTrades2.amount_init * tenToPower60) / currentTrades2.amount_sell);
 
@@ -13705,6 +13906,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         currentTrades2.trade_done == 1 or currentTrades2.init_paid != 1
       ) continue a;
 
+      // SECURITY FIX (P17): an oversized fill takes the full-order (else) arm below yet
+      // is still flagged `partial = (A != amount_init)`, so the settlement's
+      // `amount_sell - i.amount_sell` / `amount_init - i.amount_init` underflow and TRAP —
+      // stranding the caller's own already-BlocksDone-marked deposit. Reject it up front,
+      // exactly like the allOrNothing skip below. Do NOT "fix" this by relaxing `!=` to
+      // `<` at the partial computation: that routes the oversized entry into the
+      // non-partial arm, which removeTrade's the order and pays the maker a scaled
+      // amount_sell ABOVE escrow — unbounded overpayment chosen by the caller.
+      // A skipped entry never enters amountInit/Sell/Fees nor TradeEntryVector, so
+      // checkReceive's sendback logic refunds the caller automatically.
+      if (amount_Sell_by_Reactor[i] > currentTrades2.amount_init) { continue a };
+
       let (amountInitInc, amountSellInc, amountFeesInc) = if (amount_Sell_by_Reactor[i] < currentTrades2.amount_init) {
         let amtInit = ((((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell)) * (10000 + currentTrades2.Fee)) / 100000000) + (10000 * sellTfees);
         let amtSell = amount_Sell_by_Reactor[i] - initTfees;
@@ -13783,6 +13996,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         continue getTradeInfo;
       };
 
+      // SECURITY FIX (P17): the SAME reject must land in BOTH scan loops. Guarding only
+      // loop `a` would leave this loop building the oversized entry into
+      // TradeEntryVector2, which the amountInit != amountInit2 branch below promotes
+      // into TradeEntries — i.e. asymmetric application manufactures P16.
+      if (amount_Sell_by_Reactor[i] > currentTrades2.amount_init) { continue getTradeInfo };
+
       if (amount_Sell_by_Reactor[i] < currentTrades2.amount_init) {
         amountInit2 += ((((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell)) * (10000 + currentTrades2.Fee)) / 100000000) + (10000 * sellTfees);
         amountSell2 += amount_Sell_by_Reactor[i] - initTfees;
@@ -13817,7 +14036,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
           addFees(token_init_identifier, ((amountInit - amountInit2) / 10000), false, Principal.toText(msg.caller), nowVar2);
         };
       } else {
-        Vector.add(tempTransferQueueLocal, (#principal(msg.caller), (amountInit / 10000), token_init_identifier, genTxId()));
+        // SECURITY FIX (P16): this refunded the full `amountInit / 10000` with NO
+        // `- sellTfees`, unlike its sibling arm above — the treasury pays the ledger fee
+        // on top, so every trip through here cost exactly 1x sellTfees of negative drift.
+        // User-triggerable and repeatable via the allOrNothing scan asymmetry (scan 1
+        // skips AON entries, scan 2 does not, forcing amountInit < amountInit2).
+        // Mirror the sibling exactly, dust fallback included.
+        let backAmt = (amountInit / 10000);
+        if (backAmt > sellTfees) {
+          Vector.add(tempTransferQueueLocal, (#principal(msg.caller), backAmt - sellTfees, token_init_identifier, genTxId()));
+        } else {
+          addFees(token_init_identifier, backAmt, false, Principal.toText(msg.caller), nowVar2);
+        };
         if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
           Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
         };
@@ -14540,7 +14770,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
                   pool with
                   reserve0 = safeSub(pool.reserve0, totalAmount0);
                   reserve1 = safeSub(pool.reserve1, totalAmount1);
-                  totalLiquidity = safeSub(pool.totalLiquidity, liq);
+                  // SECURITY FIX (L1b): was `safeSub(pool.totalLiquidity, liq)`, which
+                  // subtracts unconditionally while activeLiquidity above is only
+                  // decremented when the position is in range — desyncing the
+                  // `totalLiquidity == activeLiquidity` invariant that syncPoolFromV3
+                  // (:802) enforces everywhere else. Track newActiveLiq instead.
+                  totalLiquidity = newActiveLiq;
                   lastUpdateTime = nowVar;
                 });
               };
@@ -16223,6 +16458,18 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
   };
 
+  // SECURITY FIX (P9b): a latch wedged by a throwing treasury call used to survive every
+  // upgrade, leaving all six queue-flush sites permanently no-op with no operational
+  // reset path (neither clearStuckLocks nor adminForceUnlockRecovery touch it).
+  // NOTE: marking this `transient` — as originally designed — is REJECTED by the
+  // compiler under enhanced orthogonal persistence:
+  //   "Compatibility error [M0169], the stable variable `FixStuckTXRunning` of the
+  //    previous version cannot be implicitly discarded."
+  // Dropping it would need an explicit `with migration` block, which then has to be
+  // stripped again before the following upgrade or M0170 blocks that one. Instead the
+  // flag is cleared in postupgrade() below, which gives the identical operational
+  // guarantee (a wedged latch never survives an upgrade) with no stable-signature
+  // change and no migration debt. The catch below is what stops it wedging at all.
   var FixStuckTXRunning = false;
 
   // Serializes adminRecoverWronglysent so two parallel admin calls cannot both
@@ -16249,9 +16496,21 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     };
     if (accesscode == "partial") {
       // Transfering the transactions that have to be made by the treasury,
-      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { return #Err(#SystemError(Error.message(err))); FixStuckTXRunning := false; false })) {
-        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+      // SECURITY FIX (P9a + P9b), ONE hunk — this site must never get the plain P9a
+      // conversion. Old shape: the catch did `return #Err(...)` BEFORE its
+      // `FixStuckTXRunning := false`, so that reset was dead code and a throwing
+      // treasury call wedged the latch permanently (no reset exists in
+      // clearStuckLocks or adminForceUnlockRecovery), making FixStuckTX("partial")
+      // self-reject forever and all six flush sites no-op. The catch must therefore
+      // restore the snapshot AND clear the latch BEFORE returning.
+      let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+      Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+      let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) {
+        Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals());
+        FixStuckTXRunning := false;
+        return #Err(#SystemError(Error.message(err)));
       };
+      if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
       FixStuckTXRunning := false;
       return #Ok("Stuck trades fixed");
     };
@@ -16634,6 +16893,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     over10 := TrieSet.empty();
     Map.clear(spamCheck);
     Map.clear(spamCheckOver10);
+    // SECURITY FIX (P9b): never let a wedged transfer-queue latch survive an upgrade.
+    // Equivalent to the `transient` drop the design called for, which EOP rejects
+    // (M0169) without a migration block. No flush is ever in flight across an upgrade,
+    // so clearing here is unconditionally safe.
+    FixStuckTXRunning := false;
+    adminRecoveryRunning := false;
   };
 
   // Periodically process tempTransferQueue to avoid tokens getting stuck
@@ -16644,9 +16909,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       func() : async () {
         if (Vector.size(tempTransferQueue) > 0 and not FixStuckTXRunning) {
           FixStuckTXRunning := true;
-          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), false) } catch (_) { false })) {
-            Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-          };
+          // SECURITY FIX (P9a): snapshot + clear before the await, restore on failure.
+          // See the note at the sibling sites; same race, same remedy (:14753 pattern).
+          let snapQ2 = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+          Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+          let okQ2 = try { await treasury.receiveTransferTasks(snapQ2, false) } catch (_) { false };
+          if (not okQ2) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ2.vals()) };
           FixStuckTXRunning := false;
         };
         startTempTransferQueueTimer<system>();
@@ -17232,9 +17500,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     if (Vector.size(tempTransferQueue) > 0) {
       if FixStuckTXRunning {} else {
         FixStuckTXRunning := true;
-        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
-          Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
-        };
+        // SECURITY FIX (P9a): snapshot + clear BEFORE the await, restore on failure.
+        // The old shape passed Vector.toArray(tempTransferQueue) as the await ARGUMENT
+        // and ran Vector.clear AFTER the await returned, so any refund appended by a
+        // concurrent message during that await window was destroyed — user refunds
+        // vanished silently (positive drift, no alarm). FixStuckTXRunning serialises
+        // flushers, not appenders. Pattern copied verbatim from the settle loop at :14753.
+        let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false };
+        if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
         FixStuckTXRunning := false;
       };
     };
