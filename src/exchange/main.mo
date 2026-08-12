@@ -376,6 +376,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // so the two never diverge.
   transient let LP_FEE_SHARE_PERCENT : Nat = 70;
   stable var verboseLogging : Bool = true;
+  // MINLEGOUT enforcement kill switch (default OFF — see setEnforceMinLegOut).
+  stable var enforceMinLegOut : Bool = false;
 
   // Unified fee calculation helpers — use these everywhere to ensure consistent integer division.
   type BlockData = {
@@ -903,6 +905,144 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     } else {
       fallback;
     };
+  };
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // L1a — FULL-RANGE SUB-POOL ISOLATION
+  //
+  // `pool.reserve0/1` hold the tokens of EVERY position: addConcentratedLiquidity
+  // credits its `used0`/`used1` to the reserves unconditionally, whatever range the
+  // position covers. `pool.totalLiquidity` does not track that — syncPoolFromV3 pins it
+  // to `v3.activeLiquidity`, which counts only liquidity that is IN RANGE at the current
+  // price. Settling a full-range position with the pro-rata share
+  // `mulDiv(L, pool.reserve0, pool.totalLiquidity)` therefore divides a numerator that
+  // includes out-of-range concentrated deposits by a denominator that excludes them.
+  //
+  // That was directly exploitable, unprivileged and repeatable: park a concentrated range
+  // entirely outside the current price, and the reserves grow while totalLiquidity does
+  // not, so a full-range position redeems at an inflated rate and the excess comes out of
+  // the other LPs' funds — then withdraw the parked range to recover the bait.
+  // checkDiffs cannot see it: reserves and liquidity stay internally consistent
+  // throughout and only the split between LPs is wrong, so a local repro moved
+  // 50,000,000 base units between two principals with BYTE-IDENTICAL drift output.
+  //
+  // The fix settles full-range positions against the FULL-RANGE SUB-POOL only:
+  //
+  //     reserveFull    = reserves − (what every concentrated position is owed)
+  //     liquidityFull  = liquidity of the full-range positions alone
+  //
+  // removeConcentratedLiquidity pays a concentrated position exactly
+  // `amountsFromLiquidity(L, its own range, v3.currentSqrtRatio)`, so holding back that
+  // same quantity makes the books balance by construction:
+  //
+  //     reserves == (paid to concentrated LPs) + (paid to full-range LPs)
+  //
+  // Measured against all 60 live pools this is exact — summed claims equal reserves on
+  // 60/60, against 7/60 over-claiming by 1,077 ICP on the deployed code. On the 49 pools
+  // that carry no concentrated liquidity it is arithmetically identical to the old
+  // pro-rata (reserveFull == reserve, liquidityFull == totalLiquidity): nothing moves.
+  //
+  // This deliberately does NOT put the full-range payout itself on the V3 basis
+  // (amountsFromLiquidity over the sentinels). `v3.currentSqrtRatio` is badly drifted on
+  // live state: recalculateActiveLiquidity and recalcV3Pure only re-derive it from
+  // reserves when it is 0, while swapWithAMMV3 advances it by the exact tick walk and the
+  // reserves by separate incremental bookkeeping. Live drift against the reserve-implied
+  // price reaches +4758%, so a payout scaled by it is wrong by that factor (that basis
+  // measured 47/60 pools over-claiming, 205.7 ICP). Here the drifted price only enters
+  // the concentrated CORRECTION term, and it enters it on the same basis
+  // removeConcentratedLiquidity settles on — so however wrong the price is, the two sides
+  // still add up to the reserves.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // Sum of the token amounts EVERY position in this pool is owed at `sqrtCurrent`, read
+  // straight off the tick tree. Exact, and does not iterate positions: amountsFromLiquidity
+  // is linear in liquidity for a fixed interval, so summing the active liquidity of each
+  // elementary interval between consecutive ticks equals summing each position's own claim
+  // over its own range (the per-position ranges telescope). Tick keys are sqrtRatios —
+  // addConcentratedLiquidity keys by sqrtLower/sqrtUpper and recalculateActiveLiquidity
+  // compares them against sqrtCurrent directly.
+  func totalPositionClaims(v3 : PoolV3Data, sqrtCurrent : Nat) : (Nat, Nat) {
+    var amount0 : Nat = 0;
+    var amount1 : Nat = 0;
+    var active : Int = 0;
+    var prevTick : Nat = 0;
+    var havePrev = false;
+    for ((tick, data) in RBTree.entries(v3.ranges)) {
+      // `active` is the liquidity covering [prevTick, tick): every position whose lower
+      // bound is at or below prevTick and whose upper bound is at or above tick.
+      if (havePrev and active > 0 and tick > prevTick) {
+        let liq = Int.abs(active);
+        // token0 is held in the part of the interval ABOVE the current price
+        if (tick > sqrtCurrent) {
+          let lo = Nat.max(prevTick, sqrtCurrent);
+          amount0 += safeSub(mulDiv(liq, tenToPower60, lo), mulDiv(liq, tenToPower60, tick));
+        };
+        // token1 is held in the part of the interval BELOW the current price
+        if (prevTick < sqrtCurrent) {
+          let hi = Nat.min(tick, sqrtCurrent);
+          amount1 += mulDiv(liq, safeSub(hi, prevTick), tenToPower60);
+        };
+      };
+      active += data.liquidityNet;
+      prevTick := tick;
+      havePrev := true;
+    };
+    (amount0, amount1);
+  };
+
+  // Total liquidity held by FULL-RANGE positions. Every full-range position opens at the
+  // FULL_RANGE_LOWER sentinel (addLiquidity adds there, removeLiquidity decrements the
+  // same key) and nothing else can key there: concentrated bounds go through
+  // ratioToSqrtRatio, whose smallest non-zero output is sqrt(1 * 10^60) = 10^30, far above
+  // the 10^20 sentinel. So this tick's net IS the full-range total.
+  func fullRangeLiquidity(v3 : PoolV3Data) : Nat {
+    switch (RBTree.get(v3.ranges, Nat.compare, FULL_RANGE_LOWER)) {
+      case (?d) { if (d.liquidityNet > 0) { Int.abs(d.liquidityNet) } else { 0 } };
+      case null { 0 };
+    };
+  };
+
+  // The full-range sub-pool that a full-range position is settled against:
+  // (reserve0Full, reserve1Full, liquidityFull) = reserves − (what the concentrated
+  // positions are owed), over the full-range liquidity alone.
+  //
+  // When `liquidityFull == 0` this still returns `reserve − concentratedClaims` (with
+  // `own0/own1 == 0`, so it is exactly the reserve MINUS the concentrated claims = the
+  // UNOWNED SURPLUS) and `subLiq == 0`. It deliberately does NOT collapse that to
+  // (0,0,0): the bootstrap branch of addLiquidity/addLiquidityV2 reads this surplus and
+  // sweeps it to the DAO before minting a fresh full-range book, so the very first
+  // full-range depositor cannot redeem the surplus on top of their own deposit (L1a
+  // bootstrap capture — proven 45× on canister). `quoteFullRangeRemoval` and every reader
+  // still short-circuit to (0,0) when `subLiq == 0`, so their behaviour is unchanged —
+  // only the two bootstrap callers observe the surplus, and they consume it, never pay it.
+  func fullRangeSubPool(pool : AMMPool, v3 : PoolV3Data) : (Nat, Nat, Nat) {
+    let liquidityFull = fullRangeLiquidity(v3);
+    // Same guard addConcentratedLiquidity applies on the add side: a 0 price would
+    // classify every position as below-range and claim the whole of reserve0.
+    let sqrtCurrent = if (v3.currentSqrtRatio > 0) { v3.currentSqrtRatio } else {
+      sqrtRatioFromReserves(pool.reserve0, pool.reserve1, 0);
+    };
+    let (all0, all1) = totalPositionClaims(v3, sqrtCurrent);
+    // amountsFromLiquidity(0, …) = (0,0), so with no full-range book own0/own1 vanish and
+    // the result is reserve − concentratedClaims = the surplus.
+    let (own0, own1) = amountsFromLiquidity(liquidityFull, FULL_RANGE_LOWER, FULL_RANGE_UPPER, sqrtCurrent);
+    // Everything the tick tree owes minus the full-range slice is what the concentrated
+    // positions will be paid — hold it back for them.
+    (
+      safeSub(pool.reserve0, safeSub(all0, own0)),
+      safeSub(pool.reserve1, safeSub(all1, own1)),
+      liquidityFull,
+    );
+  };
+
+  // What `liquidity` of a FULL-RANGE position redeems for. Single source of truth for the
+  // full-range payout: removeLiquidity pays exactly this, and every reader that shows a
+  // user a redeemable balance must quote exactly this — a reader on a different basis
+  // shows amounts that cannot actually be withdrawn.
+  func quoteFullRangeRemoval(pool : AMMPool, v3 : PoolV3Data, liquidity : Nat) : (Nat, Nat) {
+    let (subRes0, subRes1, subLiq) = fullRangeSubPool(pool, v3);
+    if (subLiq == 0) { return (0, 0) };
+    (mulDiv(liquidity, subRes0, subLiq), mulDiv(liquidity, subRes1, subLiq));
   };
 
   // Recalculate currentSqrtRatio from reserves + activeLiquidity from tick tree.
@@ -2169,15 +2309,25 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // Get AMM reserves, ensuring token0 maps to res0
     var res0 : Nat = 0;
     var res1 : Nat = 0;
+    var flipped = false;
     switch (Map.get(AMMpools, hashtt, poolKey)) {
       case (null) {};
       case (?pool) {
         if (pool.token0 == token0) { res0 := pool.reserve0; res1 := pool.reserve1 }
-        else { res0 := pool.reserve1; res1 := pool.reserve0 };
+        else { flipped := true; res0 := pool.reserve1; res1 := pool.reserve0 };
       };
     };
     let hasAMM = res0 > 0 and res1 > 0;
-    let v3MidRatio = getPoolRatioV3(poolKey);
+    // ORIENTATION FIX: getPoolRatioV3 returns the CANONICAL (pool-stored order)
+    // ratio; a caller passing the pair flipped previously got the wrong-direction
+    // mid (proven live: both argument orders returned bit-identical mids on
+    // ckBTC/ICP). Invert at the RATIO level — ratio is res1/res0 × 10^60, so the
+    // flipped caller's ratio is 10^120 / canonical — which keeps the caller-decimal
+    // adjustment below correct for unequal-decimal pairs. Native-order callers take
+    // the unchanged branch (bit-identical output). The V2 reserve fallback already
+    // uses caller-oriented res0/res1 — untouched.
+    let v3MidRatioCanonical = getPoolRatioV3(poolKey);
+    let v3MidRatio = if (flipped and v3MidRatioCanonical > 0) { tenToPower120 / v3MidRatioCanonical } else { v3MidRatioCanonical };
     var midRatio : Nat = if (v3MidRatio > 0) { v3MidRatio } else if (res0 > 0) { res1 * tenToPower60 / res0 } else { 0 };
 
     // If no AMM, try to derive mid price from best bid/ask in limit orderbook
@@ -2616,6 +2766,24 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     verboseLogging := on;
     verboseLogging;
   };
+
+  // ── minLegOut enforcement toggle ────────────────────────────────────────────
+  // SplitLeg.minLegOut was accepted-but-ignored since b62e0d4 removed the
+  // pre-execution simulation loop. Enforcement now lives in the post-execution
+  // checks of swapSplitRoutes / swapSplitRoutesV2, gated by this flag.
+  // DEFAULT OFF: the only non-zero senders (DAO treasury + buyback) compute a
+  // pro-rata-by-input legMinOut; measured on live pools, disjoint multi-route
+  // plans can leave a leg 1-2% under that pro-rata bound at quote-exact
+  // execution (heterogeneous route rates), which at the treasury's live 100bp
+  // tolerance would revert legitimate rebalances/buybacks. Flip on only after
+  // the callers add per-leg headroom to their legMinOut computation.
+  public shared ({ caller }) func setEnforceMinLegOut(enabled : Bool) : async ExTypes.ActionResult {
+    if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
+    enforceMinLegOut := enabled;
+    #Ok("enforceMinLegOut = " # (if enabled { "true" } else { "false" }));
+  };
+
+  public query func getEnforceMinLegOut() : async Bool { enforceMinLegOut };
 
   // Memory diagnostic: RTS live-heap vs total Wasm memory (distinguishes a real
   // leak from a high-water mark), plus per-structure entry counts to find the hog.
@@ -4092,33 +4260,103 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       };
       case (?existingPool) {
         if (returnMinimum(token0, existingPool.reserve0, false) and returnMinimum(token1, existingPool.reserve1, false) and existingPool.reserve0 > 0 and existingPool.reserve1 > 0) {
-          // Add to existing pool
-          let amount0Optimal = (amount1 * existingPool.reserve0) / existingPool.reserve1;
-          let amount1Optimal = (amount0 * existingPool.reserve1) / existingPool.reserve0;
-
-          let (useAmount0, useAmount1, refund0, refund1) = if (amount0Optimal <= amount0) {
-            (amount0Optimal, amount1, amount0 - amount0Optimal, 0);
-          } else { (amount0, amount1Optimal, 0, amount1 - amount1Optimal) };
-
-          let liquidity0 = (useAmount0 * existingPool.totalLiquidity) / existingPool.reserve0;
-          let liquidity1 = (useAmount1 * existingPool.totalLiquidity) / existingPool.reserve1;
-          let liquidityMinted = Nat.min(liquidity0, liquidity1);
-
-          let updatedPool = {
-            existingPool with
-            reserve0 = existingPool.reserve0 + useAmount0;
-            reserve1 = existingPool.reserve1 + useAmount1;
-            totalLiquidity = existingPool.totalLiquidity + liquidityMinted;
-            lastUpdateTime = nowVar;
-            providers = TrieSet.put(existingPool.providers, caller, Principal.hash(caller), Principal.equal);
+          // Add to existing pool.
+          // L1a: mint against the SAME full-range sub-pool removeLiquidity settles
+          // against, so add and remove stay exact inverses. Minting on the raw reserves
+          // while removal pays out of the sub-pool would hand out a free round trip: on a
+          // pool carrying IN-RANGE concentrated liquidity the raw basis mints
+          // totalLiquidity/reserve per token but redeems reserveFull/liquidityFull, and
+          // that ratio exceeds 1 — measured on the live pool shapes at +0.62%
+          // (kknbx/n6tkf), +14.04% (zfcdd/ryjl3) and +232% (o6ncl/xevnm) per round trip.
+          // On a pool with no concentrated liquidity the sub-pool IS the pool, so this is
+          // arithmetically identical to the old code (49 of the 60 live pools).
+          let (subRes0, subRes1, subLiq) = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v3sub) { fullRangeSubPool(existingPool, v3sub) };
+            // No V3 data - no concentrated position can exist - sub-pool == pool.
+            case null { (existingPool.reserve0, existingPool.reserve1, existingPool.totalLiquidity) };
           };
-          Map.set(AMMpools, hashtt, poolKey, updatedPool);
-          (liquidityMinted, refund0, refund1);
+          if (subLiq > 0 and (subRes0 == 0 or subRes1 == 0)) {
+            // The concentrated positions are owed at least one whole side of the reserves,
+            // so there is no honest rate at which to mint into the full-range book —
+            // minting anyway would dilute the existing full-range LPs on the side that is
+            // still solvent. Refuse and refund, mirroring the recreation reject below.
+            // (Unreachable on current live state: 0 of the 60 pools.)
+            let TfeesR0 = returnTfees(token0);
+            let TfeesR1 = returnTfees(token1);
+            if (amount0 > TfeesR0) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - TfeesR0, token0, genTxId()));
+            };
+            if (amount1 > TfeesR1) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - TfeesR1, token1, genTxId()));
+            };
+            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+              Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+            };
+            return #Err(#InsufficientFunds("Full-range reserves are fully claimed by concentrated positions in this pool"));
+          };
+          let (liquidityMinted, refund0, refund1) = if (subLiq == 0) {
+            // ── Bootstrap: no full-range book exists yet. After the L1a fix `subRes` now
+            // carries the UNOWNED SURPLUS (reserves minus what the concentrated positions
+            // are owed; fullRangeSubPool returns it with subLiq == 0). Minting the deposit
+            // and leaving the surplus in reserves would hand the surplus to THIS depositor
+            // on the next removal: a fresh full-range book redeems mulDiv(L, subResAfter, L)
+            // = subResAfter, and subResAfter = surplus + deposit. So SWEEP the surplus to
+            // the DAO first — decrementing the reserves by exactly what feescollectedDAO
+            // gains, in this same synchronous region (amm-balance falls by what fee-balance
+            // rises: no P15 double count, drift stays ≥ 0) — THEN mint the deposit as a
+            // brand-new full-range book (sqrt scale on the full deposit, exactly like the
+            // fresh-pool branch). After the sweep reserve == the concentrated claims, so
+            // post-deposit subRes == the deposit and removeLiquidity returns the deposit.
+            // The surplus lands in feescollectedDAO, claimable only by the DAO fee sweep —
+            // never by an LP or an arbitrary caller.
+            if (subRes0 > 0) { addFees(existingPool.token0, subRes0, false, "", nowVar) };
+            if (subRes1 > 0) { addFees(existingPool.token1, subRes1, false, "", nowVar) };
+            recordOpDrift("addLiq_bootstrap_sweep", existingPool.token0, -subRes0);
+            recordOpDrift("addLiq_bootstrap_sweep", existingPool.token1, -subRes1);
+            let initialLiquidity = sqrt(amount0 * amount1);
+            let updatedPool = {
+              existingPool with
+              reserve0 = safeSub(existingPool.reserve0, subRes0) + amount0;
+              reserve1 = safeSub(existingPool.reserve1, subRes1) + amount1;
+              totalLiquidity = existingPool.totalLiquidity + initialLiquidity;
+              lastUpdateTime = nowVar;
+              providers = TrieSet.put(existingPool.providers, caller, Principal.hash(caller), Principal.equal);
+            };
+            Map.set(AMMpools, hashtt, poolKey, updatedPool);
+            (initialLiquidity, 0, 0);
+          } else {
+            // ── Non-bootstrap (audited L1a): mint against the full-range SUB-POOL so add
+            // and remove stay exact inverses. Minting on the raw reserves while removal
+            // pays out of the sub-pool would hand out a free round trip: on a pool carrying
+            // IN-RANGE concentrated liquidity the raw basis mints totalLiquidity/reserve per
+            // token but redeems reserveFull/liquidityFull, and that ratio exceeds 1 —
+            // measured on the live pool shapes at +0.62% (kknbx/n6tkf), +14.04% (zfcdd/
+            // ryjl3) and +232% (o6ncl/xevnm) per round trip. On a pool with no concentrated
+            // liquidity the sub-pool IS the pool, so this is arithmetically identical to the
+            // old code (49 of the 60 live pools).
+            let amount0Optimal = (amount1 * subRes0) / subRes1;
+            let amount1Optimal = (amount0 * subRes1) / subRes0;
+
+            let (useAmount0, useAmount1, refund0, refund1) = if (amount0Optimal <= amount0) {
+              (amount0Optimal, amount1, amount0 - amount0Optimal, 0);
+            } else { (amount0, amount1Optimal, 0, amount1 - amount1Optimal) };
+
+            let liquidity0 = (useAmount0 * subLiq) / subRes0;
+            let liquidity1 = (useAmount1 * subLiq) / subRes1;
+            let liquidityMinted = Nat.min(liquidity0, liquidity1);
+
+            let updatedPool = {
+              existingPool with
+              reserve0 = existingPool.reserve0 + useAmount0;
+              reserve1 = existingPool.reserve1 + useAmount1;
+              totalLiquidity = existingPool.totalLiquidity + liquidityMinted;
+              lastUpdateTime = nowVar;
+              providers = TrieSet.put(existingPool.providers, caller, Principal.hash(caller), Principal.equal);
+            };
+            Map.set(AMMpools, hashtt, poolKey, updatedPool);
+            (liquidityMinted, refund0, refund1);
+          };
         } else {
-          addFees(existingPool.token0, existingPool.reserve0, false, "", nowVar);
-          addFees(existingPool.token1, existingPool.reserve1, false, "", nowVar);
-          recordOpDrift("addLiq_recreate", existingPool.token0, existingPool.reserve0);
-          recordOpDrift("addLiq_recreate", existingPool.token1, existingPool.reserve1);
           // Recreate pool — register pair if not yet in pool_canister
           if (amount0 < MINIMUM_LIQUIDITY0 or amount1 < MINIMUM_LIQUIDITY1) {
             // DRIFT FIX: same as new-pool branch above — refund full amounts so
@@ -4136,6 +4374,16 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             };
             return #Err(#InsufficientFunds("Amounts below minimum liquidity for pool recreation"));
           };
+          // P15 FIX: sweep the old pool's reserves into feescollectedDAO only AFTER
+          // the reject above. Booking before it double-counted the reserves (both
+          // feescollectedDAO and ammbalance) on the reject path — the pool row is
+          // only replaced on the success Map.set below, so the reject left permanent
+          // negative drift. On success this books exactly once, same as before the
+          // reorder (no await between here and the Map.set below).
+          addFees(existingPool.token0, existingPool.reserve0, false, "", nowVar);
+          addFees(existingPool.token1, existingPool.reserve1, false, "", nowVar);
+          recordOpDrift("addLiq_recreate", existingPool.token0, existingPool.reserve0);
+          recordOpDrift("addLiq_recreate", existingPool.token1, existingPool.reserve1);
           // F16: committed to withholding — mark only now (see new-pool branch).
           if (MINIMUM_LIQUIDITY0 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal) };
           if (MINIMUM_LIQUIDITY1 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal) };
@@ -4780,6 +5028,29 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (?p) { p };
     };
 
+    // L1a sibling guard — mirror the add-side rejection (addConcentratedLiquidity:4610,
+    // addConcentratedLiquidityV2:19429). A FULL-RANGE position must exit through
+    // removeLiquidity, which settles it against the full-range SUB-POOL (reserves minus
+    // what the concentrated positions are owed, over full-range liquidity alone — see
+    // quoteFullRangeRemoval). Settling it HERE instead uses amountsFromLiquidity over the
+    // FULL_RANGE_* sentinels capped at reserves (:5027-5038) — the drifted-currentSqrtRatio
+    // basis that over-claimed 205.7 ICP across 47/60 live pools and was deliberately
+    // rejected for removeLiquidity by L1a. This closes the same over-claim on the sibling
+    // entrypoint (reachable unprivileged: getUserConcentratedPositions returns a full-range
+    // positionId any allowed caller can pass here).
+    //   `and`, NOT `or`: this rejects EXACTLY the set removeLiquidity serves
+    // (ratioLower==FULL_RANGE_LOWER and ratioUpper==FULL_RANGE_UPPER — the same both-sentinel
+    // test used everywhere a STORED position is classified: :785/:5249/:5299/:5734/:16414),
+    // so every position it now rejects is one removeLiquidity can withdraw — no stranding.
+    // A partial-sentinel position (one bound only) is a DIFFERENT case: removeLiquidity's
+    // :5734 scan requires BOTH sentinels and would miss it, so removeConcentratedLiquidity
+    // is its only exit — an `or` here would strand it. The four add-side guards
+    // (:4610/:4647/:19429/:19466) reject either-sentinel on creation, so none can exist;
+    // `and` also leaves any hypothetical legacy one untouched (still served here).
+    if (position.ratioLower == FULL_RANGE_LOWER and position.ratioUpper == FULL_RANGE_UPPER) {
+      return #Err(#InvalidInput("Use removeLiquidity for full-range positions"));
+    };
+
     let actualLiquidityToRemove = Nat.min(liquidityAmount, position.liquidity);
     if (actualLiquidityToRemove == 0) { return #Err(#InvalidInput("Nothing to remove")) };
 
@@ -5028,10 +5299,21 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             let fee0 = Nat.min(theoreticalFee0, maxClaimable0);
             let fee1 = Nat.min(theoreticalFee1, maxClaimable1);
 
-            // Compute token amounts from liquidity + price range + current price
-            let sqrtLower = ratioToSqrtRatio(pos.ratioLower);
-            let sqrtUpper = ratioToSqrtRatio(pos.ratioUpper);
-            let (amount0, amount1) = amountsFromLiquidity(pos.liquidity, sqrtLower, sqrtUpper, v3.currentSqrtRatio);
+            // Quote on EXACTLY the basis the matching removal path pays out, or the UI
+            // shows balances that cannot be withdrawn:
+            //   full-range   → removeLiquidity              → quoteFullRangeRemoval
+            //   concentrated → removeConcentratedLiquidity  → amountsFromLiquidity, capped
+            // The full-range branch must also use the RAW sentinels as sqrt bounds — the
+            // payout key convention — not ratioToSqrtRatio of them.
+            let isFullRange = (pos.ratioLower == FULL_RANGE_LOWER and pos.ratioUpper == FULL_RANGE_UPPER);
+            let sqrtLower = if (isFullRange) { FULL_RANGE_LOWER } else { ratioToSqrtRatio(pos.ratioLower) };
+            let sqrtUpper = if (isFullRange) { FULL_RANGE_UPPER } else { ratioToSqrtRatio(pos.ratioUpper) };
+            let (amount0, amount1) = if (isFullRange) {
+              quoteFullRangeRemoval(pool, v3, pos.liquidity);
+            } else {
+              let (rawAmt0, rawAmt1) = amountsFromLiquidity(pos.liquidity, sqrtLower, sqrtUpper, v3.currentSqrtRatio);
+              (Nat.min(rawAmt0, pool.reserve0), Nat.min(rawAmt1, pool.reserve1));
+            };
 
             // Share of pool: only in-range positions actively earn fees
             let isInRange = v3.currentSqrtRatio > sqrtLower and v3.currentSqrtRatio < sqrtUpper;
@@ -5536,16 +5818,41 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             let maxClaimable1 = safeSub(v3.totalFeesCollected1, v3.totalFeesClaimed1);
             let actualFee1 = Nat.min(theoreticalFee1, maxClaimable1);
 
-            // Calculate token amounts using proportional share of actual reserves.
-            // addLiquidity adds exact deposit amounts to reserves, so we must remove
-            // proportionally from reserves (not from V3 math, which rounds differently).
+            // Calculate token amounts as a proportional share of the FULL-RANGE SUB-POOL:
+            // the reserves left after setting aside what the concentrated positions are
+            // owed, over the full-range liquidity alone (see fullRangeSubPool).
+            // This used to share the RAW reserves over pool.totalLiquidity, which
+            // syncPoolFromV3 pins to v3.activeLiquidity — in-range liquidity only. Anyone
+            // could then park an out-of-range concentrated range to inflate the numerator
+            // without touching the denominator, redeem a full-range position at the
+            // inflated rate, and pull the difference out of the other LPs' funds (L1a:
+            // unprivileged, repeatable, and invisible to checkDiffs).
             // DRIFT FIX: see removeConcentratedLiquidity — same full-range key convention.
             let sqrtLower = if (position.ratioLower == FULL_RANGE_LOWER) { FULL_RANGE_LOWER } else { ratioToSqrtRatio(position.ratioLower) };
             let sqrtUpper = if (position.ratioUpper == FULL_RANGE_UPPER) { FULL_RANGE_UPPER } else { ratioToSqrtRatio(position.ratioUpper) };
-            let baseAmount0 = if (pool.totalLiquidity > 0) { mulDiv(removeAmt, pool.reserve0, pool.totalLiquidity) } else { 0 };
-            let baseAmount1 = if (pool.totalLiquidity > 0) { mulDiv(removeAmt, pool.reserve1, pool.totalLiquidity) } else { 0 };
+            if (fullRangeLiquidity(v3) == 0) {
+              // The caller demonstrably holds a full-range position, yet the tick tree
+              // records no full-range liquidity — the tree and the position store are out
+              // of sync (see the TICK_TREE_MISS warnings). Refuse rather than burn the
+              // position for a zero payout; an admin can resync and the funds stay put.
+              logger.warn("AMM", "removeLiquidity refused — full-range book desync. posId=" # Nat.toText(position.positionId), "removeLiquidity");
+              return #Err(#PoolNotFound("Full-range liquidity book out of sync for this pool — removal refused"));
+            };
+            let (baseAmount0, baseAmount1) = quoteFullRangeRemoval(pool, v3, removeAmt);
             let totalAmount0 = baseAmount0 + (actualFee0 * removeAmt / position.liquidity);
             let totalAmount1 = baseAmount1 + (actualFee1 * removeAmt / position.liquidity);
+
+            // DEFECT-2 guard: quoteFullRangeRemoval can return 0 on a token whose full-range
+            // sub-pool side is empty (subRes == 0) even while fullRangeLiquidity(v3) > 0 — so
+            // the desync refusal above does not catch it. If BOTH sides (base + fee) pay
+            // nothing, proceeding would burn `removeAmt` for a zero payout, permanently
+            // forfeiting the position's share. Refuse here — no pool/position state has been
+            // mutated yet, so a bare return is safe and the funds stay put. A legitimate
+            // one-sided exit (one side positive) still proceeds untouched.
+            if (totalAmount0 == 0 and totalAmount1 == 0) {
+              logger.warn("AMM", "removeLiquidity refused — full-range sub-pool empty on both sides. posId=" # Nat.toText(position.positionId), "removeLiquidity");
+              return #Err(#InsufficientFunds("Full-range sub-pool holds nothing for this position on either side — removal refused to avoid burning liquidity for a zero payout"));
+            };
 
             // Update range tree
             var ranges = v3.ranges;
@@ -6845,7 +7152,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   // which requires a destructive remove+re-add. Floor of 1000 (inclusive).
   public shared ({ caller }) func setMinimumAmount(token : Text, newMinimum : Nat) : async ExTypes.ActionResult {
     if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
-    if (newMinimum < 100) { return #Err(#InvalidInput("Minimum must be >= 100")) };
+    // P15 precondition guard: a minimum below 1000 opens the recreate-reject
+    // window (minimum*10 < amount < minimumLiquidity=10000) in addLiquidity.
+    // Floor future writes at 1000, matching addAcceptedToken's existing assert.
+    // Guards NEW writes only — pre-existing sub-1000 values (mainnet ckBTC = 500)
+    // are deliberately NOT migrated.
+    if (newMinimum < 1000) { return #Err(#InvalidInput("Minimum must be >= 1000")) };
 
     let idx = switch (Array.indexOf<Text>(token, acceptedTokens, Text.equal)) {
       case (?i) { i };
@@ -10236,6 +10548,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // consumed by a counterparty transfer. Only book the buffer to feescollectedDAO
     // if NO leg had an orderbook match (matches swapMultiHop:7588 semantics).
     var anyLegHadOrderbookMatch = false;
+    // MINLEGOUT: set when any leg with minLegOut > 0 produced less than it.
+    var legBelowMin = false;
 
     for (legIndex in Iter.range(0, splits.size() - 1)) {
       let leg = splits[legIndex];
@@ -10387,6 +10701,9 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // Aggregate orderbook-match detection across legs for inputTfees decision below.
       if (legFirstHopHadOrderbookMatch) { anyLegHadOrderbookMatch := true };
 
+      // MINLEGOUT: record a per-leg minimum violation (enforced at the aggregate
+      // check below only when enforceMinLegOut is on; minLegOut = 0 is a no-op).
+      if (leg.minLegOut > 0 and currentAmount < leg.minLegOut) { legBelowMin := true };
       totalOutput += currentAmount;
     };
 
@@ -10441,8 +10758,12 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     // The user's deposit on the ledger remains in the exchange treasury and the
     // BlocksDone marker is reverted, so the same Block can be retried (or recovered
     // via checkDiffs later if treasury moves on).
-    if (totalOutput < minAmountOut) {
-      Debug.trap("SlippageExceeded: expected at least " # Nat.toText(minAmountOut) # " got " # Nat.toText(totalOutput));
+    // MINLEGOUT (flag-gated, default OFF): when enforceMinLegOut is on, a leg
+    // landing under its declared minLegOut fails the whole swap through this same
+    // trap — matching both the aggregate idiom and the original (pre-b62e0d4)
+    // per-leg check's fail-the-whole-swap semantics. minLegOut = 0 is a no-op.
+    if (totalOutput < minAmountOut or (enforceMinLegOut and legBelowMin)) {
+      Debug.trap("SlippageExceeded: expected at least " # Nat.toText(minAmountOut) # " got " # Nat.toText(totalOutput) # (if (enforceMinLegOut and legBelowMin) { " (minLegOut violated on at least one leg)" } else { "" }));
     };
 
     // ── 8. Consolidate transfers (combine same recipient+token to save transfer fees) ──
@@ -13895,6 +14216,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     let TradeEntryVector = Vector.new<{ initPrincipal : Text; accesscode : Text; amount_init : Nat; amount_sell : Nat; Fee : Nat; RevokeFee : Nat; partial : Bool }>();
     var initTfeesDone = false;
 
+    // SECURITY FIX (duplicate accesscode double-fill): an accesscode repeated in the
+    // batch was counted once PER OCCURRENCE into amountInit (which sizes the deposit
+    // pull / requirement) AND into the aggregate reactor payout amountSell, while the
+    // settlement's removeTrade dedups only the MAKER side — so the reactor over-received
+    // (N-1)x the escrow out of pooled funds (negative drift) plus a stranded overpull.
+    // Precompute the DUPLICATE indices (an accesscode already seen at a lower index) ONCE
+    // and skip them identically in BOTH scan loops. A skipped entry never enters
+    // amountInit/Sell/Fees nor TradeEntryVector, so checkReceive's sendback refunds the
+    // caller automatically — same mechanism/style as the P17 skip. Both loops MUST agree:
+    // asymmetric handling manufactures the amountInit != amountInit2 divergence class.
+    let isDupIndex = Array.init<Bool>(accesscode.size(), false);
+    let seenAccesscodesDedup = Map.new<Text, Bool>();
+    for (di in Iter.range(0, accesscode.size() - 1)) {
+      if (Map.has(seenAccesscodesDedup, thash, accesscode[di])) { isDupIndex[di] := true } else {
+        Map.set(seenAccesscodesDedup, thash, accesscode[di], true);
+      };
+    };
     label a for (i in Iter.range(0, accesscode.size() - 1)) {
       let currentTrades2 = switch (Map.get(tradeStorePublic, thash, accesscode[i])) {
         case (?(foundTrades)) foundTrades;
@@ -13917,6 +14255,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // A skipped entry never enters amountInit/Sell/Fees nor TradeEntryVector, so
       // checkReceive's sendback logic refunds the caller automatically.
       if (amount_Sell_by_Reactor[i] > currentTrades2.amount_init) { continue a };
+      if (isDupIndex[i]) { continue a }; // dedup: process each accesscode at most once
 
       let (amountInitInc, amountSellInc, amountFeesInc) = if (amount_Sell_by_Reactor[i] < currentTrades2.amount_init) {
         let amtInit = ((((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell)) * (10000 + currentTrades2.Fee)) / 100000000) + (10000 * sellTfees);
@@ -14001,6 +14340,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       // TradeEntryVector2, which the amountInit != amountInit2 branch below promotes
       // into TradeEntries — i.e. asymmetric application manufactures P16.
       if (amount_Sell_by_Reactor[i] > currentTrades2.amount_init) { continue getTradeInfo };
+      if (isDupIndex[i]) { continue getTradeInfo }; // dedup: process each accesscode at most once
 
       if (amount_Sell_by_Reactor[i] < currentTrades2.amount_init) {
         amountInit2 += ((((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell)) * (10000 + currentTrades2.Fee)) / 100000000) + (10000 * sellTfees);
@@ -14162,7 +14502,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   public shared (msg) func FinishSell(
     Block : Nat64,
     accesscode : Text,
-    amountSelling : Nat,
+    amountSellingRaw : Nat, // raw taker amount; clamped to amount_sell below (over-fill fix)
   ) : async ExTypes.ActionResult {
     if (isAllowed(msg.caller) != 1) {
       return #Err(#NotAuthorized);
@@ -14197,7 +14537,7 @@ shared (deployer) persistent actor class create_trading_canister() = this {
     var tType : { #ICP; #ICRC12; #ICRC3 } = returnType(currentTrades2.token_sell_identifier);
     var blockData : BlockData = #ICRC12([]);
     if (
-      returnMinimum(currentTrades2.token_sell_identifier, amountSelling, false) == false or
+      returnMinimum(currentTrades2.token_sell_identifier, amountSellingRaw, false) == false or
       ((switch (Array.find<Text>(pausedTokens, func(t) { t == currentTrades2.token_sell_identifier })) { case null { false }; case (?_) { true } })) or
       ((switch (Array.find<Text>(pausedTokens, func(t) { t == currentTrades2.token_init_identifier })) { case null { false }; case (?_) { true } })) or
       currentTrades2.trade_number == 0 or currentTrades2.trade_done == 1
@@ -14217,6 +14557,23 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       return #Err(#TokenPaused("Amount too low or token paused"));
     };
 
+    // SECURITY FIX (single-fill over-fill): cap the taker's fill at the maker's
+    // escrowed order size. Without this, amountSelling > amount_sell drives
+    // amountBuying (the amount_init * amountSelling/amount_sell payout below) past
+    // amount_init, and the non-partial (else) arm pays the maker's UNBACKED excess
+    // from pooled reserves — an unbounded, caller-chosen drain, self-fillable via a
+    // private/OTC/allOrNothing order whose ratio is stored verbatim (addPosition's
+    // AMM auto-match is skipped for those). Clamp mirrors orderPairing, which never
+    // fills beyond amount_sell. The clamped fill is an exact FULL fill, so `partial`
+    // (computed BELOW from the clamped value) is correctly false; and because
+    // checkReceive is called with this clamped amount, its own sendback refunds the
+    // taker's over-deposit (amountSelling - amount_sell) automatically — no manual
+    // refund, no double-pay. amount_sell is >= 1 for every stored order (addPosition
+    // normalizes 0 -> 1; Faketrade's amount_sell == 0 is gated out above via
+    // trade_number == 0), so the amountBuying divisor stays non-zero.
+    let amountSelling = if (amountSellingRaw > currentTrades2.amount_sell) {
+      currentTrades2.amount_sell;
+    } else { amountSellingRaw };
     let partial = (amountSelling < currentTrades2.amount_sell);
 
     blockData := try {
@@ -16122,10 +16479,24 @@ shared (deployer) persistent actor class create_trading_canister() = this {
               case null { (0, 0) };
             };
 
-            let sqrtLower = ratioToSqrtRatio(pos.ratioLower);
-            let sqrtUpper = ratioToSqrtRatio(pos.ratioUpper);
+            // Quote on EXACTLY the basis the matching removal path pays out (see
+            // getUserLiquidityDetailed): full-range positions settle against the
+            // full-range sub-pool via removeLiquidity, concentrated positions against
+            // their own range via removeConcentratedLiquidity. Full-range bounds stay the
+            // RAW sentinels — the payout key convention.
+            let isFullRange = (pos.ratioLower == FULL_RANGE_LOWER and pos.ratioUpper == FULL_RANGE_UPPER);
+            let sqrtLower = if (isFullRange) { FULL_RANGE_LOWER } else { ratioToSqrtRatio(pos.ratioLower) };
+            let sqrtUpper = if (isFullRange) { FULL_RANGE_UPPER } else { ratioToSqrtRatio(pos.ratioUpper) };
             let currentSqrt = switch (v3) { case (?v) { v.currentSqrtRatio }; case null { tenToPower60 } };
-            let (amount0, amount1) = amountsFromLiquidity(pos.liquidity, sqrtLower, sqrtUpper, currentSqrt);
+            let (amount0, amount1) = switch (v3, Map.get(AMMpools, hashtt, poolKey)) {
+              case (?v, ?pool) {
+                if (isFullRange) { quoteFullRangeRemoval(pool, v, pos.liquidity) } else {
+                  let (rawAmt0, rawAmt1) = amountsFromLiquidity(pos.liquidity, sqrtLower, sqrtUpper, currentSqrt);
+                  (Nat.min(rawAmt0, pool.reserve0), Nat.min(rawAmt1, pool.reserve1));
+                };
+              };
+              case _ { amountsFromLiquidity(pos.liquidity, sqrtLower, sqrtUpper, currentSqrt) };
+            };
 
             {
               positionId = pos.positionId;
@@ -17966,6 +18337,4758 @@ shared (deployer) persistent actor class create_trading_canister() = this {
   };
 
   // certain rules that get applied before cyclespent so spamming is mitigated. Here also certain ruling is available considering who can access certain functions.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V2 API — GROSS-INPUT + ICRC-2 PULL
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Design: PART 2 of the exchange remediation plan (audited; BUG A..Q + ★1..★6
+  // fixes are all load-bearing and each is annotated at its enforcement site).
+  //
+  // HARD RULE: NO V1 FUNCTION IS MODIFIED. Every V2 entrypoint below is a full
+  // copy of its V1 twin differing in exactly two ways:
+  //   (1) the input amount is GROSS ("what you hand over"), and
+  //   (2) the deposit arrives via icrc2_transfer_from (a PULL) instead of a
+  //       caller-supplied ledger block the exchange must read back.
+  // Shared helpers (checkReceive, addFees, orderPairing, calculateFee,
+  // returnTfees, returnMinimum, claimProtocolFeeInV3, recordSwap, findRoutes,
+  // simulateMultiHop, snapshotPairsState/restorePairsState, doInfoBeforeStep2,
+  // computeQuoteRoutesForRequest, extractRecipientToTreasuryAmount) are CALLED,
+  // never copied.
+  //
+  // Deposit-flow invariants (each tagged where enforced):
+  //  BUG A  refundPullV2 / checkReceive(0)-style refunds run ONLY where the
+  //         fee-booking checkReceive has NOT run.
+  //  BUG B  when checkReceive returns (false, transfers): queue ONLY those
+  //         transfers — never an additional refund.
+  //  BUG H  pull outcome classified by RESPONSE KIND, not success (see
+  //         pullFromV2). Only a #call_error reject proves the call never left
+  //         this canister; every other reject is AMBIGUOUS.
+  //  BUG J  V2 WRITES BlocksDone for the pull's real ledger block — otherwise
+  //         the same block is redeemable for 21 days via public
+  //         recoverWronglysent or V1 addLiquidity (double-spend).
+  //  BUG M  every V2 checkReceive call site hard-codes tType = #ICRC12 (the
+  //         synthetic block is #ICRC12-shaped; reading tokenType would silently
+  //         no-credit #ICP tokens).
+  //  BUG N  the BlocksDone burn is the FIRST statement after a pull returns
+  //         #Ok(blk), above every branch.
+  //  BUG O  the pendingPullsV2 record is deleted on EVERY post-pull exit; a
+  //         surviving record means exactly "outcome genuinely unknown".
+  //  BUG Q / ★5  the fee triple (feeBp, revokeBp, tf) is snapshotted BEFORE the
+  //         pull, stored in the PullRecord, and threaded through EVERY fee read
+  //         in the copied body — a ChangeTradingfees landing during the pull
+  //         await must not make booked fees exceed the deposit carve-out.
+  //  ★1/★2  multi-pull unwind: burn + record-delete on EVERY failure path;
+  //         order is pull0 → pull1 → validate → checkReceive0 → checkReceive1;
+  //         a leg whose checkReceive already ran is refunded ONLY via the
+  //         explicit `amount - returnTfees(token)` idiom, never refundPullV2.
+  //  ★4    nothing verifies a ledger transfers exactly `amount` — so V2 is
+  //         gated behind an explicit per-token allowlist (v2TokenAllowlistV2)
+  //         of ledgers proven not to skim (no fee-on-transfer / rebasing).
+  //         Balance-delta verification was rejected: concurrent V1 deposits and
+  //         treasury payouts during the pull await make the delta racy in both
+  //         directions on a live exchange.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── V2 types ───────────────────────────────────────────────────────────────
+
+  // ICRC-2 pull interface (defined locally; src/icrc.types.mo is owned by the
+  // test harness right now and mo:icrc1's FullInterface has no icrc2 methods).
+  // NOTE: #Expired is an ApproveError, NOT a TransferFromError — deliberately
+  // absent here (adding it would be a wire-type lie).
+  type TransferFromArgsV2 = {
+    spender_subaccount : ?[Nat8];
+    from : ICRC2.Account;
+    to : ICRC2.Account;
+    amount : Nat;
+    fee : ?Nat;
+    memo : ?Blob;
+    created_at_time : ?Nat64;
+  };
+  type TransferFromErrorV2 = {
+    #BadFee : { expected_fee : Nat };
+    #BadBurn : { min_burn_amount : Nat };
+    #InsufficientFunds : { balance : Nat };
+    #InsufficientAllowance : { allowance : Nat };
+    #TooOld;
+    #CreatedInFuture : { ledger_time : Nat64 };
+    #Duplicate : { duplicate_of : Nat };
+    #TemporarilyUnavailable;
+    #GenericError : { error_code : Nat; message : Text };
+  };
+  type ICRC2LedgerV2 = actor {
+    icrc2_transfer_from : (TransferFromArgsV2) -> async { #Ok : Nat; #Err : TransferFromErrorV2 };
+  };
+
+  // BUG C: the record deliberately has NO ledger-block field — it could never be
+  // observed populated on the paths that keep the record. A surviving record
+  // always means "outcome unknown"; the admin confirms the real block off-chain
+  // by the pull's memo ("TACOV2:<id>") and passes it to adminResolvePendingPull.
+  type PullRecordV2 = {
+    id : Nat;
+    caller : Principal;
+    token : Text;
+    gross : Nat;
+    feeBp : Nat; //  ICPfee snapshot taken BEFORE the pull        (BUG Q)
+    revokeBp : Nat; //  RevokeFeeNow snapshot taken BEFORE the pull  (BUG Q)
+    tf : Nat; //  returnTfees(token) snapshot BEFORE the pull  (BUG Q)
+    time : Time;
+    context : Text; //  which V2 function issued the pull
+    note : Text; //  "inflight" | "ambiguous: <err>"
+  };
+
+  type PullOutcomeV2 = {
+    #Ok : Nat; // ledger block index — funds confirmed moved
+    #ErrDeclined : Text; // ledger replied #Err, or the send never left this canister — funds did NOT move
+    #ErrAmbiguous : (Nat, Text); // (pullId, err) — outcome unknown; record kept for admin resolution
+  };
+
+  // ── V2 stable state ────────────────────────────────────────────────────────
+
+  stable let pendingPullsV2 = Map.new<Nat, PullRecordV2>();
+  stable var nextPullIdV2 : Nat = 0;
+  // ★4: explicit per-token opt-in. Default-empty ⇒ V2 ships dark; an admin must
+  // enable each ledger after verifying it supports icrc2_transfer_from AND
+  // transfers exactly `amount` (no fee-on-transfer, no rebasing).
+  stable let v2TokenAllowlistV2 = Map.new<Text, Bool>();
+
+  // Global V2 kill switch. Defaults OFF so an upgrade can ship the (still-audited)
+  // V2 code completely inert. Composes with the per-token v2TokenAllowlistV2 — the
+  // global switch is checked FIRST, before any state mutation / pull / lock / await,
+  // so a disabled V2 call costs the caller nothing and changes no state. Recovery /
+  // admin paths (getMyPendingPulls, adminListPendingPulls, adminResolvePendingPull,
+  // adminDropPendingPull, adminSweepPendingPulls, adminSetV2TokenAllowed,
+  // getV2AllowedTokens) are deliberately NOT gated: flipping V2 off must never strand
+  // funds already mid-flight in a pending pull.
+  stable var v2Enabled : Bool = false;
+
+  // No real ledger index can reach 2^64, so checkReceive's INTERNAL
+  // Map.delete(BlocksDone, …) sites (keyed on the block passed to checkReceive)
+  // can never collide with a real key. This is separate from the deliberate
+  // BlocksDone WRITE for the pull's real block (BUG J).
+  transient let PULL_SENTINEL_BLOCK_V2 : Nat = 18_446_744_073_709_551_616; // 2^64
+
+  // Cap/sweeper spec for pendingPullsV2: records are NEVER auto-evicted (a
+  // hostile token must not be able to evict a real victim's evidence). Instead,
+  // when a cap is reached NEW V2 calls are refused pre-pull (no funds moved);
+  // V1 is unaffected. Cleanup is a deliberate admin action only
+  // (adminDropPendingPull / adminSweepPendingPulls).
+  transient let PENDING_PULLS_CAP_V2 : Nat = 200;
+  transient let PENDING_PULLS_PER_TOKEN_CAP_V2 : Nat = 25;
+
+  // ── V2 gross/net math ──────────────────────────────────────────────────────
+  // Termination of netFromGrossV2: at most 2 loop iterations. ChangeTradingfees
+  // clamps ICPfee to 1..50 and ChangeRevokefees clamps RevokeFeeNow to >= 3, so
+  // divisors are never 0. Invariant: requiredForNetV2(netFromGrossV2(g)) <= g,
+  // i.e. checkReceive can never reject a V2 deposit on the exchange's own
+  // arithmetic.
+
+  private func requiredForNetV2(net : Nat, tf : Nat, feeBp : Nat) : Nat {
+    ((net * (10000 + feeBp)) / 10000) + tf;
+  };
+
+  private func netFromGrossV2(gross : Nat, tf : Nat, feeBp : Nat) : Nat {
+    if (gross <= tf) { return 0 };
+    var net = ((gross - tf) * 10000) / (10000 + feeBp);
+    while (requiredForNetV2(net + 1, tf, feeBp) <= gross) { net += 1 };
+    net;
+  };
+
+  // Synthetic #ICRC12 block for a completed pull: from=caller → to=treasury of
+  // exactly `gross`, fee = the pre-pull tf snapshot, timestamp = nowVar2 (so the
+  // 21-day check passes with timeDiff == 0). created_at_time = null makes
+  // getTimestamp use the top-level timestamp.
+  private func syntheticPullBlockV2(pullCaller : Principal, gross : Nat, tfSnap : Nat, nowVar2 : Time) : BlockData {
+    #ICRC12([{
+      burn = null;
+      kind = "transfer";
+      mint = null;
+      timestamp = Nat64.fromNat(Int.abs(nowVar2));
+      index = null;
+      transfer = ?{
+        to = { owner = treasury_principal; subaccount = null };
+        fee = ?tfSnap;
+        from = { owner = pullCaller; subaccount = null };
+        memo = null;
+        created_at_time = null;
+        amount = gross;
+      };
+    }]);
+  };
+
+  // Pre-pull gate, run per pulled token BEFORE any funds move.
+  // Returns null when the pull may proceed, or the refusal reason.
+  private func v2PullPreflight(token : Text) : ?Text {
+    if (Map.get(v2TokenAllowlistV2, thash, token) != ?true) {
+      return ?("Token not enabled for V2 (ICRC-2 allowlist): " # token);
+    };
+    if (Map.size(pendingPullsV2) >= PENDING_PULLS_CAP_V2) {
+      return ?"V2 temporarily unavailable: pending-pull ledger at capacity";
+    };
+    var perToken = 0;
+    for (r in Map.vals(pendingPullsV2)) { if (r.token == token) { perToken += 1 } };
+    if (perToken >= PENDING_PULLS_PER_TOKEN_CAP_V2) {
+      return ?("V2 temporarily unavailable for token (per-token pending-pull cap): " # token);
+    };
+    null;
+  };
+
+  // ── The pull ───────────────────────────────────────────────────────────────
+  // BUG H: classify by RESPONSE KIND.
+  //   reply #Ok(blk)                  → funds moved; record deleted (caller burns
+  //                                     BlocksDone as its FIRST statement — same
+  //                                     atomic region, no commit point between).
+  //   reply #Err(e)                   → callee completed and declined; record deleted.
+  //   reject with code #call_error    → synchronous send failure, the call never
+  //                                     left this canister; record deleted.
+  //   ANY other reject / callee trap  → AMBIGUOUS (icrc1-mo/icrc2-mo ledgers can
+  //                                     commit the debit then trap on a
+  //                                     post-commit await — sGLDT, EXE). Record
+  //                                     KEPT; caller must return #SystemError
+  //                                     naming the pull id and MUST NOT retry.
+  //
+  // The transfer_from await is a PLAIN guaranteed-response await. NEVER add
+  // `(with timeout = …)` here or on any fund-moving path: a best-effort call can
+  // fail SYS_UNKNOWN, destroying the atomicity this whole design rests on.
+  // created_at_time stays null (two legitimate identical swaps must both
+  // execute); that is safe ONLY because nothing ever retries a pull.
+  private func pullFromV2(
+    pullCaller : Principal,
+    token : Text,
+    gross : Nat,
+    feeBp : Nat,
+    revokeBp : Nat,
+    tf : Nat,
+    context : Text,
+  ) : async* PullOutcomeV2 {
+    let pullId = nextPullIdV2;
+    nextPullIdV2 += 1;
+    let rec : PullRecordV2 = {
+      id = pullId;
+      caller = pullCaller;
+      token;
+      gross;
+      feeBp;
+      revokeBp;
+      tf;
+      time = Time.now();
+      context;
+      note = "inflight";
+    };
+    // Written BEFORE the await so it is committed at the suspension point: if the
+    // canister traps/upgrades mid-flight the record survives as evidence.
+    Map.set(pendingPullsV2, nhash, pullId, rec);
+    let ledger = actor (token) : ICRC2LedgerV2;
+    let memoBlob = Text.encodeUtf8("TACOV2:" # Nat.toText(pullId));
+    try {
+      let res = await ledger.icrc2_transfer_from({
+        spender_subaccount = null;
+        from = { owner = pullCaller; subaccount = null };
+        to = { owner = treasury_principal; subaccount = null };
+        amount = gross;
+        fee = null;
+        memo = ?memoBlob;
+        created_at_time = null;
+      });
+      switch (res) {
+        case (#Ok(blk)) {
+          // BUG O: outcome now KNOWN — delete the record. This runs in the same
+          // atomic region as the caller's BlocksDone burn (async* return is not
+          // a commit point), so a later trap rolls BOTH back together and the
+          // surviving record correctly reads "outcome unknown" again.
+          Map.delete(pendingPullsV2, nhash, pullId);
+          #Ok(blk);
+        };
+        case (#Err(e)) {
+          // Callee completed and declined — funds did not move.
+          Map.delete(pendingPullsV2, nhash, pullId);
+          #ErrDeclined(debug_show (e));
+        };
+      };
+    } catch (err) {
+      switch (Error.code(err)) {
+        case (#call_error _) {
+          // Synchronous send failure — the request never left this canister.
+          Map.delete(pendingPullsV2, nhash, pullId);
+          #ErrDeclined("call_error: " # Error.message(err));
+        };
+        case _ {
+          // AMBIGUOUS: the callee may have committed the debit before trapping.
+          // Keep the record (BUG O: it now means exactly "outcome unknown").
+          Map.set(pendingPullsV2, nhash, pullId, { rec with note = "ambiguous: " # Error.message(err) });
+          #ErrAmbiguous(pullId, Error.message(err));
+        };
+      };
+    };
+  };
+
+  // BUG A: called ONLY where the fee-booking checkReceive has NOT run for this
+  // token. Queues a refund of the pulled gross into `queue` (dispatched by the
+  // caller). Threshold is gross > 3*tf — NOT the mathematically tight 2*tf —
+  // because the treasury reads its OWN tokenInfo fee cache (a different map
+  // from main.mo's returnTfees): a refund the treasury's cache deems sub-fee is
+  // silently dropped at treasury.mo:168. Sub-threshold dust is booked to
+  // feescollectedDAO (the file's own idiom, mirroring checkReceive's
+  // amount-short arm) so it stays on the books instead of stranding as drift.
+  // treasury.mo pays `fee = ?Tfees` ON TOP of the amount, so queuing gross - tf
+  // costs the treasury exactly gross.
+  private func refundPullV2(
+    pullCaller : Principal,
+    token : Text,
+    gross : Nat,
+    tf : Nat,
+    queue : Vector.Vector<(TransferRecipient, Nat, Text, Text)>,
+    nowVar : Time,
+  ) {
+    if (gross > 3 * tf) {
+      Vector.add(queue, (#principal(pullCaller), gross - tf, token, genTxId()));
+    } else if (gross > 0) {
+      // Confiscation-as-fees: amount too small to survive the treasury's own fee
+      // handling. Logged so it is visible, booked so drift stays clean.
+      logger.warn("V2", "refundPullV2: sub-threshold pull of " # Nat.toText(gross) # " " # token # " booked as fees (cannot be safely refunded)", "refundPullV2");
+      addFees(token, gross, false, "", nowVar);
+    };
+  };
+
+  // BUG R / PULL-RACE: claim the pull's ledger block, ATOMICALLY.
+  //
+  // BUG N puts the BlocksDone burn immediately after `#Ok(blk)`, but that is
+  // still AFTER `await ledger.icrc2_transfer_from(...)` — so it is not atomic
+  // with the ledger's creation of the block. The block exists, and is a
+  // perfectly ordinary "principal X sent tokens to the treasury" block, for the
+  // whole remainder of the pull's round trip. Every competing claimant does its
+  // own check-then-set BEFORE its first await and therefore wins that window:
+  //   * public recoverWronglysent → recoverWronglysentFor (:9050/:9054), and
+  //   * every V1 deposit path (:4035, :4091, :4121, :4530, :4623, :4653,
+  //     :9354/:9377/:9395/:9426/:9447 addPosition family, :9972 swapMultiHop).
+  // A bare Map.set here then overwrote the winner's marker and credited anyway:
+  // the same deposit paid out twice (measured: payer handed over two ledger
+  // fees and kept the full swap output; treasury short by the whole gross).
+  //
+  // Mirroring V1's check-then-set makes the two atomic regions mutually
+  // exclusive — there is no commit point between the Map.has and the Map.set,
+  // so exactly one claimant can ever own a given block.
+  //
+  // Returns true when the key was free (and is now ours); false when another
+  // claimant already owns this block, in which case the caller MUST NOT credit.
+  //
+  // NO REFUND on false — deliberate, and provably not a fund loss:
+  //  * every writer of this key requires the block's `from` to be its own
+  //    caller (recoverWronglysentFor: `from.owner == sender`; checkReceive's
+  //    processTransaction: `from == Principal.toText(caller)`), and this
+  //    block's `from` IS the V2 caller — so the only non-admin principal that
+  //    can take the key is the V2 caller themselves;
+  //  * if that claimant pays out, it pays THE SAME principal, so refunding here
+  //    would be the second payout — precisely the double-spend being closed;
+  //  * if that claimant instead aborts, every one of its non-paying exits
+  //    deletes the key on the way out, leaving the block unburned with nothing
+  //    credited — the ordinary mistransfer state, self-recoverable exactly once
+  //    through recoverWronglysent (which sets BlocksDone AND
+  //    BlocksAdminRecovered on success, so it cannot pay a second time).
+  //
+  // pendingPullsV2 needs no cleanup here: pullFromV2 already deleted the record
+  // on #Ok, in the same atomic region (BUG O).
+  private func claimPullBlockV2(token : Text, blk : Nat, nowVar : Time) : Bool {
+    let key = token # ":" # Nat.toText(blk);
+    if (Map.has(BlocksDone, thash, key)) {
+      logger.warn(
+        "V2",
+        "PULL-RACE: pull block " # key # " was already claimed by a concurrent recovery or V1 deposit from the same principal — refusing to credit (no refund: the other claimant owns the payout)",
+        "claimPullBlockV2",
+      );
+      return false;
+    };
+    Map.set(BlocksDone, thash, key, nowVar);
+    true;
+  };
+
+  // Shared wording for the refusal above, so every V2 site reports it the same.
+  private func pullRaceErrV2(token : Text, blk : Nat) : Text {
+    "Deposit block " # token # ":" # Nat.toText(blk)
+    # " was already claimed by a concurrent recoverWronglysent or V1 deposit from this same principal — NOT credited and NOT refunded here, because that claimant owns the payout. If it did not pay out it released the block; recover it with recoverWronglysent.";
+  };
+
+  // ── V2 public helpers (compute what to approve / what a gross buys) ────────
+
+  public query func grossToNetV2(token : Text, gross : Nat) : async Nat {
+    if (not v2Enabled) { return 0 }; // V2 kill switch
+    netFromGrossV2(gross, returnTfees(token), ICPfee);
+  };
+
+  public query func netToGrossV2(token : Text, net : Nat) : async Nat {
+    if (not v2Enabled) { return 0 }; // V2 kill switch
+    requiredForNetV2(net, returnTfees(token), ICPfee);
+  };
+
+  // The icrc2 allowance must cover amount + the ledger fee charged on the pull.
+  public query func requiredAllowanceV2(token : Text, gross : Nat) : async Nat {
+    if (not v2Enabled) { return 0 }; // V2 kill switch
+    gross + returnTfees(token);
+  };
+
+  // Decomposition of a gross deposit. Self-consistent by construction:
+  // gross == transferFee + tradingFee + netSwapped (tradingFee absorbs the
+  // integer-division surplus, which is exactly where it ends up on-chain).
+  public query func quoteDepositV2(token : Text, gross : Nat) : async {
+    transferFee : Nat;
+    tradingFee : Nat;
+    netSwapped : Nat;
+  } {
+    if (not v2Enabled) { return { transferFee = 0; tradingFee = 0; netSwapped = 0 } }; // V2 kill switch
+    let tf = returnTfees(token);
+    let net = netFromGrossV2(gross, tf, ICPfee);
+    let tfPart = Nat.min(tf, gross);
+    {
+      transferFee = tfPart;
+      tradingFee = gross - tfPart - net; // net <= gross - tfPart by construction
+      netSwapped = net;
+    };
+  };
+
+  // ── V2 pending-pull queries / recovery ─────────────────────────────────────
+
+  public query ({ caller }) func getMyPendingPulls() : async [PullRecordV2] {
+    let out = Vector.new<PullRecordV2>();
+    for (r in Map.vals(pendingPullsV2)) {
+      if (r.caller == caller) { Vector.add(out, r) };
+    };
+    Vector.toArray(out);
+  };
+
+  public query ({ caller }) func adminListPendingPulls() : async [PullRecordV2] {
+    if (not ownercheck(caller)) { return [] };
+    Iter.toArray(Map.vals(pendingPullsV2));
+  };
+
+  public query ({ caller }) func getV2AllowedTokens() : async [Text] {
+    let out = Vector.new<Text>();
+    for ((t, allowed) in Map.entries(v2TokenAllowlistV2)) {
+      if (allowed) { Vector.add(out, t) };
+    };
+    Vector.toArray(out);
+  };
+
+  // ★4 allowlist management. Enable a token for V2 ONLY after verifying its
+  // ledger (a) exports icrc2_transfer_from and (b) moves exactly `amount`
+  // (standard ICRC-1/2 semantics — no fee-on-transfer, no rebasing).
+  public shared ({ caller }) func adminSetV2TokenAllowed(token : Text, allowed : Bool) : async ExTypes.ActionResult {
+    if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
+    if (not containsToken(token)) { return #Err(#TokenNotAccepted(token)) };
+    Map.set(v2TokenAllowlistV2, thash, token, allowed);
+    logger.info("V2", "adminSetV2TokenAllowed: " # token # " -> " # debug_show (allowed) # " by " # Principal.toText(caller), "adminSetV2TokenAllowed");
+    #Ok("V2 allowlist updated: " # token # " = " # debug_show (allowed));
+  };
+
+  // Global V2 kill switch setter. Same auth (ownercheck) + audit-logging as
+  // adminSetV2TokenAllowed. Composes with the per-token allowlist: a V2 method
+  // requires BOTH v2Enabled == true AND its token allowlisted (global checked
+  // first, inside each gated method). NOT in the frozen allowlist (falls to the
+  // inspect `case (_) false`), consistent with the rest of V2.
+  public shared ({ caller }) func admin_setV2Enabled(enabled : Bool) : async ExTypes.ActionResult {
+    if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
+    v2Enabled := enabled;
+    logger.info("V2", "admin_setV2Enabled: -> " # debug_show (enabled) # " by " # Principal.toText(caller), "admin_setV2Enabled");
+    #Ok("V2 globally " # (if (enabled) { "ENABLED" } else { "DISABLED" }));
+  };
+
+  // Ungated feature-detect so clients can tell whether V2 is live.
+  public query func getV2Enabled() : async Bool { v2Enabled };
+
+  // ★3: FULLY IMPLEMENTED resolution of an ambiguous pull — pays the caller
+  // back after on-chain verification. Mirrors adminRecoverWronglysent: block
+  // fetch, 21-day gate, extractRecipientToTreasuryAmount, amount-vs-rec.gross
+  // check, BlocksAdminRecovered set. Without the BlocksAdminRecovered set,
+  // adminRecoverWronglysent (which dedups only on that map) could pay the same
+  // block a second time. The treasury's `delivered` return is NOT trusted as
+  // proof of payment (treasury.mo:receiveTransferTasks returns true
+  // unconditionally) — it only chooses dispatch-now vs queue-for-later.
+  //
+  // The admin locates `confirmedLedgerBlock` off-chain by the pull's memo
+  // ("TACOV2:<pullId>") in the caller's ledger history.
+  public shared ({ caller }) func adminResolvePendingPull(pullId : Nat, confirmedLedgerBlock : Nat, tType : { #ICP; #ICRC12; #ICRC3 }) : async ExTypes.ActionResult {
+    if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
+    if (adminRecoveryRunning) { return #Err(#SystemError("Recovery already running")) };
+    adminRecoveryRunning := true;
+
+    let rec = switch (Map.get(pendingPullsV2, nhash, pullId)) {
+      case (?r) r;
+      case null {
+        adminRecoveryRunning := false;
+        return #Err(#OrderNotFound("No pending pull with id " # Nat.toText(pullId)));
+      };
+    };
+
+    let blockKey = rec.token # ":" # Nat.toText(confirmedLedgerBlock);
+    // Cross-path dedup: a block redeemed via ANY path (V1 deposit, public
+    // recoverWronglysent, adminRecoverWronglysent) must not be paid again here.
+    if (Map.has(BlocksDone, thash, blockKey) or Map.has(BlocksAdminRecovered, thash, blockKey)) {
+      adminRecoveryRunning := false;
+      return #Err(#InvalidInput("Block already processed/recovered. If the pull is confirmed settled elsewhere, use adminDropPendingPull to clear the record."));
+    };
+
+    let nowVar = Time.now();
+    // Mark BEFORE the block-fetch await (the recoverWronglysentFor pattern):
+    // every replay path gates on BlocksDone, so no V1 path can race-redeem this
+    // block during our awaits. Deleted again on every refusal below.
+    Map.set(BlocksDone, thash, blockKey, nowVar);
+
+    let blockData = try { await* getBlockData(rec.token, confirmedLedgerBlock, tType) } catch (e) {
+      Map.delete(BlocksDone, thash, blockKey);
+      adminRecoveryRunning := false;
+      return #Err(#SystemError("Block fetch failed: " # Error.message(e)));
+    };
+
+    // 21-day gate (mirrors adminRecoverWronglysent).
+    let timestamp = getTimestamp(blockData);
+    if (timestamp == 0) {
+      Map.delete(BlocksDone, thash, blockKey);
+      adminRecoveryRunning := false;
+      return #Err(#InvalidInput("Block unreadable or not found"));
+    };
+    if (Int.abs(Time.now()) - timestamp > 1814400000000000) {
+      Map.delete(BlocksDone, thash, blockKey);
+      adminRecoveryRunning := false;
+      return #Err(#InvalidInput("Block older than 21 days"));
+    };
+
+    // The block must be a transfer rec.caller → treasury …
+    let depositAmount : Nat = switch (extractRecipientToTreasuryAmount(blockData, rec.caller)) {
+      case (?n) n;
+      case null {
+        Map.delete(BlocksDone, thash, blockKey);
+        adminRecoveryRunning := false;
+        return #Err(#InvalidInput("Block is not a transfer from the pull's caller to the treasury"));
+      };
+    };
+    // … of EXACTLY the pull's gross (a pull moves exactly `amount`; any other
+    // amount means the wrong block was supplied).
+    if (depositAmount != rec.gross) {
+      Map.delete(BlocksDone, thash, blockKey);
+      adminRecoveryRunning := false;
+      return #Err(#InvalidInput("Block amount " # Nat.toText(depositAmount) # " does not match the pull's gross " # Nat.toText(rec.gross)));
+    };
+
+    // Same dust bound as adminRecoverWronglysent (P3): below 2*Tfees the
+    // treasury's own fee handling would drop the refund silently.
+    let Tfees = returnTfees(rec.token);
+    if (rec.gross <= 2 * Tfees) {
+      Map.delete(BlocksDone, thash, blockKey);
+      adminRecoveryRunning := false;
+      return #Err(#InvalidInput("Pull gross too small to refund safely"));
+    };
+    let refundAmount = rec.gross - Tfees;
+
+    // Point of no return: both marks + record delete in ONE synchronous region
+    // (BUG O — the evidence is consumed exactly when the payment is committed).
+    // BlocksDone is already set above; add the admin-recovery mark.
+    Map.set(BlocksAdminRecovered, thash, blockKey, nowVar);
+    Map.delete(pendingPullsV2, nhash, pullId);
+
+    let q = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    Vector.add(q, (#principal(rec.caller), refundAmount, rec.token, genTxId()));
+    let delivered = try {
+      await treasury.receiveTransferTasks(
+        Vector.toArray<(TransferRecipient, Nat, Text, Text)>(q),
+        isInAllowedCanisters(rec.caller),
+      );
+    } catch (_) { false };
+    adminRecoveryRunning := false;
+    if (not delivered) {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(q));
+    };
+    logger.info(
+      "V2",
+      "adminResolvePendingPull: pull " # Nat.toText(pullId) # " resolved via block " # Nat.toText(confirmedLedgerBlock)
+      # ", refund " # Nat.toText(refundAmount) # " " # rec.token # " to " # Principal.toText(rec.caller)
+      # (if (delivered) { " (dispatched)" } else { " (queued)" }) # " by admin " # Principal.toText(caller),
+      "adminResolvePendingPull",
+    );
+    #Ok("Resolved pull " # Nat.toText(pullId) # ": refund of " # Nat.toText(refundAmount) # " " # rec.token # (if (delivered) { " dispatched" } else { " queued" }));
+  };
+
+  // Drop a pending-pull record WITHOUT paying — for pulls verified (off-chain,
+  // by memo absence in the ledger) to have never debited the caller, or already
+  // settled through another path (the BlocksDone/BlocksAdminRecovered gates in
+  // adminResolvePendingPull surface that case explicitly).
+  public shared ({ caller }) func adminDropPendingPull(pullId : Nat) : async ExTypes.ActionResult {
+    if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
+    switch (Map.get(pendingPullsV2, nhash, pullId)) {
+      case null { #Err(#OrderNotFound("No pending pull with id " # Nat.toText(pullId))) };
+      case (?r) {
+        Map.delete(pendingPullsV2, nhash, pullId);
+        logger.info("V2", "adminDropPendingPull: dropped pull " # Nat.toText(pullId) # " (" # Nat.toText(r.gross) # " " # r.token # ", caller " # Principal.toText(r.caller) # ", note: " # r.note # ") by " # Principal.toText(caller), "adminDropPendingPull");
+        #Ok("Dropped pull " # Nat.toText(pullId));
+      };
+    };
+  };
+
+  // Bulk cleanup of investigated records older than `olderThanSeconds`.
+  // Deliberate admin action only — records are never auto-evicted.
+  public shared ({ caller }) func adminSweepPendingPulls(olderThanSeconds : Nat) : async ExTypes.ActionResult {
+    if (not ownercheck(caller)) { return #Err(#NotAuthorized) };
+    let cutoff : Int = Time.now() - (olderThanSeconds * 1_000_000_000);
+    let toDrop = Vector.new<Nat>();
+    for (r in Map.vals(pendingPullsV2)) {
+      if (r.time < cutoff) { Vector.add(toDrop, r.id) };
+    };
+    for (id in Vector.vals(toDrop)) { Map.delete(pendingPullsV2, nhash, id) };
+    logger.info("V2", "adminSweepPendingPulls: dropped " # Nat.toText(Vector.size(toDrop)) # " records older than " # Nat.toText(olderThanSeconds) # "s by " # Principal.toText(caller), "adminSweepPendingPulls");
+    #Ok("Swept " # Nat.toText(Vector.size(toDrop)) # " pending-pull records");
+  };
+
+  // ── addLiquidityV2 — twin of addLiquidity ──────────────────────────────────
+  // dao=true, amount = GROSS with NO carve-out (BUG G: feeding a carved-out
+  // net < gross into a dao=true site makes the exchange credit net and refund
+  // the whole carve-out). Two pulls; ★1/★2 unwind rules apply.
+  public shared ({ caller }) func addLiquidityV2(token0i : Text, token1i : Text, amount0i : Nat, amount1i : Nat, isInitial : ?Bool) : async ExTypes.AddLiquidityResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    // isInitial is a hint from the caller that this is a dust-pool / initial-creation deposit.
+    // Exchange currently auto-detects dust pools via reserve checks; the flag is accepted for
+    // future use and interface compatibility with the treasury wrapper.
+    ignore isInitial;
+    if (isAllowed(caller) != 1) {
+      return #Err(#NotAuthorized);
+    };
+    if (Text.size(token0i) > 150 or Text.size(token1i) > 150) {
+      return #Err(#Banned);
+    };
+
+    if (token0i == token1i) {
+      return #Err(#InvalidInput("token0 and token1 must be different"));
+    };
+
+    let (token0, token1) = getPool(token0i, token1i);
+    let poolKey = (token0, token1);
+    var amount1 = amount1i;
+    var amount0 = amount0i;
+    if (token1i != token1) {
+      amount1 := amount0i;
+      amount0 := amount1i;
+    };
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    var nowVar = Time.now();
+    // Check if the amounts are allowed to be traded (not paused, at least the minimum amount).
+    // V2: no funds have moved yet (the pull happens below), so this is a plain
+    // refusal — V1's block-processing refund loop has nothing to refund here.
+    if (
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == token0 })) { case null { false }; case (?_) { true } })) or ((switch (Array.find<Text>(pausedTokens, func(t) { t == token1 })) { case null { false }; case (?_) { true } })) or ((returnMinimum(token0, amount0, true) and returnMinimum(token1, amount1, true)) == false)
+    ) {
+      return #Err(#TokenPaused("Token paused or below minimum"));
+    };
+
+    // FIX C — refundability floor. A two-leg V2 add pulls token0 first; if the
+    // token1 pull then fails, the unwind hands token0 back through refundPullV2,
+    // which can only queue a refund when `gross > 3 * tf` — below that it books
+    // the deposit to feescollectedDAO (confiscated, not returned).
+    //
+    // The per-token minimum does NOT cover that band. It bites whenever
+    // `minimumAmount * 10 <= 3 * tf`, which holds for 10 of the 31 accepted
+    // tokens — every one whose transfer fee is large relative to its minimum
+    // (GOLDAO tf 1e9 vs minimumAmount*10 = 1e5 ⇒ band (1e5, 3e9]).
+    //
+    // Refusing pre-pull costs the caller nothing (no funds have moved) and
+    // rejects nothing economically sensible: at the old floor the transfer fee
+    // is 50%–2e9 % of the deposit, i.e. the payer already loses more to fees
+    // than they deposit. Guarding both legs keeps the rule symmetric — which
+    // leg is "token0" is decided by canonical ordering, not by the caller.
+    let tfFloor0 = returnTfees(token0);
+    let tfFloor1 = returnTfees(token1);
+    if (amount0 <= 3 * tfFloor0 or amount1 <= 3 * tfFloor1) {
+      return #Err(#InsufficientFunds("Each leg must exceed 3x its token transfer fee (refundability floor)"));
+    };
+
+    // Pre-flight check — if the pool needs creation/recreation and the amounts
+    // are below MINIMUM_LIQUIDITY, fail BEFORE pulling any deposits (V2: plain
+    // refusal — nothing has moved).
+    let prePoolMinLiq0 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal))) { minimumLiquidity } else { 0 };
+    let prePoolMinLiq1 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal))) { minimumLiquidity } else { 0 };
+    let existingPoolPre = Map.get(AMMpools, hashtt, poolKey);
+    let needsNewPool = switch (existingPoolPre) {
+      case null { true };
+      case (?p) {
+        not (returnMinimum(token0, p.reserve0, false) and returnMinimum(token1, p.reserve1, false) and p.reserve0 > 0 and p.reserve1 > 0);
+      };
+    };
+    if (needsNewPool and (amount0 < prePoolMinLiq0 or amount1 < prePoolMinLiq1)) {
+      return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool (pre-check)"));
+    };
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity, per token.
+    switch (v2PullPreflight(token0)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+    switch (v2PullPreflight(token1)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+
+    // BUG Q / ★5: snapshot the fee triple BEFORE any pull; threaded through
+    // every deposit-side fee read below and stored in the PullRecords.
+    let feeBpSnap = ICPfee;
+    let revokeBpSnap = RevokeFeeNow;
+    let tfSnap0 = returnTfees(token0);
+    let tfSnap1 = returnTfees(token1);
+
+    // ── pull0 → pull1 (★2 order) ──
+    let blk0 : Nat = switch (await* pullFromV2(caller, token0, amount0, feeBpSnap, revokeBpSnap, tfSnap0, "addLiquidityV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        return #Err(#InsufficientFunds("V2 pull (token0) declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " (token0) outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: the BlocksDone burn for the pull's real block is the FIRST
+    // statement after #Ok, above every branch (BUG J: without this write the
+    // same block stays redeemable via public recoverWronglysent or V1
+    // addLiquidity for 21 days).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(token0, blk0, nowVar)) {
+      return #Err(#InvalidInput(pullRaceErrV2(token0, blk0)));
+    };
+
+    let blk1 : Nat = switch (await* pullFromV2(caller, token1, amount1, feeBpSnap, revokeBpSnap, tfSnap1, "addLiquidityV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        // ★1 multi-pull failure path: pull0's block is burned (above) and its
+        // record deleted (inside pullFromV2); pull1 moved nothing and its record
+        // is deleted too. Refund the pulled token0 — checkReceive has NOT run
+        // for it, so refundPullV2 is legal here (BUG A).
+        refundPullV2(caller, token0, amount0, tfSnap0, tempTransferQueueLocal, nowVar);
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+        return #Err(#InsufficientFunds("V2 pull (token1) declined: " # e # " — the token0 pull was refunded"));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        // ★1: token1's outcome is unknown (its record is KEPT); token0 definitely
+        // moved (burned + record deleted) and checkReceive has not run → refund it.
+        refundPullV2(caller, token0, amount0, tfSnap0, tempTransferQueueLocal, nowVar);
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " (token1) outcome UNKNOWN — do NOT retry. The token0 pull was refunded; token1 will be resolved by an admin via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(token1, blk1, nowVar)) {
+      // BUG R unwind, identical to this site's #ErrDeclined arm: pull0 moved and
+      // this call is aborting, so token0 must come back (checkReceive has NOT
+      // run for it — BUG A). pull1's gross belongs to the other claimant.
+      refundPullV2(caller, token0, amount0, tfSnap0, tempTransferQueueLocal, nowVar);
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InvalidInput(pullRaceErrV2(token1, blk1)));
+    };
+
+    nowVar := Time.now();
+    let nowVar2 = nowVar;
+
+    var receiveBool = true;
+    // Track per-token acceptance so we can explicitly refund tokens that were
+    // accepted when the OTHER token's validation failed. checkReceive with exact amount
+    // generates NO refund transfer — an accepted token would be stuck otherwise.
+    // ★2: this per-token tracking + the explicit refunds below ARE the unwind
+    // spec for "checkReceive0 succeeded, checkReceive1 failed": the accepted leg
+    // is refunded via the explicit `amount - returnTfees(token)` idiom, NEVER
+    // refundPullV2 (its fees may be booked — BUG A), and the failed leg queues
+    // ONLY its own receiveTransfers (BUG B).
+    var token0Accepted = false;
+    var token1Accepted = false;
+    let receiveTransfersVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+
+    label a for ((token, amount, tfS) in ([(token1, amount1, tfSnap1), (token0, amount0, tfSnap0)]).vals()) {
+      // BUG M: tType hard-coded #ICRC12 (the synthetic block is #ICRC12-shaped).
+      // BUG G: dao=true — amount is the GROSS, no carve-out.
+      let receiveData = checkReceive(PULL_SENTINEL_BLOCK_V2, caller, amount, token, feeBpSnap, revokeBpSnap, true, true, syntheticPullBlockV2(caller, amount, tfS, nowVar2), #ICRC12, nowVar2);
+      Vector.addFromIter(receiveTransfersVec, receiveData.1.vals());
+      let thisResult = receiveData.0;
+      if (not thisResult) {
+        logger.error("addLiquidityV2", "checkReceive FAILED for token=" # token # " amount=" # Nat.toText(amount) # " caller=" # Principal.toText(caller), "addLiquidityV2");
+      } else {
+        if (token == token0) { token0Accepted := true } else { token1Accepted := true };
+      };
+      receiveBool := receiveBool and thisResult;
+    };
+
+    Vector.addFromIter(tempTransferQueueLocal, Vector.vals(receiveTransfersVec));
+    if (not receiveBool) {
+      logger.error("addLiquidityV2", "receiveBool=false token0=" # token0 # " token1=" # token1 # " amt0=" # Nat.toText(amount0) # " amt1=" # Nat.toText(amount1), "addLiquidityV2");
+      // Explicitly refund any accepted token to prevent one-sided deposit loss.
+      // checkReceive only generates refund transfers for overpayment; exact amounts produce
+      // no transfers, leaving accepted tokens stuck. Queue explicit refunds here.
+      if (token0Accepted and amount0 > returnTfees(token0)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - returnTfees(token0), token0, genTxId()));
+      };
+      if (token1Accepted and amount1 > returnTfees(token1)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - returnTfees(token1), token1, genTxId()));
+      };
+      // Transfering the transactions that have to be made to the treasury,
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
+
+      } else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InsufficientFunds("Deposit not received"));
+    };
+
+    var deleteOld = false;
+    // F16: compute the withhold amounts but DO NOT mark the token here. Marking is
+    // deferred to the branch that actually withholds (reserve = amount - MIN_LIQ),
+    // so the reject/refund paths below (which never withhold) cannot leave a token
+    // marked-but-not-withheld — that mismatch made checkDiffs subtract a phantom
+    // -minimumLiquidity per polluted token forever.
+    let MINIMUM_LIQUIDITY0 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal))) { minimumLiquidity } else { 0 };
+    let MINIMUM_LIQUIDITY1 = if (not (TrieSet.contains(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal))) { minimumLiquidity } else { 0 };
+    var oldProviders = TrieSet.empty<Principal>();
+    let (liquidityMinted, refund0, refund1) = switch (Map.get(AMMpools, hashtt, poolKey)) {
+      case (null) {
+        // Create new pool — register pair if not yet in pool_canister
+        if (amount0 < MINIMUM_LIQUIDITY0 or amount1 < MINIMUM_LIQUIDITY1) {
+          // DRIFT FIX: tokens have already been checkReceive'd into the treasury.
+          // Refund the full accepted amounts before rejecting; otherwise they
+          // strand (no AMMpools entry to count them in ammbalance).
+          let Tfees0 = returnTfees(token0);
+          let Tfees1 = returnTfees(token1);
+          if (amount0 > Tfees0) {
+            Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - Tfees0, token0, genTxId()));
+          };
+          if (amount1 > Tfees1) {
+            Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - Tfees1, token1, genTxId()));
+          };
+          if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+            Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+          };
+          return #Err(#InsufficientFunds("Amounts below minimum liquidity for new pool"));
+        };
+        // F16: now committed to withholding — mark the token(s) so checkDiffs credits
+        // back exactly the minimumLiquidity actually held out of reserves.
+        if (MINIMUM_LIQUIDITY0 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal) };
+        if (MINIMUM_LIQUIDITY1 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal) };
+        registerPoolPair(token0, token1);
+        let initialLiquidity = sqrt((amount0 -MINIMUM_LIQUIDITY0) * (amount1 -MINIMUM_LIQUIDITY1));
+
+        let newPool : AMMPool = {
+          token0 = token0;
+          token1 = token1;
+          reserve0 = amount0 -MINIMUM_LIQUIDITY0;
+          reserve1 = amount1 -MINIMUM_LIQUIDITY1;
+          totalLiquidity = initialLiquidity;
+          totalFee0 = 0;
+          totalFee1 = 0;
+          lastUpdateTime = nowVar;
+          providers = TrieSet.put(TrieSet.empty<Principal>(), caller, Principal.hash(caller), Principal.equal);
+        };
+        Map.set(AMMpools, hashtt, poolKey, newPool);
+
+        deleteOld := true;
+        (initialLiquidity, 0, 0);
+      };
+      case (?existingPool) {
+        if (returnMinimum(token0, existingPool.reserve0, false) and returnMinimum(token1, existingPool.reserve1, false) and existingPool.reserve0 > 0 and existingPool.reserve1 > 0) {
+          // Add to existing pool.
+          // L1a: mint against the SAME full-range sub-pool removeLiquidity settles
+          // against, so add and remove stay exact inverses. Minting on the raw reserves
+          // while removal pays out of the sub-pool would hand out a free round trip: on a
+          // pool carrying IN-RANGE concentrated liquidity the raw basis mints
+          // totalLiquidity/reserve per token but redeems reserveFull/liquidityFull, and
+          // that ratio exceeds 1 — measured on the live pool shapes at +0.62%
+          // (kknbx/n6tkf), +14.04% (zfcdd/ryjl3) and +232% (o6ncl/xevnm) per round trip.
+          // On a pool with no concentrated liquidity the sub-pool IS the pool, so this is
+          // arithmetically identical to the old code (49 of the 60 live pools).
+          let (subRes0, subRes1, subLiq) = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v3sub) { fullRangeSubPool(existingPool, v3sub) };
+            // No V3 data - no concentrated position can exist - sub-pool == pool.
+            case null { (existingPool.reserve0, existingPool.reserve1, existingPool.totalLiquidity) };
+          };
+          if (subLiq > 0 and (subRes0 == 0 or subRes1 == 0)) {
+            // The concentrated positions are owed at least one whole side of the reserves,
+            // so there is no honest rate at which to mint into the full-range book —
+            // minting anyway would dilute the existing full-range LPs on the side that is
+            // still solvent. Refuse and refund, mirroring the recreation reject below.
+            // (Unreachable on current live state: 0 of the 60 pools.)
+            let TfeesR0 = returnTfees(token0);
+            let TfeesR1 = returnTfees(token1);
+            if (amount0 > TfeesR0) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - TfeesR0, token0, genTxId()));
+            };
+            if (amount1 > TfeesR1) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - TfeesR1, token1, genTxId()));
+            };
+            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+              Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+            };
+            return #Err(#InsufficientFunds("Full-range reserves are fully claimed by concentrated positions in this pool"));
+          };
+          let (liquidityMinted, refund0, refund1) = if (subLiq == 0) {
+            // ── Bootstrap: no full-range book exists yet. After the L1a fix `subRes` now
+            // carries the UNOWNED SURPLUS (reserves minus what the concentrated positions
+            // are owed; fullRangeSubPool returns it with subLiq == 0). Minting the deposit
+            // and leaving the surplus in reserves would hand the surplus to THIS depositor
+            // on the next removal: a fresh full-range book redeems mulDiv(L, subResAfter, L)
+            // = subResAfter, and subResAfter = surplus + deposit. So SWEEP the surplus to
+            // the DAO first — decrementing the reserves by exactly what feescollectedDAO
+            // gains, in this same synchronous region (amm-balance falls by what fee-balance
+            // rises: no P15 double count, drift stays ≥ 0) — THEN mint the deposit as a
+            // brand-new full-range book (sqrt scale on the full deposit, exactly like the
+            // fresh-pool branch). After the sweep reserve == the concentrated claims, so
+            // post-deposit subRes == the deposit and removeLiquidity returns the deposit.
+            // The surplus lands in feescollectedDAO, claimable only by the DAO fee sweep —
+            // never by an LP or an arbitrary caller. Twin of addLiquidity's bootstrap fix.
+            if (subRes0 > 0) { addFees(existingPool.token0, subRes0, false, "", nowVar) };
+            if (subRes1 > 0) { addFees(existingPool.token1, subRes1, false, "", nowVar) };
+            recordOpDrift("addLiq_bootstrap_sweep_v2", existingPool.token0, -subRes0);
+            recordOpDrift("addLiq_bootstrap_sweep_v2", existingPool.token1, -subRes1);
+            let initialLiquidity = sqrt(amount0 * amount1);
+            let updatedPool = {
+              existingPool with
+              reserve0 = safeSub(existingPool.reserve0, subRes0) + amount0;
+              reserve1 = safeSub(existingPool.reserve1, subRes1) + amount1;
+              totalLiquidity = existingPool.totalLiquidity + initialLiquidity;
+              lastUpdateTime = nowVar;
+              providers = TrieSet.put(existingPool.providers, caller, Principal.hash(caller), Principal.equal);
+            };
+            Map.set(AMMpools, hashtt, poolKey, updatedPool);
+            (initialLiquidity, 0, 0);
+          } else {
+            // ── Non-bootstrap (audited L1a): mint against the full-range SUB-POOL so add
+            // and remove stay exact inverses. Minting on the raw reserves while removal
+            // pays out of the sub-pool would hand out a free round trip: on a pool carrying
+            // IN-RANGE concentrated liquidity the raw basis mints totalLiquidity/reserve per
+            // token but redeems reserveFull/liquidityFull, and that ratio exceeds 1 —
+            // measured on the live pool shapes at +0.62% (kknbx/n6tkf), +14.04% (zfcdd/
+            // ryjl3) and +232% (o6ncl/xevnm) per round trip. On a pool with no concentrated
+            // liquidity the sub-pool IS the pool, so this is arithmetically identical to the
+            // old code (49 of the 60 live pools).
+            let amount0Optimal = (amount1 * subRes0) / subRes1;
+            let amount1Optimal = (amount0 * subRes1) / subRes0;
+
+            let (useAmount0, useAmount1, refund0, refund1) = if (amount0Optimal <= amount0) {
+              (amount0Optimal, amount1, amount0 - amount0Optimal, 0);
+            } else { (amount0, amount1Optimal, 0, amount1 - amount1Optimal) };
+
+            let liquidity0 = (useAmount0 * subLiq) / subRes0;
+            let liquidity1 = (useAmount1 * subLiq) / subRes1;
+            let liquidityMinted = Nat.min(liquidity0, liquidity1);
+
+            let updatedPool = {
+              existingPool with
+              reserve0 = existingPool.reserve0 + useAmount0;
+              reserve1 = existingPool.reserve1 + useAmount1;
+              totalLiquidity = existingPool.totalLiquidity + liquidityMinted;
+              lastUpdateTime = nowVar;
+              providers = TrieSet.put(existingPool.providers, caller, Principal.hash(caller), Principal.equal);
+            };
+            Map.set(AMMpools, hashtt, poolKey, updatedPool);
+            (liquidityMinted, refund0, refund1);
+          };
+        } else {
+          // Recreate pool — register pair if not yet in pool_canister
+          if (amount0 < MINIMUM_LIQUIDITY0 or amount1 < MINIMUM_LIQUIDITY1) {
+            // DRIFT FIX: same as new-pool branch above — refund full amounts so
+            // rejected deposits don't strand.
+            let Tfees0 = returnTfees(token0);
+            let Tfees1 = returnTfees(token1);
+            if (amount0 > Tfees0) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - Tfees0, token0, genTxId()));
+            };
+            if (amount1 > Tfees1) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - Tfees1, token1, genTxId()));
+            };
+            if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+              Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+            };
+            return #Err(#InsufficientFunds("Amounts below minimum liquidity for pool recreation"));
+          };
+          // P15 FIX (V2 twin): sweep the old pool's reserves only AFTER the reject
+          // above — see the V1 recreate branch for the full rationale. Success path
+          // books exactly once; the reject path no longer double-counts.
+          addFees(existingPool.token0, existingPool.reserve0, false, "", nowVar);
+          addFees(existingPool.token1, existingPool.reserve1, false, "", nowVar);
+          recordOpDrift("addLiq_recreate_v2", existingPool.token0, existingPool.reserve0);
+          recordOpDrift("addLiq_recreate_v2", existingPool.token1, existingPool.reserve1);
+          // F16: committed to withholding — mark only now (see new-pool branch).
+          if (MINIMUM_LIQUIDITY0 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token0, Text.hash(token0), Text.equal) };
+          if (MINIMUM_LIQUIDITY1 > 0) { AMMMinimumLiquidityDone := TrieSet.put(AMMMinimumLiquidityDone, token1, Text.hash(token1), Text.equal) };
+          registerPoolPair(token0, token1);
+          let initialLiquidity = sqrt((amount0 -MINIMUM_LIQUIDITY0) * (amount1 -MINIMUM_LIQUIDITY1));
+          oldProviders := existingPool.providers;
+          let newPool : AMMPool = {
+            token0 = token0;
+            token1 = token1;
+            reserve0 = amount0 -MINIMUM_LIQUIDITY0;
+            reserve1 = amount1 -MINIMUM_LIQUIDITY1;
+            totalLiquidity = initialLiquidity;
+            totalFee0 = 0;
+            totalFee1 = 0;
+            lastUpdateTime = nowVar;
+            providers = TrieSet.put(TrieSet.empty<Principal>(), caller, Principal.hash(caller), Principal.equal);
+          };
+
+          deleteOld := true;
+          Map.set(AMMpools, hashtt, poolKey, newPool);
+          (initialLiquidity, 0, 0);
+
+        };
+      };
+    };
+
+    // Sync V3 data: ensure full-range addLiquidity also creates/updates V3 pool data
+    let poolAfterAdd = switch (Map.get(AMMpools, hashtt, poolKey)) { case (?p) { p }; case null { { token0; token1; reserve0 = 0; reserve1 = 0; totalLiquidity = 0; totalFee0 = 0; totalFee1 = 0; lastUpdateTime = nowVar; providers = TrieSet.empty<Principal>() } } };
+    if (poolAfterAdd.reserve0 > 0 and poolAfterAdd.reserve1 > 0) {
+      let sqrtR = ratioToSqrtRatio((poolAfterAdd.reserve1 * tenToPower60) / poolAfterAdd.reserve0);
+      switch (Map.get(poolV3Data, hashtt, poolKey)) {
+        case null {
+          // Create V3 data for new pool
+          var rangeTree = RBTree.init<Nat, RangeData>();
+          rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_LOWER, {
+            liquidityNet = poolAfterAdd.totalLiquidity; liquidityGross = poolAfterAdd.totalLiquidity;
+            feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
+          });
+          rangeTree := RBTree.put(rangeTree, Nat.compare, FULL_RANGE_UPPER, {
+            liquidityNet = -poolAfterAdd.totalLiquidity; liquidityGross = poolAfterAdd.totalLiquidity;
+            feeGrowthOutside0 = 0; feeGrowthOutside1 = 0;
+          });
+          Map.set(poolV3Data, hashtt, poolKey, {
+            activeLiquidity = poolAfterAdd.totalLiquidity;
+            currentSqrtRatio = sqrtR;
+            feeGrowthGlobal0 = 0; feeGrowthGlobal1 = 0;
+            totalFeesCollected0 = 0; totalFeesCollected1 = 0;
+            totalFeesClaimed0 = 0; totalFeesClaimed1 = 0;
+            ranges = rangeTree;
+          });
+        };
+        case (?v3) {
+          // Update existing V3 data: add liquidity to full range
+          var ranges = v3.ranges;
+          let lData = switch (RBTree.get(ranges, Nat.compare, FULL_RANGE_LOWER)) {
+            case null { { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = 0; feeGrowthOutside1 = 0 } };
+            case (?d) { d };
+          };
+          ranges := RBTree.put(ranges, Nat.compare, FULL_RANGE_LOWER, { lData with liquidityNet = lData.liquidityNet + liquidityMinted; liquidityGross = lData.liquidityGross + liquidityMinted });
+          let uData = switch (RBTree.get(ranges, Nat.compare, FULL_RANGE_UPPER)) {
+            case null { { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = 0; feeGrowthOutside1 = 0 } };
+            case (?d) { d };
+          };
+          ranges := RBTree.put(ranges, Nat.compare, FULL_RANGE_UPPER, { uData with liquidityNet = uData.liquidityNet - liquidityMinted; liquidityGross = uData.liquidityGross + liquidityMinted });
+          Map.set(poolV3Data, hashtt, poolKey, {
+            v3 with
+            activeLiquidity = v3.activeLiquidity + liquidityMinted;
+            ranges = ranges;
+          });
+        };
+      };
+
+      // Create or merge concentrated position for this user (full-range)
+      let existingConc = switch (Map.get(concentratedPositions, phash, caller)) { case null { [] }; case (?a) { a } };
+      // Check if a full-range position already exists for this pool
+      let existingIndex = Array.indexOf<ConcentratedPosition>(
+        { positionId = 0; token0; token1; liquidity = 0; ratioLower = FULL_RANGE_LOWER; ratioUpper = FULL_RANGE_UPPER; lastFeeGrowth0 = 0; lastFeeGrowth1 = 0; lastUpdateTime = 0 },
+        existingConc,
+        func(a, b) { a.token0 == b.token0 and a.token1 == b.token1 and a.ratioLower == FULL_RANGE_LOWER and a.ratioUpper == FULL_RANGE_UPPER },
+      );
+      switch (existingIndex) {
+        case (?idx) {
+          // Merge: auto-claim accrued fees to the user before re-snapshotting lastFeeGrowth,
+          // then add the new liquidity. Matches claimLPFees behavior so the user receives
+          // what they earned instead of abandoning it to feescollectedDAO on pool deletion.
+          let old = existingConc[idx];
+          let v3Now = switch (Map.get(poolV3Data, hashtt, poolKey)) { case (?v) v; case null { { activeLiquidity = 0; currentSqrtRatio = 0; feeGrowthGlobal0 = 0; feeGrowthGlobal1 = 0; totalFeesCollected0 = 0; totalFeesCollected1 = 0; totalFeesClaimed0 = 0; totalFeesClaimed1 = 0; ranges = RBTree.init<Nat, RangeData>() } } };
+          let (insideNow0, insideNow1) = positionFeeGrowthInside(old, v3Now);
+          let pendingFee0 = old.liquidity * safeSub(insideNow0, old.lastFeeGrowth0) / tenToPower60;
+          let pendingFee1 = old.liquidity * safeSub(insideNow1, old.lastFeeGrowth1) / tenToPower60;
+          let maxClaim0 = safeSub(v3Now.totalFeesCollected0, v3Now.totalFeesClaimed0);
+          let maxClaim1 = safeSub(v3Now.totalFeesCollected1, v3Now.totalFeesClaimed1);
+          let claim0 = Nat.min(pendingFee0, maxClaim0);
+          let claim1 = Nat.min(pendingFee1, maxClaim1);
+          let Tfees0 = returnTfees(token0);
+          let Tfees1 = returnTfees(token1);
+          if (claim0 > Tfees0) { Vector.add(tempTransferQueueLocal, (#principal(caller), claim0 - Tfees0, token0, genTxId())) }
+          else if (claim0 > 0) { addFees(token0, claim0, false, "", nowVar) };
+          if (claim1 > Tfees1) { Vector.add(tempTransferQueueLocal, (#principal(caller), claim1 - Tfees1, token1, genTxId())) }
+          else if (claim1 > 0) { addFees(token1, claim1, false, "", nowVar) };
+          if (claim0 > 0 or claim1 > 0) {
+            Map.set(poolV3Data, hashtt, poolKey, { v3Now with totalFeesClaimed0 = v3Now.totalFeesClaimed0 + claim0; totalFeesClaimed1 = v3Now.totalFeesClaimed1 + claim1 });
+          };
+          let updated = Array.tabulate<ConcentratedPosition>(existingConc.size(), func(i) {
+            if (i == idx) {
+              { old with liquidity = old.liquidity + liquidityMinted; lastFeeGrowth0 = insideNow0; lastFeeGrowth1 = insideNow1; lastUpdateTime = nowVar }
+            } else { existingConc[i] }
+          });
+          Map.set(concentratedPositions, phash, caller, updated);
+        };
+        case null {
+          // Create new full-range concentrated position
+          nextPositionId += 1;
+          let (initInside0, initInside1) = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+            case (?v) { (v.feeGrowthGlobal0, v.feeGrowthGlobal1) };  // full-range: inside == global
+            case null { (0, 0) };
+          };
+          let fullRangePos : ConcentratedPosition = {
+            positionId = nextPositionId;
+            token0; token1;
+            liquidity = liquidityMinted;
+            ratioLower = FULL_RANGE_LOWER;
+            ratioUpper = FULL_RANGE_UPPER;
+            lastFeeGrowth0 = initInside0;
+            lastFeeGrowth1 = initInside1;
+            lastUpdateTime = nowVar;
+          };
+          let cVec = Vector.fromArray<ConcentratedPosition>(existingConc);
+          Vector.add(cVec, fullRangePos);
+          Map.set(concentratedPositions, phash, caller, Vector.toArray(cVec));
+        };
+      };
+    };
+
+    // Sync AMMPool from V3 after liquidity addition
+    syncPoolFromV3(poolKey);
+
+    if (refund0 > 0 or refund1 > 0) {
+      let Tfees0 = returnTfees(token0);
+      let Tfees1 = returnTfees(token1);
+
+      if (refund0 > Tfees0) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), refund0 - Tfees0, token0, genTxId()));
+      } else { addFees(token0, refund0, false, "", nowVar) };
+      if (refund1 > Tfees1) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), refund1 - Tfees1, token1, genTxId()));
+      } else {
+        addFees(token1, refund1, false, "", nowVar);
+      };
+    };
+    // Transferring the transactions that have to be made to the treasury,
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {
+
+    } else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+    #Ok({
+      liquidityMinted = liquidityMinted;
+      token0 = token0;
+      token1 = token1;
+      amount0Used = amount0 - refund0;
+      amount1Used = amount1 - refund1;
+      refund0 = refund0;
+      refund1 = refund1;
+    });
+  };
+
+  // ── addConcentratedLiquidityV2 — twin of addConcentratedLiquidity ──────────
+  // dao=true, amounts = GROSS with NO carve-out (BUG G). Two pulls; ★1/★2
+  // unwind rules apply exactly as in addLiquidityV2.
+  public shared ({ caller }) func addConcentratedLiquidityV2(
+    token0i : Text, token1i : Text,
+    amount0i : Nat, amount1i : Nat,
+    priceLower : Nat, priceUpper : Nat,
+  ) : async ExTypes.AddConcentratedResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    if (isAllowed(caller) != 1) { return #Err(#NotAuthorized) };
+    if (Text.size(token0i) > 150 or Text.size(token1i) > 150) {
+      return #Err(#Banned);
+    };
+    if (token0i == token1i) {
+      return #Err(#InvalidInput("token0 and token1 must be different"));
+    };
+
+    let (token0, token1) = getPool(token0i, token1i);
+    let poolKey = (token0, token1);
+    var amount1 = amount1i;
+    var amount0 = amount0i;
+    var priceLowerC = priceLower;
+    var priceUpperC = priceUpper;
+    if (token1i != token1) {
+      amount1 := amount0i; amount0 := amount1i;
+      // user supplied bounds in "userToken1 per userToken0" — relabel just
+      // flipped the canonical orientation, so price bounds must be inverted (and swapped
+      // because 1/big < 1/small) to remain in canonical "token1 per token0" form.
+      let prevLower = priceLowerC;
+      priceLowerC := if (priceUpperC > 0) { tenToPower120 / priceUpperC } else { 0 };
+      priceUpperC := if (prevLower > 0)   { tenToPower120 / prevLower }   else { tenToPower120 };
+    };
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    var nowVar = Time.now();
+
+    // V2: every reject below this point and above the pulls happens BEFORE any
+    // funds move, so V1's refundAndReject (which verifies + refunds the already
+    // sent deposit blocks) reduces to a plain error return.
+    func refundAndRejectV2(errMsg : ExTypes.ExchangeError) : ExTypes.AddConcentratedResult {
+      #Err(errMsg);
+    };
+
+    // reject full-range endpoints. Full-range positions must go through
+    // addLiquidity (V2) so the position's ratioLower/ratioUpper match FULL_RANGE_*
+    // AND the tick-tree key uses the raw constant (see main.mo:771 convention).
+    // If we allowed this path, the position would store ratioLower=FULL_RANGE_LOWER
+    // but its tick-tree entry would be at ratioToSqrtRatio(FULL_RANGE_LOWER), breaking
+    // the conditional lookup in removeConcentratedLiquidity.
+    if (priceLowerC == FULL_RANGE_LOWER or priceUpperC == FULL_RANGE_UPPER) {
+      return refundAndRejectV2(#InvalidInput("Use addLiquidity for full-range positions"));
+    };
+
+    // decode human price → canonical raw ratio. The user's input represents
+    // (canonicalToken1_human / canonicalToken0_human) × 10^60. Canonical convention is
+    // (raw_reserve1 × 10^60) / raw_reserve0 = human_price × 10^(dec1 − dec0) × 10^60.
+    // Apply 10^(dec1 − dec0) in integer math; default to 8 decimals if tokenInfo missing.
+    let dec0Int = switch (Map.get(tokenInfo, thash, token0)) { case (?i) { i.Decimals }; case null { 8 } };
+    let dec1Int = switch (Map.get(tokenInfo, thash, token1)) { case (?i) { i.Decimals }; case null { 8 } };
+    let (lowerCanonical, upperCanonical) = if (dec0Int == dec1Int) {
+      (priceLowerC, priceUpperC);
+    } else if (dec1Int > dec0Int) {
+      let factor = 10 ** (dec1Int - dec0Int);
+      (priceLowerC * factor, priceUpperC * factor);
+    } else {
+      let factor = 10 ** (dec0Int - dec1Int);
+      if (priceLowerC < factor or priceUpperC < factor) {
+        return refundAndRejectV2(#InvalidInput("Price below minimum representable for this pair"));
+      };
+      (priceLowerC / factor, priceUpperC / factor);
+    };
+
+    // Snap to tick boundaries
+    let ratioLower = snapToTick(lowerCanonical);
+    let ratioUpper = snapToTick(upperCanonical);
+    if (ratioLower >= ratioUpper or ratioLower == 0) {
+      return refundAndRejectV2(#InvalidInput("Invalid price range"));
+    };
+    // SECURITY FIX: snapToTick can snap user input just above a sentinel down to the
+    // sentinel itself (e.g. priceLower in (10^20, 10^20+1000] → 10^20). The pre-snap
+    // check above only tests for exact equality to the sentinels. Without this guard
+    // the position would store ratioLower=FULL_RANGE_LOWER while the tick tree is
+    // keyed at ratioToSqrtRatio(FULL_RANGE_LOWER) — so removeConcentratedLiquidity's
+    // `if (ratioLower == FULL_RANGE_LOWER) raw else sqrt` lookup would miss, leaving
+    // phantom liquidity in the tick tree and draining the pool over time. Full-range
+    // positions MUST go through addLiquidity (which writes raw sentinels directly).
+    if (ratioLower == FULL_RANGE_LOWER or ratioUpper == FULL_RANGE_UPPER) {
+      return refundAndRejectV2(#InvalidInput("Range snaps to full-range sentinel — use addLiquidity for full-range positions"));
+    };
+
+    // Validate: not paused, minimums (V2: plain refusal — nothing pulled yet)
+    if (
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == token0 })) { case null { false }; case (?_) { true } })) or
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == token1 })) { case null { false }; case (?_) { true } })) or
+      ((returnMinimum(token0, amount0, true) and returnMinimum(token1, amount1, true)) == false)
+    ) {
+      return refundAndRejectV2(#TokenPaused("Validation failed"));
+    };
+
+    // FIX C — refundability floor (see the matching guard in addLiquidityV2).
+    // token0 is pulled first; if the token1 pull fails, the unwind returns
+    // token0 via refundPullV2, which confiscates to fees when `gross <= 3*tf`.
+    // The per-token minimum leaves that band open on the 10 accepted tokens
+    // where `minimumAmount * 10 <= 3 * tf`. Refuse pre-pull — nothing has moved,
+    // and below 3*tf a leg loses more to transfer fees than it deposits.
+    let tfFloorC0 = returnTfees(token0);
+    let tfFloorC1 = returnTfees(token1);
+    if (amount0 <= 3 * tfFloorC0 or amount1 <= 3 * tfFloorC1) {
+      return refundAndRejectV2(#InsufficientFunds("Each leg must exceed 3x its token transfer fee (refundability floor)"));
+    };
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity, per token.
+    switch (v2PullPreflight(token0)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+    switch (v2PullPreflight(token1)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+
+    // BUG Q / ★5: snapshot the fee triple BEFORE any pull.
+    let feeBpSnap = ICPfee;
+    let revokeBpSnap = RevokeFeeNow;
+    let tfSnap0 = returnTfees(token0);
+    let tfSnap1 = returnTfees(token1);
+
+    // ── pull0 → pull1 (★2 order) ──
+    let blk0 : Nat = switch (await* pullFromV2(caller, token0, amount0, feeBpSnap, revokeBpSnap, tfSnap0, "addConcentratedLiquidityV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        return #Err(#InsufficientFunds("V2 pull (token0) declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " (token0) outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: burn FIRST, above every branch (BUG J write).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(token0, blk0, nowVar)) {
+      return #Err(#InvalidInput(pullRaceErrV2(token0, blk0)));
+    };
+
+    let blk1 : Nat = switch (await* pullFromV2(caller, token1, amount1, feeBpSnap, revokeBpSnap, tfSnap1, "addConcentratedLiquidityV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        // ★1: burn0 + record0-delete already done; token1 never moved. Refund
+        // token0 (checkReceive has NOT run — BUG A).
+        refundPullV2(caller, token0, amount0, tfSnap0, tempTransferQueueLocal, nowVar);
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+        return #Err(#InsufficientFunds("V2 pull (token1) declined: " # e # " — the token0 pull was refunded"));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        refundPullV2(caller, token0, amount0, tfSnap0, tempTransferQueueLocal, nowVar);
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " (token1) outcome UNKNOWN — do NOT retry. The token0 pull was refunded; token1 will be resolved by an admin via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(token1, blk1, nowVar)) {
+      // BUG R unwind, identical to this site's #ErrDeclined arm: pull0 moved and
+      // this call is aborting, so token0 must come back (checkReceive has NOT
+      // run for it — BUG A). pull1's gross belongs to the other claimant.
+      refundPullV2(caller, token0, amount0, tfSnap0, tempTransferQueueLocal, nowVar);
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InvalidInput(pullRaceErrV2(token1, blk1)));
+    };
+
+    nowVar := Time.now();
+    let nowVar2 = nowVar;
+
+    // Verify on-chain transfers (V2: against the synthetic pull blocks)
+    var receiveBool = true;
+    // Track per-token acceptance so we can explicitly refund tokens that were
+    // accepted when the OTHER token's validation failed. checkReceive with exact amount
+    // generates NO refund transfer — an accepted token would be stuck otherwise.
+    // ★2: this IS the unwind spec — accepted leg refunded via the explicit idiom
+    // only; failed leg contributes only its own receiveTransfers (BUG B).
+    var token0Accepted = false;
+    var token1Accepted = false;
+    let receiveTransfersVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    label a for ((token, amount, tfS) in ([(token1, amount1, tfSnap1), (token0, amount0, tfSnap0)]).vals()) {
+      // BUG M: tType hard-coded #ICRC12. BUG G: dao=true, amount = gross.
+      let receiveData = checkReceive(PULL_SENTINEL_BLOCK_V2, caller, amount, token, feeBpSnap, revokeBpSnap, true, true, syntheticPullBlockV2(caller, amount, tfS, nowVar2), #ICRC12, nowVar2);
+      Vector.addFromIter(receiveTransfersVec, receiveData.1.vals());
+      let thisResult = receiveData.0;
+      if (thisResult) {
+        if (token == token0) { token0Accepted := true } else { token1Accepted := true };
+      };
+      receiveBool := receiveBool and thisResult;
+    };
+    Vector.addFromIter(tempTransferQueueLocal, Vector.vals(receiveTransfersVec));
+    if (not receiveBool) {
+      // Explicitly refund any accepted token to prevent one-sided deposit loss.
+      // checkReceive only generates refund transfers for overpayment; exact amounts produce
+      // no transfers, leaving accepted tokens stuck. Queue explicit refunds here.
+      if (token0Accepted and amount0 > returnTfees(token0)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - returnTfees(token0), token0, genTxId()));
+      };
+      if (token1Accepted and amount1 > returnTfees(token1)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - returnTfees(token1), token1, genTxId()));
+      };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InsufficientFunds("Deposit not received"));
+    };
+
+    // Get or create pool and V3 data — register pair if not yet in pool_canister
+    // SECURITY FIX (P12): remember whether THIS call created the pool, so the
+    // `liquidity == 0` bail-out below can roll it back instead of leaving an empty
+    // 0/0 pool registered.
+    var poolWasCreatedHere = false;
+    var pool = switch (Map.get(AMMpools, hashtt, poolKey)) {
+      case null {
+        poolWasCreatedHere := true;
+        registerPoolPair(token0, token1);
+        let newPool : AMMPool = {
+          token0; token1;
+          reserve0 = 0; reserve1 = 0;
+          totalLiquidity = 0;
+          totalFee0 = 0; totalFee1 = 0;
+          lastUpdateTime = nowVar;
+          providers = TrieSet.empty<Principal>();
+        };
+        Map.set(AMMpools, hashtt, poolKey, newPool);
+        newPool;
+      };
+      case (?p) { p };
+    };
+
+    var v3 = switch (Map.get(poolV3Data, hashtt, poolKey)) {
+      case null {
+        let sqrtRatio = if (pool.reserve0 > 0 and pool.reserve1 > 0) {
+          ratioToSqrtRatio((pool.reserve1 * tenToPower60) / pool.reserve0);
+        } else if (amount0 > 0 and amount1 > 0) {
+          ratioToSqrtRatio((amount1 * tenToPower60) / amount0);
+        } else { tenToPower60 }; // default 1:1
+        {
+          activeLiquidity = 0;
+          currentSqrtRatio = sqrtRatio;
+          feeGrowthGlobal0 = 0; feeGrowthGlobal1 = 0;
+          totalFeesCollected0 = 0; totalFeesCollected1 = 0;
+          totalFeesClaimed0 = 0; totalFeesClaimed1 = 0;
+          ranges = RBTree.init<Nat, RangeData>();
+        };
+      };
+      case (?v) { v };
+    };
+
+    // Calculate virtual liquidity for this range
+    let sqrtLower = ratioToSqrtRatio(ratioLower);
+    let sqrtUpper = ratioToSqrtRatio(ratioUpper);
+    let sqrtCurrent = if (v3.currentSqrtRatio > 0) { v3.currentSqrtRatio } else { sqrtRatioFromReserves(pool.reserve0, pool.reserve1, 0) };
+    let liquidity = liquidityFromAmounts(amount0, amount1, sqrtLower, sqrtUpper, sqrtCurrent);
+    let (rawUsed0, rawUsed1) = amountsFromLiquidity(liquidity, sqrtLower, sqrtUpper, sqrtCurrent);
+    let used0 = Nat.min(rawUsed0 + 1, amount0);
+    let used1 = Nat.min(rawUsed1 + 1, amount1);
+
+    if (liquidity == 0) {
+      // SECURITY FIX (P12): tempTransferQueueLocal holds ONLY checkReceive's overpay
+      // dust at this point — both deposits passed checkReceive with their exact amount,
+      // which generates no refund transfer. Flushing that alone stranded BOTH deposits
+      // outright. Queue explicit full refunds, mirroring the verified idiom on the
+      // `not receiveBool` branch above.
+      if (amount0 > returnTfees(token0)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount0 - returnTfees(token0), token0, genTxId()));
+      };
+      if (amount1 > returnTfees(token1)) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), amount1 - returnTfees(token1), token1, genTxId()));
+      };
+      // ...and undo a pool this same call created + registered above, so a rejected
+      // add never leaves an empty 0/0 pool behind.
+      if (poolWasCreatedHere) { Map.delete(AMMpools, hashtt, poolKey) };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InvalidInput("Zero liquidity for range"));
+    };
+
+    // Update range tree: add liquidityNet at boundaries
+    var ranges = v3.ranges;
+    // Use sqrtRatio as tree keys (not price ratios) for consistency with swap engine.
+    // When creating a new tick, initialize feeGrowthOutside per Uniswap V3 convention
+    // so that feeGrowthInside is computed correctly for this range's positions.
+    let lowerData = switch (RBTree.get(ranges, Nat.compare, sqrtLower)) {
+      case null {
+        let (fgo0, fgo1) = initialFeeGrowthOutside(sqrtLower, v3.currentSqrtRatio, v3.feeGrowthGlobal0, v3.feeGrowthGlobal1);
+        { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = fgo0; feeGrowthOutside1 = fgo1 };
+      };
+      case (?d) { d };
+    };
+    ranges := RBTree.put(ranges, Nat.compare, sqrtLower, {
+      liquidityNet = lowerData.liquidityNet + liquidity;
+      liquidityGross = lowerData.liquidityGross + liquidity;
+      feeGrowthOutside0 = lowerData.feeGrowthOutside0;
+      feeGrowthOutside1 = lowerData.feeGrowthOutside1;
+    });
+
+    let upperData = switch (RBTree.get(ranges, Nat.compare, sqrtUpper)) {
+      case null {
+        let (fgo0, fgo1) = initialFeeGrowthOutside(sqrtUpper, v3.currentSqrtRatio, v3.feeGrowthGlobal0, v3.feeGrowthGlobal1);
+        { liquidityNet = 0 : Int; liquidityGross = 0; feeGrowthOutside0 = fgo0; feeGrowthOutside1 = fgo1 };
+      };
+      case (?d) { d };
+    };
+    ranges := RBTree.put(ranges, Nat.compare, sqrtUpper, {
+      liquidityNet = upperData.liquidityNet - liquidity;
+      liquidityGross = upperData.liquidityGross + liquidity;
+      feeGrowthOutside0 = upperData.feeGrowthOutside0;
+      feeGrowthOutside1 = upperData.feeGrowthOutside1;
+    });
+
+    // Update active liquidity if current price is in range
+    let currentRatio = if (sqrtCurrent > 0) { (sqrtCurrent * sqrtCurrent) / tenToPower60 } else { 0 };
+    let newActiveLiquidity = if (currentRatio >= ratioLower and currentRatio < ratioUpper) {
+      v3.activeLiquidity + liquidity;
+    } else { v3.activeLiquidity };
+
+    // Update pool reserves with USED amounts only (excess refunded to user)
+    pool := {
+      pool with
+      reserve0 = pool.reserve0 + used0;
+      reserve1 = pool.reserve1 + used1;
+      totalLiquidity = pool.totalLiquidity + liquidity;
+      lastUpdateTime = nowVar;
+      providers = TrieSet.put(pool.providers, caller, Principal.hash(caller), Principal.equal);
+    };
+    Map.set(AMMpools, hashtt, poolKey, pool);
+
+    // Store updated V3 data — do NOT update currentSqrtRatio (maintained by swap engine only)
+    Map.set(poolV3Data, hashtt, poolKey, {
+      v3 with
+      activeLiquidity = newActiveLiquidity;
+      ranges = ranges;
+    });
+
+    // Sync AMMPool from V3
+    syncPoolFromV3(poolKey);
+
+    // Store or merge position for user (merge if same pool + same range exists)
+    let existingConc = switch (Map.get(concentratedPositions, phash, caller)) {
+      case null { [] }; case (?arr) { arr };
+    };
+    let existingIndex = Array.indexOf<ConcentratedPosition>(
+      { positionId = 0; token0; token1; liquidity = 0; ratioLower; ratioUpper; lastFeeGrowth0 = 0; lastFeeGrowth1 = 0; lastUpdateTime = 0 },
+      existingConc,
+      func(a, b) { a.token0 == b.token0 and a.token1 == b.token1 and a.ratioLower == b.ratioLower and a.ratioUpper == b.ratioUpper },
+    );
+    let v3Now = switch (Map.get(poolV3Data, hashtt, poolKey)) { case (?v) v; case null v3 };
+    switch (existingIndex) {
+      case (?idx) {
+        // Merge: re-snapshot lastFeeGrowthInside before adding new liquidity.
+        // Pending in-range fees accrued under the old liquidity are credited via
+        // totalFeesClaimed increment (so the canister's accounting stays consistent).
+        let old = existingConc[idx];
+        let (insideNow0, insideNow1) = positionFeeGrowthInside(old, v3Now);
+        let pendingFee0 = old.liquidity * safeSub(insideNow0, old.lastFeeGrowth0) / tenToPower60;
+        let pendingFee1 = old.liquidity * safeSub(insideNow1, old.lastFeeGrowth1) / tenToPower60;
+        let maxClaim0 = safeSub(v3Now.totalFeesCollected0, v3Now.totalFeesClaimed0);
+        let maxClaim1 = safeSub(v3Now.totalFeesCollected1, v3Now.totalFeesClaimed1);
+        let claimed0 = Nat.min(pendingFee0, maxClaim0);
+        let claimed1 = Nat.min(pendingFee1, maxClaim1);
+        let Tfees0 = returnTfees(token0);
+        let Tfees1 = returnTfees(token1);
+        if (claimed0 > Tfees0) { Vector.add(tempTransferQueueLocal, (#principal(caller), claimed0 - Tfees0, token0, genTxId())) }
+        else if (claimed0 > 0) { addFees(token0, claimed0, false, "", nowVar) };
+        if (claimed1 > Tfees1) { Vector.add(tempTransferQueueLocal, (#principal(caller), claimed1 - Tfees1, token1, genTxId())) }
+        else if (claimed1 > 0) { addFees(token1, claimed1, false, "", nowVar) };
+        if (claimed0 > 0 or claimed1 > 0) {
+          Map.set(poolV3Data, hashtt, poolKey, { v3Now with totalFeesClaimed0 = v3Now.totalFeesClaimed0 + claimed0; totalFeesClaimed1 = v3Now.totalFeesClaimed1 + claimed1 });
+        };
+        let updated = Array.tabulate<ConcentratedPosition>(existingConc.size(), func(i) {
+          if (i == idx) {
+            { old with liquidity = old.liquidity + liquidity; lastFeeGrowth0 = insideNow0; lastFeeGrowth1 = insideNow1; lastUpdateTime = nowVar }
+          } else { existingConc[i] }
+        });
+        Map.set(concentratedPositions, phash, caller, updated);
+      };
+      case null {
+        // Create new concentrated position — snapshot feeGrowthInside NOW so future
+        // claims correctly isolate to in-range growth only.
+        nextPositionId += 1;
+        let dummyPos : ConcentratedPosition = {
+          positionId = 0; token0; token1; liquidity = 0;
+          ratioLower; ratioUpper; lastFeeGrowth0 = 0; lastFeeGrowth1 = 0; lastUpdateTime = 0;
+        };
+        let (initInside0, initInside1) = positionFeeGrowthInside(dummyPos, v3Now);
+        let newPosition : ConcentratedPosition = {
+          positionId = nextPositionId;
+          token0; token1;
+          liquidity;
+          ratioLower; ratioUpper;
+          lastFeeGrowth0 = initInside0;
+          lastFeeGrowth1 = initInside1;
+          lastUpdateTime = nowVar;
+        };
+        let posVec = Vector.fromArray<ConcentratedPosition>(existingConc);
+        Vector.add(posVec, newPosition);
+        Map.set(concentratedPositions, phash, caller, Vector.toArray(posVec));
+      };
+    };
+
+    // Refund excess tokens not used by the position
+    let refund0 = if (amount0 > used0) { amount0 - used0 } else { 0 };
+    let refund1 = if (amount1 > used1) { amount1 - used1 } else { 0 };
+    if (refund0 > returnTfees(token0)) {
+      Vector.add(tempTransferQueueLocal, (#principal(caller), refund0 - returnTfees(token0), token0, genTxId()));
+    } else if (refund0 > 0) {
+      // [38] sub-Tfees refund dust can't be transferred — book to feescollectedDAO so
+      // it stays on the books instead of stranding as positive drift.
+      let cur = switch (Map.get(feescollectedDAO, thash, token0)) { case (?v) v; case null 0 };
+      Map.set(feescollectedDAO, thash, token0, cur + refund0);
+    };
+    if (refund1 > returnTfees(token1)) {
+      Vector.add(tempTransferQueueLocal, (#principal(caller), refund1 - returnTfees(token1), token1, genTxId()));
+    } else if (refund1 > 0) {
+      let cur = switch (Map.get(feescollectedDAO, thash, token1)) { case (?v) v; case null 0 };
+      Map.set(feescollectedDAO, thash, token1, cur + refund1);
+    };
+
+    doInfoBeforeStep2();
+
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+
+    #Ok({
+      liquidity = liquidity;
+      positionId = nextPositionId;
+      token0 = token0;
+      token1 = token1;
+      amount0Used = used0;
+      amount1Used = used1;
+      refund0 = refund0;
+      refund1 = refund1;
+      priceLower = priceLower;
+      priceUpper = priceUpper;
+    });
+  };
+
+  // ── addLiquidityDAOV2 — REMOVED ────────────────────────────────────────────
+  // It delegated to addLiquidityV2 through a SELF-CALL, so inside the callee `caller`
+  // was this canister and the ICRC-2 pull targeted the exchange's own ledger account
+  // instead of the invoker's. It could never pull from any caller: functionally dead.
+  // V1's addLiquidityDAO works because it takes already-settled block indices rather
+  // than pulling, so the same shape is not a defect there.
+  // Removed rather than repaired: making it work means threading an explicit LP
+  // principal through all 421 lines and 31 `caller` uses of addLiquidityV2 — the
+  // ICRC-2 pull path, the most fund-sensitive code in this file — to add a NEW
+  // privileged pull entry point, inside a change whose whole purpose is to CLOSE a
+  // theft hole. Deleting a dead admin-gated method only shrinks the attack surface,
+  // and no capability is lost: an admin adds V2-style liquidity by calling
+  // addLiquidityV2 directly, where the pull correctly draws on their own allowance.
+
+  // ── addPositionV2 — twin of addPosition ────────────────────────────────────
+  // dao=false: the order is created for netFromGrossV2(amount_init) and the
+  // deposit test carves fee+tf out of the pulled gross (BUG G row 1).
+  public shared ({ caller }) func addPositionV2(
+    amount_sell : Nat,
+    amount_init : Nat, // GROSS — "what you hand over"
+    token_sell_identifier : Text,
+    token_init_identifier : Text,
+    pub : Bool,
+    excludeDAO : Bool,
+    OC : ?Text,
+    referrer : Text,
+    allOrNothing : Bool,
+    strictlyOTC : Bool,
+  ) : async ExTypes.OrderResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    if (isAllowed(caller) != 1) {
+      return #Err(#NotAuthorized);
+    };
+
+    // made it > 150 incase a manual trader accedentily double pastes (was 70 at first)
+    if (Text.size(referrer) > 150 or Text.size(token_sell_identifier) > 150 or Text.size(token_init_identifier) > 150) {
+      dayBan := TrieSet.put(dayBan, caller, Principal.hash(caller), Principal.equal);
+      return #Err(#Banned);
+    };
+    var OCname = switch (OC) {
+      //Open chat names are between 3 and 16 characters
+      case (?T) {
+        if (Text.size(T) < 24 or Text.size(T) > 30) {
+          if (Text.size(T) > 150) {
+            dayBan := TrieSet.put(dayBan, caller, Principal.hash(caller), Principal.equal);
+            return #Err(#Banned);
+          } else { "" };
+        } else { T };
+      };
+      case _ { "" };
+    };
+
+    var nowVar = Time.now();
+    // F9 [17] + BUG Q/★5: snapshot the fee pair ONCE before any await/pull. The
+    // snapshot feeds the order record, the deposit carve-out, the pull record
+    // and EVERY fee read below — a ChangeTradingfees landing during the pull
+    // await must not desync booked fees from the carve-out.
+    let ICPfeeSnap = ICPfee;
+    let RevokeFeeSnap = RevokeFeeNow;
+
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+
+    // Same-token reject: makes no economic sense and can drain pools via cyclic
+    // AMM routes. Burn canister exempt (adminFlashArb routes back to start token).
+    // V2: nothing has been pulled yet — plain refusal (V1 refunds the deposit here).
+    if (token_sell_identifier == token_init_identifier and not isFlashArbCaller(caller)) {
+      return #Err(#InvalidInput("Sell and buy token must be different"));
+    };
+
+    // Check if tokens are accepted. V2: plain refusal — no deposit exists yet.
+    let tokenNotAccepted = (token_sell_identifier != "ryjl3-tyaaa-aaaaa-aaaba-cai" and containsToken(token_sell_identifier) == false)
+      or (token_init_identifier != "ryjl3-tyaaa-aaaaa-aaaba-cai" and containsToken(token_init_identifier) == false);
+    if (tokenNotAccepted) {
+      return #Err(#TokenNotAccepted(token_init_identifier));
+    };
+    let user = Principal.toText(caller);
+
+    if (((switch (Array.find<Text>(pausedTokens, func(t) { t == token_sell_identifier })) { case null { false }; case (?_) { true } })) or ((switch (Array.find<Text>(pausedTokens, func(t) { t == token_init_identifier })) { case null { false }; case (?_) { true } }))) {
+      return #Err(#TokenPaused("Init or sell token is paused at the moment OR order is public and one of the tokens is not a a base token"));
+    };
+
+    let nonPoolOrder = (pub and not isKnownPool(token_sell_identifier, token_init_identifier)) or strictlyOTC or allOrNothing;
+
+    // check if amounts are not too low
+    let amount_sell2 = if (amount_sell < 1) {
+      1;
+    } else { amount_sell };
+    // BUG Q/★5: tf snapshot BEFORE the pull; gross → net for the order size.
+    let tfSnap = returnTfees(token_init_identifier);
+    let netInit = netFromGrossV2(amount_init, tfSnap, ICPfeeSnap);
+    if (netInit == 0 or not returnMinimum(token_init_identifier, netInit, false)) {
+      // V2: plain refusal — nothing pulled yet, zero cost to the caller.
+      return #Err(#InvalidInput("Amount too low"));
+    };
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity.
+    switch (v2PullPreflight(token_init_identifier)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+
+    let nowVar2 = nowVar;
+    trade_number += 1;
+    var trade : TradePrivate = {
+      Fee = ICPfeeSnap; // F9 [17]: snapshotted fee pair
+      amount_sell = amount_sell2;
+      amount_init = netInit; // V2: the order is sized in NET (execution space)
+      token_sell_identifier = token_sell_identifier;
+      token_init_identifier = token_init_identifier;
+      trade_done = 0;
+      seller_paid = 0;
+      init_paid = 1;
+      trade_number = trade_number;
+      SellerPrincipal = "0";
+      initPrincipal = Principal.toText(caller);
+      seller_paid2 = 0;
+      init_paid2 = 0;
+      RevokeFee = RevokeFeeSnap; // F9 [17]: snapshotted fee pair
+      OCname = OCname;
+      time = nowVar;
+      filledInit = 0;
+      filledSell = 0;
+      allOrNothing = allOrNothing;
+      strictlyOTC = strictlyOTC;
+    };
+
+    if (Vector.size(tempTransferQueue) > 0) {
+      if FixStuckTXRunning {} else {
+        FixStuckTXRunning := true;
+        // SECURITY FIX (P9a): snapshot + clear BEFORE the await, restore on failure.
+        // The old shape passed Vector.toArray(tempTransferQueue) as the await ARGUMENT
+        // and ran Vector.clear AFTER the await returned, so any refund appended by a
+        // concurrent message during that await window was destroyed — user refunds
+        // vanished silently (positive drift, no alarm). FixStuckTXRunning serialises
+        // flushers, not appenders. Pattern copied verbatim from the settle loop at :14753.
+        let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false };
+        if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
+        FixStuckTXRunning := false;
+      };
+    };
+
+    // ── the pull (replaces V1's getBlockData deposit proof) ──
+    let blkPull : Nat = switch (await* pullFromV2(caller, token_init_identifier, amount_init, ICPfeeSnap, RevokeFeeSnap, tfSnap, "addPositionV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        return #Err(#InsufficientFunds("V2 pull declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: burn FIRST, above every branch (BUG J: closes the 21-day replay of
+    // the pull's real block through V1 paths).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(token_init_identifier, blkPull, nowVar)) {
+      return #Err(#InvalidInput(pullRaceErrV2(token_init_identifier, blkPull)));
+    };
+
+    // BUG M: synthetic #ICRC12 deposit proof for the pulled gross.
+    let blockData = syntheticPullBlockV2(caller, amount_init, tfSnap, nowVar2);
+    nowVar := Time.now();
+    if (blockData != #ICRC12([])) {
+      //Check whether the referrer var is valid and whether the user does not have a referrer yet
+      switch (Map.get(userReferrerLink, thash, user)) {
+        case (?_) {
+          // User already has a referrer link, do nothing
+
+        };
+        case (null) {
+          // User doesn't have a referrer link, let's set it
+          if (referrer == "") {
+            // If no referrer provided, set to null
+            Map.set(userReferrerLink, thash, user, null);
+          } else {
+            // Check if the referrer is a valid principal AND not the caller
+            // themselves (self-referral would let the user siphon ReferralFees%
+            // of their OWN fees back via claimFeesReferrer, stealing from DAO).
+            let a = PrincipalExt.fromText(referrer);
+            if (a == null or referrer == user) {
+              Map.set(userReferrerLink, thash, user, null);
+            } else {
+              Map.set(userReferrerLink, thash, user, ?referrer);
+
+            };
+          };
+        };
+      };
+      if ((
+        (containsToken(token_init_identifier) == false) or (containsToken(token_sell_identifier) == false) or ((switch (Array.find<Text>(pausedTokens, func(t) { t == token_sell_identifier })) { case null { false }; case (?_) { true } })) or ((switch (Array.find<Text>(pausedTokens, func(t) { t == token_init_identifier })) { case null { false }; case (?_) { true } }))
+      )) {
+        // Asset paused/delisted during the pull await. checkReceive has NOT run
+        // (BUG A), so refund the whole pulled gross via the file's own
+        // checkReceive(amount=0, dao=true, sendback=true) idiom — it books
+        // nothing and queues gross - tf back to the caller.
+        Vector.clear(tempTransferQueueLocal);
+        let nowVar2 = nowVar;
+
+        Vector.addFromIter(tempTransferQueueLocal, (checkReceive(PULL_SENTINEL_BLOCK_V2, caller, 0, token_init_identifier, ICPfeeSnap, RevokeFeeSnap, true, true, syntheticPullBlockV2(caller, amount_init, tfSnap, nowVar2), #ICRC12, nowVar2)).1.vals());
+        // Transfering the transactions that have to be made to the treasury,
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+        return #Err(#TokenPaused("Asset paused during execution"));
+
+      };
+    };
+    // revokeFees are already added in checkreceive, thats why we initiate the referrer loop already
+    let (receiveBool, receiveTransfers) = if (blockData != #ICRC12([])) {
+      checkReceive(PULL_SENTINEL_BLOCK_V2, caller, netInit, token_init_identifier, ICPfeeSnap, RevokeFeeSnap, false, true, blockData, #ICRC12, nowVar2); // F9 [17]: snapshotted fee pair; BUG M: #ICRC12 hard-coded
+    } else { (false, []) };
+    Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
+    if (not receiveBool) {
+      // BUG B: only checkReceive's own transfers are queued here — no extra refund.
+      // Transfering the transactions that have to be made to the treasury,
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {
+
+      } else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+
+      return #Err(#InsufficientFunds("Deposit not received"));
+    };
+
+    var PrivateAC : Text = PrivateHash();
+    if pub {
+      PrivateAC := "Public" #PrivateAC;
+    };
+
+    if (excludeDAO and not pub) { PrivateAC := PrivateAC # "excl" };
+    var plsbreak = 0;
+
+    var feesToAdd = (token_init_identifier, 0);
+
+    if (pub and not strictlyOTC and not allOrNothing) {
+
+      // checking whether there are existing orders that can fulfill this one (partly)
+      let thePairing = orderPairing(trade);
+      let leftAmountInit = thePairing.0;
+      Vector.addFromIter(tempTransferQueueLocal, thePairing.3.vals());
+      let tfees = returnTfees(token_init_identifier);
+      if (test) {
+        Debug.print("DRIFT_TRACE addPositionV2: token=" # token_init_identifier
+          # " amt=" # Nat.toText(netInit)
+          # " left=" # Nat.toText(leftAmountInit)
+          # " wasAMM=" # debug_show(thePairing.4)
+          # " pFee=" # Nat.toText(thePairing.1)
+          # " poolFee=" # Nat.toText(thePairing.2)
+          # " transfers=" # Nat.toText(thePairing.3.size())
+          # " consumed=" # Nat.toText(thePairing.5));
+      };
+      if (leftAmountInit != netInit and leftAmountInit != 0 and tfees < leftAmountInit) {
+        if (amount_sell2 > 1) {
+
+          let add = (((((netInit - leftAmountInit) * ICPfeeSnap)) - (((((netInit - leftAmountInit) * ICPfeeSnap) * 100000) / RevokeFeeSnap) / 100000)) / 10000); // F9 [17]: snapshotted fee pair
+          if (add > 0) {
+            addFees(token_init_identifier, add, false, user, nowVar);
+          };
+
+          // Record the instantly-filled portion
+          var partialBuyAmount : Nat = 0;
+          for (transaction in thePairing.3.vals()) {
+            if (transaction.0 == #principal(caller) and transaction.2 == token_sell_identifier) {
+              partialBuyAmount += transaction.1;
+            };
+          };
+          if (partialBuyAmount > 0) {
+            nextSwapId += 1;
+            recordSwap(caller, {
+              swapId = nextSwapId;
+              tokenIn = token_init_identifier; tokenOut = token_sell_identifier;
+              amountIn = netInit - leftAmountInit; amountOut = partialBuyAmount;
+              route = [token_init_identifier, token_sell_identifier];
+              fee = thePairing.1 + thePairing.2;
+              swapType = if (pub) { #direct } else { #otc };
+              timestamp = nowVar;
+            });
+          };
+
+          trade := {
+            trade with
+            amount_sell = (((leftAmountInit * 100000000000) / netInit) * amount_sell2) / 100000000000;
+            amount_init = leftAmountInit -tfees;
+            seller_paid = 0;
+            init_paid = 1;
+            seller_paid2 = 0;
+            init_paid2 = 0;
+            time = nowVar;
+            filledInit = netInit -leftAmountInit;
+            filledSell = amount_sell2 -((((leftAmountInit * 100000000000) / netInit) * amount_sell2) / 100000000000);
+          };
+        } else {
+          if (leftAmountInit > returnTfees(token_init_identifier)) {
+            Vector.add(tempTransferQueueLocal, (#principal(caller), leftAmountInit, token_init_identifier, genTxId()));
+          } else {
+            addFees(token_init_identifier, leftAmountInit, false, "", nowVar);
+          };
+          plsbreak := 1;
+
+        };
+      } else if (leftAmountInit == 0) {
+
+        let add = (((((netInit) * ICPfeeSnap)) - (((((netInit) * ICPfeeSnap) * 100000) / RevokeFeeSnap) / 100000)) / 10000); // F9 [17]: snapshotted fee pair
+        let posInputTfees = if (thePairing.4) { tfees } else { 0 };
+        if (add + posInputTfees > 0) {
+          addFees(token_init_identifier, add + posInputTfees, false, user, nowVar);
+        };
+        // Record instant fill in swap history
+        var toBeBoughtForHistory : Nat = 0;
+        for (transaction in Vector.vals(tempTransferQueueLocal)) {
+          if (transaction.0 == #principal(caller) and transaction.2 == token_sell_identifier) {
+            toBeBoughtForHistory += transaction.1;
+          };
+        };
+        nextSwapId += 1;
+        recordSwap(caller, {
+          swapId = nextSwapId;
+          tokenIn = token_init_identifier; tokenOut = token_sell_identifier;
+          amountIn = netInit; amountOut = toBeBoughtForHistory;
+          route = [token_init_identifier, token_sell_identifier];
+          fee = thePairing.1 + thePairing.2;
+          swapType = if (pub) { #direct } else { #otc };
+          timestamp = nowVar;
+        });
+
+        if (thePairing.4) {
+          var toBeBought = 0;
+          for (transaction in Vector.vals(tempTransferQueueLocal)) {
+            if (transaction.0 == #principal(caller) and transaction.2 == token_sell_identifier) {
+              toBeBought += transaction.1;
+            }; // transaction.1 should be the amount received
+          };
+          var pool : (Text, Text) = ("", "");
+          label getPool for (p in Vector.vals(pool_canister)) {
+            if ((token_init_identifier, token_sell_identifier) == p or (token_sell_identifier, token_init_identifier) == p) {
+              pool := p;
+              break getPool;
+            };
+          };
+          var history_pool = switch (Map.get(pool_history, hashtt, pool)) {
+            case null {
+              RBTree.init<Time, [{ amount_init : Nat; amount_sell : Nat; init_principal : Text; sell_principal : Text; accesscode : Text; token_init_identifier : Text; filledInit : Nat; filledSell : Nat; strictlyOTC : Bool; allOrNothing : Bool }]>();
+            };
+            case (?a) { a };
+          };
+          let histEntry = { amount_init = trade.amount_init; amount_sell = toBeBought; init_principal = trade.initPrincipal; sell_principal = "AMM"; accesscode = PrivateAC; token_init_identifier = trade.token_init_identifier; filledInit = trade.amount_init; filledSell = toBeBought; strictlyOTC = trade.strictlyOTC; allOrNothing = trade.allOrNothing };
+          Map.set(pool_history, hashtt, pool, switch (RBTree.get(history_pool, compareTime, nowVar)) { case null { RBTree.put(history_pool, compareTime, nowVar, [histEntry]) }; case (?a) { let hVec = Vector.fromArray<{ amount_init : Nat; amount_sell : Nat; init_principal : Text; sell_principal : Text; accesscode : Text; token_init_identifier : Text; filledInit : Nat; filledSell : Nat; strictlyOTC : Bool; allOrNothing : Bool }>(a); Vector.add(hVec, histEntry); RBTree.put(history_pool, compareTime, nowVar, Vector.toArray(hVec)) } });
+        };
+
+        plsbreak := 1;
+      } else if (tfees >= leftAmountInit and leftAmountInit != netInit and leftAmountInit != 0) {
+
+        // For AMM-only swaps, leftAmountInit is a phantom from buyTfees adjustment.
+        // Use full net amount for fee calculation. Track input Tfees for AMM-only
+        // fills (same as full fill path) since the order's Tfees deposit must be
+        // accounted for after the order is consumed.
+        let matchedForFee = if (thePairing.4) { netInit } else { netInit - leftAmountInit };
+        let posInputTfees = if (thePairing.4) { tfees } else { 0 };
+        let add = ((((matchedForFee * ICPfeeSnap)) - ((((matchedForFee * ICPfeeSnap) * 100000) / RevokeFeeSnap) / 100000)) / 10000) + (if (thePairing.4) { posInputTfees } else { leftAmountInit }); // ★5: snapshotted fee pair
+        if (add > 0) {
+          addFees(token_init_identifier, add, false, user, nowVar);
+        };
+
+        // Record as near-full fill (remainder was dust)
+        var dustFillBuyAmount : Nat = 0;
+        for (transaction in thePairing.3.vals()) {
+          if (transaction.0 == #principal(caller) and transaction.2 == token_sell_identifier) {
+            dustFillBuyAmount += transaction.1;
+          };
+        };
+        if (dustFillBuyAmount > 0) {
+          nextSwapId += 1;
+          recordSwap(caller, {
+            swapId = nextSwapId;
+            tokenIn = token_init_identifier; tokenOut = token_sell_identifier;
+            amountIn = netInit - leftAmountInit; amountOut = dustFillBuyAmount;
+            route = [token_init_identifier, token_sell_identifier];
+            fee = thePairing.1 + thePairing.2;
+            swapType = if (pub) { #direct } else { #otc };
+            timestamp = nowVar;
+          });
+        };
+
+        plsbreak := 1;
+      };
+
+      // Auto multi-hop: if direct pairing left significant unfilled amount, try routing through intermediate pools
+      if (plsbreak == 0 and leftAmountInit > tfees * 3 and leftAmountInit > 10000) {
+        let routes = findRoutes(token_init_identifier, token_sell_identifier, leftAmountInit);
+        label routeSearch for (r in routes.vals()) {
+          if (r.hops.size() <= 1) continue routeSearch; // skip direct (already tried above)
+
+          // Check if AMM estimate meets user's price ratio (user wants at least amount_sell2 for netInit)
+          let requiredOutput = (leftAmountInit * amount_sell2) / netInit;
+          if (r.estimatedOut < requiredOutput) continue routeSearch;
+
+          // Execute multi-hop for the remaining amount
+          var hopAmount = leftAmountInit;
+          var hopFailed = false;
+          var lastSuccessfulHopOutput : Nat = 0;
+          var lastSuccessfulHopToken : Text = "";
+
+          for (hop in r.hops.vals()) {
+            let syntheticTrade : TradePrivate = {
+              Fee = ICPfeeSnap; // ★5: snapshotted fee pair
+              amount_sell = 1;
+              amount_init = hopAmount;
+              token_sell_identifier = hop.tokenOut;
+              token_init_identifier = hop.tokenIn;
+              trade_done = 0;
+              seller_paid = 0;
+              init_paid = 1;
+              seller_paid2 = 0;
+              init_paid2 = 0;
+              trade_number = 0;
+              SellerPrincipal = "0";
+              initPrincipal = Principal.toText(caller);
+              RevokeFee = RevokeFeeSnap; // ★5: snapshotted fee pair
+              OCname = "";
+              time = nowVar;
+              filledInit = 0;
+              filledSell = 0;
+              allOrNothing = false;
+              strictlyOTC = false;
+            };
+            let (_, pFee, _, transfers, _, _, _) = orderPairing(syntheticTrade);
+
+            var thisHopOut : Nat = 0;
+            for (tx in transfers.vals()) {
+              if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
+                thisHopOut += tx.1;
+              } else {
+                // Counterparty transfers — queue them
+                Vector.add(tempTransferQueueLocal, tx);
+              };
+            };
+            if (thisHopOut > 0) {
+              lastSuccessfulHopOutput := thisHopOut;
+              lastSuccessfulHopToken := hop.tokenOut;
+            };
+            hopAmount := thisHopOut;
+            if (hopAmount == 0) { hopFailed := true };
+          };
+
+          if (not hopFailed and hopAmount >= requiredOutput) {
+            // Multi-hop succeeded — send final output to user
+            if (hopAmount > returnTfees(token_sell_identifier)) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), hopAmount, token_sell_identifier, genTxId()));
+            };
+            // Fee accounting for the portion filled by multi-hop
+            let add = (((((leftAmountInit) * ICPfeeSnap)) - (((((leftAmountInit) * ICPfeeSnap) * 100000) / RevokeFeeSnap) / 100000)) / 10000); // ★5: snapshotted fee pair
+            if (add > 0) {
+              addFees(token_init_identifier, add, false, user, nowVar);
+            };
+            plsbreak := 1;
+          } else if (hopFailed and lastSuccessfulHopOutput > 0) {
+            // Auto-multihop failed AFTER hop 0 succeeded.
+            // - Hop 0 consumed the input tokens via AMM (state already modified)
+            // - Intermediate tokens are in the wallet (AMM released them, no transfer)
+            // - Send the intermediate output to the USER (fair: they deposited input,
+            //   hop 0 converted it — give them what was produced by the successful hop).
+            // - This also fixes accounting: wallet sends intermediate out, matching AMM decrease.
+            let intermediateTransferFee = returnTfees(lastSuccessfulHopToken);
+            if (lastSuccessfulHopOutput > intermediateTransferFee) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), lastSuccessfulHopOutput - intermediateTransferFee, lastSuccessfulHopToken, genTxId()));
+            };
+            // Fee accounting for the consumed input
+            let add = (((((leftAmountInit) * ICPfeeSnap)) - (((((leftAmountInit) * ICPfeeSnap) * 100000) / RevokeFeeSnap) / 100000)) / 10000); // ★5: snapshotted fee pair
+            if (add > 0) {
+              addFees(token_init_identifier, add, false, user, nowVar);
+            };
+            plsbreak := 1; // Don't place order — input was consumed by AMM
+          };
+          break routeSearch; // only try best route
+        };
+      };
+    };
+    if (plsbreak == 0) {
+
+      if (not excludeDAO) {
+        replaceLiqMap(false, false, token_init_identifier, token_sell_identifier, PrivateAC, (trade.amount_init, trade.amount_sell, ICPfeeSnap, RevokeFeeSnap, Principal.toText(caller), trade.OCname, trade.time, trade.token_init_identifier, trade.token_sell_identifier, trade.strictlyOTC, trade.allOrNothing), #Zero, null, null); // ★5: snapshotted fee pair (matches the order record)
+      };
+
+      addTrade(PrivateAC, Principal.toText(caller), trade, (token_init_identifier, token_sell_identifier));
+
+
+      doInfoBeforeStep2();
+      let poolKey = getPool(token_init_identifier, token_sell_identifier);
+      ignore updatePriceDayBefore(poolKey, nowVar);
+      // Transfering the transactions that have to be made to the treasury,
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print("Check"); Debug.print(Error.message(err)); false })) {
+
+      } else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      label a if nonPoolOrder {
+        let pair1 = (token_init_identifier, token_sell_identifier);
+        let pair2 = (token_sell_identifier, token_init_identifier);
+
+        let existsInForeignPools = (Map.has(foreignPools, hashtt, pair1) or Map.has(foreignPools, hashtt, pair2));
+
+        if (not existsInForeignPools) {
+          Map.set(foreignPools, hashtt, getPool(token_init_identifier, token_sell_identifier), 1);
+          break a;
+        };
+
+        let pairToAdd = if existsInForeignPools {
+          if (Map.has(foreignPools, hashtt, pair1)) pair1 else pair2;
+        } else { getPool(token_init_identifier, token_sell_identifier) };
+        Map.set(foreignPools, hashtt, pairToAdd, switch (Map.get(foreignPools, hashtt, pairToAdd)) { case (?a) { a +1 }; case null { 1 } });
+      };
+      label a if (not pub) {
+        let pair1 = (token_init_identifier, token_sell_identifier);
+        let pair2 = (token_sell_identifier, token_init_identifier);
+
+        let existsInForeignPools = (Map.has(foreignPrivatePools, hashtt, pair1) or Map.has(foreignPrivatePools, hashtt, pair2));
+
+        let pairToAdd = if existsInForeignPools {
+          if (Map.has(foreignPrivatePools, hashtt, pair1)) pair1 else pair2;
+        } else { getPool(token_init_identifier, token_sell_identifier) };
+        Map.set(foreignPrivatePools, hashtt, pairToAdd, switch (Map.get(foreignPrivatePools, hashtt, pairToAdd)) { case (?a) { a +1 }; case null { 1 } });
+      };
+      return #Ok({
+        accessCode = PrivateAC;
+        tokenIn = token_init_identifier;
+        tokenOut = token_sell_identifier;
+        amountIn = amount_init; // V2: echoes the caller's GROSS
+        filled = 0;
+        remaining = netInit;
+        buyAmountReceived = 0;
+        swapId = null;
+        isPublic = pub;
+      });
+    } else {
+
+      doInfoBeforeStep2();
+      let poolKey = getPool(token_init_identifier, token_sell_identifier);
+      ignore updatePriceDayBefore(poolKey, nowVar);
+      // Transfering the transactions that have to be made to the treasury,
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print("Check"); Debug.print(Error.message(err)); false })) {
+
+      } else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Ok({
+        accessCode = "";
+        tokenIn = token_init_identifier;
+        tokenOut = token_sell_identifier;
+        amountIn = amount_init; // V2: echoes the caller's GROSS
+        filled = netInit;
+        remaining = 0;
+        buyAmountReceived = 0;
+        swapId = null;
+        isPublic = pub;
+      });
+    };
+  };
+
+  // ── swapMultiHopV2 — twin of swapMultiHop ──────────────────────────────────
+  // dao=false: executes on netFromGrossV2(amountIn); #Ok.amountIn echoes gross.
+  public shared ({ caller }) func swapMultiHopV2(
+    tokenIn : Text,
+    tokenOut : Text,
+    amountIn : Nat, // GROSS — "what you hand over"
+    route : [SwapHop],
+    minAmountOut : Nat,
+  ) : async ExTypes.SwapResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    // 1. Auth & validation
+    if (isAllowed(caller) != 1) return #Err(#NotAuthorized);
+
+    // BUG Q/★5: snapshot the fee triple BEFORE the pull; it also derives the
+    // net the whole body executes on.
+    let feeBpSnap = ICPfee;
+    let revokeBpSnap = RevokeFeeNow;
+    let tfSnap = returnTfees(tokenIn);
+    let netIn = netFromGrossV2(amountIn, tfSnap, feeBpSnap);
+
+    // Validate route structure (cheap checks before any pull)
+    var validationError : Text = "";
+    if (tokenIn == tokenOut and not isFlashArbCaller(caller)) {
+      validationError := "Same token (cyclic route not allowed)";
+    };
+    if (validationError != "") { /* same-token already rejected */ }
+    else if (route.size() < 1 or route.size() > 3) { validationError := "Invalid route: 1-3 hops required" }
+    else if (route[0].tokenIn != tokenIn) { validationError := "Route mismatch: first hop tokenIn != tokenIn" }
+    else if (route[route.size() - 1].tokenOut != tokenOut) { validationError := "Route mismatch: last hop tokenOut != tokenOut" }
+    else {
+      var i = 0;
+      while (i < route.size() - 1) {
+        if (route[i].tokenOut != route[i + 1].tokenIn) { validationError := "Route broken at hop " # Nat.toText(i) };
+        i += 1;
+      };
+      if (validationError == "") {
+        for (hop in route.vals()) {
+          if (not containsToken(hop.tokenIn) or not containsToken(hop.tokenOut)) { validationError := "Token not accepted" };
+          if ((switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenIn })) { case null { false }; case (?_) { true } }) or
+              (switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenOut })) { case null { false }; case (?_) { true } })) {
+            validationError := "A token in the route is paused";
+          };
+        };
+      };
+      if (validationError == "") {
+        for (hop in route.vals()) {
+          if (not isKnownPool(hop.tokenIn, hop.tokenOut)) { validationError := "No pool exists for hop " # hop.tokenIn # " -> " # hop.tokenOut };
+        };
+      };
+      if (validationError == "") {
+        if (netIn == 0 or not returnMinimum(tokenIn, netIn, false)) { validationError := "Amount too low" };
+      };
+    };
+
+    // If validation failed: V2 has pulled nothing yet — plain refusal at zero
+    // cost to the caller (V1 must process the block and refund here).
+    if (validationError != "") {
+      return #Err(#InvalidInput(validationError));
+    };
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity.
+    switch (v2PullPreflight(tokenIn)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+
+    var nowVar = Time.now();
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    let user = Principal.toText(caller);
+    let nowVar2 = nowVar;
+
+    // Flush stuck transfers if any
+    if (Vector.size(tempTransferQueue) > 0) {
+      if FixStuckTXRunning {} else {
+        FixStuckTXRunning := true;
+        // SECURITY FIX (P9a): snapshot + clear BEFORE the await, restore on failure.
+        // The old shape passed Vector.toArray(tempTransferQueue) as the await ARGUMENT
+        // and ran Vector.clear AFTER the await returned, so any refund appended by a
+        // concurrent message during that await window was destroyed — user refunds
+        // vanished silently (positive drift, no alarm). FixStuckTXRunning serialises
+        // flushers, not appenders. Pattern copied verbatim from the settle loop at :14753.
+        let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false };
+        if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
+        FixStuckTXRunning := false;
+      };
+    };
+
+    // 2. Fund receipt via ICRC-2 pull (replaces V1's block validation)
+    let blkPull : Nat = switch (await* pullFromV2(caller, tokenIn, amountIn, feeBpSnap, revokeBpSnap, tfSnap, "swapMultiHopV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        return #Err(#InsufficientFunds("V2 pull declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: burn FIRST, above every branch (BUG J write for the pull's block).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(tokenIn, blkPull, nowVar)) {
+      return #Err(#InvalidInput(pullRaceErrV2(tokenIn, blkPull)));
+    };
+
+    // BUG M: synthetic #ICRC12 deposit proof for the pulled gross.
+    let blockData = syntheticPullBlockV2(caller, amountIn, tfSnap, nowVar2);
+    nowVar := Time.now();
+
+    // Verify token acceptance again after await
+    if (blockData == #ICRC12([])) {
+      // Unreachable for a synthetic block; kept for structural parity with V1.
+      return #Err(#SystemError("Failed to get block data"));
+    };
+
+    let (receiveBool, receiveTransfers) = checkReceive(PULL_SENTINEL_BLOCK_V2, caller, netIn, tokenIn, feeBpSnap, revokeBpSnap, false, true, blockData, #ICRC12, nowVar2);
+    Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
+    if (not receiveBool) {
+      // BUG B: only checkReceive's own transfers — no extra refund on top.
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InsufficientFunds("Funds not received"));
+    };
+
+    // 3. Pre-check: simulate all hops to estimate output. Reject BEFORE state modification
+    // if the estimated output is clearly below minAmountOut. This is a safety net — simulateSwap
+    // only simulates AMM (not orderbook), so it may underestimate. False positives (rejecting
+    // a swap that would succeed) are acceptable; false negatives (executing a swap that clearly
+    // fails slippage) are NOT — the user would lose their input tokens.
+    var estimatedOut = netIn;
+    for (hop in route.vals()) {
+      let pk = getPool(hop.tokenIn, hop.tokenOut);
+      switch (Map.get(AMMpools, hashtt, pk)) {
+        case (?pool) {
+          let v3 = Map.get(poolV3Data, hashtt, pk);
+          let (out, _, _) = simulateSwap(pool, v3, hop.tokenIn, estimatedOut, feeBpSnap);
+          estimatedOut := out;
+        };
+        case null { estimatedOut := 0 };
+      };
+    };
+    if (estimatedOut < minAmountOut) {
+      // Refund — no state was modified yet by orderPairing. checkReceive already
+      // booked the revoke portion, so book the rest of the trading fee (★5:
+      // snapshot) and return the full net; physical retention = fee + dust ≥ booked.
+      let tradingFeePortion = (netIn * feeBpSnap) / 10000;
+      let revokeFeePortion = (netIn * feeBpSnap) / (10000 * revokeBpSnap);
+      let untrackedFees = tradingFeePortion - revokeFeePortion;
+      if (untrackedFees > 0) {
+        addFees(tokenIn, untrackedFees, false, user, nowVar);
+      };
+      Vector.add(tempTransferQueueLocal, (#principal(caller), netIn, tokenIn, genTxId()));
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#SlippageExceeded({ expected = minAmountOut; got = estimatedOut }));
+    };
+
+    // 4. Execute hops via orderPairing (modifies state — real execution)
+    var currentAmount = netIn;
+    var firstHopRemaining : Nat = 0;
+    var firstHopPoolFee : Nat = 0;
+    var firstHopProtocolFee : Nat = 0;
+    var firstHopHadOrderbookMatch = false;
+    var lastHopWasAMMOnly = false;
+
+    for (hopIndex in Iter.range(0, route.size() - 1)) {
+      let hop = route[hopIndex];
+      let isLastHop : Bool = hopIndex + 1 == route.size();
+
+      let syntheticTrade : TradePrivate = {
+        // Charge trading fee on ALL hops so LP providers earn fees on
+        // intermediate pools (e.g. ICP/TACO pool in a DKP→ICP→TACO route).
+        // Hop 0 fee is covered by the user's deposit overpayment.
+        // Hops 1+ fee is covered by collecting protocol fees from
+        // the intermediate token via addFees below.
+        Fee = feeBpSnap; // ★5: snapshotted fee pair
+        amount_sell = 1;
+        amount_init = currentAmount;
+        token_sell_identifier = hop.tokenOut;
+        token_init_identifier = hop.tokenIn;
+        trade_done = 0;
+        seller_paid = 0;
+        init_paid = 1;
+        seller_paid2 = 0;
+        init_paid2 = 0;
+        trade_number = 0;
+        SellerPrincipal = "0";
+        initPrincipal = user;
+        RevokeFee = revokeBpSnap; // ★5: snapshotted fee pair
+        OCname = "";
+        time = nowVar;
+        filledInit = 0;
+        filledSell = 0;
+        allOrNothing = false;
+        strictlyOTC = false;
+      };
+
+      let (remaining, protocolFee, poolFee, transfers, wasAMMOnly, consumedOrders, _) = orderPairing(syntheticTrade);
+      lastHopWasAMMOnly := wasAMMOnly;
+      if (hopIndex == 0) {
+        firstHopRemaining := remaining;
+        firstHopPoolFee := poolFee;
+        firstHopProtocolFee := protocolFee;
+      };
+
+      // For hops 1+, V3 already tracks both pool and protocol fees internally
+      // via totalFeesCollected. No additional fee collection needed for
+      // intermediate tokens since no extra deposit backs them.
+
+      var hopOutput : Nat = 0;
+      for (tx in transfers.vals()) {
+        if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
+          hopOutput += tx.1;
+          if (isLastHop) {
+            // Last hop: transfer final output to caller
+            Vector.add(tempTransferQueueLocal, tx);
+          };
+          // Intermediate hop: don't transfer — tokens stay for next hop
+        } else {
+          // Counterparty payments — always queue
+          Vector.add(tempTransferQueueLocal, tx);
+          // Track if hop 0 matched against orderbook (counterparty receives input token)
+          if (hopIndex == 0 and tx.2 == tokenIn) {
+            firstHopHadOrderbookMatch := true;
+          };
+        };
+      };
+
+      // Handle unfilled portion on first hop — only refund genuine partial fills
+      if (hopIndex == 0 and remaining > tfSnap * 3) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), remaining, hop.tokenIn, genTxId()));
+        // F5 [14]: this refund physically spends the user's single inputTfees buffer
+        // (treasury pays the ledger fee on the outflow). Mark hop-0 as buffer-consumed so
+        // the fee booking below does NOT re-book inputTfees a second time (negative drift).
+        firstHopHadOrderbookMatch := true;
+      };
+
+      let prevCurrentAmount = currentAmount; // Save before overwrite for error path
+      currentAmount := hopOutput;
+      if (currentAmount == 0) {
+        // No output — collect hop 0 fees. User deposited net * (1 + Fee%) upfront;
+        // the non-revoke portion (calculateFee) is user's fee to DAO. Additionally, any
+        // AMM protocol fee deducted during partial hop-0 execution (firstHopProtocolFee)
+        // also goes to DAO. The 70% LP portion stays in v3 residual (claimable by LPs).
+        // Sync v3 claim by protocolFee only, so residual retains exactly the LP portion.
+        let tradingFee = calculateFee(netIn, feeBpSnap, revokeBpSnap) + firstHopProtocolFee; // ★5
+        if (tradingFee > 0) { addFees(tokenIn, tradingFee, false, user, nowVar) };
+        if (firstHopProtocolFee > 0) {
+          claimProtocolFeeInV3(tokenIn, route[0].tokenOut, firstHopProtocolFee);
+        };
+
+        // For hop 1+ failures: the intermediate tokens from previous hops are in the
+        // wallet (AMM reserves decreased but tokens weren't transferred out).
+        // Send them to the USER (fair: their input was converted by hop 0, give them
+        // the result). This also fixes accounting: wallet sends intermediate out,
+        // matching the AMM reserve decrease.
+        if (hopIndex > 0 and prevCurrentAmount > 0) {
+          let intermediateToken = route[hopIndex].tokenIn;
+          let intermediateTransferFee = returnTfees(intermediateToken);
+          if (prevCurrentAmount > intermediateTransferFee) {
+            Vector.add(tempTransferQueueLocal, (#principal(caller), prevCurrentAmount - intermediateTransferFee, intermediateToken, genTxId()));
+          } else {
+            // Dust too small to transfer — track in feescollectedDAO so nothing is lost
+            let cur = switch (Map.get(feescollectedDAO, thash, intermediateToken)) { case (?v) v; case null 0 };
+            Map.set(feescollectedDAO, thash, intermediateToken, cur + prevCurrentAmount);
+          };
+        };
+
+        // No output from this hop, stop
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+        return #Err(#RouteFailed({ hop = hopIndex; reason = "No output" }));
+      };
+
+      // For intermediate hops: orderPairing deducted one transfer fee (sellTfees)
+      // from the payout assuming a real transfer to the user. But intermediate hops
+      // don't actually transfer — the tokens stay for the next hop. Add back the
+      // unused transfer fee ONLY when the hop was AMM-only (where sellTfees was
+      // deducted). When orderbook orders matched, the transfer amount already
+      // includes extraFees and no sellTfees was deducted, so adding back would
+      // inflate the amount.
+      if (not isLastHop and wasAMMOnly) {
+        currentAmount += returnTfees(hop.tokenOut);
+      };
+      // For intermediate hops with orderbook matches: the order tracking decreased
+      // by the full matched amount, but the pool received sellTfees less (from the
+      // transfer fee deduction in orderPairing). Track the gap in feescollectedDAO.
+      // For intermediate hops with orderbook matches: a sellTfees gap exists between
+      // order tracking and pool tracking. Track it in feescollectedDAO.
+      // Also record which orders' counterparty tokens were compensated, so
+      // revokeTrade can deduct if the order is later canceled.
+      if (not isLastHop and not wasAMMOnly) {
+        let hopTfees = returnTfees(hop.tokenOut);
+        addFees(hop.tokenOut, hopTfees, false, "", nowVar);
+      };
+    };
+
+    // 5. Fee collection — before slippage check since hops already executed and modified state.
+    // Use full net: the "remaining" from orderPairing is phantom (totalbuyTfees accounting)
+    // for AMM-only swaps (~10K). The AMM consumed the full amount. For real partial fills,
+    // the remaining is refunded to the user and the fee on that portion was collected at checkReceive.
+    // NOTE: This only collects hop 0 fees. Hops 1+ fees are collected inside the loop above.
+    let firstHopMatched : Nat = netIn;
+    if (firstHopMatched > 0) {
+      // tradingFee = user's upfront non-revoke (calculateFee) + AMM protocol 30% (firstHopProtocolFee).
+      // LP 70% stays in v3 residual (claimable). Sync v3 claim by protocolFee only.
+      let tradingFee = calculateFee(firstHopMatched, feeBpSnap, revokeBpSnap) + firstHopProtocolFee; // ★5
+      let inputTfees = if (firstHopHadOrderbookMatch) { 0 } else { tfSnap }; // ★5
+      let feeToAdd = tradingFee + inputTfees;
+      addFees(tokenIn, feeToAdd, false, user, nowVar);
+      if (firstHopProtocolFee > 0) {
+        claimProtocolFeeInV3(tokenIn, route[0].tokenOut, firstHopProtocolFee);
+      };
+    };
+
+    // 6. Slippage check on actual result
+    if (currentAmount < minAmountOut) {
+      // Execution already modified state (pools/orderbook).
+      // We can't roll back, so we send whatever was obtained to the user.
+      // The pre-check above should prevent this in most cases.
+      // Return error message but still send the transfers.
+      let routeVecSlip = Vector.new<Text>();
+      Vector.add(routeVecSlip, tokenIn);
+      for (hop in route.vals()) { Vector.add(routeVecSlip, hop.tokenOut) };
+      nextSwapId += 1;
+      recordSwap(caller, {
+        swapId = nextSwapId; tokenIn; tokenOut;
+        amountIn = netIn; amountOut = currentAmount;
+        route = Vector.toArray(routeVecSlip);
+        fee = calculateFee(netIn, feeBpSnap, revokeBpSnap); // ★5
+        swapType = #multihop;
+        timestamp = Time.now();
+      });
+      doInfoBeforeStep2();
+      // Consolidate transfers before sending
+      let slipConsolidatedMap = Map.new<Text, (TransferRecipient, Nat, Text, Text)>();
+      for (tx in Vector.vals(tempTransferQueueLocal)) {
+        let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+        let key = rcpt # ":" # tx.2;
+        switch (Map.get(slipConsolidatedMap, thash, key)) {
+          case (?existing) { Map.set(slipConsolidatedMap, thash, key, (tx.0, existing.1 + tx.1, tx.2, tx.3)) };
+          case null { Map.set(slipConsolidatedMap, thash, key, tx) };
+        };
+      };
+      let slipConsolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+      for ((_, tx) in Map.entries(slipConsolidatedMap)) { Vector.add(slipConsolidatedVec, tx) };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(slipConsolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(slipConsolidatedVec));
+      };
+      return #Err(#SlippageExceeded({ expected = minAmountOut; got = currentAmount }));
+    };
+
+    // 7. Record swap history
+    let routeVec = Vector.new<Text>();
+    Vector.add(routeVec, tokenIn);
+    for (hop in route.vals()) { Vector.add(routeVec, hop.tokenOut) };
+    nextSwapId += 1;
+    recordSwap(caller, {
+      swapId = nextSwapId; tokenIn; tokenOut;
+      amountIn = netIn; amountOut = currentAmount;
+      route = Vector.toArray(routeVec);
+      fee = calculateFee(netIn, feeBpSnap, revokeBpSnap); // ★5
+      swapType = #multihop;
+      timestamp = Time.now();
+    });
+
+    // 8. Update exchange info
+    doInfoBeforeStep2();
+
+    // 9. Consolidate transfers (combine same recipient+token to save transfer fees)
+    let consolidatedMap = Map.new<Text, (TransferRecipient, Nat, Text, Text)>();
+    for (tx in Vector.vals(tempTransferQueueLocal)) {
+      let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+      let key = rcpt # ":" # tx.2;
+      switch (Map.get(consolidatedMap, thash, key)) {
+        case (?existing) { Map.set(consolidatedMap, thash, key, (tx.0, existing.1 + tx.1, tx.2, tx.3)) };
+        case null { Map.set(consolidatedMap, thash, key, tx) };
+      };
+    };
+    let consolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    for ((_, tx) in Map.entries(consolidatedMap)) { Vector.add(consolidatedVec, tx) };
+
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
+    };
+
+    #Ok({
+      amountIn = amountIn; // V2: echoes the caller's GROSS
+      amountOut = currentAmount;
+      tokenIn = tokenIn;
+      tokenOut = tokenOut;
+      route = Vector.toArray(routeVec);
+      fee = calculateFee(netIn, feeBpSnap, revokeBpSnap); // ★5
+      swapId = nextSwapId;
+      hops = route.size();
+      firstHopOrderbookMatch = firstHopHadOrderbookMatch;
+      lastHopAMMOnly = lastHopWasAMMOnly;
+    });
+  };
+
+  // ── swapSplitRoutesV2 — twin of swapSplitRoutes ────────────────────────────
+  // dao=false. The caller's legs are GROSS shares; the single pull moves their
+  // sum, netTotal = netFromGrossV2(sum) is executed (checkReceive amount =
+  // netFromGross(gross) exactly per the §2.6 table), and each leg executes its
+  // proportional share of netTotal (floor, remainder to leg 0 — Σ == netTotal).
+  // simulateSplitRoutesV2 applies the identical transformation so quotes match
+  // execution.
+  public shared ({ caller }) func swapSplitRoutesV2(
+    tokenIn : Text,
+    tokenOut : Text,
+    splits : [SplitLeg], // amountIn fields are GROSS shares
+    minAmountOut : Nat,
+  ) : async ExTypes.SwapResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    // ── 1. Auth & structural validation (no state modification) ──
+    if (isAllowed(caller) != 1) return #Err(#NotAuthorized);
+
+    // BUG Q/★5: snapshot the fee triple BEFORE the pull; derive net-space amounts.
+    var grossTotal : Nat = 0;
+    for (leg in splits.vals()) { grossTotal += leg.amountIn };
+    let feeBpSnap = ICPfee;
+    let revokeBpSnap = RevokeFeeNow;
+    let tfSnap = returnTfees(tokenIn);
+    let netTotal = netFromGrossV2(grossTotal, tfSnap, feeBpSnap);
+
+    // Proportional leg scaling: netLeg[i] = floor(grossLeg[i] * netTotal /
+    // grossTotal); the flooring remainder (≤ legs-1) goes to leg 0 so the sum is
+    // exactly netTotal.
+    let netLegAmounts = Array.init<Nat>(splits.size(), 0);
+    if (grossTotal > 0) {
+      var assigned : Nat = 0;
+      var li = 0;
+      while (li < splits.size()) {
+        netLegAmounts[li] := (splits[li].amountIn * netTotal) / grossTotal;
+        assigned += netLegAmounts[li];
+        li += 1;
+      };
+      if (splits.size() > 0 and netTotal > assigned) {
+        netLegAmounts[0] += netTotal - assigned;
+      };
+    };
+
+    var validationError : Text = "";
+    if (tokenIn == tokenOut and not isFlashArbCaller(caller)) {
+      validationError := "Same token (cyclic route not allowed)";
+    };
+    if (validationError == "" and (splits.size() < 1 or splits.size() > 3)) { validationError := "1-3 splits required" };
+
+    var legIdxV = 0;
+    for (leg in splits.vals()) {
+      if (validationError == "") {
+        if (netLegAmounts[legIdxV] == 0) { validationError := "Leg amount must be > 0" };
+        if (leg.route.size() < 1 or leg.route.size() > 3) { validationError := "Each leg: 1-3 hops required" };
+        if (validationError == "") {
+          if (leg.route[0].tokenIn != tokenIn) { validationError := "Leg route must start with tokenIn" };
+          if (leg.route[leg.route.size() - 1].tokenOut != tokenOut) { validationError := "Leg route must end with tokenOut" };
+          var i = 0;
+          while (i + 1 < leg.route.size()) {
+            if (leg.route[i].tokenOut != leg.route[i + 1].tokenIn) { validationError := "Route broken at hop " # Nat.toText(i) };
+            i += 1;
+          };
+          for (hop in leg.route.vals()) {
+            if (not containsToken(hop.tokenIn) or not containsToken(hop.tokenOut)) { validationError := "Token not accepted" };
+            if ((switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenIn })) { case null { false }; case (?_) { true } }) or
+                (switch (Array.find<Text>(pausedTokens, func(t) { t == hop.tokenOut })) { case null { false }; case (?_) { true } })) {
+              validationError := "A token in the route is paused";
+            };
+            if (not isKnownPool(hop.tokenIn, hop.tokenOut)) { validationError := "No pool for hop " # hop.tokenIn # " -> " # hop.tokenOut };
+          };
+        };
+      };
+      legIdxV += 1;
+    };
+
+    if (validationError == "" and (netTotal == 0 or not returnMinimum(tokenIn, netTotal, false))) { validationError := "Total amount too low" };
+
+    // ── Validation failed: V2 has pulled nothing yet — plain refusal ──
+    if (validationError != "") {
+      return #Err(#InvalidInput(validationError));
+    };
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity.
+    switch (v2PullPreflight(tokenIn)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+
+    // ── 2. Fund receipt via ICRC-2 pull ──
+    var nowVar = Time.now();
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    let user = Principal.toText(caller);
+    let nowVar2 = nowVar;
+
+    // Flush stuck transfers if any
+    if (Vector.size(tempTransferQueue) > 0) {
+      if FixStuckTXRunning {} else {
+        FixStuckTXRunning := true;
+        // SECURITY FIX (P9a): snapshot + clear BEFORE the await, restore on failure.
+        // The old shape passed Vector.toArray(tempTransferQueue) as the await ARGUMENT
+        // and ran Vector.clear AFTER the await returned, so any refund appended by a
+        // concurrent message during that await window was destroyed — user refunds
+        // vanished silently (positive drift, no alarm). FixStuckTXRunning serialises
+        // flushers, not appenders. Pattern copied verbatim from the settle loop at :14753.
+        let snapQ = Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue);
+        let okQ = try { await treasury.receiveTransferTasks(snapQ, isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false };
+        if (not okQ) { Vector.addFromIter<(TransferRecipient, Nat, Text, Text)>(tempTransferQueue, snapQ.vals()) };
+        FixStuckTXRunning := false;
+      };
+    };
+
+    let blkPull : Nat = switch (await* pullFromV2(caller, tokenIn, grossTotal, feeBpSnap, revokeBpSnap, tfSnap, "swapSplitRoutesV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        return #Err(#InsufficientFunds("V2 pull declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: burn FIRST, above every branch (BUG J write for the pull's block).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(tokenIn, blkPull, nowVar)) {
+      return #Err(#InvalidInput(pullRaceErrV2(tokenIn, blkPull)));
+    };
+
+    // BUG M: synthetic #ICRC12 deposit proof for the pulled gross.
+    let blockData = syntheticPullBlockV2(caller, grossTotal, tfSnap, nowVar2);
+    nowVar := Time.now();
+
+    if (blockData == #ICRC12([])) {
+      // Unreachable for a synthetic block; kept for structural parity with V1.
+      return #Err(#SystemError("Failed to get block data"));
+    };
+
+    // checkReceive with TOTAL net amount — single deposit covers all legs
+    // Revoke fee collected here: (netTotal * feeBpSnap) / (10000 * revokeBpSnap)
+    let (receiveBool, receiveTransfers) = checkReceive(PULL_SENTINEL_BLOCK_V2, caller, netTotal, tokenIn, feeBpSnap, revokeBpSnap, false, true, blockData, #ICRC12, nowVar2);
+    Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
+    if (not receiveBool) {
+      // BUG B: only checkReceive's own transfers — no extra refund on top.
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (err) { Debug.print(Error.message(err)); false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InsufficientFunds("Funds not received"));
+    };
+
+    // ── 3. Execute all legs sequentially (state IS modified — NO await until transfers) ──
+    // Between simulation check above and execution below: ZERO awaits.
+    // Motoko actor model guarantees no other message interleaves.
+    // Pool state is identical to simulation → execution output ≥ simulated.
+    var totalOutput : Nat = 0;
+    // Track whether ANY leg's first hop had an orderbook match. If so, the
+    // single inputTfees buffer (one Tfees deposited with the transaction) was
+    // consumed by a counterparty transfer. Only book the buffer to feescollectedDAO
+    // if NO leg had an orderbook match (matches swapMultiHop semantics).
+    var anyLegHadOrderbookMatch = false;
+    // MINLEGOUT: set when any leg with minLegOut > 0 produced less than it.
+    var legBelowMin = false;
+
+    for (legIndex in Iter.range(0, splits.size() - 1)) {
+      let leg = splits[legIndex];
+      let legNetIn = netLegAmounts[legIndex]; // V2: scaled net share of this leg
+      var currentAmount = legNetIn;
+      var legFirstHopRemaining : Nat = 0;
+      var legFirstHopPoolFee : Nat = 0;
+      var legFirstHopProtocolFee : Nat = 0;
+      var legFirstHopHadOrderbookMatch = false;
+
+      // Execute hops — identical logic to swapMultiHop
+      label hopExec for (hopIndex in Iter.range(0, leg.route.size() - 1)) {
+        let hop = leg.route[hopIndex];
+        let isLastHop : Bool = hopIndex + 1 == leg.route.size();
+
+        let syntheticTrade : TradePrivate = {
+          Fee = feeBpSnap; // ★5: snapshotted fee pair
+          amount_sell = 1;
+          amount_init = currentAmount;
+          token_sell_identifier = hop.tokenOut;
+          token_init_identifier = hop.tokenIn;
+          trade_done = 0;
+          seller_paid = 0;
+          init_paid = 1;
+          seller_paid2 = 0;
+          init_paid2 = 0;
+          trade_number = 0;
+          SellerPrincipal = "0";
+          initPrincipal = user;
+          RevokeFee = revokeBpSnap; // ★5: snapshotted fee pair
+          OCname = "";
+          time = nowVar;
+          filledInit = 0;
+          filledSell = 0;
+          allOrNothing = false;
+          strictlyOTC = false;
+        };
+
+        let (remaining, legProtocolFee, poolFee, transfers, wasAMMOnly, consumedOrders, _) = orderPairing(syntheticTrade);
+
+        if (hopIndex == 0) {
+          legFirstHopRemaining := remaining;
+          legFirstHopPoolFee := poolFee;
+          legFirstHopProtocolFee := legProtocolFee;
+        };
+
+        // For intermediate hops, V3 already tracks both pool and protocol fees
+        // internally via totalFeesCollected. No additional fee collection needed.
+
+        // Transfer routing (same as swapMultiHop)
+        var hopOutput : Nat = 0;
+        for (tx in transfers.vals()) {
+          if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
+            hopOutput += tx.1;
+            if (isLastHop) {
+              // Last hop: transfer final output to caller
+              Vector.add(tempTransferQueueLocal, tx);
+            };
+            // Intermediate hop: tokens stay for next hop
+          } else {
+            // Counterparty payments — always queue
+            Vector.add(tempTransferQueueLocal, tx);
+            // Track if hop 0 matched against orderbook
+            if (hopIndex == 0 and tx.2 == tokenIn) {
+              legFirstHopHadOrderbookMatch := true;
+            };
+          };
+        };
+
+        // Handle unfilled portion on first hop
+        // Small phantom remaining (≈ buyTfees from totalbuyTfees accounting) is already
+        // in AMM reserves — don't track it separately. Only refund genuine partial fills.
+        if (hopIndex == 0 and remaining > tfSnap * 3) {
+          Vector.add(tempTransferQueueLocal, (#principal(caller), remaining, hop.tokenIn, genTxId()));
+          // DRIFT FIX: this refund transfer consumes the user's inputTfees buffer
+          // (ledger fee deducted on outflow). Flag so we don't double-book it later.
+          legFirstHopHadOrderbookMatch := true;
+          recordOpDrift("splitRoutes_firstHopRefund_v2", hop.tokenIn, -remaining);
+        };
+
+        let prevCurrentAmount = currentAmount;
+        currentAmount := hopOutput;
+        if (currentAmount == 0) {
+          // Hop failed. If hopIndex > 0, refund intermediate tokens to user
+          // (same pattern as swapMultiHop: user's input was converted by prior hops,
+          // give them the intermediate result).
+          if (hopIndex > 0 and prevCurrentAmount > 0) {
+            let intermediateToken = hop.tokenIn;
+            let itf = returnTfees(intermediateToken);
+            if (prevCurrentAmount > itf) {
+              Vector.add(tempTransferQueueLocal, (#principal(caller), prevCurrentAmount - itf, intermediateToken, genTxId()));
+              recordOpDrift("splitRoutes_intermediateRefund_v2", intermediateToken, -prevCurrentAmount);
+            } else {
+              // Dust too small to transfer — track in feescollectedDAO so nothing is lost
+              let cur = switch (Map.get(feescollectedDAO, thash, intermediateToken)) { case (?v) v; case null 0 };
+              Map.set(feescollectedDAO, thash, intermediateToken, cur + prevCurrentAmount);
+              recordOpDrift("splitRoutes_intermediateDust_v2", intermediateToken, 0);
+            };
+          };
+          // DRIFT FIX: book the leg's trading fee on failure (mirrors swapMultiHop).
+          // Without this, the user's deposited fee for the partial route is unaccounted → positive drift.
+          // Use direct Map update to avoid addFees' -1 sat loss (would cause negative drift).
+          // Additive: calculateFee (user upfront) + legFirstHopProtocolFee (AMM protocol).
+          // Sync v3 claim by protocolFee only. LP 70% stays in v3 residual.
+          let failedLegTradingFee = calculateFee(legNetIn, feeBpSnap, revokeBpSnap) + legFirstHopProtocolFee; // ★5
+          if (failedLegTradingFee > 0) {
+            let curFee = switch (Map.get(feescollectedDAO, thash, tokenIn)) { case (?v) v; case null 0 };
+            Map.set(feescollectedDAO, thash, tokenIn, curFee + failedLegTradingFee);
+            if (legFirstHopProtocolFee > 0) {
+              claimProtocolFeeInV3(tokenIn, leg.route[0].tokenOut, legFirstHopProtocolFee);
+            };
+            recordOpDrift("splitRoutes_failedLegFee_v2", tokenIn, 0);
+          };
+          break hopExec;
+        };
+
+        // Restore transfer fee for intermediate AMM-only hops
+        // (orderPairing deducted sellTfees assuming real transfer, but intermediate
+        // hops don't actually transfer — add it back for AMM-only)
+        if (not isLastHop and wasAMMOnly) {
+          currentAmount += returnTfees(hop.tokenOut);
+          recordOpDrift("splitRoutes_ammOnlyRefund_v2", hop.tokenOut, 0);
+        };
+        if (not isLastHop and not wasAMMOnly) {
+          // DRIFT FIX: use direct Map update instead of addFees to avoid -1 sat loss.
+          let hopTfees = returnTfees(hop.tokenOut);
+          let curFee = switch (Map.get(feescollectedDAO, thash, hop.tokenOut)) { case (?v) v; case null 0 };
+          Map.set(feescollectedDAO, thash, hop.tokenOut, curFee + hopTfees);
+          recordOpDrift("splitRoutes_hopTfees_v2", hop.tokenOut, 0);
+        };
+      };
+
+      // Per-leg fee tracking — only charge if the leg produced output.
+      // Don't charge fees for failed legs (user got nothing from them).
+      if (currentAmount > 0) {
+        // Additive: calculateFee (user upfront) + legFirstHopProtocolFee (AMM protocol).
+        // Sync v3 claim by protocolFee only. LP 70% stays in v3 residual.
+        let legTradingFee = calculateFee(legNetIn, feeBpSnap, revokeBpSnap) + legFirstHopProtocolFee; // ★5
+        if (legTradingFee > 0) {
+          // Direct Map update to avoid addFees' -1 sat loss.
+          let curFee = switch (Map.get(feescollectedDAO, thash, tokenIn)) { case (?v) v; case null 0 };
+          Map.set(feescollectedDAO, thash, tokenIn, curFee + legTradingFee);
+          if (legFirstHopProtocolFee > 0) {
+            claimProtocolFeeInV3(tokenIn, leg.route[0].tokenOut, legFirstHopProtocolFee);
+          };
+          recordOpDrift("splitRoutes_legTradingFee_v2", tokenIn, 0);
+        };
+      };
+
+      // Aggregate orderbook-match detection across legs for inputTfees decision below.
+      if (legFirstHopHadOrderbookMatch) { anyLegHadOrderbookMatch := true };
+
+      // MINLEGOUT: record a per-leg minimum violation (enforced at the aggregate
+      // check below only when enforceMinLegOut is on; minLegOut = 0 is a no-op).
+      if (leg.minLegOut > 0 and currentAmount < leg.minLegOut) { legBelowMin := true };
+      totalOutput += currentAmount;
+    };
+
+    // DRIFT FIX: book the inputTfees buffer ONLY if no leg matched orderbook.
+    // If any leg had an orderbook counterparty transfer, the Tfees buffer was
+    // consumed by that transfer's ledger fee. Booking it would over-credit and
+    // cause negative drift. Matches swapMultiHop semantics.
+    if (not anyLegHadOrderbookMatch) {
+      let inputTfees = tfSnap; // ★5
+      if (inputTfees > 0) {
+        let curFee = switch (Map.get(feescollectedDAO, thash, tokenIn)) { case (?v) v; case null 0 };
+        Map.set(feescollectedDAO, thash, tokenIn, curFee + inputTfees);
+        recordOpDrift("splitRoutes_inputTfees_v2", tokenIn, 0);
+      };
+    } else {
+      recordOpDrift("splitRoutes_inputTfees_SKIPPED_v2", tokenIn, 0);
+    };
+
+    // ── 5. Record swap history (single entry for all legs) ──
+    let routeVec = Vector.new<Text>();
+    Vector.add(routeVec, tokenIn);
+    var legNum : Nat = 0;
+    for (leg in splits.vals()) {
+      for (hop in leg.route.vals()) { Vector.add(routeVec, hop.tokenOut) };
+      if (legNum + 1 < splits.size()) { Vector.add(routeVec, "|") }; // leg separator
+      legNum += 1;
+    };
+    nextSwapId += 1;
+    recordSwap(caller, {
+      swapId = nextSwapId;
+      tokenIn;
+      tokenOut;
+      amountIn = netTotal;
+      amountOut = totalOutput;
+      route = Vector.toArray(routeVec);
+      fee = calculateFee(netTotal, feeBpSnap, revokeBpSnap); // ★5
+      swapType = #multihop;
+      timestamp = Time.now();
+    });
+
+    // ── 6. Update exchange info ──
+    doInfoBeforeStep2();
+
+    // ── Post-execution global slippage check ──
+    // V2 DEVIATION (forced by the pull invariants): V1 uses Debug.trap here for
+    // atomic rollback — safe in V1 because the caller-supplied deposit Block
+    // survives the rollback and stays retriable. Under the pull model a trap
+    // would ALSO roll back the BlocksDone burn (BUG N/J) and the pendingPulls
+    // record-delete (BUG O), leaving the pulled gross in evidence-limbo on
+    // every slippage failure and re-opening the pull block for V1 replay paths.
+    // Those invariants must persist on EVERY post-pull exit, so the twin uses
+    // swapMultiHop's own post-execution slippage idiom instead: keep the
+    // executed state, dispatch everything obtained, return #Err(#SlippageExceeded).
+    // MINLEGOUT (flag-gated, default OFF): when enforceMinLegOut is on, a leg
+    // landing under its declared minLegOut fails the whole swap through this same
+    // idiom — the executed state persists, everything obtained is dispatched, and
+    // the caller gets #Err(#SlippageExceeded). NEVER a trap here (see above: a
+    // trap would roll back the BlocksDone burn and re-open the pull block).
+    // Note: on a leg-only violation the error payload can carry got >= expected —
+    // expected stays the aggregate bound; the leg bound is the caller's own input.
+    if (totalOutput < minAmountOut or (enforceMinLegOut and legBelowMin)) {
+      let slipPreCountMap = Map.new<Text, Nat>();
+      for (tx in Vector.vals(tempTransferQueueLocal)) {
+        let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+        let key = rcpt # ":" # tx.2;
+        switch (Map.get(slipPreCountMap, thash, key)) {
+          case (?n) { Map.set(slipPreCountMap, thash, key, n + 1) };
+          case null { Map.set(slipPreCountMap, thash, key, 1) };
+        };
+      };
+      let slipConsolidatedMap = Map.new<Text, (TransferRecipient, Nat, Text, Text)>();
+      for (tx in Vector.vals(tempTransferQueueLocal)) {
+        let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+        let key = rcpt # ":" # tx.2;
+        switch (Map.get(slipConsolidatedMap, thash, key)) {
+          case (?existing) { Map.set(slipConsolidatedMap, thash, key, (tx.0, existing.1 + tx.1, tx.2, tx.3)) };
+          case null { Map.set(slipConsolidatedMap, thash, key, tx) };
+        };
+      };
+      let slipConsolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+      for ((_, tx) in Map.entries(slipConsolidatedMap)) { Vector.add(slipConsolidatedVec, tx) };
+      for ((key, count) in Map.entries(slipPreCountMap)) {
+        if (count > 1) {
+          let token = switch (Map.get(slipConsolidatedMap, thash, key)) {
+            case (?tx) { tx.2 };
+            case null { "" };
+          };
+          if (token == tokenOut) {
+            let savedFees = (count - 1) * returnTfees(token);
+            addFees(token, savedFees, false, "", nowVar);
+          };
+        };
+      };
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(slipConsolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(slipConsolidatedVec));
+      };
+      return #Err(#SlippageExceeded({ expected = minAmountOut; got = totalOutput }));
+    };
+
+    // ── 8. Consolidate transfers (combine same recipient+token to save transfer fees) ──
+    // Track per-token transfer counts before consolidation
+    let preCountMap = Map.new<Text, Nat>();
+    for (tx in Vector.vals(tempTransferQueueLocal)) {
+      let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+      let key = rcpt # ":" # tx.2;
+      switch (Map.get(preCountMap, thash, key)) {
+        case (?n) { Map.set(preCountMap, thash, key, n + 1) };
+        case null { Map.set(preCountMap, thash, key, 1) };
+      };
+    };
+    let consolidatedMap = Map.new<Text, (TransferRecipient, Nat, Text, Text)>();
+    for (tx in Vector.vals(tempTransferQueueLocal)) {
+      let rcpt = switch (tx.0) { case (#principal(p)) { Principal.toText(p) }; case (#accountId(a)) { Principal.toText(a.owner) } };
+      let key = rcpt # ":" # tx.2;
+      switch (Map.get(consolidatedMap, thash, key)) {
+        case (?existing) { Map.set(consolidatedMap, thash, key, (tx.0, existing.1 + tx.1, tx.2, tx.3)) };
+        case null { Map.set(consolidatedMap, thash, key, tx) };
+      };
+    };
+    let consolidatedVec = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    for ((_, tx) in Map.entries(consolidatedMap)) { Vector.add(consolidatedVec, tx) };
+
+    // Track saved ledger fees from consolidation for OUTPUT token only.
+    // Consolidating taker output transfers (tokenOut) saves ledger fees that create
+    // untracked surplus.
+    for ((key, count) in Map.entries(preCountMap)) {
+      if (count > 1) {
+        let token = switch (Map.get(consolidatedMap, thash, key)) {
+          case (?tx) { tx.2 };
+          case null { "" };
+        };
+        if (token == tokenOut) {
+          let savedFees = (count - 1) * returnTfees(token);
+          addFees(token, savedFees, false, "", nowVar);
+        };
+      };
+    };
+
+    // Send consolidated transfers to treasury
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(consolidatedVec), isInAllowedCanisters(caller)) } catch (err) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(consolidatedVec));
+    };
+
+    #Ok({
+      amountIn = grossTotal; // V2: echoes the caller's GROSS total
+      amountOut = totalOutput;
+      tokenIn = tokenIn;
+      tokenOut = tokenOut;
+      route = Vector.toArray(routeVec);
+      fee = calculateFee(netTotal, feeBpSnap, revokeBpSnap); // ★5
+      swapId = nextSwapId;
+      hops = splits.size();
+      firstHopOrderbookMatch = false;
+      lastHopAMMOnly = false;
+    });
+  };
+
+  // ── treasurySwapV2 — twin of treasurySwap ──────────────────────────────────
+  // dao=true: pulls and credits exactly the GROSS (BUG G — no carve-out).
+  public shared ({ caller }) func treasurySwapV2(
+    tokenIn : Text, tokenOut : Text,
+    amountIn : Nat, minAmountOut : Nat, // amountIn = GROSS
+  ) : async ExTypes.SwapResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    if (not DAOcheck(caller)) return #Err(#NotAuthorized);
+    if (not containsToken(tokenIn) or not containsToken(tokenOut)) return #Err(#TokenNotAccepted("Token not accepted"));
+    if (tokenIn == tokenOut) return #Err(#InvalidInput("Same token"));
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity.
+    switch (v2PullPreflight(tokenIn)) { case (?e) { return #Err(#InvalidInput(e)) }; case null {} };
+
+    // BUG Q/★5: snapshot the fee triple BEFORE the pull.
+    let feeBpSnap = ICPfee;
+    let revokeBpSnap = RevokeFeeNow;
+    let tfSnap = returnTfees(tokenIn);
+
+    let nowVar = Time.now();
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+
+    // ── the pull (replaces V1's block validation) ──
+    let blkPull : Nat = switch (await* pullFromV2(caller, tokenIn, amountIn, feeBpSnap, revokeBpSnap, tfSnap, "treasurySwapV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        return #Err(#InsufficientFunds("V2 pull declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: burn FIRST, above every branch (BUG J write for the pull's block).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(tokenIn, blkPull, nowVar)) {
+      return #Err(#InvalidInput(pullRaceErrV2(tokenIn, blkPull)));
+    };
+
+    // BUG M: synthetic #ICRC12 deposit proof for the pulled gross.
+    let blockData = syntheticPullBlockV2(caller, amountIn, tfSnap, nowVar);
+
+    // checkReceive with dao=true — simpler validation, no fee in deposit required
+    let (receiveBool, receiveTransfers) = checkReceive(PULL_SENTINEL_BLOCK_V2, caller, amountIn, tokenIn, feeBpSnap, revokeBpSnap, true, true, blockData, #ICRC12, nowVar);
+    Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
+    if (not receiveBool) {
+      // BUG B: only checkReceive's own transfers — no extra refund on top.
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      return #Err(#InsufficientFunds("Funds not received"));
+    };
+
+    // Find best route internally (FREE — no inter-canister call)
+    let routes = findRoutes(tokenIn, tokenOut, amountIn);
+    let bestRoute = if (routes.size() > 0 and routes[0].hops.size() >= 1) {
+      routes[0].hops;
+    } else {
+      [{ tokenIn = tokenIn; tokenOut = tokenOut }];
+    };
+
+    // Execute hops via orderPairing
+    // Pre-check removed: simulateMultiHop mutates AMMpools in update context,
+    // causing actual execution to run against wrong reserves. Post-execution
+    // slippage check below handles failures safely.
+    var currentAmount = amountIn;
+    label hopLoop for (hopIndex in Iter.range(0, bestRoute.size() - 1)) {
+      let hop = bestRoute[hopIndex];
+      let isLastHop = hopIndex + 1 == bestRoute.size();
+
+      let syntheticTrade : TradePrivate = {
+        Fee = feeBpSnap; // DAO pays LP fees (70% to LPs via AMM), no exchange trading fee; ★5: snapshot
+        amount_sell = 1; amount_init = currentAmount;
+        token_sell_identifier = hop.tokenOut;
+        token_init_identifier = hop.tokenIn;
+        trade_done = 0; seller_paid = 0; init_paid = 1;
+        seller_paid2 = 0; init_paid2 = 0; trade_number = 0;
+        SellerPrincipal = "0";
+        initPrincipal = Principal.toText(caller);
+        RevokeFee = revokeBpSnap; OCname = ""; time = nowVar; // ★5: snapshot
+        filledInit = 0; filledSell = 0;
+        allOrNothing = false; strictlyOTC = false;
+      };
+
+      // F6 [61]: capture orderPairing's REAL remaining (unconsumed tokenIn, in tokenIn units).
+      let (realRemaining, _, _, transfers, _, _, _) = orderPairing(syntheticTrade);
+      var hopOutput : Nat = 0;
+      for (tx in transfers.vals()) {
+        if (tx.0 == #principal(caller) and tx.2 == hop.tokenOut) {
+          hopOutput += tx.1;
+          if (isLastHop) {
+            Vector.add(tempTransferQueueLocal, tx);
+          };
+        } else {
+          Vector.add(tempTransferQueueLocal, tx);
+        };
+      };
+
+      // F6 [61]: refund unconsumed tokenIn using realRemaining. The old
+      // safeSub(currentAmount, hopOutput) subtracted across DIFFERENT tokens
+      // (currentAmount in tokenIn units, hopOutput in tokenOut units) and could fabricate
+      // a refund of tokenIn the AMM already booked into reserveIn = negative drift.
+      // realRemaining = amount_init - amountCoveredSell (floored) <= amount_init.
+      if (realRemaining > returnTfees(hop.tokenIn) and hopIndex == 0) {
+        Vector.add(tempTransferQueueLocal, (#principal(caller), realRemaining, hop.tokenIn, genTxId()));
+      };
+
+      currentAmount := hopOutput;
+      if (currentAmount == 0) break hopLoop;
+
+      // Add back transfer fee for intermediate hops
+      if (not isLastHop) {
+        currentAmount += returnTfees(hop.tokenOut);
+      };
+    };
+
+    // Record in swap history
+    let routeVec = Vector.new<Text>();
+    Vector.add(routeVec, tokenIn);
+    for (hop in bestRoute.vals()) { Vector.add(routeVec, hop.tokenOut) };
+    nextSwapId += 1;
+    recordSwap(caller, {
+      swapId = nextSwapId; tokenIn; tokenOut;
+      amountIn; amountOut = currentAmount;
+      route = Vector.toArray(routeVec);
+      fee = 0;
+      swapType = #direct;
+      timestamp = nowVar;
+    });
+
+    // Send all transfers
+    doInfoBeforeStep2();
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(caller)) } catch (_) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+
+    if (currentAmount < minAmountOut) {
+      return #Err(#SlippageExceeded({ expected = minAmountOut; got = currentAmount }));
+    };
+
+    #Ok({
+      amountIn = amountIn; // dao=true: the credited amount IS the gross
+      amountOut = currentAmount;
+      tokenIn = tokenIn;
+      tokenOut = tokenOut;
+      route = Vector.toArray(routeVec);
+      fee = 0;
+      swapId = nextSwapId;
+      hops = bestRoute.size();
+      firstHopOrderbookMatch = false;
+      lastHopAMMOnly = false;
+    });
+  };
+
+  // ── FinishSellV2 — twin of FinishSell ──────────────────────────────────────
+  // dao=false; the net derivation uses the ORDER's snapshotted Fee/RevokeFee
+  // (never the live globals) plus the pre-pull tf snapshot of the order's sell
+  // token (§2.6 row 1).
+  public shared (msg) func FinishSellV2(
+    accesscode : Text,
+    amountSelling : Nat, // GROSS — "what you hand over" (in the order's token_sell)
+  ) : async ExTypes.ActionResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    if (isAllowed(msg.caller) != 1) {
+      return #Err(#NotAuthorized);
+    };
+    if (Text.size(accesscode) > 150) {
+      return #Err(#Banned);
+    };
+
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    var currentTrades2 : TradePrivate = Faketrade;
+    let pub = Text.startsWith(accesscode, #text "Public");
+    let excludeDAO = (Text.endsWith(accesscode, #text "excl") and not pub);
+
+    // Get current trade details
+    if (pub) {
+      switch (Map.get(tradeStorePublic, thash, accesscode)) {
+        case (?(foundTrades)) { currentTrades2 := foundTrades };
+        case null {};
+      };
+    } else {
+      switch (Map.get(tradeStorePrivate, thash, accesscode)) {
+        case (?(foundTrades)) { currentTrades2 := foundTrades };
+        case null {};
+      };
+    };
+
+    let nowVar2 = Time.now();
+
+    tradesBeingWorkedOn := TrieSet.put(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+    // BUG Q/★5: tf snapshot BEFORE the pull; net derived from the ORDER's
+    // Fee/RevokeFee (order-level snapshots taken at order creation).
+    let tfSnap = returnTfees(currentTrades2.token_sell_identifier);
+    let netSellingRaw = netFromGrossV2(amountSelling, tfSnap, currentTrades2.Fee);
+    if (
+      returnMinimum(currentTrades2.token_sell_identifier, netSellingRaw, false) == false or
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == currentTrades2.token_sell_identifier })) { case null { false }; case (?_) { true } })) or
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == currentTrades2.token_init_identifier })) { case null { false }; case (?_) { true } })) or
+      currentTrades2.trade_number == 0 or currentTrades2.trade_done == 1
+    ) {
+      // V2: nothing pulled yet — plain refusal at zero cost (V1 must process
+      // the deposit block and refund it here). Covers order-not-found
+      // (trade_number == 0 via Faketrade), netSelling == 0, minimum, paused.
+      tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      return #Err(#TokenPaused("Amount too low or token paused"));
+    };
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity.
+    switch (v2PullPreflight(currentTrades2.token_sell_identifier)) {
+      case (?e) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+        return #Err(#InvalidInput(e));
+      };
+      case null {};
+    };
+
+    // SECURITY FIX (single-fill over-fill): identical to V1 FinishSell. Cap the
+    // fill at the maker's escrowed order size so netSelling > amount_sell cannot
+    // drive amountBuying past amount_init and pay the maker's UNBACKED excess from
+    // pooled reserves (the non-partial else arm below). Clamp mirrors orderPairing.
+    // The clamped fill is an exact FULL fill (partial=false); checkReceive, called
+    // with the clamped net, refunds the taker's over-pull automatically via its
+    // sendback (the pulled gross exceeds requiredForNetV2(amount_sell)).
+    let netSelling = if (netSellingRaw > currentTrades2.amount_sell) {
+      currentTrades2.amount_sell;
+    } else { netSellingRaw };
+    let partial = (netSelling < currentTrades2.amount_sell);
+
+    // ── the pull (replaces V1's getBlockData deposit proof). PullRecord carries
+    // the ORDER's Fee/RevokeFee — the pair the carve-out was derived from.
+    let blkPull : Nat = switch (await* pullFromV2(msg.caller, currentTrades2.token_sell_identifier, amountSelling, currentTrades2.Fee, currentTrades2.RevokeFee, tfSnap, "FinishSellV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+        return #Err(#InsufficientFunds("V2 pull declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: burn FIRST, above every branch (BUG J write for the pull's block).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(currentTrades2.token_sell_identifier, blkPull, nowVar2)) {
+      tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      return #Err(#InvalidInput(pullRaceErrV2(currentTrades2.token_sell_identifier, blkPull)));
+    };
+
+    // BUG M: synthetic #ICRC12 deposit proof for the pulled gross.
+    let blockData : BlockData = syntheticPullBlockV2(msg.caller, amountSelling, tfSnap, nowVar2);
+    let (receiveBool, receiveTransfers) = if (blockData != #ICRC12([])) {
+      checkReceive(PULL_SENTINEL_BLOCK_V2, msg.caller, netSelling, currentTrades2.token_sell_identifier, currentTrades2.Fee, currentTrades2.RevokeFee, false, true, blockData, #ICRC12, nowVar2);
+    } else { (false, []) };
+
+    Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
+    if (not receiveBool) {
+      // BUG B: only checkReceive's own transfers — no extra refund on top.
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      return #Err(#InsufficientFunds("Deposit not received"));
+    };
+
+    // Re-check trade details after await
+    var sendBack = false;
+    switch (if pub { Map.get(tradeStorePublic, thash, accesscode) } else { Map.get(tradeStorePrivate, thash, accesscode) }) {
+      case (?(foundTrades)) {
+        if (foundTrades.amount_init == currentTrades2.amount_init and foundTrades.amount_sell == currentTrades2.amount_sell and foundTrades.trade_done == currentTrades2.trade_done and (not currentTrades2.allOrNothing or not partial)) {
+          currentTrades2 := foundTrades;
+        } else { sendBack := true };
+      };
+      case null { sendBack := true };
+    };
+    if sendBack {
+      // F2 [32]: the dao=false checkReceive above (success path) booked
+      // (netSelling*Fee)/(10000*RevokeFee) of token_sell_identifier into feescollectedDAO.
+      // The full refund below returns the WHOLE deposit, so that credit becomes unbacked
+      // (negative drift), and the overpay-refund entries queued above would double-flush with
+      // the full refund. Reverse the credit (delfees=true floors at 0 -> never negative) and
+      // rebuild the queue to a single full refund. currentTrades2 is the ORIGINAL order here,
+      // matching the Fee/RevokeFee/token the checkReceive call used.
+      addFees(currentTrades2.token_sell_identifier, ((netSelling * currentTrades2.Fee) / (10000 * currentTrades2.RevokeFee)), true, "", nowVar2);
+      Vector.clear<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal);
+      // checkReceive(amount=0, dao=true, sendback=true) on the synthetic block
+      // queues the full pulled gross minus one tf back to the caller and books
+      // nothing (the file's own full-refund idiom).
+      Vector.addFromIter(tempTransferQueueLocal, (checkReceive(PULL_SENTINEL_BLOCK_V2, msg.caller, 0, currentTrades2.token_sell_identifier, currentTrades2.Fee, currentTrades2.RevokeFee, true, true, blockData, #ICRC12, nowVar2)).1.vals());
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      return #Err(#OrderNotFound("Trade no longer exists"));
+    };
+
+    // Check if order details have changed
+    var amountBuying = (currentTrades2.amount_init * ((netSelling * tenToPower80) / currentTrades2.amount_sell)) / tenToPower80;
+
+    // Proceed with the trade
+    let init_paid2 = 1;
+    let seller_paid2 = 1;
+
+    // Handle transfers and fees
+    Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(currentTrades2.initPrincipal)), netSelling, currentTrades2.token_sell_identifier, genTxId()));
+    // F3 [60]: on a PARTIAL fill, dock the taker's token_init receipt by one Tfees. The maker
+    // deposited a single token_init buffer; a full fill consumes it on the final payout and the
+    // order is removed (releasing its booked +Tfees), but each partial payout also costs a ledger
+    // fee while the reduced order RE-BOOKS +Tfees in checkDiffs. Docking makes the taker fund
+    // their own partial-receipt ledger fee, preserving the maker buffer to back the persisting
+    // order. Without this the order is short one Tfees(token_init) per partial fill = negative
+    // drift (confirmed -9,999 via runDriftDiag). safeSub floors at 0 for sub-fee dust fills.
+    let takerPayout = if (partial) { safeSub(amountBuying, returnTfees(currentTrades2.token_init_identifier)) } else { amountBuying };
+    Vector.add(tempTransferQueueLocal, (#principal(msg.caller), takerPayout, currentTrades2.token_init_identifier, genTxId()));
+    if pub {
+      let pair1 = (currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier);
+      let pair2 = (currentTrades2.token_sell_identifier, currentTrades2.token_init_identifier);
+      if ((Map.has(foreignPools, hashtt, pair1) or Map.has(foreignPools, hashtt, pair2)) == false) {
+        // amountBuying is in token_init units; netSelling is in token_sell units.
+        // Map to canonical (amount0, amount1).
+        let cPair = getPool(currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier);
+        let (amt0, amt1) = if (cPair.0 == currentTrades2.token_init_identifier) {
+          (amountBuying, netSelling)
+        } else {
+          (netSelling, amountBuying)
+        };
+        updateLastTradedPrice(cPair, amt0, amt1);
+      };
+    };
+    var nowVar = nowVar2;
+    addFees(currentTrades2.token_sell_identifier, (((((netSelling) * currentTrades2.Fee)) - (((((netSelling) * currentTrades2.Fee) * 100000) / currentTrades2.RevokeFee) / 100000)) / 10000), false, Principal.toText(msg.caller), nowVar);
+    addFees(currentTrades2.token_init_identifier, (((((amountBuying) * currentTrades2.Fee)) - (((((amountBuying) * currentTrades2.Fee) * 100000) / currentTrades2.RevokeFee) / 100000)) / 10000), false, currentTrades2.initPrincipal, nowVar);
+
+    // Update trade record for partial fills (reduce amounts, track filled)
+    if (partial) {
+      currentTrades2 := {
+        currentTrades2 with
+        amount_sell = currentTrades2.amount_sell - netSelling;
+        amount_init = currentTrades2.amount_init - amountBuying;
+        filledInit = currentTrades2.filledInit + amountBuying;
+        filledSell = currentTrades2.filledSell + netSelling;
+      };
+    };
+    // Update liquidity map if necessary
+    if (not excludeDAO) {
+      replaceLiqMap(not partial, partial, currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier, accesscode, if (partial) (currentTrades2.amount_init, currentTrades2.amount_sell, currentTrades2.Fee, currentTrades2.RevokeFee, currentTrades2.initPrincipal, currentTrades2.OCname, currentTrades2.time, currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier, currentTrades2.strictlyOTC, currentTrades2.allOrNothing) else (currentTrades2.amount_init, currentTrades2.amount_sell, 0, 0, "", currentTrades2.OCname, currentTrades2.time, currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier, currentTrades2.strictlyOTC, currentTrades2.allOrNothing), if (partial) #Value(((currentTrades2.amount_init + amountBuying) * tenToPower60) / (currentTrades2.amount_sell + netSelling)) else #Zero, if (partial) ?{ Fee = currentTrades2.Fee; RevokeFee = currentTrades2.RevokeFee } else null, ?{ amount_init = amountBuying; amount_sell = netSelling; init_principal = currentTrades2.initPrincipal; sell_principal = Principal.toText(msg.caller); accesscode = accesscode; token_init_identifier = currentTrades2.token_init_identifier; filledInit = amountBuying; filledSell = netSelling; strictlyOTC = currentTrades2.strictlyOTC; allOrNothing = currentTrades2.allOrNothing });
+    };
+    if (partial) {
+      addTrade(accesscode, currentTrades2.initPrincipal, currentTrades2, (currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier));
+    } else {
+      removeTrade(accesscode, currentTrades2.initPrincipal, (currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier));
+    };
+
+    // Record swap for the filler (seller)
+    nextSwapId += 1;
+    recordSwap(msg.caller, {
+      swapId = nextSwapId;
+      tokenIn = currentTrades2.token_sell_identifier; tokenOut = currentTrades2.token_init_identifier;
+      amountIn = netSelling; amountOut = amountBuying;
+      route = [currentTrades2.token_sell_identifier, currentTrades2.token_init_identifier];
+      fee = (netSelling * currentTrades2.Fee) / 10000;
+      swapType = #direct;
+      timestamp = nowVar;
+    });
+    // Record swap for the order maker (initiator)
+    nextSwapId += 1;
+    recordSwap(Principal.fromText(currentTrades2.initPrincipal), {
+      swapId = nextSwapId;
+      tokenIn = currentTrades2.token_init_identifier; tokenOut = currentTrades2.token_sell_identifier;
+      amountIn = amountBuying; amountOut = netSelling;
+      route = [currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier];
+      fee = (amountBuying * currentTrades2.Fee) / 10000;
+      swapType = #limit;
+      timestamp = nowVar;
+    });
+
+    doInfoBeforeStep2();
+    let poolKey = getPool(currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier);
+    ignore updatePriceDayBefore(poolKey, nowVar);
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+
+    tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+    return #Ok("Trade completed successfully");
+  };
+
+  // ── FinishSellBatchV2 — twin of FinishSellBatch ────────────────────────────
+  // ★6: the pull is amountInit / 10000 denominated in token_init_identifier —
+  // the EXACT deposit V1's dao=true checkReceive expects. It is NOT a sum of
+  // amount_Sell_by_Reactor (those are token_sell-denominated; pulling them
+  // would fail the dao=true check and cost the caller transfer fees).
+  // The amountInit != amountInit2 reconciliation is KEPT — the pull IS the
+  // interleaving await; removing the reconciliation causes double-fill.
+  public shared (msg) func FinishSellBatchV2(
+    accesscode : [Text],
+    amount_Sell_by_Reactor : [Nat],
+    token_sell_identifier : Text,
+    token_init_identifier : Text,
+  ) : async ExTypes.ActionResult {
+    if (not v2Enabled) { return #Err(#InvalidInput("V2 disabled")) }; // V2 kill switch
+    if (isAllowed(msg.caller) != 1) return #Err(#NotAuthorized);
+    if (accesscode.size() == 0 or accesscode.size() != amount_Sell_by_Reactor.size()) {
+      return #Err(#InvalidInput("empty or mismatched batch"));
+    };
+    if (Text.size(token_sell_identifier) > 150 or Text.size(token_init_identifier) > 150 or Text.size(accesscode[0]) > 150) {
+      return #Err(#Banned);
+    };
+    let tempTransferQueueLocal = Vector.new<(TransferRecipient, Nat, Text, Text)>();
+    // Read once at the top, BEFORE the pull — these two feed the deposit math
+    // (amountInit includes 10000*sellTfees), so the top-of-function read IS the
+    // BUG Q/★5 pre-pull snapshot.
+    let sellTfees = returnTfees(token_init_identifier);
+    let initTfees = returnTfees(token_sell_identifier);
+    var haveToReturn = false;
+    var totalInit = 0;
+
+    for (i in amount_Sell_by_Reactor.vals()) {
+      if (initTfees >= i) {
+        haveToReturn := true;
+      };
+      totalInit += i;
+    };
+    if (not returnMinimum(token_sell_identifier, totalInit, false)) {
+      haveToReturn := true;
+    };
+
+    let nowVar2 = Time.now();
+
+    for (accesscode in accesscode.vals()) {
+      tradesBeingWorkedOn := TrieSet.put(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+    };
+
+    if (
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == token_sell_identifier })) { case null false; case (?_) true })) or
+      ((switch (Array.find<Text>(pausedTokens, func(t) { t == token_init_identifier })) { case null false; case (?_) true })) or haveToReturn
+    ) {
+      // V2: nothing pulled yet — plain refusal + lock release (V1 must process
+      // the deposit block and refund it here).
+      for (accesscode in accesscode.vals()) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      };
+      return #Err(#TokenPaused("Token paused"));
+    };
+
+    var amountInit = 0;
+    var amountSell = 0;
+    var amountFees = 0;
+    let TradeEntryVector = Vector.new<{ initPrincipal : Text; accesscode : Text; amount_init : Nat; amount_sell : Nat; Fee : Nat; RevokeFee : Nat; partial : Bool }>();
+    var initTfeesDone = false;
+
+    // SECURITY FIX (duplicate accesscode double-fill): an accesscode repeated in the
+    // batch was counted once PER OCCURRENCE into amountInit (which sizes the deposit
+    // pull / requirement) AND into the aggregate reactor payout amountSell, while the
+    // settlement's removeTrade dedups only the MAKER side — so the reactor over-received
+    // (N-1)x the escrow out of pooled funds (negative drift) plus a stranded overpull.
+    // Precompute the DUPLICATE indices (an accesscode already seen at a lower index) ONCE
+    // and skip them identically in BOTH scan loops. A skipped entry never enters
+    // amountInit/Sell/Fees nor TradeEntryVector, so checkReceive's sendback refunds the
+    // caller automatically — same mechanism/style as the P17 skip. Both loops MUST agree:
+    // asymmetric handling manufactures the amountInit != amountInit2 divergence class.
+    let isDupIndex = Array.init<Bool>(accesscode.size(), false);
+    let seenAccesscodesDedup = Map.new<Text, Bool>();
+    for (di in Iter.range(0, accesscode.size() - 1)) {
+      if (Map.has(seenAccesscodesDedup, thash, accesscode[di])) { isDupIndex[di] := true } else {
+        Map.set(seenAccesscodesDedup, thash, accesscode[di], true);
+      };
+    };
+    label a for (i in Iter.range(0, accesscode.size() - 1)) {
+      let currentTrades2 = switch (Map.get(tradeStorePublic, thash, accesscode[i])) {
+        case (?(foundTrades)) foundTrades;
+        case null continue a;
+      };
+      if (
+        not Text.startsWith(accesscode[i], #text "Public") or currentTrades2.trade_number == 0 or
+        currentTrades2.token_sell_identifier != token_init_identifier or currentTrades2.token_init_identifier != token_sell_identifier or
+        currentTrades2.trade_done == 1 or currentTrades2.init_paid != 1
+      ) continue a;
+
+      // SECURITY FIX (P17): an oversized fill takes the full-order (else) arm below yet
+      // is still flagged `partial = (A != amount_init)`, so the settlement's
+      // `amount_sell - i.amount_sell` / `amount_init - i.amount_init` underflow and TRAP —
+      // stranding the caller's own deposit. Reject it up front,
+      // exactly like the allOrNothing skip below. Do NOT "fix" this by relaxing `!=` to
+      // `<` at the partial computation: that routes the oversized entry into the
+      // non-partial arm, which removeTrade's the order and pays the maker a scaled
+      // amount_sell ABOVE escrow — unbounded overpayment chosen by the caller.
+      // A skipped entry never enters amountInit/Sell/Fees nor TradeEntryVector, so
+      // checkReceive's sendback logic refunds the caller automatically.
+      if (amount_Sell_by_Reactor[i] > currentTrades2.amount_init) { continue a };
+      if (isDupIndex[i]) { continue a }; // dedup: process each accesscode at most once
+
+      let (amountInitInc, amountSellInc, amountFeesInc) = if (amount_Sell_by_Reactor[i] < currentTrades2.amount_init) {
+        let amtInit = ((((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell)) * (10000 + currentTrades2.Fee)) / 100000000) + (10000 * sellTfees);
+        let amtSell = amount_Sell_by_Reactor[i] - initTfees;
+        let amtFees = ((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell) * currentTrades2.Fee) / 100000000;
+        (amtInit, amtSell, amtFees);
+      } else {
+        let amtInit = (currentTrades2.amount_sell * (10000 + currentTrades2.Fee)) + (10000 * sellTfees);
+        let amtSell = amount_Sell_by_Reactor[i] + (if (initTfeesDone) { initTfees } else { initTfeesDone := true; 0 });
+        let amtFees = (currentTrades2.amount_sell * currentTrades2.Fee);
+        (amtInit, amtSell, amtFees);
+      };
+      if (amount_Sell_by_Reactor[i] != currentTrades2.amount_init and currentTrades2.allOrNothing) {
+        continue a;
+      };
+      amountInit += amountInitInc;
+      amountSell += amountSellInc;
+      amountFees += amountFeesInc;
+
+      Vector.add(
+        TradeEntryVector,
+        {
+          initPrincipal = currentTrades2.initPrincipal;
+          accesscode = accesscode[i];
+          amount_init = amount_Sell_by_Reactor[i];
+          amount_sell = (((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell) / 100000000;
+          Fee = currentTrades2.Fee;
+          RevokeFee = currentTrades2.RevokeFee;
+          partial = (amount_Sell_by_Reactor[i] != currentTrades2.amount_init);
+        },
+      );
+    };
+
+    var TradeEntries = Vector.toArray(TradeEntryVector);
+
+    // ★6: derive the exact deposit V1 expects for this batch and PULL it.
+    // V1's checkReceive amount is `if (amountInit != 0) { amountInit / 10000 }
+    // else { 0 }` — the pull is that same number, so the dao=true test matches
+    // it exactly (received == amount, no refund, no lost transfer fees).
+    let pullAmt = if (amountInit != 0) { amountInit / 10000 } else { 0 };
+    if (pullAmt == 0) {
+      // No fillable orders (or a batch so small the deposit rounds to zero) —
+      // V2 refuses BEFORE pulling instead of pulling 0. V1 reaches the same
+      // "No orders left" outcome after refunding its already-made deposit.
+      for (accesscode in accesscode.vals()) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      };
+      return #Err(#OrderNotFound("No orders left"));
+    };
+
+    // V2 pre-pull gate: allowlist (★4) + pendingPulls capacity.
+    switch (v2PullPreflight(token_init_identifier)) {
+      case (?e) {
+        for (accesscode in accesscode.vals()) {
+          tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+        };
+        return #Err(#InvalidInput(e));
+      };
+      case null {};
+    };
+
+    // Snapshot of the live pair for the dao=true checkReceive args (the dao
+    // branch ignores them; snapshotted anyway for ★5 hygiene). Per-order fees
+    // use each order's own snapshotted Fee/RevokeFee in the settlement below.
+    let feeBpSnap = ICPfee;
+    let revokeBpSnap = RevokeFeeNow;
+
+    // ── the pull — the interleaving await the reconciliation below exists for.
+    let blkPull : Nat = switch (await* pullFromV2(msg.caller, token_init_identifier, pullAmt, feeBpSnap, revokeBpSnap, sellTfees, "FinishSellBatchV2")) {
+      case (#Ok(b)) { b };
+      case (#ErrDeclined(e)) {
+        for (accesscode in accesscode.vals()) {
+          tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+        };
+        return #Err(#InsufficientFunds("V2 pull declined: " # e));
+      };
+      case (#ErrAmbiguous(id, e)) {
+        for (accesscode in accesscode.vals()) {
+          tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+        };
+        return #Err(#SystemError("V2 pull #" # Nat.toText(id) # " outcome UNKNOWN — do NOT retry. Funds may have moved; an admin will resolve it via adminResolvePendingPull. Ledger error: " # e));
+      };
+    };
+    // BUG N: burn FIRST, above every branch (BUG J write for the pull's block).
+    // BUG R (PULL-RACE): check-then-set, not a bare set — a concurrent
+    // recoverWronglysent / V1 deposit for this same block does its own
+    // check-then-set before its first await and would otherwise be paid on
+    // top of this credit. Losing the race means: no credit, no refund.
+    if (not claimPullBlockV2(token_init_identifier, blkPull, nowVar2)) {
+      for (accesscode in accesscode.vals()) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      };
+      return #Err(#InvalidInput(pullRaceErrV2(token_init_identifier, blkPull)));
+    };
+
+    // BUG M: synthetic #ICRC12 deposit proof for the pulled gross.
+    let blockData = syntheticPullBlockV2(msg.caller, pullAmt, sellTfees, nowVar2);
+
+    let (receiveBool, receiveTransfers) = if (blockData != #ICRC12([])) {
+      checkReceive(PULL_SENTINEL_BLOCK_V2, msg.caller, pullAmt, token_init_identifier, feeBpSnap, revokeBpSnap, true, true, blockData, #ICRC12, nowVar2);
+    } else { (false, []) };
+
+    Vector.addFromIter(tempTransferQueueLocal, receiveTransfers.vals());
+    if (not receiveBool) {
+      // BUG B: only checkReceive's own transfers — no extra refund on top.
+      if (Vector.size(tempTransferQueueLocal) > 0) {
+        if (try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false }) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+      };
+      for (accesscode in accesscode.vals()) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      };
+      return #Err(#InsufficientFunds("Deposit not received"));
+    };
+
+    // Re-check trade details after await (★6: the pull above IS the
+    // interleaving await — this reconciliation MUST stay)
+
+    var amountInit2 = 0;
+    var amountSell2 = 0;
+    var amountFees2 = 0;
+    initTfeesDone := false;
+    var TradeEntryVector2 = Vector.new<{ initPrincipal : Text; accesscode : Text; amount_init : Nat; amount_sell : Nat; Fee : Nat; RevokeFee : Nat; partial : Bool }>();
+    label getTradeInfo for (i in Iter.range(0, accesscode.size() - 1)) {
+      let pub = Text.startsWith(accesscode[i], #text "Public");
+      var currentTrades2 : TradePrivate = switch (Map.get(tradeStorePublic, thash, accesscode[i])) {
+        case (?(foundTrades)) foundTrades;
+        case null continue getTradeInfo;
+      };
+      if (
+        not pub or currentTrades2.trade_number == 0 or currentTrades2.token_sell_identifier != token_init_identifier or
+        currentTrades2.token_init_identifier != token_sell_identifier or currentTrades2.trade_done == 1 or currentTrades2.init_paid != 1
+      ) {
+        continue getTradeInfo;
+      };
+
+      // SECURITY FIX (P17): the SAME reject must land in BOTH scan loops. Guarding only
+      // loop `a` would leave this loop building the oversized entry into
+      // TradeEntryVector2, which the amountInit != amountInit2 branch below promotes
+      // into TradeEntries — i.e. asymmetric application manufactures P16.
+      if (amount_Sell_by_Reactor[i] > currentTrades2.amount_init) { continue getTradeInfo };
+      if (isDupIndex[i]) { continue getTradeInfo }; // dedup: process each accesscode at most once
+
+      if (amount_Sell_by_Reactor[i] < currentTrades2.amount_init) {
+        amountInit2 += ((((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell)) * (10000 + currentTrades2.Fee)) / 100000000) + (10000 * sellTfees);
+        amountSell2 += amount_Sell_by_Reactor[i] - initTfees;
+        amountFees2 += ((((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell) * currentTrades2.Fee) / 100000000;
+      } else {
+        amountInit2 += (currentTrades2.amount_sell * (10000 + currentTrades2.Fee)) + (10000 * sellTfees);
+        amountSell2 += amount_Sell_by_Reactor[i] + (if (initTfeesDone) { initTfees } else { initTfeesDone := true; 0 });
+        amountFees2 += (currentTrades2.amount_sell * currentTrades2.Fee);
+      };
+
+      Vector.add(
+        TradeEntryVector2,
+        {
+          initPrincipal = currentTrades2.initPrincipal;
+          accesscode = accesscode[i];
+          amount_init = amount_Sell_by_Reactor[i];
+          amount_sell = (((amount_Sell_by_Reactor[i] * 100000000) / currentTrades2.amount_init) * currentTrades2.amount_sell) / 100000000;
+          Fee = currentTrades2.Fee;
+          RevokeFee = currentTrades2.RevokeFee;
+          partial = (amount_Sell_by_Reactor[i] != currentTrades2.amount_init);
+        },
+      );
+    };
+
+    if (amountInit != amountInit2) {
+      TradeEntries := Vector.toArray(TradeEntryVector2);
+      if (amountInit > amountInit2) {
+        let add = ((amountInit - amountInit2) / 10000);
+        if (add > sellTfees) {
+          Vector.add(tempTransferQueueLocal, (#principal(msg.caller), ((amountInit - amountInit2) / 10000) - sellTfees, token_init_identifier, genTxId()));
+        } else {
+          addFees(token_init_identifier, ((amountInit - amountInit2) / 10000), false, Principal.toText(msg.caller), nowVar2);
+        };
+      } else {
+        // SECURITY FIX (P16): this refunded the full `amountInit / 10000` with NO
+        // `- sellTfees`, unlike its sibling arm above — the treasury pays the ledger fee
+        // on top, so every trip through here cost exactly 1x sellTfees of negative drift.
+        // User-triggerable and repeatable via the allOrNothing scan asymmetry (scan 1
+        // skips AON entries, scan 2 does not, forcing amountInit < amountInit2).
+        // Mirror the sibling exactly, dust fallback included.
+        let backAmt = (amountInit / 10000);
+        if (backAmt > sellTfees) {
+          Vector.add(tempTransferQueueLocal, (#principal(msg.caller), backAmt - sellTfees, token_init_identifier, genTxId()));
+        } else {
+          addFees(token_init_identifier, backAmt, false, Principal.toText(msg.caller), nowVar2);
+        };
+        if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
+          Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+        };
+        for (accesscode in accesscode.vals()) {
+          tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+        };
+        return #Err(#SystemError("Order updated during await"));
+      };
+      amountFees := amountFees2;
+      amountSell := amountSell2;
+      amountInit := amountInit2;
+    };
+
+    if (TradeEntries.size() == 0) {
+      if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
+        Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+      };
+      for (accesscode in accesscode.vals()) {
+        tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+      };
+      return #Err(#OrderNotFound("No orders left"));
+    };
+
+    Vector.add(tempTransferQueueLocal, (#principal(msg.caller), amountSell, token_sell_identifier, genTxId()));
+    addFees(token_init_identifier, (amountFees / 10000), false, Principal.toText(msg.caller), nowVar2);
+
+    var endmessage = "";
+    label a for (i in TradeEntries.vals()) {
+
+      var currentTrades2 = switch (Map.get(if (Text.startsWith(i.accesscode, #text "Public")) { tradeStorePublic } else { tradeStorePrivate }, thash, i.accesscode)) {
+        case (?(foundTrades)) foundTrades;
+        case null continue a;
+      };
+
+      Vector.add(tempTransferQueueLocal, (#principal(Principal.fromText(i.initPrincipal)), i.amount_sell, token_init_identifier, genTxId()));
+      addFees(token_sell_identifier, ((((i.amount_init) * i.Fee)) - (((((i.amount_init) * i.Fee) * 100000) / i.RevokeFee) / 100000)) / 10000, false, i.initPrincipal, nowVar2);
+
+      if (i.partial) {
+        currentTrades2 := {
+          currentTrades2 with
+          amount_sell = currentTrades2.amount_sell - i.amount_sell;
+          amount_init = currentTrades2.amount_init - i.amount_init;
+          trade_done = 0;
+          seller_paid = 0;
+          init_paid = 1;
+          SellerPrincipal = Principal.toText(msg.caller);
+          seller_paid2 = 0;
+          init_paid2 = 0;
+          filledInit = currentTrades2.filledInit + i.amount_init;
+          filledSell = currentTrades2.filledSell + i.amount_sell;
+        };
+        addTrade(i.accesscode, currentTrades2.initPrincipal, currentTrades2, (currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier));
+
+        replaceLiqMap(false, true, currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier, i.accesscode, (currentTrades2.amount_init, currentTrades2.amount_sell, currentTrades2.Fee, currentTrades2.RevokeFee, currentTrades2.initPrincipal, currentTrades2.OCname, currentTrades2.time, currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier, currentTrades2.strictlyOTC, currentTrades2.allOrNothing), #Value(((currentTrades2.amount_init + i.amount_init) * tenToPower60) / (currentTrades2.amount_sell + i.amount_sell)), ?{ Fee = currentTrades2.Fee; RevokeFee = currentTrades2.RevokeFee }, ?{ amount_init = i.amount_init; amount_sell = i.amount_sell; init_principal = currentTrades2.initPrincipal; sell_principal = Principal.toText(msg.caller); accesscode = i.accesscode; token_init_identifier = currentTrades2.token_init_identifier; filledInit = i.amount_init; filledSell = i.amount_sell; strictlyOTC = currentTrades2.strictlyOTC; allOrNothing = currentTrades2.allOrNothing });
+      } else {
+        removeTrade(i.accesscode, currentTrades2.initPrincipal, (currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier));
+        replaceLiqMap(true, false, currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier, i.accesscode, (currentTrades2.amount_init, currentTrades2.amount_sell, 0, 0, "", currentTrades2.OCname, currentTrades2.time, currentTrades2.token_init_identifier, currentTrades2.token_sell_identifier, currentTrades2.strictlyOTC, currentTrades2.allOrNothing), #Zero, null, ?{ amount_init = i.amount_init; amount_sell = i.amount_sell; init_principal = currentTrades2.initPrincipal; sell_principal = Principal.toText(msg.caller); accesscode = i.accesscode; token_init_identifier = currentTrades2.token_init_identifier; filledInit = i.amount_init; filledSell = i.amount_sell; strictlyOTC = currentTrades2.strictlyOTC; allOrNothing = currentTrades2.allOrNothing });
+      };
+
+      // Record swap for filler and order maker
+      nextSwapId += 1;
+      recordSwap(msg.caller, {
+        swapId = nextSwapId;
+        tokenIn = token_sell_identifier; tokenOut = token_init_identifier;
+        amountIn = i.amount_sell; amountOut = i.amount_init;
+        route = [token_sell_identifier, token_init_identifier];
+        fee = (i.amount_sell * i.Fee) / 10000;
+        swapType = #direct;
+        timestamp = nowVar2;
+      });
+      nextSwapId += 1;
+      recordSwap(Principal.fromText(i.initPrincipal), {
+        swapId = nextSwapId;
+        tokenIn = token_init_identifier; tokenOut = token_sell_identifier;
+        amountIn = i.amount_init; amountOut = i.amount_sell;
+        route = [token_init_identifier, token_sell_identifier];
+        fee = (i.amount_init * i.Fee) / 10000;
+        swapType = #limit;
+        timestamp = nowVar2;
+      });
+
+      // Update kline data for this fill
+      let fillPair = getPool(token_init_identifier, token_sell_identifier);
+      let isForeignPool = Map.has(foreignPools, hashtt, (token_init_identifier, token_sell_identifier)) or
+                          Map.has(foreignPools, hashtt, (token_sell_identifier, token_init_identifier));
+      if (not isForeignPool) {
+        // Map trade-direction amounts to canonical (amount0, amount1).
+        // If the trade direction matches canonical order, amount_init = amount0.
+        // Otherwise the amounts are swapped relative to canonical.
+        let (amt0, amt1) = if (fillPair.0 == token_init_identifier) {
+          (i.amount_init, i.amount_sell)
+        } else {
+          (i.amount_sell, i.amount_init)
+        };
+        updateLastTradedPrice(fillPair, amt0, amt1);
+      };
+    };
+
+    doInfoBeforeStep2();
+    let poolKey = getPool(token_init_identifier, token_sell_identifier);
+    ignore updatePriceDayBefore(poolKey, nowVar2);
+    if ((try { await treasury.receiveTransferTasks(Vector.toArray<(TransferRecipient, Nat, Text, Text)>(tempTransferQueueLocal), isInAllowedCanisters(msg.caller)) } catch (err) { false })) {} else {
+      Vector.addFromIter(tempTransferQueue, Vector.vals(tempTransferQueueLocal));
+    };
+    for (accesscode in accesscode.vals()) {
+      tradesBeingWorkedOn := TrieSet.delete(tradesBeingWorkedOn, accesscode, Text.hash(accesscode), Text.equal);
+    };
+    return #Ok("Trade done" # (if (endmessage != "") { ". Recoverable: " # endmessage } else { "" }));
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V2 QUOTES — full copies of the V1 quote functions taking GROSS input
+  // (BUG E/F: shipping V2 without gross-input quotes would reintroduce the
+  // exact gross/net confusion V2 exists to remove). Each converts gross → net
+  // with the same netFromGrossV2 the fund-moving twins use, then runs the V1
+  // logic on the net, so V2quote(gross) ≡ V1quote(grossToNetV2(gross)).
+  // The IC0522 instruction guard stays single-sourced in the shared
+  // computeQuoteRoutesForRequest (called, not copied).
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  public query ({ caller }) func getExpectedReceiveAmountV2(
+    tokenSell : Text,
+    tokenBuy : Text,
+    amountSell : Nat, // GROSS — "what you hand over"
+  ) : async {
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    routeDescription : Text;
+    canFulfillFully : Bool;
+    potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+    hopDetails : [HopDetail];
+  } {
+    if (not v2Enabled) { return { expectedBuyAmount = 0; fee = 0; priceImpact = 0; routeDescription = "V2 disabled"; canFulfillFully = false; potentialOrderDetails = null; hopDetails = [] } }; // V2 kill switch
+    // FIX B: mirror v2PullPreflight's allowlist gate (see :18520) so a quote is
+    // never shown for a token whose pull would refuse at execution.
+    if (Map.get(v2TokenAllowlistV2, thash, tokenSell) != ?true) {
+      return { expectedBuyAmount = 0; fee = 0; priceImpact = 0; routeDescription = "Token not enabled for V2"; canFulfillFully = false; potentialOrderDetails = null; hopDetails = [] };
+    };
+    if (isAllowedQuery(caller) != 1) {
+      return {
+        expectedBuyAmount = 0;
+        fee = 0;
+        priceImpact = 0;
+        routeDescription = "Query not allowed";
+        canFulfillFully = false;
+        potentialOrderDetails = null;
+        hopDetails = [];
+      };
+    };
+    let nowVar = Time.now();
+    // V2: quote on the net the exchange would actually execute for this gross.
+    let netSell = netFromGrossV2(amountSell, returnTfees(tokenSell), ICPfee);
+
+    // Snapshot pre-swap reserves AND V3 sqrtRatio for accurate price impact calculation
+    // (orderPairing mutates both AMMpools and poolV3Data in-place, even in query context)
+    let preSwapPoolKey = getPool(tokenSell, tokenBuy);
+    let preSwapReserves : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKey)) {
+      case (?pool) {
+        let (rIn, rOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+        ?(rIn, rOut);
+      };
+      case null { null };
+    };
+    let preSwapV3Ratio : Nat = getPoolRatioV3(preSwapPoolKey);
+
+    let dummyTrade : TradePrivate = {
+      Fee = ICPfee;
+      amount_sell = 0; // This will be filled by orderPairing
+      amount_init = netSell;
+      token_sell_identifier = tokenBuy;
+      token_init_identifier = tokenSell;
+      trade_done = 0;
+      seller_paid = 0;
+      init_paid = 1;
+      trade_number = 0;
+      SellerPrincipal = "0";
+      initPrincipal = Principal.toText(caller);
+      seller_paid2 = 0;
+      init_paid2 = 0;
+      RevokeFee = RevokeFeeNow;
+      OCname = "";
+      time = nowVar;
+      filledInit = 0;
+      filledSell = 0;
+      allOrNothing = false;
+      strictlyOTC = false;
+    };
+
+    let (remainingAmountInit, totalProtocolFeeAmount, totalPoolFeeAmount, transactions, _, _, ammAmountIn) = orderPairing(dummyTrade);
+
+    let amountFilled = if (netSell > remainingAmountInit) {
+      netSell - remainingAmountInit;
+    } else { 0 };
+    var expectedBuyAmount : Nat = 0;
+
+    // Calculate expectedBuyAmount from the transactions
+    for (transaction in transactions.vals()) {
+      if (transaction.0 == #principal(caller) and transaction.2 == tokenBuy) {
+        expectedBuyAmount += transaction.1;
+      }; // transaction.1 should be the amount received
+    };
+
+    var totalFee = totalProtocolFeeAmount + totalPoolFeeAmount;
+
+    // Always compare direct vs multi-hop to find the best route
+    var multiHopUsed = false;
+    var multiHopRoute : [SwapHop] = [];
+    var multiHopDetails : [HopDetail] = [];
+    let routes = findRoutes(tokenSell, tokenBuy, netSell);
+    label routeSearch for (r in routes.vals()) {
+      if (r.hops.size() <= 1) continue routeSearch;
+      let sim = simulateMultiHop(r.hops, netSell, caller);
+      if (sim.amountOut > expectedBuyAmount) {
+        expectedBuyAmount := sim.amountOut;
+        totalFee := sim.totalFees;
+        multiHopUsed := true;
+        multiHopRoute := r.hops;
+        multiHopDetails := sim.hopDetails;
+      };
+      break routeSearch;
+    };
+
+    let priceImpact = if (expectedBuyAmount > 0 and netSell > 10000) {
+      if (multiHopUsed) {
+        // Multi-hop price impact: sum per-hop impacts from simulation
+        var totalMHImpact = 0.0;
+        for (hd in multiHopDetails.vals()) {
+          totalMHImpact += hd.priceImpact;
+        };
+        totalMHImpact;
+      } else {
+        // V3-aware overall price impact: (actual output) vs (spot × full requested input).
+        // Uses pre-swap snapshots — orderPairing already mutated post-swap state.
+        computeBlendedAmmImpact(preSwapPoolKey, tokenSell, expectedBuyAmount, netSell, preSwapV3Ratio, preSwapReserves);
+      };
+    } else {
+      0.0;
+    };
+
+    let routeDescription = if (multiHopUsed) {
+      var desc = "Multi-hop (" # Nat.toText(multiHopRoute.size()) # " hops): " # tokenSell;
+      for (hop in multiHopRoute.vals()) {
+        desc := desc # " → " # hop.tokenOut;
+      };
+      desc;
+    } else if (expectedBuyAmount > 0) {
+      if (totalPoolFeeAmount > 0) {
+        if (totalProtocolFeeAmount > 0) {
+          "AMM and Orderbook";
+        } else {
+          "AMM only";
+        };
+      } else {
+        "Orderbook only";
+      };
+    } else {
+      "No liquidity available";
+    };
+
+    let canFulfillFully = if (multiHopUsed) { expectedBuyAmount > 0 } else { remainingAmountInit < 10001 };
+    let potentialOrderDetails = if (not canFulfillFully and expectedBuyAmount > 0) {
+      ?{ amount_init = netSell; amount_sell = expectedBuyAmount };
+    } else {
+      null;
+    };
+
+    {
+      expectedBuyAmount = expectedBuyAmount;
+      fee = totalFee;
+      priceImpact = priceImpact;
+      routeDescription = routeDescription;
+      canFulfillFully = canFulfillFully;
+      potentialOrderDetails = potentialOrderDetails;
+      hopDetails = multiHopDetails;
+    };
+  };
+
+  // Batch quote (V2, gross input): mirrors getExpectedReceiveAmountBatch exactly,
+  // with each request's amountSell converted gross → net up front.
+  public query ({ caller }) func getExpectedReceiveAmountBatchV2(
+    requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }], // amountSell = GROSS
+  ) : async [{
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    routeDescription : Text;
+    canFulfillFully : Bool;
+    potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+    hopDetails : [HopDetail];
+  }] {
+    if (not v2Enabled) { return [] }; // V2 kill switch
+    if (isAllowedQuery(caller) != 1 or requests.size() > 20) { return [] };
+    let nowVar = Time.now();
+
+    // Each request wraps its simulations in pair-scoped snapshot/restore so every
+    // request runs against the SAME pre-batch pool state — without this, request N
+    // is biased by the cumulative mutations of requests 0..N-1 within the same call.
+    let results = Vector.new<{
+      expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
+      routeDescription : Text; canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
+    }>();
+
+    // Instruction-budget guard: hard line at ~4.8B of the 5B limit, PLUS an adaptive
+    // check — skip when the remaining budget can't fit 1.5× the most expensive
+    // request measured so far in this call. Skipped requests get empty results so
+    // result length stays == requests length.
+    var maxReqCost : Nat64 = 0;
+    label reqLoop for (req in requests.vals()) {
+      // FIX B: mirror v2PullPreflight's allowlist gate (see :18520) per entry —
+      // a non-allowlisted sell token gets the same zeroed entry the budget guard
+      // emits (keeps result length == requests length), other entries still quote.
+      if (Map.get(v2TokenAllowlistV2, thash, req.tokenSell) != ?true) {
+        Vector.add(results, {
+          expectedBuyAmount = 0; fee = 0; priceImpact = 0.0;
+          routeDescription = "Token not enabled for V2"; canFulfillFully = false;
+          potentialOrderDetails = null; hopDetails = [];
+        });
+        continue reqLoop;
+      };
+      let tokenSell = req.tokenSell;
+      let tokenBuy = req.tokenBuy;
+      // V2: quote on the net the exchange would execute for this gross.
+      let amountSell = netFromGrossV2(req.amountSell, returnTfees(req.tokenSell), ICPfee);
+
+      let spent = EIC.performanceCounter(0);
+      if (amountSell == 0 or spent > 4_800_000_000 or spent + maxReqCost + maxReqCost / 2 > 5_000_000_000) {
+        Vector.add(results, {
+          expectedBuyAmount = 0; fee = 0; priceImpact = 0.0;
+          routeDescription = ""; canFulfillFully = false;
+          potentialOrderDetails = null; hopDetails = [];
+        });
+      } else {
+        // ── Mirror of getExpectedReceiveAmount body ──
+        // Pair-scoped snapshot: reverted after the direct sim (leave-clean per request)
+        let directSnapB = snapshotPairsState([(tokenSell, tokenBuy)]);
+        // Snapshot pre-swap reserves AND V3 sqrtRatio for accurate price impact
+        let preSwapPoolKeyB = getPool(tokenSell, tokenBuy);
+        let preSwapReservesB : ?(Nat, Nat) = switch (Map.get(AMMpools, hashtt, preSwapPoolKeyB)) {
+          case (?pool) {
+            let (rIn, rOut) = if (pool.token0 == tokenSell) { (pool.reserve0, pool.reserve1) } else { (pool.reserve1, pool.reserve0) };
+            ?(rIn, rOut);
+          };
+          case null { null };
+        };
+        let preSwapV3RatioB : Nat = getPoolRatioV3(preSwapPoolKeyB);
+
+        let dummyTrade : TradePrivate = {
+          Fee = ICPfee;
+          amount_sell = 0;
+          amount_init = amountSell;
+          token_sell_identifier = tokenBuy;
+          token_init_identifier = tokenSell;
+          trade_done = 0;
+          seller_paid = 0;
+          init_paid = 1;
+          trade_number = 0;
+          SellerPrincipal = "0";
+          initPrincipal = Principal.toText(caller);
+          seller_paid2 = 0;
+          init_paid2 = 0;
+          RevokeFee = RevokeFeeNow;
+          OCname = "";
+          time = nowVar;
+          filledInit = 0;
+          filledSell = 0;
+          allOrNothing = false;
+          strictlyOTC = false;
+        };
+
+        let (remainingAmountInit, totalProtocolFeeAmount, totalPoolFeeAmount, transactions, _, _, ammAmountIn) = orderPairing(dummyTrade);
+
+        var expectedBuyAmount : Nat = 0;
+        for (transaction in transactions.vals()) {
+          if (transaction.0 == #principal(caller) and transaction.2 == tokenBuy) {
+            expectedBuyAmount += transaction.1;
+          };
+        };
+
+        var totalFee = totalProtocolFeeAmount + totalPoolFeeAmount;
+
+        var multiHopUsed = false;
+        var multiHopRoute : [SwapHop] = [];
+        var multiHopDetails : [HopDetail] = [];
+        // Restore BEFORE findRoutes + simulateMultiHop — otherwise route enumeration
+        // and simulation read post-direct-swap state, biasing the multi-hop pick.
+        restorePairsState(directSnapB);
+        let routes = findRoutes(tokenSell, tokenBuy, amountSell);
+        label routeSearch for (r in routes.vals()) {
+          if (r.hops.size() <= 1) continue routeSearch;
+          let mhSnapB = snapshotPairsState(hopsToPairs(r.hops));
+          let sim = simulateMultiHop(r.hops, amountSell, caller);
+          restorePairsState(mhSnapB);
+          if (sim.amountOut > expectedBuyAmount) {
+            expectedBuyAmount := sim.amountOut;
+            totalFee := sim.totalFees;
+            multiHopUsed := true;
+            multiHopRoute := r.hops;
+            multiHopDetails := sim.hopDetails;
+          };
+          break routeSearch;
+        };
+
+        let priceImpact = if (expectedBuyAmount > 0 and amountSell > 10000) {
+          if (multiHopUsed) {
+            var totalMHImpact = 0.0;
+            for (hd in multiHopDetails.vals()) { totalMHImpact += hd.priceImpact };
+            totalMHImpact;
+          } else {
+            // V3-aware overall price impact against full requested amount (partial fills surface as impact)
+            computeBlendedAmmImpact(preSwapPoolKeyB, tokenSell, expectedBuyAmount, amountSell, preSwapV3RatioB, preSwapReservesB);
+          };
+        } else { 0.0 };
+
+        let routeDescription = if (multiHopUsed) {
+          var desc = "Multi-hop (" # Nat.toText(multiHopRoute.size()) # " hops): " # tokenSell;
+          for (hop in multiHopRoute.vals()) { desc := desc # " → " # hop.tokenOut };
+          desc;
+        } else if (expectedBuyAmount > 0) {
+          if (totalPoolFeeAmount > 0) {
+            if (totalProtocolFeeAmount > 0) { "AMM and Orderbook" } else { "AMM only" };
+          } else { "Orderbook only" };
+        } else { "No liquidity available" };
+
+        let canFulfillFully = if (multiHopUsed) { expectedBuyAmount > 0 } else { remainingAmountInit < 10001 };
+        let potentialOrderDetails = if (not canFulfillFully and expectedBuyAmount > 0) {
+          ?{ amount_init = amountSell; amount_sell = expectedBuyAmount };
+        } else { null };
+
+        Vector.add(results, {
+          expectedBuyAmount = expectedBuyAmount;
+          fee = totalFee;
+          priceImpact = priceImpact;
+          routeDescription = routeDescription;
+          canFulfillFully = canFulfillFully;
+          potentialOrderDetails = potentialOrderDetails;
+          hopDetails = multiHopDetails;
+        });
+        let cost = EIC.performanceCounter(0) - spent;
+        if (cost > maxReqCost) { maxReqCost := cost };
+      };
+    };
+
+    Vector.toArray(results);
+  };
+
+  // Multi-route batch quote (V2, gross input). The per-request routing logic —
+  // including the IC0522 instruction guard's inner workings — stays
+  // single-sourced in the shared computeQuoteRoutesForRequest.
+  public query ({ caller }) func getExpectedReceiveAmountBatchMultiV2(
+    requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }], // amountSell = GROSS
+    maxRoutesPerRequest : Nat,
+  ) : async [{
+    routes : [{
+      expectedBuyAmount : Nat;
+      fee : Nat;
+      priceImpact : Float;
+      routeDescription : Text;
+      canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
+      routeTokens : [Text]; // [tokenSell, …intermediates, tokenBuy] for cross-fraction matching
+      tradingFeeBps : Nat;  // snapshot of ICPfee for the simulation that produced this route
+    }];
+  }] {
+    if (not v2Enabled) { return [] }; // V2 kill switch
+    if (isAllowedQuery(caller) != 1 or requests.size() > 20) { return [] };
+    let cap : Nat = if (maxRoutesPerRequest == 0) { 5 }
+                    else if (maxRoutesPerRequest > 10) { 10 }
+                    else { maxRoutesPerRequest };
+    let nowVar = Time.now();
+
+    type QuoteRoute = {
+      expectedBuyAmount : Nat;
+      fee : Nat;
+      priceImpact : Float;
+      routeDescription : Text;
+      canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail];
+      routeTokens : [Text];
+      tradingFeeBps : Nat;
+    };
+    let allResults = Vector.new<{ routes : [QuoteRoute] }>();
+    // Per-call findRoutes cache: same (tokenSell, tokenBuy) pair across multiple
+    // probe amounts in the batch shares topology, so we only enumerate once.
+    // AMM-estimate ranking is amount-monotone so reusing across probes preserves
+    // top-cap selection. simulateMultiHop still runs at the actual probe amount.
+    let findRoutesCache = Map.new<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>();
+
+    // Instruction-budget guard: hard line at ~4.8B of the 5B limit, PLUS an adaptive
+    // check — skip when the remaining budget can't fit 1.5× the most expensive
+    // request measured so far in this call (a single heavy request can cost >200M,
+    // so a fixed line alone can still trap). Skipped requests get empty routes so
+    // result length stays == requests length.
+    var maxReqCost : Nat64 = 0;
+    label reqLoop for (req in requests.vals()) {
+      // FIX B: mirror v2PullPreflight's allowlist gate (see :18520) per entry —
+      // a non-allowlisted sell token gets the same empty-routes entry the budget
+      // guard emits (keeps result length == requests length).
+      if (Map.get(v2TokenAllowlistV2, thash, req.tokenSell) != ?true) {
+        Vector.add(allResults, { routes = ([] : [QuoteRoute]) });
+        continue reqLoop;
+      };
+      let spent = EIC.performanceCounter(0);
+      if (spent > 4_800_000_000 or spent + maxReqCost + maxReqCost / 2 > 5_000_000_000) {
+        Vector.add(allResults, { routes = ([] : [QuoteRoute]) });
+      } else {
+        let routes = computeQuoteRoutesForRequest(
+          req.tokenSell, req.tokenBuy,
+          // V2: quote on the net the exchange would execute for this gross.
+          netFromGrossV2(req.amountSell, returnTfees(req.tokenSell), ICPfee),
+          cap,
+          findRoutesCache, nowVar, caller,
+        );
+        Vector.add(allResults, { routes });
+        let cost = EIC.performanceCounter(0) - spent;
+        if (cost > maxReqCost) { maxReqCost := cost };
+      };
+    };
+
+    Vector.toArray(allResults);
+  };
+
+  // Optimal split quote (V2, gross input): the 10-fraction probe grid and the
+  // 2/3-leg optimizer run on netFromGrossV2(amountIn). Single-leg plans execute
+  // via swapMultiHopV2 at the same gross; multi-leg via swapSplitRoutesV2 with
+  // gross legs of bp × gross / 10000 (the executor re-derives the same net).
+  public query ({ caller }) func getExpectedReceiveAmountBatchMultiOptimalV2(
+    tokenSell : Text,
+    tokenBuy : Text,
+    amountIn : Nat, // GROSS — "what you hand over"
+  ) : async {
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    canFulfillFully : Bool;
+    tradingFeeBps : Nat;
+    routeDescription : Text;
+    legs : [{
+      bp : Nat;
+      expectedBuyAmount : Nat;
+      route : [SwapHop];
+      routeDescription : Text;
+    }];
+  } {
+    let emptyPlan = {
+      expectedBuyAmount = 0;
+      fee = 0;
+      priceImpact = 0.0;
+      canFulfillFully = false;
+      tradingFeeBps = ICPfee;
+      routeDescription = "No liquidity";
+      legs = [];
+    };
+if (not v2Enabled) { return emptyPlan }; // V2 kill switch
+    // FIX B: mirror v2PullPreflight's allowlist gate (see :18520) so a quote is
+    // never shown for a token whose pull would refuse at execution.
+    if (Map.get(v2TokenAllowlistV2, thash, tokenSell) != ?true) { return emptyPlan };
+        if (isAllowedQuery(caller) != 1) { return emptyPlan };
+    if (amountIn == 0) { return emptyPlan };
+    if (tokenSell == tokenBuy) { return emptyPlan };
+
+    // V2: probe on the net the exchange would execute for this gross.
+    let netIn = netFromGrossV2(amountIn, returnTfees(tokenSell), ICPfee);
+    if (netIn == 0) { return emptyPlan };
+
+    let nowVar = Time.now();
+    let findRoutesCache = Map.new<Text, [{ hops : [SwapHop]; estimatedOut : Nat }]>();
+
+    // ── Build the 10-fraction probe grid ──
+    let TOP_ROUTES : Nat = 5;
+    type ProbeRoute = {
+      expectedBuyAmount : Nat; fee : Nat; priceImpact : Float;
+      routeDescription : Text; canFulfillFully : Bool;
+      potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+      hopDetails : [HopDetail]; routeTokens : [Text]; tradingFeeBps : Nat;
+    };
+    let probeResults = Vector.new<{ bp : Nat; routes : [ProbeRoute] }>();
+    // Instruction-budget guard: hard line at ~4.8B plus adaptive headroom for 1.5×
+    // the most expensive probe so far — a partial probe grid still yields a valid plan.
+    var maxProbeCost : Nat64 = 0;
+    label probeGrid for (i in Iter.range(0, 9)) {
+      let spent = EIC.performanceCounter(0);
+      if (spent > 4_800_000_000 or spent + maxProbeCost + maxProbeCost / 2 > 5_000_000_000) { break probeGrid };
+      let bp : Nat = (i + 1) * 1000;
+      let amount : Nat = (netIn * bp) / 10000;
+      if (amount > 0) {
+        let routes = computeQuoteRoutesForRequest(
+          tokenSell, tokenBuy, amount, TOP_ROUTES,
+          findRoutesCache, nowVar, caller,
+        );
+        Vector.add(probeResults, { bp; routes });
+        let cost = EIC.performanceCounter(0) - spent;
+        if (cost > maxProbeCost) { maxProbeCost := cost };
+      };
+    };
+
+    if (Vector.size(probeResults) == 0) {
+      return emptyPlan;
+    };
+
+    // ── Flatten + dedup (matches OC's build_swap_plan / flatten_batch) ──
+    type FlatEntry = {
+      bp : Nat;
+      expectedOut : Nat;
+      fee : Nat;
+      priceImpact : Float;
+      route : [SwapHop];
+      routeDescription : Text;
+      canFulfillFully : Bool;
+      routeKey : Text;
+      edgeKeys : [Text];
+    };
+    let entries = Vector.new<FlatEntry>();
+    let seen = Map.new<Text, Bool>();
+    for (req in Vector.vals(probeResults)) {
+      for (route in req.routes.vals()) {
+        if (route.expectedBuyAmount > 0) {
+          // Materialize hops: prefer hopDetails (multi-hop); synthesize from routeTokens for direct.
+          let hops : [SwapHop] = if (route.hopDetails.size() > 0) {
+            Array.map<HopDetail, SwapHop>(route.hopDetails, func(h) {
+              { tokenIn = h.tokenIn; tokenOut = h.tokenOut }
+            })
+          } else if (route.routeTokens.size() == 2) {
+            [{ tokenIn = route.routeTokens[0]; tokenOut = route.routeTokens[1] }]
+          } else { [] };
+          if (hops.size() > 0) {
+            // route_key = joined tokens; edge_keys = normalized per-hop pool edges.
+            var rk : Text = if (route.routeTokens.size() > 0) { route.routeTokens[0] } else { "" };
+            if (route.routeTokens.size() > 1) {
+              var ri : Nat = 1;
+              while (ri < route.routeTokens.size()) {
+                rk := rk # "→" # route.routeTokens[ri];
+                ri += 1;
+              };
+            };
+            let dedupKey = Nat.toText(req.bp) # "|" # rk;
+            if (not Map.has(seen, thash, dedupKey)) {
+              Map.set(seen, thash, dedupKey, true);
+              let edgeKeys = Array.map<SwapHop, Text>(hops, func(h) {
+                if (h.tokenIn < h.tokenOut) { h.tokenIn # "|" # h.tokenOut }
+                else { h.tokenOut # "|" # h.tokenIn }
+              });
+              Vector.add(entries, {
+                bp = req.bp;
+                expectedOut = route.expectedBuyAmount;
+                fee = route.fee;
+                priceImpact = route.priceImpact;
+                route = hops;
+                routeDescription = route.routeDescription;
+                canFulfillFully = route.canFulfillFully;
+                routeKey = rk;
+                edgeKeys;
+              });
+            };
+          };
+        };
+      };
+    };
+
+    if (Vector.size(entries) == 0) {
+      return emptyPlan;
+    };
+
+    // ── Group by bp, sort each group by expectedOut descending ──
+    let byBp = Map.new<Nat, [Nat]>();
+    do {
+      let collect = Map.new<Nat, Vector.Vector<Nat>>();
+      var idx : Nat = 0;
+      let total = Vector.size(entries);
+      while (idx < total) {
+        let e = Vector.get(entries, idx);
+        let g = switch (Map.get(collect, Map.nhash, e.bp)) {
+          case (?v) { v };
+          case null { let v = Vector.new<Nat>(); Map.set(collect, Map.nhash, e.bp, v); v };
+        };
+        Vector.add(g, idx);
+        idx += 1;
+      };
+      for ((bp, g) in Map.entries(collect)) {
+        let arr = Vector.toArray(g);
+        let sorted = Array.sort<Nat>(arr, func(a, b) {
+          Nat.compare(Vector.get(entries, b).expectedOut, Vector.get(entries, a).expectedOut)
+        });
+        Map.set(byBp, Map.nhash, bp, sorted);
+      };
+    };
+
+    func entry(idx : Nat) : FlatEntry { Vector.get(entries, idx) };
+    func group(bp : Nat) : [Nat] {
+      switch (Map.get(byBp, Map.nhash, bp)) { case (?arr) { arr }; case null { [] } }
+    };
+    func groupTopOut(bp : Nat) : Nat {
+      let g = group(bp); if (g.size() == 0) { 0 } else { entry(g[0]).expectedOut }
+    };
+    func edgesOverlap(a : [Text], b : [Text]) : Bool {
+      for (ea in a.vals()) { for (eb in b.vals()) { if (ea == eb) { return true } } };
+      false
+    };
+    func pairCompatible(a : FlatEntry, b : FlatEntry) : Bool {
+      a.routeKey != b.routeKey and not edgesOverlap(a.edgeKeys, b.edgeKeys)
+    };
+
+    // ── Baseline: top 10000-bp entry ──
+    var hasBaseline : Bool = false;
+    var baselineIdx : Nat = 0;
+    var baselineOut : Nat = 0;
+    let baselineGroup = group(10000);
+    if (baselineGroup.size() > 0) {
+      baselineIdx := baselineGroup[0];
+      baselineOut := entry(baselineIdx).expectedOut;
+      hasBaseline := true;
+    };
+
+    // ── Pre-seed bestTotal to baseline × 1001 / 1000 (0.1% threshold) ──
+    var bestTotal : Nat = (baselineOut * 1001) / 1000;
+    var bestPlan : ?[Nat] = null;
+
+    // ── 2-leg search ──
+    let twoLegPairs : [(Nat, Nat)] = [(1000, 9000), (2000, 8000), (3000, 7000), (4000, 6000), (5000, 5000)];
+    for ((bpA, bpB) in twoLegPairs.vals()) {
+      if (groupTopOut(bpA) + groupTopOut(bpB) > bestTotal) {
+        let gA = group(bpA);
+        if (bpA == bpB) {
+          let n = gA.size();
+          var xi : Nat = 0;
+          label sLoop while (xi + 1 < n) {
+            let i = gA[xi];
+            let aOut = entry(i).expectedOut;
+            let nextOut = entry(gA[xi + 1]).expectedOut;
+            if (aOut + nextOut <= bestTotal) { break sLoop };
+            var xj : Nat = xi + 1;
+            label sInner while (xj < n) {
+              let j = gA[xj];
+              let t = aOut + entry(j).expectedOut;
+              if (t <= bestTotal) { break sInner };
+              if (pairCompatible(entry(i), entry(j))) {
+                bestTotal := t; bestPlan := ?[i, j];
+              };
+              xj += 1;
+            };
+            xi += 1;
+          };
+        } else {
+          let gB = group(bpB);
+          let maxBOut = groupTopOut(bpB);
+          let nA = gA.size(); let nB = gB.size();
+          var xi : Nat = 0;
+          label dOuter while (xi < nA) {
+            let i = gA[xi];
+            let aOut = entry(i).expectedOut;
+            if (aOut + maxBOut <= bestTotal) { break dOuter };
+            var xj : Nat = 0;
+            label dInner while (xj < nB) {
+              let j = gB[xj];
+              let t = aOut + entry(j).expectedOut;
+              if (t <= bestTotal) { break dInner };
+              if (pairCompatible(entry(i), entry(j))) {
+                bestTotal := t; bestPlan := ?[i, j];
+              };
+              xj += 1;
+            };
+            xi += 1;
+          };
+        };
+      };
+    };
+
+    // ── 3-leg search ──
+    let threeLegTriples : [(Nat, Nat, Nat)] = [
+      (1000, 1000, 8000), (1000, 2000, 7000), (1000, 3000, 6000), (1000, 4000, 5000),
+      (2000, 2000, 6000), (2000, 3000, 5000), (2000, 4000, 4000), (3000, 3000, 4000),
+    ];
+    for ((bpA, bpB, bpC) in threeLegTriples.vals()) {
+      if (groupTopOut(bpA) + groupTopOut(bpB) + groupTopOut(bpC) > bestTotal) {
+        let gA = group(bpA); let gB = group(bpB); let gC = group(bpC);
+        let sameAB = bpA == bpB; let sameBC = bpB == bpC;
+        let maxCOut = groupTopOut(bpC);
+        let nA = gA.size(); let nB = gB.size(); let nC = gC.size();
+        var xi : Nat = 0;
+        label tA while (xi < nA) {
+          let i = gA[xi];
+          let aOut = entry(i).expectedOut;
+          let bStart : Nat = if (sameAB) { xi + 1 } else { 0 };
+          if (bStart < nB) {
+            let maxBAtStart = entry(gB[bStart]).expectedOut;
+            if (aOut + maxBAtStart + maxCOut <= bestTotal) { break tA };
+            var xj : Nat = bStart;
+            label tB while (xj < nB) {
+              let j = gB[xj];
+              let bOut = entry(j).expectedOut;
+              if (aOut + bOut + maxCOut <= bestTotal) { break tB };
+              if (pairCompatible(entry(i), entry(j))) {
+                let cStart : Nat = if (sameBC) { xj + 1 } else { 0 };
+                if (cStart < nC) {
+                  var xk : Nat = cStart;
+                  label tC while (xk < nC) {
+                    let k = gC[xk];
+                    let t = aOut + bOut + entry(k).expectedOut;
+                    if (t <= bestTotal) { break tC };
+                    if (pairCompatible(entry(i), entry(k)) and pairCompatible(entry(j), entry(k))) {
+                      bestTotal := t; bestPlan := ?[i, j, k];
+                    };
+                    xk += 1;
+                  };
+                };
+              };
+              xj += 1;
+            };
+          };
+          xi += 1;
+        };
+      };
+    };
+
+    // ── Build response ──
+    // No restore needed: computeQuoteRoutesForRequest leaves state clean, and IC
+    // query semantics revert everything at end-of-message anyway.
+
+    switch (bestPlan) {
+      case (?legIndices) {
+        // Multi-leg plan (2 or 3 legs).
+        var totalFee : Nat = 0;
+        var weightedImpact : Float = 0.0;
+        var allCanFulfill : Bool = true;
+        let legsOut = Array.map<Nat, {
+          bp : Nat; expectedBuyAmount : Nat; route : [SwapHop]; routeDescription : Text;
+        }>(legIndices, func(idx) {
+          let e = entry(idx);
+          totalFee += e.fee;
+          weightedImpact += (Float.fromInt(e.bp) * e.priceImpact) / 10000.0;
+          if (not e.canFulfillFully) { allCanFulfill := false };
+          { bp = e.bp; expectedBuyAmount = e.expectedOut; route = e.route; routeDescription = e.routeDescription }
+        });
+        var descParts : Text = "Split: ";
+        var firstPart : Bool = true;
+        for (l in legsOut.vals()) {
+          if (firstPart) { firstPart := false } else { descParts := descParts # " + " };
+          let pct = (l.bp + 50) / 100;  // round to nearest %
+          descParts := descParts # Nat.toText(pct) # "% (" # l.routeDescription # ")";
+        };
+        {
+          expectedBuyAmount = bestTotal;
+          fee = totalFee;
+          priceImpact = weightedImpact;
+          canFulfillFully = allCanFulfill;
+          tradingFeeBps = ICPfee;
+          routeDescription = descParts;
+          legs = legsOut;
+        };
+      };
+      case null {
+        // No accepted multi-leg plan. Use baseline if available; else fall back to
+        // the highest-output entry across the whole grid (best-effort).
+        if (hasBaseline) {
+          let e = entry(baselineIdx);
+          {
+            expectedBuyAmount = e.expectedOut;
+            fee = e.fee;
+            priceImpact = e.priceImpact;
+            canFulfillFully = e.canFulfillFully;
+            tradingFeeBps = ICPfee;
+            routeDescription = e.routeDescription;
+            legs = [{ bp = 10000; expectedBuyAmount = e.expectedOut; route = e.route; routeDescription = e.routeDescription }];
+          };
+        } else {
+          var bestIdx : Nat = 0;
+          var bestOut : Nat = 0;
+          let total = Vector.size(entries);
+          var i : Nat = 0;
+          while (i < total) {
+            let e = entry(i);
+            if (e.expectedOut > bestOut) { bestOut := e.expectedOut; bestIdx := i };
+            i += 1;
+          };
+          if (bestOut == 0) { emptyPlan }
+          else {
+            let e = entry(bestIdx);
+            // Force bp = 10000 for single-leg plans even if the source entry came from a
+            // partial-fraction probe. The executor (swapMultiHopV2) runs at the full
+            // gross amountIn, not at amount × bp / 10000.
+            {
+              expectedBuyAmount = e.expectedOut;
+              fee = e.fee;
+              priceImpact = e.priceImpact;
+              canFulfillFully = e.canFulfillFully;
+              tradingFeeBps = ICPfee;
+              routeDescription = e.routeDescription;
+              legs = [{ bp = 10000; expectedBuyAmount = e.expectedOut; route = e.route; routeDescription = e.routeDescription }];
+            };
+          };
+        };
+      };
+    };
+  };
+
+  // Split simulation (V2, gross legs): applies the IDENTICAL gross → net
+  // transformation swapSplitRoutesV2 executes (total-net + proportional leg
+  // scaling, remainder to leg 0), so this quote matches execution exactly.
+  public query ({ caller }) func simulateSplitRoutesV2(
+    splits : [{ amountIn : Nat; route : [SwapHop] }], // amountIn fields are GROSS shares
+  ) : async { totalOut : Nat; perLegOut : [Nat]; error : Text } {
+    if (not v2Enabled) { return { totalOut = 0; perLegOut = []; error = "V2 disabled" } }; // V2 kill switch
+    if (isAllowedQuery(caller) != 1) {
+      return { totalOut = 0; perLegOut = []; error = "Not authorized" };
+    };
+    if (splits.size() == 0 or splits.size() > 3) {
+      return { totalOut = 0; perLegOut = []; error = "1-3 splits required" };
+    };
+
+    // V2 netting — mirrors swapSplitRoutesV2: tokenIn is every leg's route[0]
+    // entry token (the executor validates that; here it is taken from leg 0).
+    let tokenInV2 : Text = if (splits[0].route.size() > 0) { splits[0].route[0].tokenIn } else { "" };
+    // FIX B: mirror v2PullPreflight's allowlist gate (see :18520) on the input
+    // token — earliest point it exists in this method. Empty-route legs keep
+    // their existing "1-3 hops required" path below.
+    if (tokenInV2 != "" and Map.get(v2TokenAllowlistV2, thash, tokenInV2) != ?true) {
+      return { totalOut = 0; perLegOut = []; error = "Token not enabled for V2" };
+    };
+    var grossTotal : Nat = 0;
+    for (leg in splits.vals()) { grossTotal += leg.amountIn };
+    let netTotal = netFromGrossV2(grossTotal, returnTfees(tokenInV2), ICPfee);
+    let netLegAmounts = Array.init<Nat>(splits.size(), 0);
+    if (grossTotal > 0) {
+      var assigned : Nat = 0;
+      var li = 0;
+      while (li < splits.size()) {
+        netLegAmounts[li] := (splits[li].amountIn * netTotal) / grossTotal;
+        assigned += netLegAmounts[li];
+        li += 1;
+      };
+      if (splits.size() > 0 and netTotal > assigned) {
+        netLegAmounts[0] += netTotal - assigned;
+      };
+    };
+
+    // Pair-scoped snapshot over the union of all legs' hop pairs. Legs still
+    // propagate mutations leg→leg (mirrors real swapSplitRoutesV2 execution);
+    // only the call boundary is restored.
+    let snap = snapshotPairsState(Array.flatten(Array.map<{ amountIn : Nat; route : [SwapHop] }, [(Text, Text)]>(splits, func(s) { hopsToPairs(s.route) })));
+    var total : Nat = 0;
+    var err : Text = "";
+    let perLegBuf = Vector.new<Nat>();
+
+    label simLoop for (legIdx in Iter.range(0, splits.size() - 1)) {
+      let leg = splits[legIdx];
+      if (leg.route.size() == 0 or leg.route.size() > 3) {
+        err := "Leg " # Nat.toText(legIdx) # ": 1-3 hops required";
+        Vector.add(perLegBuf, 0);
+        break simLoop;
+      };
+      let res = simulateMultiHop(leg.route, netLegAmounts[legIdx], caller);
+      Vector.add(perLegBuf, res.amountOut);
+      if (res.amountOut == 0) {
+        err := "Leg " # Nat.toText(legIdx) # ": zero output at simulation";
+        break simLoop;
+      };
+      total += res.amountOut;
+    };
+
+    restorePairsState(snap);
+    { totalOut = total; perLegOut = Vector.toArray(perLegBuf); error = err }
+  };
+
+  // Multi-hop route discovery (V2, gross input).
+  public query ({ caller }) func getExpectedMultiHopAmountV2(
+    tokenIn : Text,
+    tokenOut : Text,
+    amountIn : Nat, // GROSS — "what you hand over"
+  ) : async {
+    bestRoute : [SwapHop];
+    expectedAmountOut : Nat;
+    totalFee : Nat;
+    priceImpact : Float;
+    hops : Nat;
+    routeTokens : [Text];
+    hopDetails : [HopDetail];
+  } {
+    let emptyResult = {
+      bestRoute : [SwapHop] = [];
+      expectedAmountOut = 0;
+      totalFee = 0;
+      priceImpact = 0.0;
+      hops = 0;
+      routeTokens : [Text] = [];
+      hopDetails : [HopDetail] = [];
+    };
+if (not v2Enabled) { return emptyResult }; // V2 kill switch
+    // FIX B: mirror v2PullPreflight's allowlist gate (see :18520) so a quote is
+    // never shown for a token whose pull would refuse at execution.
+    if (Map.get(v2TokenAllowlistV2, thash, tokenIn) != ?true) { return emptyResult };
+        if (isAllowedQuery(caller) != 1) { return emptyResult };
+
+    // V2: quote on the net the exchange would execute for this gross.
+    let netIn = netFromGrossV2(amountIn, returnTfees(tokenIn), ICPfee);
+    if (netIn == 0) { return emptyResult };
+
+    let routes = findRoutes(tokenIn, tokenOut, netIn);
+    if (routes.size() == 0) { return emptyResult };
+
+    // Full hybrid simulation on the best route (by AMM estimate)
+    let best = routes[0];
+    let sim = simulateMultiHop(best.hops, netIn, caller);
+    var finalRoute = best.hops;
+    var finalOut = sim.amountOut;
+    var finalFee = sim.totalFees;
+    var finalHopDetails = sim.hopDetails;
+
+    // Also try 2nd best if it exists (AMM ranking might differ from hybrid)
+    if (routes.size() > 1) {
+      let sim2 = simulateMultiHop(routes[1].hops, netIn, caller);
+      if (sim2.amountOut > finalOut) {
+        finalRoute := routes[1].hops;
+        finalOut := sim2.amountOut;
+        finalFee := sim2.totalFees;
+        finalHopDetails := sim2.hopDetails;
+      };
+    };
+
+    // Price impact: sum per-hop mathematical impacts from hopDetails
+    let priceImpact = if (finalOut > 0 and netIn > 0) {
+      var totalImpact = 0.0;
+      for (hd in finalHopDetails.vals()) {
+        totalImpact += hd.priceImpact;
+      };
+      totalImpact;
+    } else { 0.0 };
+
+    // Build route token list for display
+    let tokenList = Vector.new<Text>();
+    Vector.add(tokenList, tokenIn);
+    for (hop in finalRoute.vals()) {
+      Vector.add(tokenList, hop.tokenOut);
+    };
+
+    {
+      bestRoute = finalRoute;
+      expectedAmountOut = finalOut;
+      totalFee = finalFee;
+      priceImpact;
+      hops = finalRoute.size();
+      routeTokens = Vector.toArray(tokenList);
+      hopDetails = finalHopDetails;
+    };
+  };
+
   system func inspect({
     caller : Principal;
     arg : Blob;
@@ -18024,6 +23147,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #clearAllBans : () -> ();
         #clearStuckLocks : () -> (accesscode : ?Text, blocksDoneKey : ?Text);
         #setMinimumAmount : () -> (token : Text, newMinimum : Nat);
+        #setEnforceMinLegOut : () -> (enabled : Bool);
+        #getEnforceMinLegOut : () -> ();
         #adminRepairLastTradedPriceAndKlines : () -> (affectedPoolIndexes : [Nat], alsoRepairVolume24h : Bool);
         #adminDeleteKlinesBefore : () -> (cutoffNs : Int, maxDeletesPerBucket : Nat);
         #adminCheckBan : () -> (p : Principal);
@@ -18181,6 +23306,37 @@ shared (deployer) persistent actor class create_trading_canister() = this {
         #debugV3Ticks : () -> (token0 : Text, token1 : Text);
         #updateTokenType : () -> (token : Text, newType : {#ICP; #ICRC12; #ICRC3});
         #canTradeTokens : () -> (tokenIn : Text, tokenOut : Text);
+        // ── V2 API (gross-input + ICRC-2 pull). M0127: the declared variant must
+        // be a supertype of the compiler-generated one, so EVERY new public
+        // method must be enumerated here. Deliberately ABSENT from the frozen
+        // allowlist above — V2 is fully blocked while the exchange is frozen.
+        #swapMultiHopV2 : () -> (tokenIn : Text, tokenOut : Text, amountIn : Nat, route : [SwapHop], minAmountOut : Nat);
+        #swapSplitRoutesV2 : () -> (tokenIn : Text, tokenOut : Text, splits : [SplitLeg], minAmountOut : Nat);
+        #addPositionV2 : () -> (amount_sell : Nat, amount_init : Nat, token_sell_identifier : Text, token_init_identifier : Text, pub : Bool, excludeDAO : Bool, OC : ?Text, referrer : Text, allOrNothing : Bool, strictlyOTC : Bool);
+        #FinishSellV2 : () -> (accesscode : Text, amountSelling : Nat);
+        #FinishSellBatchV2 : () -> (accesscode : [Text], amount_Sell_by_Reactor : [Nat], token_sell_identifier : Text, token_init_identifier : Text);
+        #addLiquidityV2 : () -> (token0i : Text, token1i : Text, amount0i : Nat, amount1i : Nat, isInitial : ?Bool);
+        #addConcentratedLiquidityV2 : () -> (token0i : Text, token1i : Text, amount0i : Nat, amount1i : Nat, priceLower : Nat, priceUpper : Nat);
+        #treasurySwapV2 : () -> (tokenIn : Text, tokenOut : Text, amountIn : Nat, minAmountOut : Nat);
+        #getExpectedReceiveAmountV2 : () -> (tokenSell : Text, tokenBuy : Text, amountSell : Nat);
+        #getExpectedReceiveAmountBatchV2 : () -> (requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }]);
+        #getExpectedReceiveAmountBatchMultiV2 : () -> (requests : [{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }], maxRoutesPerRequest : Nat);
+        #getExpectedReceiveAmountBatchMultiOptimalV2 : () -> (tokenSell : Text, tokenBuy : Text, amountIn : Nat);
+        #simulateSplitRoutesV2 : () -> (splits : [{ amountIn : Nat; route : [SwapHop] }]);
+        #getExpectedMultiHopAmountV2 : () -> (tokenIn : Text, tokenOut : Text, amountIn : Nat);
+        #grossToNetV2 : () -> (token : Text, gross : Nat);
+        #netToGrossV2 : () -> (token : Text, net : Nat);
+        #requiredAllowanceV2 : () -> (token : Text, gross : Nat);
+        #quoteDepositV2 : () -> (token : Text, gross : Nat);
+        #adminResolvePendingPull : () -> (pullId : Nat, confirmedLedgerBlock : Nat, tType : { #ICP; #ICRC12; #ICRC3 });
+        #adminDropPendingPull : () -> (pullId : Nat);
+        #adminListPendingPulls : () -> ();
+        #getMyPendingPulls : () -> ();
+        #adminSweepPendingPulls : () -> (olderThanSeconds : Nat);
+        #adminSetV2TokenAllowed : () -> (token : Text, allowed : Bool);
+        #getV2AllowedTokens : () -> ();
+        #admin_setV2Enabled : () -> (enabled : Bool);
+        #getV2Enabled : () -> ();
     };
   }) : Bool {
 
@@ -18222,6 +23378,8 @@ shared (deployer) persistent actor class create_trading_canister() = this {
       case (#adminForceUnlockRecovery _) callerIsAdmin;
       case (#adminRecoverWronglysent _) callerIsAdmin;
       case (#setMinimumAmount _) callerIsAdmin;
+      case (#setEnforceMinLegOut _) callerIsAdmin;
+      case (#getEnforceMinLegOut _) true;
       case (#adminRepairLastTradedPriceAndKlines _) callerIsAdmin;
       case (#adminDeleteKlinesBefore _) callerIsAdmin;
       case (#resetAllState _) callerIsAdmin;
@@ -18347,6 +23505,48 @@ shared (deployer) persistent actor class create_trading_canister() = this {
             };
           };
         };
+      };
+
+      // ── V2 API runtime pre-checks — each mirrors its V1 twin's branch where a
+      // correct one exists. FinishSellBatchV2 deliberately has NO case here: V1's
+      // #finishSellBatch branch is the known dead lower-case-tag bug (P11) and
+      // must not be replicated; the catch-all admits it and the body validates.
+      case (#treasurySwapV2 _) callerIsAdmin;
+      case (#adminResolvePendingPull _) callerIsAdmin;
+      case (#adminDropPendingPull _) callerIsAdmin;
+      case (#adminListPendingPulls _) callerIsAdmin;
+      case (#adminSweepPendingPulls _) callerIsAdmin;
+      case (#adminSetV2TokenAllowed _) callerIsAdmin;
+      case (#admin_setV2Enabled _) callerIsAdmin;
+      case (#getV2Enabled _) true;
+      case (#FinishSellV2 d) {
+        var tid : Text = d().0;
+        if ((tid.size() >= 32 and tid.size() < 60)) { return true } else {
+          return false;
+        };
+      };
+      case (#addPositionV2 d) {
+        var buy : Text = d().3;
+        var sell : Text = d().2;
+
+        if (containsToken(sell) and containsToken(buy)) { return true } else {
+          return false;
+        };
+      };
+      case (#swapMultiHopV2 d) {
+        let (tokenIn, tokenOut, _, route, _) = d();
+        if (not containsToken(tokenIn) or not containsToken(tokenOut)) return false;
+        if (route.size() < 1 or route.size() > 3) return false; // allow 1-hop direct + 2-3 hop multi
+        return true;
+      };
+      case (#swapSplitRoutesV2 d) {
+        let (tokenIn, tokenOut, splits, _) = d();
+        if (not containsToken(tokenIn) or not containsToken(tokenOut)) return false;
+        if (splits.size() < 1 or splits.size() > 3) return false;
+        for (leg in splits.vals()) {
+          if (leg.route.size() < 1 or leg.route.size() > 3) return false;
+        };
+        return true;
       };
 
       case _ { true };

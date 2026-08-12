@@ -137,9 +137,17 @@
     "batch_quoter_fid": {
       "main": "arb-bot/canister/batch_quoter.mo",
       "type": "motoko"
+    },
+    "exchange_mock_ledger": {
+      "main": "src/exchange/examples/mock_ledger.mo",
+      "type": "motoko"
+    },
+    "exchange_mock_ledger_b": {
+      "main": "src/exchange/examples/mock_ledger.mo",
+      "type": "motoko"
     }
   },
-  "networks":  {
+  "networks": {
     "staging": {
       "providers": [
         "https://icp0.io"

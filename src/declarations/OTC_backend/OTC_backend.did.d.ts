@@ -236,6 +236,18 @@ export interface ProcessedTrade {
   'amountBought' : bigint,
   'identifier' : string,
 }
+export interface PullRecordV2 {
+  'id' : bigint,
+  'tf' : bigint,
+  'token' : string,
+  'context' : string,
+  'revokeBp' : bigint,
+  'note' : string,
+  'time' : Time,
+  'gross' : bigint,
+  'caller' : Principal,
+  'feeBp' : bigint,
+}
 export type Ratio = { 'Max' : null } |
   { 'Zero' : null } |
   { 'Value' : bigint };
@@ -422,6 +434,11 @@ export interface create_trading_canister {
     [Array<TradeData>, boolean, Array<bigint>],
     [] | [BatchProcessResult]
   >,
+  'FinishSellBatchV2' : ActorMethod<
+    [Array<string>, Array<bigint>, string, string],
+    ActionResult
+  >,
+  'FinishSellV2' : ActorMethod<[string, bigint], ActionResult>,
   'FixStuckTX' : ActorMethod<[string], ActionResult>,
   'Freeze' : ActorMethod<[], undefined>,
   'addAcceptedToken' : ActorMethod<
@@ -441,6 +458,10 @@ export interface create_trading_canister {
     [string, string, bigint, bigint, bigint, bigint, bigint, bigint],
     AddConcentratedResult
   >,
+  'addConcentratedLiquidityV2' : ActorMethod<
+    [string, string, bigint, bigint, bigint, bigint],
+    AddConcentratedResult
+  >,
   'addFeeCollector' : ActorMethod<[Principal], ActionResult>,
   'addLiquidity' : ActorMethod<
     [string, string, bigint, bigint, bigint, bigint, [] | [boolean]],
@@ -450,9 +471,28 @@ export interface create_trading_canister {
     [string, string, bigint, bigint, bigint, bigint, [] | [boolean]],
     AddLiquidityResult
   >,
+  'addLiquidityV2' : ActorMethod<
+    [string, string, bigint, bigint, [] | [boolean]],
+    AddLiquidityResult
+  >,
   'addPosition' : ActorMethod<
     [
       bigint,
+      bigint,
+      bigint,
+      string,
+      string,
+      boolean,
+      boolean,
+      [] | [string],
+      string,
+      boolean,
+      boolean,
+    ],
+    OrderResult
+  >,
+  'addPositionV2' : ActorMethod<
+    [
       bigint,
       bigint,
       string,
@@ -483,6 +523,7 @@ export interface create_trading_canister {
   'adminDeleteKlinesBefore' : ActorMethod<[bigint, bigint], string>,
   'adminDrainTestModeExchange' : ActorMethod<[Principal], string>,
   'adminDrainTestModeStatus' : ActorMethod<[], string>,
+  'adminDropPendingPull' : ActorMethod<[bigint], ActionResult>,
   'adminExecuteRouteStrategy' : ActorMethod<
     [bigint, Array<SwapHop>, bigint, bigint],
     SwapResult
@@ -521,6 +562,11 @@ export interface create_trading_canister {
       { 'Err' : string }
   >,
   'adminForceUnlockRecovery' : ActorMethod<[], boolean>,
+  'adminListPendingPulls' : ActorMethod<[], Array<PullRecordV2>>,
+  'adminPruneBlocksDone' : ActorMethod<
+    [bigint],
+    { 'deleted' : bigint, 'skippedICRC3' : bigint, 'remaining' : bigint }
+  >,
   'adminRecoverWronglysent' : ActorMethod<
     [
       Principal,
@@ -536,6 +582,20 @@ export interface create_trading_canister {
     [Array<bigint>, boolean],
     string
   >,
+  'adminResolvePendingPull' : ActorMethod<
+    [
+      bigint,
+      bigint,
+      { 'ICP' : null } |
+        { 'ICRC3' : null } |
+        { 'ICRC12' : null },
+    ],
+    ActionResult
+  >,
+  'adminSetV2TokenAllowed' : ActorMethod<[string, boolean], ActionResult>,
+  'adminSweepPendingPulls' : ActorMethod<[bigint], ActionResult>,
+  'admin_setV2Enabled' : ActorMethod<[boolean], ActionResult>,
+  'admin_setVerboseLogging' : ActorMethod<[boolean], boolean>,
   'batchAdjustLiquidity' : ActorMethod<
     [
       Array<
@@ -677,6 +737,8 @@ export interface create_trading_canister {
     [] | [[Array<string>, Array<TradePrivate>]]
   >,
   'getAllowedCanisters' : ActorMethod<[], Array<string>>,
+  'getBlockDoneStatus' : ActorMethod<[string, bigint], boolean>,
+  'getBlocksDoneSize' : ActorMethod<[], bigint>,
   'getCurrentLiquidity' : ActorMethod<
     [
       string,
@@ -759,7 +821,20 @@ export interface create_trading_canister {
     }
   >,
   'getDriftOpTracker' : ActorMethod<[], Array<[string, bigint]>>,
+  'getEnforceMinLegOut' : ActorMethod<[], boolean>,
   'getExpectedMultiHopAmount' : ActorMethod<
+    [string, string, bigint],
+    {
+      'hopDetails' : Array<HopDetail>,
+      'expectedAmountOut' : bigint,
+      'routeTokens' : Array<string>,
+      'hops' : bigint,
+      'priceImpact' : number,
+      'totalFee' : bigint,
+      'bestRoute' : Array<SwapHop>,
+    }
+  >,
+  'getExpectedMultiHopAmountV2' : ActorMethod<
     [string, string, bigint],
     {
       'hopDetails' : Array<HopDetail>,
@@ -851,6 +926,86 @@ export interface create_trading_canister {
       'expectedBuyAmount' : bigint,
     }
   >,
+  'getExpectedReceiveAmountBatchMultiOptimalV2' : ActorMethod<
+    [string, string, bigint],
+    {
+      'fee' : bigint,
+      'tradingFeeBps' : bigint,
+      'routeDescription' : string,
+      'canFulfillFully' : boolean,
+      'legs' : Array<
+        {
+          'bp' : bigint,
+          'routeDescription' : string,
+          'route' : Array<SwapHop>,
+          'expectedBuyAmount' : bigint,
+        }
+      >,
+      'priceImpact' : number,
+      'expectedBuyAmount' : bigint,
+    }
+  >,
+  'getExpectedReceiveAmountBatchMultiV2' : ActorMethod<
+    [
+      Array<
+        { 'tokenBuy' : string, 'amountSell' : bigint, 'tokenSell' : string }
+      >,
+      bigint,
+    ],
+    Array<
+      {
+        'routes' : Array<
+          {
+            'fee' : bigint,
+            'tradingFeeBps' : bigint,
+            'hopDetails' : Array<HopDetail>,
+            'routeDescription' : string,
+            'canFulfillFully' : boolean,
+            'routeTokens' : Array<string>,
+            'priceImpact' : number,
+            'potentialOrderDetails' : [] | [
+              { 'amount_init' : bigint, 'amount_sell' : bigint }
+            ],
+            'expectedBuyAmount' : bigint,
+          }
+        >,
+      }
+    >
+  >,
+  'getExpectedReceiveAmountBatchV2' : ActorMethod<
+    [
+      Array<
+        { 'tokenBuy' : string, 'amountSell' : bigint, 'tokenSell' : string }
+      >,
+    ],
+    Array<
+      {
+        'fee' : bigint,
+        'hopDetails' : Array<HopDetail>,
+        'routeDescription' : string,
+        'canFulfillFully' : boolean,
+        'priceImpact' : number,
+        'potentialOrderDetails' : [] | [
+          { 'amount_init' : bigint, 'amount_sell' : bigint }
+        ],
+        'expectedBuyAmount' : bigint,
+      }
+    >
+  >,
+  'getExpectedReceiveAmountV2' : ActorMethod<
+    [string, string, bigint],
+    {
+      'fee' : bigint,
+      'hopDetails' : Array<HopDetail>,
+      'routeDescription' : string,
+      'canFulfillFully' : boolean,
+      'priceImpact' : number,
+      'potentialOrderDetails' : [] | [
+        { 'amount_init' : bigint, 'amount_sell' : bigint }
+      ],
+      'expectedBuyAmount' : bigint,
+    }
+  >,
   'getFeeCollectors' : ActorMethod<[], Array<Principal>>,
   'getKlineData' : ActorMethod<
     [string, string, TimeFrame, boolean],
@@ -865,6 +1020,18 @@ export interface create_trading_canister {
     Array<[bigint, string]>
   >,
   'getLogs' : ActorMethod<[bigint], Array<LogEntry>>,
+  'getMemoryStats' : ActorMethod<
+    [],
+    {
+      'memory_size' : bigint,
+      'max_live_size' : bigint,
+      'sizes' : Array<[string, bigint]>,
+      'heap_size' : bigint,
+      'total_allocation' : bigint,
+      'reclaimed' : bigint,
+    }
+  >,
+  'getMyPendingPulls' : ActorMethod<[], Array<PullRecordV2>>,
   'getOrderbookCombined' : ActorMethod<
     [string, string, bigint, bigint],
     {
@@ -1019,6 +1186,9 @@ export interface create_trading_canister {
     >
   >,
   'getUserTrades' : ActorMethod<[], Array<TradePrivate2>>,
+  'getV2AllowedTokens' : ActorMethod<[], Array<string>>,
+  'getV2Enabled' : ActorMethod<[], boolean>,
+  'getVerboseLogging' : ActorMethod<[], boolean>,
   'get_cycles' : ActorMethod<[], bigint>,
   'get_token_trends_7d' : ActorMethod<
     [Array<Principal>],
@@ -1035,10 +1205,12 @@ export interface create_trading_canister {
       } |
       { 'err' : string }
   >,
+  'grossToNetV2' : ActorMethod<[string, bigint], bigint>,
   'hmFee' : ActorMethod<[], bigint>,
   'hmRefFee' : ActorMethod<[], bigint>,
   'hmRevokeFee' : ActorMethod<[], bigint>,
   'isExchangeFrozen' : ActorMethod<[], boolean>,
+  'netToGrossV2' : ActorMethod<[string, bigint], bigint>,
   'p2a' : ActorMethod<[], string>,
   'p2acannister' : ActorMethod<[], string>,
   'p2athird' : ActorMethod<[string], string>,
@@ -1059,6 +1231,10 @@ export interface create_trading_canister {
     undefined
   >,
   'pauseToken' : ActorMethod<[string], undefined>,
+  'quoteDepositV2' : ActorMethod<
+    [string, bigint],
+    { 'transferFee' : bigint, 'tradingFee' : bigint, 'netSwapped' : bigint }
+  >,
   'recalibrateDAOpositions' : ActorMethod<
     [Array<PositionData>],
     Array<RecalibratedPosition>
@@ -1084,6 +1260,7 @@ export interface create_trading_canister {
     [string, string, bigint],
     RemoveLiquidityResult
   >,
+  'requiredAllowanceV2' : ActorMethod<[string, bigint], bigint>,
   'resetAllState' : ActorMethod<[], string>,
   'resetDriftOpTracker' : ActorMethod<[], undefined>,
   'retrieveFundsDao' : ActorMethod<[Array<[string, bigint]>], undefined>,
@@ -1111,9 +1288,14 @@ export interface create_trading_canister {
       ]
     >
   >,
+  'setEnforceMinLegOut' : ActorMethod<[boolean], ActionResult>,
   'setMinimumAmount' : ActorMethod<[string, bigint], ActionResult>,
   'setTest' : ActorMethod<[boolean], undefined>,
   'simulateSplitRoutes' : ActorMethod<
+    [Array<{ 'amountIn' : bigint, 'route' : Array<SwapHop> }>],
+    { 'perLegOut' : Array<bigint>, 'error' : string, 'totalOut' : bigint }
+  >,
+  'simulateSplitRoutesV2' : ActorMethod<
     [Array<{ 'amountIn' : bigint, 'route' : Array<SwapHop> }>],
     { 'perLegOut' : Array<bigint>, 'error' : string, 'totalOut' : bigint }
   >,
@@ -1121,14 +1303,23 @@ export interface create_trading_canister {
     [string, string, bigint, Array<SwapHop>, bigint, bigint],
     SwapResult
   >,
+  'swapMultiHopV2' : ActorMethod<
+    [string, string, bigint, Array<SwapHop>, bigint],
+    SwapResult
+  >,
   'swapSplitRoutes' : ActorMethod<
     [string, string, Array<SplitLeg>, bigint, bigint],
+    SwapResult
+  >,
+  'swapSplitRoutesV2' : ActorMethod<
+    [string, string, Array<SplitLeg>, bigint],
     SwapResult
   >,
   'treasurySwap' : ActorMethod<
     [string, string, bigint, bigint, bigint],
     SwapResult
   >,
+  'treasurySwapV2' : ActorMethod<[string, string, bigint, bigint], SwapResult>,
   'updateTokenType' : ActorMethod<
     [string, { 'ICP' : null } | { 'ICRC3' : null } | { 'ICRC12' : null }],
     ActionResult

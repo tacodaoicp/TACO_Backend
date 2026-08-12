@@ -74,12 +74,15 @@ echo "--- Step 3: Deploying ICP Ledger ---"
 cd "$PARENT_DIR/ledger_canister"
 
 # Ensure wasm is in dfx cache
+# Ledger release: ledger-suite-icp-2025-08-29 (full ICRC-2 incl. icrc2_transfer_from).
+# dfx re-downloads the wasm from the URL pinned in ledger_canister/dfx.json on every
+# deploy; the local copy below is only an offline fallback / provenance record.
 mkdir -p ./.dfx/local/canisters/ledger_canister/
-if [ -f ledger-canister.wasm.gz ]; then
-  cp ledger-canister.wasm.gz ./.dfx/local/canisters/ledger_canister/
+if [ -f ledger-canister_notify-method.wasm.gz ]; then
+  cp ledger-canister_notify-method.wasm.gz ./.dfx/local/canisters/ledger_canister/download-ledger-canister_notify-method.wasm.gz
 else
-  echo "ERROR: ledger-canister.wasm.gz not found in $PARENT_DIR/ledger_canister/"
-  echo "Please download it first."
+  echo "ERROR: ledger-canister_notify-method.wasm.gz not found in $PARENT_DIR/ledger_canister/"
+  echo "Download it from https://github.com/dfinity/ic/releases/tag/ledger-suite-icp-2025-08-29 first."
   exit 1
 fi
 
@@ -125,7 +128,7 @@ cd "$PARENT_DIR/icrc1_ledger_canister"
 # Ensure wasm is in dfx cache
 mkdir -p ./.dfx/local/canisters/icrc1_ledger_canister/
 if [ -f ic-icrc1-ledger.wasm.gz ]; then
-  cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/
+  cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/download-ic-icrc1-ledger.wasm.gz
 else
   echo "ERROR: ic-icrc1-ledger.wasm.gz not found in $PARENT_DIR/icrc1_ledger_canister/"
   echo "Please download it first."

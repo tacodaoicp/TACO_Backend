@@ -86,8 +86,8 @@ else
   "canisters": {
     "ledger_canister": {
       "type": "custom",
-      "candid": "https://raw.githubusercontent.com/dfinity/ic/d87954601e4b22972899e9957e800406a0a6b929/rs/rosetta-api/icp_ledger/ledger.did",
-      "wasm": "https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ledger-canister.wasm.gz",
+      "candid": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger.did",
+      "wasm": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger-canister_notify-method.wasm.gz",
       "remote": {
         "id": {
           "ic": "ryjl3-tyaaa-aaaaa-aaaba-cai"
@@ -118,13 +118,14 @@ dfx identity use minterTACO
 export MINTER_ACCOUNT_ID=$(dfx ledger account-id)
 dfx identity use defaultTACO
 export DEFAULT_ACCOUNT_ID=$(dfx ledger account-id)
-# URL of the file to download
-download_url="https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ledger-canister.wasm.gz"
+# URL of the file to download (ledger-suite-icp-2025-08-29: full ICRC-2 incl. icrc2_transfer_from)
+download_url="https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger-canister_notify-method.wasm.gz"
 
-# Download the file to the current directory
-curl -o ledger-canister.wasm.gz "$download_url"
+# Download the file to the current directory (offline fallback only — dfx re-downloads
+# from the dfx.json URL at deploy time)
+curl -L -o ledger-canister_notify-method.wasm.gz "$download_url"
 mkdir -p ./.dfx/local/canisters/ledger_canister/
-cp ledger-canister.wasm.gz ./.dfx/local/canisters/ledger_canister/
+cp ledger-canister_notify-method.wasm.gz ./.dfx/local/canisters/ledger_canister/download-ledger-canister_notify-method.wasm.gz
 yes | dfx deploy --specified-id ryjl3-tyaaa-aaaaa-aaaba-cai ledger_canister --argument "
   (variant {
     Init = record {
@@ -247,7 +248,10 @@ export MINTER=$(dfx identity get-principal)
 export TOKEN_NAME="My Token"
 export TOKEN_SYMBOL="XMTK"
 dfx identity use defaultTACO
-download_url="https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ic-icrc1-ledger.wasm.gz"
+# NOTE: was pinned to the 2023-09 d879546 commit — a DIFFERENT ic-icrc1 build than the
+# 5849c6d one in the dfx.json above (dfx.json wins at install time; this copy is only a
+# fallback). Aligned to 5849c6d so both refer to the same build.
+download_url="https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
 
 # Download the file to the current directory
 
@@ -255,7 +259,7 @@ curl -o ic-icrc1-ledger.wasm.gz "$download_url"
 
 mkdir -p ./.dfx/local/canisters/icrc1_ledger_canister/
 
-cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/
+cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/download-ic-icrc1-ledger.wasm.gz
 
 export DEFAULT=$(dfx identity get-principal)
 export PRE_MINTED_TOKENS=10_000_000_000_000_000_000

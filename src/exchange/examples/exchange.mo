@@ -350,6 +350,7 @@ module {
     getPoolHistory : shared query (Text, Text, Nat) -> async [(Time, [{ amount_init : Nat; amount_sell : Nat; init_principal : Text; sell_principal : Text; accesscode : Text; token_init_identifier : Text; strictlyOTC : Bool; allOrNothing : Bool }])];
     getKlineData : shared query (Text, Text, TimeFrame, Bool) -> async [KlineData];
     recoverWronglysent : shared (Text, Nat, { #ICP; #ICRC12; #ICRC3 }) -> async Bool;
+    adminRecoverWronglysent : shared (Principal, Text, Nat, { #ICP; #ICRC12; #ICRC3 }) -> async Bool;
     get_cycles : shared query () -> async Nat;
     hmFee : shared query () -> async Nat;
     hmRevokeFee : shared query () -> async Nat;
@@ -419,6 +420,10 @@ module {
     addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async ExTypes.AddConcentratedResult;
     removeConcentratedLiquidity : shared (Text, Text, Nat, Nat) -> async ExTypes.RemoveConcentratedResult;
     getUserConcentratedPositions : shared query () -> async [ConcentratedPosition];
+    getPoolRanges : shared query (Text, Text) -> async [{
+      ratioLower : Nat; ratioUpper : Nat; liquidity : Nat;
+      token0Locked : Nat; token1Locked : Nat;
+    }];
     getOrderbookCombined : shared query (Text, Text, Nat, Nat) -> async OrderbookCombinedResult;
     getUserReferralInfo : shared query () -> async ReferralInfo;
     getAllAMMPools : shared query () -> async [AMMPoolSummary];

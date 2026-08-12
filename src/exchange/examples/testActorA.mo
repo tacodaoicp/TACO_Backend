@@ -14,7 +14,10 @@ import DAO "./dao";
 import fuzz "mo:fuzz";
 import Array "mo:base/Array";
 import Nat "mo:base/Nat";
+import Text "mo:base/Text";
 import ExTypes "../exchangeTypes";
+import actorTypes "./actorTypes";
+import ICRCTypes "../src/icrc.types";
 
 shared (deployer) persistent actor class testActorA() = this {
 
@@ -856,5 +859,237 @@ shared (deployer) persistent actor class testActorA() = this {
     lastFeeGrowth0 : Nat; lastFeeGrowth1 : Nat; lastUpdateTime : Int;
   }] {
     await exchange.getUserConcentratedPositions();
+  };
+  // ═══════════════════════════════════════════════════════════════════════
+  // V2 (gross-input + ICRC-2 pull) support — identical in actors A/B/C.
+  // ═══════════════════════════════════════════════════════════════════════
+  // The SPENDER of every icrc2 approval is the EXCHANGE canister (qioex) —
+  // it performs the icrc2_transfer_from pull. qbnpl (exchangePrincipal above)
+  // is only the transfer DESTINATION and must never be the spender.
+  transient let exchangeCanisterPrincipal = Principal.fromText("qioex-5iaaa-aaaan-q52ba-cai");
+  transient let exchangeV2 = actor ("qioex-5iaaa-aaaan-q52ba-cai") : actorTypes.ExchangeV2;
+  transient let icrc2ICP = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai") : ICRCTypes.Self2Full;
+  transient let icrc2A = actor ("mxzaz-hqaaa-aaaar-qaada-cai") : ICRCTypes.Self2Full;
+  transient let icrc2B = actor ("zxeu2-7aaaa-aaaaq-aaafa-cai") : ICRCTypes.Self2Full;
+
+  private func approveForExchange(ledger : ICRCTypes.Self2Full, allowance : Nat, expiresAt : ?Nat64, ledgerFee : Nat) : async Nat {
+    let r = await ledger.icrc2_approve({
+      from_subaccount = null;
+      spender = { owner = exchangeCanisterPrincipal; subaccount = null };
+      amount = allowance;
+      expected_allowance = null;
+      expires_at = expiresAt;
+      fee = ?ledgerFee;
+      memo = null;
+      created_at_time = null;
+    });
+    switch (r) {
+      case (#Ok(blk)) { blk };
+      case (#Err(e)) { throw Error.reject("icrc2_approve failed: " # debug_show (e)) };
+    };
+  };
+  private func allowanceForExchange(ledger : ICRCTypes.Self2Full) : async Nat {
+    (await ledger.icrc2_allowance({ account = { owner = actorPrincipal; subaccount = null }; spender = { owner = exchangeCanisterPrincipal; subaccount = null } })).allowance;
+  };
+
+  public func ApproveICPforExchange(allowance : Nat, expiresAt : ?Nat64) : async Nat {
+    await approveForExchange(icrc2ICP, allowance, expiresAt, 10000);
+  };
+  public func ApproveICRCAforExchange(allowance : Nat, expiresAt : ?Nat64) : async Nat {
+    await approveForExchange(icrc2A, allowance, expiresAt, 10000);
+  };
+  public func ApproveICRCBforExchange(allowance : Nat, expiresAt : ?Nat64) : async Nat {
+    await approveForExchange(icrc2B, allowance, expiresAt, 10000);
+  };
+  public func getAllowanceICP() : async Nat { await allowanceForExchange(icrc2ICP) };
+  public func getAllowanceICRCA() : async Nat { await allowanceForExchange(icrc2A) };
+  public func getAllowanceICRCB() : async Nat { await allowanceForExchange(icrc2B) };
+  public func RevokeApprovalICP() : async Nat { await approveForExchange(icrc2ICP, 0, null, 10000) };
+  public func RevokeApprovalICRCA() : async Nat { await approveForExchange(icrc2A, 0, null, 10000) };
+  public func RevokeApprovalICRCB() : async Nat { await approveForExchange(icrc2B, 0, null, 10000) };
+
+  public func getMyPendingPullsCount() : async Nat {
+    (await exchangeV2.getMyPendingPulls()).size();
+  };
+
+  // ── V2 thin wrappers — the V1 wrappers minus the Block param. Inputs are
+  // GROSS ("what you hand over"); the V1 gross-up formula does NOT apply.
+  // Where the V2 #Ok carries an amountIn echo the wrapper verifies it equals
+  // the gross that was passed (V2 contract: the echo is the caller's gross).
+  public func swapMultiHopV2(
+    tokenIn : Text,
+    tokenOut : Text,
+    amountIn : Nat,
+    route : [{ tokenIn : Text; tokenOut : Text }],
+    minAmountOut : Nat,
+  ) : async Text {
+    let r = await exchangeV2.swapMultiHopV2(tokenIn, tokenOut, amountIn, route, minAmountOut);
+    switch (r) {
+      case (#Ok(ok)) { if (ok.amountIn != amountIn) { return "AMOUNTIN_MISMATCH:got:" # Nat.toText(ok.amountIn) # ":expected:" # Nat.toText(amountIn) } };
+      case (#Err(_)) {};
+    };
+    unwrapSwap(r);
+  };
+
+  // ── Test122 concurrency probes (PULL-RACE) ────────────────────────────────
+  // Both probes fire a V2 pull WITHOUT awaiting it, then deliver a second,
+  // competing claim for the ledger block that pull is about to create. Both
+  // messages are enqueued from this one execution, so the exchange sees them
+  // in FIFO order on the same input queue: the V2 call suspends inside
+  // `await ledger.icrc2_transfer_from(...)`, and the competing claim executes
+  // during that suspension — before the V2 continuation reaches its
+  // Map.set(BlocksDone, ...). `predictedBlock` is the approve block + 1.
+  //
+  // The retry loop exists because swapMultiHopV2 may suspend EARLIER than the
+  // pull (the FixStuckTXRunning treasury flush): an attempt that lands before
+  // the block exists reads an empty block, deletes its own marker and returns
+  // false, so it is free to repeat.
+  // Thin single-block recovery probe (Test123).
+  public func recoverBlock(token : Text, block : Nat) : async Bool {
+    await exchange.recoverWronglysent(token, block, #ICRC12);
+  };
+
+  public func raceV2SwapVsRecover(
+    tokenIn : Text,
+    tokenOut : Text,
+    gross : Nat,
+    predictedBlock : Nat,
+    attempts : Nat,
+  ) : async { swap : Text; recovered : Bool; tries : Nat } {
+    let fut = exchangeV2.swapMultiHopV2(tokenIn, tokenOut, gross, [{ tokenIn = tokenIn; tokenOut = tokenOut }], 0);
+    var rec = false;
+    var i = 0;
+    while (i < attempts and not rec) {
+      rec := await exchange.recoverWronglysent(tokenIn, predictedBlock, #ICRC12);
+      i += 1;
+    };
+    let swapTxt = try { unwrapSwap(await fut) } catch (e) { "TRAP:" # Error.message(e) };
+    { swap = swapTxt; recovered = rec; tries = i };
+  };
+
+  // Same interleave, but the competing claimant is a V1 deposit path
+  // (swapMultiHop with an explicit Block) instead of recoverWronglysent.
+  public func raceV2SwapVsV1Swap(
+    tokenIn : Text,
+    tokenOut : Text,
+    gross : Nat,
+    v1Amount : Nat,
+    predictedBlock : Nat,
+    attempts : Nat,
+  ) : async { swapV2 : Text; swapV1 : Text; tries : Nat } {
+    let hop = [{ tokenIn = tokenIn; tokenOut = tokenOut }];
+    let fut = exchangeV2.swapMultiHopV2(tokenIn, tokenOut, gross, hop, 0);
+    var v1 = "";
+    var i = 0;
+    while (i < attempts and not Text.contains(v1, #text "done")) {
+      v1 := unwrapSwap(await exchange.swapMultiHop(tokenIn, tokenOut, v1Amount, hop, 0, predictedBlock));
+      i += 1;
+    };
+    let swapTxt = try { unwrapSwap(await fut) } catch (e) { "TRAP:" # Error.message(e) };
+    { swapV2 = swapTxt; swapV1 = v1; tries = i };
+  };
+
+  public func swapSplitRoutesV2(
+    tokenIn : Text,
+    tokenOut : Text,
+    splits : [{ amountIn : Nat; route : [{ tokenIn : Text; tokenOut : Text }]; minLegOut : Nat }],
+    minAmountOut : Nat,
+  ) : async Text {
+    var grossTotal = 0;
+    for (leg in splits.vals()) { grossTotal += leg.amountIn };
+    let r = await exchangeV2.swapSplitRoutesV2(tokenIn, tokenOut, splits, minAmountOut);
+    switch (r) {
+      case (#Ok(ok)) { if (ok.amountIn != grossTotal) { return "AMOUNTIN_MISMATCH:got:" # Nat.toText(ok.amountIn) # ":expected:" # Nat.toText(grossTotal) } };
+      case (#Err(_)) {};
+    };
+    unwrapSwap(r);
+  };
+
+  public func CreatePrivatePositionV2(
+    amount_sell : Nat,
+    amount_init : Nat, // GROSS
+    token_sell_identifier : Text,
+    token_init_identifier : Text,
+  ) : async Text {
+    let r = await exchangeV2.addPositionV2(amount_sell, amount_init, token_sell_identifier, token_init_identifier, false, true, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, false);
+    switch (r) {
+      case (#Ok(ok)) { if (ok.amountIn != amount_init) { return "AMOUNTIN_MISMATCH:got:" # Nat.toText(ok.amountIn) # ":expected:" # Nat.toText(amount_init) } };
+      case (#Err(_)) {};
+    };
+    unwrapOrder(r);
+  };
+
+  public func CreatePublicPositionV2(
+    amount_sell : Nat,
+    amount_init : Nat, // GROSS
+    token_sell_identifier : Text,
+    token_init_identifier : Text,
+  ) : async Text {
+    let r = await exchangeV2.addPositionV2(amount_sell, amount_init, token_sell_identifier, token_init_identifier, true, false, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, false);
+    switch (r) {
+      case (#Ok(ok)) { if (ok.amountIn != amount_init) { return "AMOUNTIN_MISMATCH:got:" # Nat.toText(ok.amountIn) # ":expected:" # Nat.toText(amount_init) } };
+      case (#Err(_)) {};
+    };
+    unwrapOrder(r);
+  };
+
+  public func CreatePublicPositionOTCV2(
+    amount_sell : Nat,
+    amount_init : Nat, // GROSS
+    token_sell_identifier : Text,
+    token_init_identifier : Text,
+  ) : async Text {
+    let r = await exchangeV2.addPositionV2(amount_sell, amount_init, token_sell_identifier, token_init_identifier, true, false, ?"kkk", allUsers[Fuzz.nat.randomRange(0, 2)], false, true);
+    switch (r) {
+      case (#Ok(ok)) { if (ok.amountIn != amount_init) { return "AMOUNTIN_MISMATCH:got:" # Nat.toText(ok.amountIn) # ":expected:" # Nat.toText(amount_init) } };
+      case (#Err(_)) {};
+    };
+    unwrapOrder(r);
+  };
+
+  public func acceptPositionV2(Secret : Text, amountSelling : Nat) : async Text {
+    unwrapAction(await exchangeV2.FinishSellV2(Secret, amountSelling));
+  };
+
+  public func acceptBatchPositionsV2(
+    Secret : [Text],
+    amount_Sell_by_Reactor : [Nat],
+    token_sell_identifier : Text,
+    token_init_identifier : Text,
+  ) : async Text {
+    unwrapAction(await exchangeV2.FinishSellBatchV2(Secret, amount_Sell_by_Reactor, token_sell_identifier, token_init_identifier));
+  };
+
+  public func addLiquidityV2(token1 : Text, token2 : Text, amount1 : Nat, amount2 : Nat) : async Text {
+    let r = await exchangeV2.addLiquidityV2(token1, token2, amount1, amount2, null);
+    switch (r) {
+      case (#Ok(ok)) { if (ok.refund0 != 0 or ok.refund1 != 0) { return "REFUNDED:" # Nat.toText(ok.refund0) # ":" # Nat.toText(ok.refund1) # ":minted:" # Nat.toText(ok.liquidityMinted) } };
+      case (#Err(_)) {};
+    };
+    unwrapAddLiq(r);
+  };
+
+  public func addConcentratedLiquidityV2(
+    t0 : Text, t1 : Text, a0 : Nat, a1 : Nat,
+    pL : Nat, pU : Nat,
+  ) : async Text {
+    let r = await exchangeV2.addConcentratedLiquidityV2(t0, t1, a0, a1, pL, pU);
+    // Extended echo: refunds are load-bearing for the money-conservation
+    // asserts in test.mo (used + refund must equal the pulled gross).
+    switch (r) {
+      case (#Ok(ok)) {
+        "concentrated:" # Nat.toText(ok.liquidity) # ":" # Nat.toText(ok.positionId) # ":" # Nat.toText(ok.refund0) # ":" # Nat.toText(ok.refund1);
+      };
+      case (#Err(e)) { unwrapErr(e) };
+    };
+  };
+
+  public func treasurySwapV2(tokenIn : Text, tokenOut : Text, amountIn : Nat, minAmountOut : Nat) : async Text {
+    let r = await exchangeV2.treasurySwapV2(tokenIn, tokenOut, amountIn, minAmountOut);
+    switch (r) {
+      case (#Ok(ok)) { if (ok.amountIn != amountIn) { return "AMOUNTIN_MISMATCH:got:" # Nat.toText(ok.amountIn) # ":expected:" # Nat.toText(amountIn) } };
+      case (#Err(_)) {};
+    };
+    unwrapSwap(r);
   };
 };

@@ -1,3 +1,5 @@
+import ExTypes "../exchangeTypes";
+
 module {
   public type SwapHop = {
     tokenIn : Text;
@@ -97,6 +99,111 @@ module {
     counterparty : Text;
   };
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // V2 (gross-input + ICRC-2 pull) — typed exchange interface for the test
+  // actors and test.mo. Signatures mirror main.mo's V2 API exactly.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  public type PullRecordV2 = {
+    id : Nat;
+    caller : Principal;
+    token : Text;
+    gross : Nat;
+    feeBp : Nat;
+    revokeBp : Nat;
+    tf : Nat;
+    time : Int;
+    context : Text;
+    note : Text;
+  };
+
+  public type QuoteResultV2 = {
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    routeDescription : Text;
+    canFulfillFully : Bool;
+    potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+    hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
+  };
+
+  public type MultiQuoteRouteV2 = {
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    routeDescription : Text;
+    canFulfillFully : Bool;
+    potentialOrderDetails : ?{ amount_init : Nat; amount_sell : Nat };
+    hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
+    routeTokens : [Text];
+    tradingFeeBps : Nat;
+  };
+
+  public type OptimalPlanV2 = {
+    expectedBuyAmount : Nat;
+    fee : Nat;
+    priceImpact : Float;
+    canFulfillFully : Bool;
+    tradingFeeBps : Nat;
+    routeDescription : Text;
+    legs : [{
+      bp : Nat;
+      expectedBuyAmount : Nat;
+      route : [SwapHop];
+      routeDescription : Text;
+    }];
+  };
+
+  public type MultiHopQuoteV2 = {
+    bestRoute : [SwapHop];
+    expectedAmountOut : Nat;
+    totalFee : Nat;
+    priceImpact : Float;
+    hops : Nat;
+    routeTokens : [Text];
+    hopDetails : [{ tokenIn : Text; tokenOut : Text; amountIn : Nat; amountOut : Nat; fee : Nat; priceImpact : Float }];
+  };
+
+  public type ExchangeV2 = actor {
+    // fund-moving twins
+    swapMultiHopV2 : shared (Text, Text, Nat, [SwapHop], Nat) -> async ExTypes.SwapResult;
+    swapSplitRoutesV2 : shared (Text, Text, [SplitLeg], Nat) -> async ExTypes.SwapResult;
+    addPositionV2 : shared (Nat, Nat, Text, Text, Bool, Bool, ?Text, Text, Bool, Bool) -> async ExTypes.OrderResult;
+    FinishSellV2 : shared (Text, Nat) -> async ExTypes.ActionResult;
+    FinishSellBatchV2 : shared ([Text], [Nat], Text, Text) -> async ExTypes.ActionResult;
+    addLiquidityV2 : shared (Text, Text, Nat, Nat, ?Bool) -> async ExTypes.AddLiquidityResult;
+    addConcentratedLiquidityV2 : shared (Text, Text, Nat, Nat, Nat, Nat) -> async ExTypes.AddConcentratedResult;
+    treasurySwapV2 : shared (Text, Text, Nat, Nat) -> async ExTypes.SwapResult;
+    // helpers
+    grossToNetV2 : shared query (Text, Nat) -> async Nat;
+    netToGrossV2 : shared query (Text, Nat) -> async Nat;
+    requiredAllowanceV2 : shared query (Text, Nat) -> async Nat;
+    quoteDepositV2 : shared query (Text, Nat) -> async { transferFee : Nat; tradingFee : Nat; netSwapped : Nat };
+    // pending-pull ops
+    getMyPendingPulls : shared query () -> async [PullRecordV2];
+    adminListPendingPulls : shared query () -> async [PullRecordV2];
+    getV2AllowedTokens : shared query () -> async [Text];
+    adminSetV2TokenAllowed : shared (Text, Bool) -> async ExTypes.ActionResult;
+    admin_setV2Enabled : shared (Bool) -> async ExTypes.ActionResult;
+    getV2Enabled : shared query () -> async Bool;
+    adminResolvePendingPull : shared (Nat, Nat, { #ICP; #ICRC12; #ICRC3 }) -> async ExTypes.ActionResult;
+    adminDropPendingPull : shared Nat -> async ExTypes.ActionResult;
+    adminSweepPendingPulls : shared Nat -> async ExTypes.ActionResult;
+    getBlockDoneStatus : shared query (Text, Nat) -> async Bool;
+    // V2 quotes
+    getExpectedReceiveAmountV2 : shared query (Text, Text, Nat) -> async QuoteResultV2;
+    getExpectedReceiveAmountBatchV2 : shared query ([{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }]) -> async [QuoteResultV2];
+    getExpectedReceiveAmountBatchMultiV2 : shared query ([{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }], Nat) -> async [{ routes : [MultiQuoteRouteV2] }];
+    getExpectedReceiveAmountBatchMultiOptimalV2 : shared query (Text, Text, Nat) -> async OptimalPlanV2;
+    simulateSplitRoutesV2 : shared query ([{ amountIn : Nat; route : [SwapHop] }]) -> async { totalOut : Nat; perLegOut : [Nat]; error : Text };
+    getExpectedMultiHopAmountV2 : shared query (Text, Text, Nat) -> async MultiHopQuoteV2;
+    // V1 quote counterparts missing from examples/exchange.mo's Self —
+    // needed for the V2quote(gross) == V1quote(net) equality tests
+    simulateSplitRoutes : shared query ([{ amountIn : Nat; route : [SwapHop] }]) -> async { totalOut : Nat; perLegOut : [Nat]; error : Text };
+    getExpectedReceiveAmountBatchMulti : shared query ([{ tokenSell : Text; tokenBuy : Text; amountSell : Nat }], Nat) -> async [{ routes : [MultiQuoteRouteV2] }];
+    getExpectedReceiveAmountBatchMultiOptimal : shared query (Text, Text, Nat) -> async OptimalPlanV2;
+  };
+
   public type Vote = { tokenIndex : Nat; token : Text; basisPoints : Nat };
   public type TokenAmount = (Text, Nat);
   public type TransactionType = {
@@ -181,5 +288,31 @@ module {
     addConcentratedLiquidity : shared (Text, Text, Nat, Nat, Nat, Nat, Nat, Nat) -> async Text;
     removeConcentratedLiquidity : shared (Text, Text, Nat, Nat) -> async Text;
     getUserConcentratedPositions : shared () -> async [ConcentratedPosition];
+
+    // ── V2 additions (icrc2 approve helpers + thin V2 wrappers) ──
+    ApproveICPforExchange : shared (Nat, ?Nat64) -> async Nat;
+    ApproveICRCAforExchange : shared (Nat, ?Nat64) -> async Nat;
+    ApproveICRCBforExchange : shared (Nat, ?Nat64) -> async Nat;
+    getAllowanceICP : shared () -> async Nat;
+    getAllowanceICRCA : shared () -> async Nat;
+    getAllowanceICRCB : shared () -> async Nat;
+    RevokeApprovalICP : shared () -> async Nat;
+    RevokeApprovalICRCA : shared () -> async Nat;
+    RevokeApprovalICRCB : shared () -> async Nat;
+    getMyPendingPullsCount : shared () -> async Nat;
+    swapMultiHopV2 : shared (Text, Text, Nat, [SwapHop], Nat) -> async Text;
+    swapSplitRoutesV2 : shared (Text, Text, [SplitLeg], Nat) -> async Text;
+    CreatePrivatePositionV2 : shared (Nat, Nat, Text, Text) -> async Text;
+    CreatePublicPositionV2 : shared (Nat, Nat, Text, Text) -> async Text;
+    CreatePublicPositionOTCV2 : shared (Nat, Nat, Text, Text) -> async Text;
+    acceptPositionV2 : shared (Text, Nat) -> async Text;
+    acceptBatchPositionsV2 : shared ([Text], [Nat], Text, Text) -> async Text;
+    addLiquidityV2 : shared (Text, Text, Nat, Nat) -> async Text;
+    addConcentratedLiquidityV2 : shared (Text, Text, Nat, Nat, Nat, Nat) -> async Text;
+    treasurySwapV2 : shared (Text, Text, Nat, Nat) -> async Text;
+    recoverBlock : shared (Text, Nat) -> async Bool;
+    // PULL-RACE concurrency probes (Test122)
+    raceV2SwapVsRecover : shared (Text, Text, Nat, Nat, Nat) -> async { swap : Text; recovered : Bool; tries : Nat };
+    raceV2SwapVsV1Swap : shared (Text, Text, Nat, Nat, Nat, Nat) -> async { swapV2 : Text; swapV1 : Text; tries : Nat };
   };
 };

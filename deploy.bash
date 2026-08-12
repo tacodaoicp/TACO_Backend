@@ -63,21 +63,22 @@ dfx identity import archive_controllerTACO identity3.pem --storage-mode=plaintex
 cd ../
 directory_name="ledger_canister"
 
-# Check if the directory exists
+# ICP ledger release: ledger-suite-icp-2025-08-29 (full ICRC-2 incl. icrc2_transfer_from).
+# dfx.json is (re)written in BOTH branches so a stale checkout cannot pin an old build.
 if [ -d "./$directory_name" ]; then
-    # Delete the directory and its contents
     echo "Directory './$directory_name' already there."
     cd ledger_canister
 else
     echo "Directory './$directory_name' does not exist."
     dfx new ledger_canister
     cd ledger_canister
-    new_json_content='{
+fi
+new_json_content='{
   "canisters": {
     "ledger_canister": {
       "type": "custom",
-      "candid": "https://raw.githubusercontent.com/dfinity/ic/d87954601e4b22972899e9957e800406a0a6b929/rs/rosetta-api/icp_ledger/ledger.did",
-      "wasm": "https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ledger-canister.wasm.gz",
+      "candid": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger.did",
+      "wasm": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger-canister_notify-method.wasm.gz",
       "remote": {
         "id": {
           "ic": "ryjl3-tyaaa-aaaaa-aaaba-cai"
@@ -96,7 +97,6 @@ else
 }'
 
 echo "$new_json_content" > dfx.json
-fi
 
 # Setup identities and get account IDs
 dfx identity new minterTACO --storage-mode=plaintext
@@ -105,11 +105,14 @@ export MINTER_ACCOUNT_ID=$(dfx ledger account-id)
 dfx identity use defaultTACO
 export DEFAULT_ACCOUNT_ID=$(dfx ledger account-id)
 
-# Download and deploy ICP ledger
-curl -o ledger-canister.wasm.gz "https://download.dfinity.systems/ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ledger-canister.wasm.gz"
+# Download and deploy ICP ledger (dfx re-downloads from the dfx.json URL at deploy
+# time; this local copy is only an offline fallback / provenance record)
+curl -L -o ledger-canister_notify-method.wasm.gz "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger-canister_notify-method.wasm.gz"
 mkdir -p ./.dfx/local/canisters/ledger_canister/
-cp ledger-canister.wasm.gz ./.dfx/local/canisters/ledger_canister/
+cp ledger-canister_notify-method.wasm.gz ./.dfx/local/canisters/ledger_canister/download-ledger-canister_notify-method.wasm.gz
 
+# No feature_flags in Init: ledger-suite-icp-2025-08-29 enables ICRC-2 by default
+# (verified empirically 2026-08-07: approve/allowance/transfer_from work with this init).
 yes | dfx deploy --specified-id ryjl3-tyaaa-aaaaa-aaaba-cai ledger_canister --argument "
   (variant {
     Init = record {
@@ -241,10 +244,11 @@ export TRIGGER_THRESHOLD=2000
 export NUM_OF_BLOCK_TO_ARCHIVE=1000
 export CYCLE_FOR_ARCHIVE_CREATION=10000000000000
 
-# Download ICRC1 ledger wasm
+# Download ICRC1 ledger wasm (ic commit 5849c6d, 2024-07-04). No feature_flags in the
+# Inits below: this build enables ICRC-2 by default (verified empirically 2026-08-07).
 curl -o ic-icrc1-ledger.wasm.gz "https://download.dfinity.systems/ic/5849c6daf2037349bd36dcb6e26ce61c2c6570d0/canisters/ic-icrc1-ledger.wasm.gz"
 mkdir -p ./.dfx/local/canisters/icrc1_ledger_canister/
-cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/
+cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/download-ic-icrc1-ledger.wasm.gz
 
 # Deploy Test Token 1
 yes | dfx deploy icrc1_ledger_canister --specified-id $TestToken1 --argument "(variant {Init = record {

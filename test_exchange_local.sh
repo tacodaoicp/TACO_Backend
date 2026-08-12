@@ -5,6 +5,16 @@
 # Usage:
 #   ./test_exchange_local.sh              # Run all tests including stress tests
 #   ./test_exchange_local.sh skip_stress  # Skip stress tests
+#   ./test_exchange_local.sh --v2         # V1 (0-77) + V2 (100-121) + MIXED (150-157), no stress
+#   ./test_exchange_local.sh --v2-only    # V2 (100-121) only, standalone seed
+#   ./test_exchange_local.sh --mixed      # MIXED (150-157) only, standalone seed
+#   ./test_exchange_local.sh --residual   # RESIDUAL (210-214) only, standalone seed (no Test46)
+#   ./test_exchange_local.sh --caps       # CAPS/KILL-SWITCH (300-308) only, standalone seed
+#   ./test_exchange_local.sh --fixab      # FIXAB (220-256) only, standalone seed (FIX A/B + movers + parity + recovery)
+#
+# V2 modes poll getTestResults for the verdict — the runTestsV2 ingress call
+# times out client-side long before the canister finishes; the exit code of
+# `dfx canister call` is meaningless there.
 #
 # Prerequisites:
 #   - dfx 0.30.1+
@@ -74,12 +84,15 @@ echo "--- Step 3: Deploying ICP Ledger ---"
 cd "$PARENT_DIR/ledger_canister"
 
 # Ensure wasm is in dfx cache
+# Ledger release: ledger-suite-icp-2025-08-29 (full ICRC-2 incl. icrc2_transfer_from).
+# NOTE: dfx re-downloads the wasm from the URL pinned in ledger_canister/dfx.json on
+# every deploy; the local copy below is only an offline fallback / provenance record.
 mkdir -p ./.dfx/local/canisters/ledger_canister/
-if [ -f ledger-canister.wasm.gz ]; then
-  cp ledger-canister.wasm.gz ./.dfx/local/canisters/ledger_canister/
+if [ -f ledger-canister_notify-method.wasm.gz ]; then
+  cp ledger-canister_notify-method.wasm.gz ./.dfx/local/canisters/ledger_canister/download-ledger-canister_notify-method.wasm.gz
 else
-  echo "ERROR: ledger-canister.wasm.gz not found in $PARENT_DIR/ledger_canister/"
-  echo "Please download it first."
+  echo "ERROR: ledger-canister_notify-method.wasm.gz not found in $PARENT_DIR/ledger_canister/"
+  echo "Download it from https://github.com/dfinity/ic/releases/tag/ledger-suite-icp-2025-08-29 first."
   exit 1
 fi
 
@@ -88,6 +101,9 @@ export MINTER_ACCOUNT_ID=$(dfx ledger account-id)
 dfx identity use defaultTACO
 export DEFAULT_ACCOUNT_ID=$(dfx ledger account-id)
 
+# No feature_flags in Init: verified empirically (2026-08-07) that this build
+# (ledger-suite-icp-2025-08-29) enables ICRC-2 by default — icrc2_approve,
+# icrc2_allowance and icrc2_transfer_from all work with exactly this init.
 yes | dfx deploy --specified-id "$ICP_LEDGER_ID" ledger_canister --argument "
   (variant {
     Init = record {
@@ -122,10 +138,14 @@ wait
 echo "--- Step 4: Deploying ICRC1 tokens ---"
 cd "$PARENT_DIR/icrc1_ledger_canister"
 
-# Ensure wasm is in dfx cache
+# Ensure wasm is in dfx cache (same caveat as the ICP ledger: dfx re-downloads
+# from the URL pinned in icrc1_ledger_canister/dfx.json on every deploy).
+# No feature_flags in the Inits below: verified empirically (2026-08-07) that this
+# build (ic commit 5849c6d, 2024-07-04) enables ICRC-2 by default — icrc2_approve,
+# icrc2_allowance and icrc2_transfer_from all work with exactly these inits.
 mkdir -p ./.dfx/local/canisters/icrc1_ledger_canister/
 if [ -f ic-icrc1-ledger.wasm.gz ]; then
-  cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/
+  cp ic-icrc1-ledger.wasm.gz ./.dfx/local/canisters/icrc1_ledger_canister/download-ic-icrc1-ledger.wasm.gz
 else
   echo "ERROR: ic-icrc1-ledger.wasm.gz not found in $PARENT_DIR/icrc1_ledger_canister/"
   echo "Please download it first."
@@ -243,6 +263,17 @@ yes | dfx deploy --specified-id "$TEST_ACTOR_B_ID" exchange_testActorB --with-cy
 dfx canister create --specified-id "$TEST_ACTOR_C_ID" exchange_testActorC
 yes | dfx deploy --specified-id "$TEST_ACTOR_C_ID" exchange_testActorC --with-cycles 10000000000000000 --mode=reinstall
 
+# Misbehaving mock ICRC-1/2 ledgers for the V2 ambiguous-path / recovery tests
+# (126-133). mock_ledger's icrc2_transfer_from can be driven into a
+# debit-then-trap (the ambiguous case). Registered + allowlisted + funded from
+# test.mo's seedMocks() at run time; here we only need the canisters to exist.
+MOCK_A_ID="rh2pm-ryaaa-aaaan-qeniq-cai"
+MOCK_B_ID="i2s4q-syaaa-aaaan-qz4sq-cai"
+dfx canister create --specified-id "$MOCK_A_ID" exchange_mock_ledger
+yes | dfx deploy --specified-id "$MOCK_A_ID" exchange_mock_ledger --with-cycles 10000000000000000 --mode=reinstall
+dfx canister create --specified-id "$MOCK_B_ID" exchange_mock_ledger_b
+yes | dfx deploy --specified-id "$MOCK_B_ID" exchange_mock_ledger_b --with-cycles 10000000000000000 --mode=reinstall
+
 dfx canister create --specified-id "$EXCHANGE_TEST_ID" exchange_test
 yes | dfx deploy --specified-id "$EXCHANGE_TEST_ID" exchange_test --with-cycles 10000000000000000 --mode=reinstall
 
@@ -253,6 +284,63 @@ dfx canister call OTC_backend addFeeCollector "(principal \"$EXCHANGE_TEST_ID\")
 # === Step 8: Run tests ===
 echo "--- Step 8: Running tests ---"
 echo ""
+
+# ── V2 modes ──
+V2_MODE=""
+case "$1" in
+  --v2|v2)           V2_MODE=1; EXPECTED=133 ;;  # 78 V1 + 26 V2 + 8 MIXED + 12 BATCH/LOAD (170-181) + 9 AMBIG (126-134)
+  --v2-only|v2_only) V2_MODE=2; EXPECTED=47  ;;  # tests 100-125 (26) + 170-181 (12) + 126-134 (9)
+  --mixed|mixed)     V2_MODE=3; EXPECTED=8   ;;  # tests 150-157
+  --ambig|ambig)     V2_MODE=6; EXPECTED=9   ;;  # tests 126-134 (V2 ambiguous-path / recovery)
+  --overfill|overfill)     V2_MODE=7; EXPECTED=5   ;;  # tests 160-164 (single-fill over-fill clamp + V2 kill switch)
+  --batchdedup|batchdedup) V2_MODE=8; EXPECTED=3   ;;  # tests 190-192 (batch duplicate-accesscode double-fill)
+  --rcl|rcl)               V2_MODE=9; EXPECTED=2   ;;  # tests 200-201 (RCL-GUARD: removeConcentratedLiquidity full-range rejection + over-claim closure)
+  --residual|residual)     V2_MODE=10; EXPECTED=5  ;;  # tests 210-214 (RESIDUAL: P15 sweep ordering, setMinimumAmount floor, minLegOut V1/V2, orderbook mid)
+  --caps|caps)             V2_MODE=11; EXPECTED=9  ;;  # tests 300-308 (CAPS/KILL-SWITCH: global 200 + per-token 25 pending-pull caps, v2Enabled AND allowlist composition, refundPullV2 confiscation band + unreachability at live params, adminResolvePendingPull double-pay, mid-flight v2Enabled disable, trap-rolls-back-the-lock)
+  --fixab|fixab)           V2_MODE=12; EXPECTED=37 ;;  # tests 220-256 (FIXAB: FinishSellBatchV2 guard-order regression + V1 trap lock, V2 quote allowlist gating x6, 8 fund-movers e2e, 6 quote parities, 4 helpers + disabled shapes, 9+ recovery/admin ops incl. adminResolvePendingPull via #debitThenTrap)
+esac
+
+if [ -n "$V2_MODE" ]; then
+    echo "Running V2 tests (mode $V2_MODE, expecting $EXPECTED results)..."
+    # Client ingress timeout mid-run is normal — the canister keeps executing.
+    dfx canister call exchange_test runTestsV2 "($V2_MODE : nat, true)" || true
+
+    echo "Polling getTestResults until the run completes..."
+    LOG="$(mktemp /tmp/v2_results.XXXXXX)"
+    PREV_COUNT=-1
+    STALL=0
+    for i in $(seq 1 360); do
+        sleep 15
+        if ! dfx canister call --query --output idl exchange_test getTestResults '()' > "$LOG" 2>/dev/null; then
+            echo "  poll $i: query failed, retrying"
+            continue
+        fi
+        COUNT=$(grep -o 'Test[0-9]*: ' "$LOG" | sort -u | wc -l)
+        echo "  poll $i: $COUNT distinct test results"
+        if [ "$COUNT" -ge "$EXPECTED" ]; then break; fi
+        if [ "$COUNT" -eq "$PREV_COUNT" ]; then STALL=$((STALL+1)); else STALL=0; fi
+        PREV_COUNT=$COUNT
+        if [ "$STALL" -ge 40 ]; then
+            echo "WARNING: results stopped growing at $COUNT/$EXPECTED (10 min stall)"
+            break
+        fi
+    done
+
+    echo ""
+    echo "=== V2 Test Results (getTestResults) ==="
+    cat "$LOG"
+    echo ""
+    # Failures print 'TestNN: Failed : <reason>' — match the colon form.
+    if grep -q ': Failed' "$LOG"; then
+        echo "!!! FAILURES DETECTED !!!"
+        grep -o 'Test[0-9]*: Failed[^"]*' "$LOG"
+        exit 1
+    fi
+    PASSCOUNT=$(grep -o 'Test[0-9]*: Success' "$LOG" | wc -l)
+    echo "All reported tests passed ($PASSCOUNT Success)."
+    echo "=== Exchange V2 test run complete ==="
+    exit 0
+fi
 
 if [ "$1" = "skip_stress" ]; then
     echo "Running tests (skipping stress tests)..."
